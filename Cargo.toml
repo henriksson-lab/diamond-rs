@@ -1,0 +1,22 @@
+[package]
+name = "diamond-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of the DIAMOND protein sequence aligner"
+license = "Apache-2.0"
+
+[lib]
+name = "diamond"
+path = "src/lib.rs"
+
+[[bin]]
+name = "diamond"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+rayon = "1"
+
+[build-dependencies]
+cmake = "0.1"
