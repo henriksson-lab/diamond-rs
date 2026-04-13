@@ -11,7 +11,14 @@ pub fn format_double(x: f64) -> String {
         format!("{}", x.ceil() as i64)
     } else {
         let rounded = (x * 10.0).round() as i64;
-        format!("{}.{}", rounded / 10, (rounded % 10).abs())
+        let int_part = rounded / 10;
+        let frac_part = (rounded % 10).abs();
+        // Preserve sign for values like -0.5 where int_part rounds to 0
+        if x < 0.0 && int_part == 0 {
+            format!("-0.{}", frac_part)
+        } else {
+            format!("{}.{}", int_part, frac_part)
+        }
     }
 }
 

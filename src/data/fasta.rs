@@ -114,16 +114,19 @@ fn read_fasta_with_encoding<R: Read>(
         } else if is_fastq {
             match fastq_state {
                 1 => {
-                    // Sequence line
-                    for ch in line.bytes() {
-                        if let Ok(letter) = encoding.convert(ch) {
-                            current_seq.push(letter);
+                    // Sequence line(s) — continue until we hit a '+' line
+                    if line.starts_with('+') {
+                        fastq_state = 3; // skip quality line next
+                    } else {
+                        for ch in line.bytes() {
+                            if let Ok(letter) = encoding.convert(ch) {
+                                current_seq.push(letter);
+                            }
                         }
                     }
-                    fastq_state = 2;
                 }
                 2 => {
-                    // Plus line
+                    // Plus line (unused — handled in state 1)
                     fastq_state = 3;
                 }
                 3 => {

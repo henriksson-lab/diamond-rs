@@ -2,6 +2,13 @@ use crate::basic::packed_transcript::EditOperation;
 use crate::basic::value::{Letter, LETTER_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
 
+/// Score a pair of letters, stripping soft-mask bits.
+#[inline]
+fn score_letters(q: Letter, s: Letter, sm: &ScoreMatrix) -> i32 {
+    sm.score(q & LETTER_MASK, s & LETTER_MASK)
+}
+
+
 /// Result of a Smith-Waterman alignment.
 #[derive(Debug, Clone, Default)]
 pub struct SwResult {
@@ -86,10 +93,7 @@ pub fn smith_waterman(
     for j in 1..=slen {
         let mut vgap = i32::MIN / 2; // vertical gap score
         for i in 1..=qlen {
-            let match_score = score_matrix.score(
-                query[i - 1] & LETTER_MASK,
-                subject[j - 1] & LETTER_MASK,
-            );
+            let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix);
             let diag = dp.get(i - 1, j - 1) + match_score;
             let s = diag.max(vgap).max(hgap[i]).max(0);
 
@@ -122,10 +126,7 @@ pub fn smith_waterman(
 
     while dp.get(i, j) > 0 && i > 0 && j > 0 {
         let score = dp.get(i, j);
-        let match_score = score_matrix.score(
-            query[i - 1] & LETTER_MASK,
-            subject[j - 1] & LETTER_MASK,
-        );
+        let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix);
         let diag = dp.get(i - 1, j - 1) + match_score;
 
         if score == diag {
@@ -198,6 +199,110 @@ fn has_hgap(dp: &DpMatrix, i: usize, j: usize, gap_open: i32, gap_extend: i32) -
     false
 }
 
+/// Local Smith-Waterman with composition-based statistics (Hauser correction).
+///
+/// The CBS correction adds a per-query-position bias to the match score,
+/// adjusting for amino acid composition to reduce false positives.
+pub fn smith_waterman_cbs(
+    query: &[Letter],
+    subject: &[Letter],
+    score_matrix: &ScoreMatrix,
+    query_cbs: &[i8],
+) -> SwResult {
+    let qlen = query.len();
+    let slen = subject.len();
+    let gap_open = score_matrix.gap_open() + score_matrix.gap_extend();
+    let gap_extend = score_matrix.gap_extend();
+
+    let mut dp = DpMatrix::new(qlen, slen);
+    let mut hgap = vec![i32::MIN / 2; qlen + 1];
+
+    for j in 1..=slen {
+        let mut vgap = i32::MIN / 2;
+        for i in 1..=qlen {
+            let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix)
+                + query_cbs[i - 1] as i32; // CBS correction
+            let diag = dp.get(i - 1, j - 1) + match_score;
+            let s = diag.max(vgap).max(hgap[i]).max(0);
+
+            let open = s - gap_open;
+            vgap = (vgap - gap_extend).max(open);
+            hgap[i] = (hgap[i] - gap_extend).max(open);
+
+            dp.set(i, j, s);
+        }
+    }
+
+    let (max_score, max_i, max_j) = dp.find_max();
+    if max_score == 0 {
+        return SwResult::default();
+    }
+
+    // Simplified traceback (same as regular SW but with CBS in match scores)
+    let mut result = SwResult {
+        score: max_score,
+        query_end: max_i as i32,
+        subject_end: max_j as i32,
+        ..Default::default()
+    };
+
+    let mut i = max_i;
+    let mut j = max_j;
+    let mut ops = Vec::new();
+
+    while dp.get(i, j) > 0 && i > 0 && j > 0 {
+        let score = dp.get(i, j);
+        let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix)
+            + query_cbs[i - 1] as i32;
+        let diag = dp.get(i - 1, j - 1) + match_score;
+
+        if score == diag {
+            if (query[i - 1] & LETTER_MASK) == (subject[j - 1] & LETTER_MASK) {
+                ops.push((EditOperation::Match, 1));
+                result.identities += 1;
+            } else {
+                ops.push((EditOperation::Substitution, 1));
+                result.mismatches += 1;
+            }
+            result.length += 1;
+            i -= 1;
+            j -= 1;
+        } else if has_hgap(&dp, i, j, gap_open, gap_extend) {
+            let mut gap_len = 1i32;
+            for k in 2..=j {
+                if score == dp.get(i, j - k) - gap_open - (k as i32 - 1) * gap_extend {
+                    gap_len = k as i32;
+                    break;
+                }
+            }
+            ops.push((EditOperation::Deletion, gap_len));
+            result.length += gap_len;
+            result.gaps += gap_len;
+            result.gap_openings += 1;
+            j -= gap_len as usize;
+        } else {
+            let mut gap_len = 1i32;
+            for k in 2..=i {
+                if score == dp.get(i - k, j) - gap_open - (k as i32 - 1) * gap_extend {
+                    gap_len = k as i32;
+                    break;
+                }
+            }
+            ops.push((EditOperation::Insertion, gap_len));
+            result.length += gap_len;
+            result.gaps += gap_len;
+            result.gap_openings += 1;
+            i -= gap_len as usize;
+        }
+    }
+
+    result.query_begin = i as i32;
+    result.subject_begin = j as i32;
+    ops.reverse();
+    result.operations = ops;
+    result
+}
+
 /// Global Needleman-Wunsch alignment (scalar).
 pub fn needleman_wunsch(
     query: &[Letter],
@@ -224,10 +329,7 @@ pub fn needleman_wunsch(
     for j in 1..=slen {
         let mut vgap = i32::MIN / 2;
         for i in 1..=qlen {
-            let match_score = score_matrix.score(
-                query[i - 1] & LETTER_MASK,
-                subject[j - 1] & LETTER_MASK,
-            );
+            let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix);
             let diag = dp.get(i - 1, j - 1) + match_score;
             let s = diag.max(vgap).max(hgap[i]);
 

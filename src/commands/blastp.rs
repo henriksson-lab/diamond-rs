@@ -42,17 +42,6 @@ pub struct BlastpConfig {
 pub fn run(config: &BlastpConfig) -> io::Result<()> {
     let start = Instant::now();
 
-    // Load scoring matrix
-    let score_matrix = ScoreMatrix::new(
-        &config.matrix,
-        config.gap_open,
-        config.gap_extend,
-        0,
-        1,
-        0,
-    )
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
     // Load database sequences - try DMND first, then FASTA
     let mut db_records = {
         let db_path = Path::new(&config.database);
@@ -81,6 +70,20 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         }
     };
 
+    // Compute total database letters for E-value normalization
+    let db_letters: u64 = db_records.iter().map(|r| r.sequence.len() as u64).sum();
+
+    // Load scoring matrix with database size
+    let score_matrix = ScoreMatrix::new(
+        &config.matrix,
+        config.gap_open,
+        config.gap_extend,
+        0,
+        1,
+        db_letters,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
     // Load query sequences
     let mut query_records = Vec::new();
     for qf in &config.query_files {
@@ -89,7 +92,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     }
     eprintln!("Queries: {} sequences", query_records.len());
 
-    // Apply tantan masking (soft masking for seed filtering)
+    // Apply tantan soft masking for seed filtering (high bit set on masked positions).
     for record in &mut db_records {
         crate::masking::mask_sequence(&mut record.sequence, crate::masking::MaskingAlgo::Tantan);
     }
@@ -111,13 +114,12 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         shapes.iter().map(|s| s.weight.to_string()).collect::<Vec<_>>().join(",")
     );
 
-    // Build seed index from database using all shapes (parallel)
+    // Build partitioned seed arrays and join for each shape (parallel)
     let db_seqs: Vec<&[Letter]> = db_records.iter().map(|r| r.sequence.as_slice()).collect();
     let query_seqs: Vec<&[Letter]> = query_records.iter().map(|r| r.sequence.as_slice()).collect();
     let mut all_seed_matches = Vec::new();
     for shape in &shapes {
-        let seed_index = parallel::build_seed_index_parallel(&db_seqs, shape, &reduction);
-        let matches = parallel::find_seed_matches_parallel(&query_seqs, &seed_index, shape, &reduction);
+        let matches = parallel::find_seed_matches_partitioned(&query_seqs, &db_seqs, shape, &reduction);
         all_seed_matches.extend(matches);
     }
     eprintln!("Total seed matches: {}", all_seed_matches.len());
@@ -160,6 +162,17 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         padded_query.extend_from_slice(query);
         padded_query.push(DELIMITER_LETTER);
 
+        // Compute ungapped score cutoff for this query length.
+        // Matches C++ CutoffTable with ungapped_evalue=10000 (default sensitivity).
+        // Uses the actual database size for normalization (not 1e9) to handle
+        // small databases correctly.
+        let ungapped_evalue = 10000.0;
+        let ungapped_cutoff = score_matrix.ungapped_cutoff_db(query.len(), ungapped_evalue);
+
+        // CBS (composition-based statistics) correction per query position.
+        // C++ default is comp-based-stats=1 (Hauser correction, window=40).
+        let query_cbs = crate::stats::cbs::hauser_correction(query, &score_matrix);
+
         // Get seed matches for this query
         let empty_matches = Vec::new();
         let query_seed_matches = query_matches.get(&(query_idx as u32)).unwrap_or(&empty_matches);
@@ -199,12 +212,30 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 best_ungapped_score = best_ungapped_score.max(ungapped.score);
             }
 
-            if best_ungapped_score <= 0 {
+            if best_ungapped_score < ungapped_cutoff {
                 continue;
             }
 
-            // Gapped Smith-Waterman alignment
-            let sw = smith_waterman::smith_waterman(query, target, &score_matrix);
+            // Banded Smith-Waterman with CBS and masking-aware scoring.
+            // Matches C++ banded_swipe.h: band constrains alignment near seed diagonal,
+            // soft-masked query positions score 0 (matching SIMD zeroing), CBS added.
+            // Use the best seed hit position as the anchor for banding.
+            let best_hit = hits.iter().max_by_key(|h| {
+                let qa = h.query_pos as usize;
+                let sa = h.ref_pos as usize;
+                if qa < query.len() && sa < target.len() {
+                    score_matrix.score(query[qa] & crate::basic::value::LETTER_MASK,
+                                       target[sa] & crate::basic::value::LETTER_MASK)
+                } else { 0 }
+            }).unwrap();
+            let sw = crate::dp::banded_cbs::banded_sw_cbs(
+                query, target,
+                best_hit.query_pos as usize,
+                best_hit.ref_pos as usize,
+                30, // band_width matching C++ default
+                &score_matrix,
+                &query_cbs,
+            );
             if sw.score <= 0 {
                 continue;
             }

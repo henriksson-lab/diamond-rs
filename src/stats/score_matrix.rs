@@ -107,16 +107,21 @@ impl ScoreMatrix {
 
         let ln_k = params.k.ln();
 
-        // Compute ALP area parameters from actual matrix constants
+        // Compute ALP area parameters from actual matrix constants.
+        // Matches C++ score_matrix.cpp line 48-49:
+        //   b = 2*G*(u.alpha - p.alpha)
+        //   beta = 2*G*(u.alpha_v - p.alpha_v)
+        //   tau = 2*G*(u.alpha_v - p.sigma)
+        //   {lambda, K, p.alpha, b, p.alpha, b, p.alpha_v, beta, p.alpha_v, beta, p.sigma, tau}
         let ungapped = standard_matrix.ungapped_constants();
         let g = (go + ge) as f64;
-        let a_val = params.alpha / params.lambda;
-        let b_val = 2.0 * g * (ungapped.alpha - params.alpha) / params.lambda;
+        let a_val = params.alpha;
+        let b_val = 2.0 * g * (ungapped.alpha - params.alpha);
         let beta_val = 2.0 * g * (ungapped.alpha_v - params.alpha_v);
         let tau_val = 2.0 * g * (ungapped.alpha_v - params.sigma);
         let area_params = super::pvalues::AreaParams {
-            a_i: a_val, b_i: b_val, alpha_i: params.alpha, beta_i: beta_val,
-            a_j: a_val, b_j: b_val, alpha_j: params.alpha, beta_j: beta_val,
+            a_i: a_val, b_i: b_val, alpha_i: params.alpha_v, beta_i: beta_val,
+            a_j: a_val, b_j: b_val, alpha_j: params.alpha_v, beta_j: beta_val,
             sigma: params.sigma, tau: tau_val,
         };
 
@@ -158,9 +163,21 @@ impl ScoreMatrix {
         self.matrix8u[(a as usize) * 32 + (b as usize)]
     }
 
-    /// Convert raw alignment score to bit score.
+    /// Convert raw alignment score to bit score (simple, no length correction).
     pub fn bitscore(&self, raw_score: f64) -> f64 {
         (self.lambda * raw_score - self.ln_k) / LN_2
+    }
+
+    /// Convert raw alignment score to bit score with ALP area correction.
+    ///
+    /// Matches C++ ScoreMatrix::bitscore_corrected():
+    ///   (lambda * raw_score - ln(K) - ln(area)) / ln(2)
+    pub fn bitscore_corrected(&self, raw_score: i32, query_len: u32, subject_len: u32) -> f64 {
+        let area = super::pvalues::compute_area(
+            &self.area_params, raw_score as f64, query_len as f64, subject_len as f64,
+        );
+        let log_area = if area > 0.0 { area.ln() } else { 0.0 };
+        (self.lambda * raw_score as f64 - self.ln_k - log_area) / LN_2
     }
 
     /// Convert bit score to raw score.
@@ -168,14 +185,63 @@ impl ScoreMatrix {
         (bitscore * LN_2 + self.ln_k) / self.lambda
     }
 
+    /// Compute the minimum ungapped raw score for a given query length and e-value threshold.
+    ///
+    /// Matches C++ CutoffTable: finds the minimum raw score S such that
+    /// K * query_len * 1e9 * exp(-lambda * S) <= evalue_threshold.
+    /// The factor 1e9 / subject_len normalizes per-residue (C++ evalue_norm), with
+    /// subject_len approximated as 1e9 for the table.
+    pub fn ungapped_cutoff(&self, query_len: usize, evalue_threshold: f64) -> i32 {
+        if evalue_threshold <= 0.0 {
+            return 0;
+        }
+        // E = K * m * n * exp(-lambda * S), with n normalized to 1e9
+        // S = -(ln(E / (K * m * 1e9))) / lambda
+        let m = query_len as f64;
+        let inner = evalue_threshold / (self.k * m * 1e9);
+        if inner <= 0.0 {
+            return 0;
+        }
+        let s = -(inner.ln()) / self.lambda;
+        s.ceil() as i32
+    }
+
+    /// Compute the minimum ungapped raw score using actual database size.
+    ///
+    /// Uses db_letters for normalization instead of 1e9, so it works correctly
+    /// for both small and large databases.
+    pub fn ungapped_cutoff_db(&self, query_len: usize, evalue_threshold: f64) -> i32 {
+        if evalue_threshold <= 0.0 || self.db_letters <= 0.0 {
+            return 0;
+        }
+        let m = query_len as f64;
+        let inner = evalue_threshold / (self.k * m * self.db_letters);
+        if inner >= 1.0 {
+            return 0; // threshold is so permissive that any positive score passes
+        }
+        if inner <= 0.0 {
+            return 0;
+        }
+        let s = -(inner.ln()) / self.lambda;
+        s.ceil().max(0.0) as i32
+    }
+
     /// Compute E-value from raw score and lengths.
     ///
     /// Uses the ALP pvalues finite-size correction with actual matrix parameters.
+    /// Matches C++ ScoreMatrix::evalue():
+    ///   evaluer.evalue(raw/scale, qlen, slen) * db_letters / slen
     pub fn evalue(&self, raw_score: i32, query_len: u32, subject_len: u32) -> f64 {
-        super::pvalues::evalue_with_area(
+        let pairwise = super::pvalues::evalue_with_area(
             self.lambda, self.k, &self.area_params,
             raw_score as f64, query_len as f64, subject_len as f64,
-        )
+        );
+        // Scale to database level (matches C++ db_letters_ / subject_len)
+        if self.db_letters > 0.0 && subject_len > 0 {
+            pairwise * self.db_letters / subject_len as f64
+        } else {
+            pairwise
+        }
     }
 
     pub fn lambda(&self) -> f64 {

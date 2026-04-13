@@ -106,6 +106,10 @@ fn main() {
             };
             run_or_exit(diamond::commands::cluster_cmd::run(&config));
         }
+        "test" => {
+            print_banner();
+            run_or_exit(diamond::commands::test_cmd::run());
+        }
         _ => {
             // Fall back to C++ FFI for full compatibility
             // Filter out --legacy flag which is not known to C++
