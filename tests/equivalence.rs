@@ -381,7 +381,7 @@ fn test_native_blastp_repeat_sequence() {
     // Non-repeat sequences match within 1 point.
     let bs_diff = (rust_bs - cpp_bs).abs();
     eprintln!("Bitscore diff: {} (Rust={}, C++={})", bs_diff, rust_bs, cpp_bs);
-    assert!(bs_diff <= 12.0,
+    assert!(bs_diff <= 11.0,
         "Bit scores too far apart: rust={} cpp={} diff={}",
         rust_bs, cpp_bs, bs_diff);
 

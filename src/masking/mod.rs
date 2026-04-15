@@ -1,5 +1,6 @@
 pub mod motifs;
 pub mod tantan;
+pub mod tantan_simd;
 
 use crate::basic::value::{Letter, LETTER_MASK, MASK_LETTER, SEED_MASK};
 

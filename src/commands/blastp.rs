@@ -171,7 +171,16 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
 
         // CBS (composition-based statistics) correction per query position.
         // C++ default is comp-based-stats=1 (Hauser correction, window=40).
-        let query_cbs = crate::stats::cbs::hauser_correction(query, &score_matrix);
+        // C++ computes Hauser from the HARD-MASKED query (masked positions = X/23).
+        // Convert soft masks to hard masks for CBS computation only.
+        let query_hardmasked: Vec<Letter> = query.iter().map(|&l| {
+            if l & crate::basic::value::SEED_MASK != 0 {
+                crate::basic::value::MASK_LETTER
+            } else {
+                l
+            }
+        }).collect();
+        let query_cbs = crate::stats::cbs::hauser_correction(&query_hardmasked, &score_matrix);
 
         // Get seed matches for this query
         let empty_matches = Vec::new();

@@ -152,6 +152,38 @@ pub fn mask_tantan(seq: &mut [Letter]) {
     default_masker().mask(seq);
 }
 
+/// Scalar forward step (generic fallback).
+fn forward_step_scalar(
+    f: &mut [f32; 50], d: &[f32; 50], e_seg: &[f32],
+    b: &mut f32, f2f: f32, p_repeat_end: f32, b2b: f32,
+    f_sum_prev: f32, f_sum_out: &mut f32,
+) {
+    let b_old = *b;
+    let mut f_sum_new = 0.0f32;
+    for off in 0..50 {
+        let vf = (f[off] * f2f + b_old * d[off]) * e_seg[off];
+        f[off] = vf;
+        f_sum_new += vf;
+    }
+    *b = b_old * b2b + f_sum_prev * p_repeat_end;
+    *f_sum_out = f_sum_new;
+}
+
+/// Scalar backward step (generic fallback).
+fn backward_step_scalar(
+    f: &mut [f32; 50], d: &[f32; 50], e_seg: &[f32],
+    b: &mut f32, f2f: f32, p_repeat_end: f32, b2b: f32,
+) {
+    let mut tsum = 0.0f32;
+    let c = p_repeat_end * *b;
+    for off in 0..50 {
+        let vf = f[off] * e_seg[off];
+        tsum += vf * d[off];
+        f[off] = vf * f2f + c;
+    }
+    *b = b2b * *b + tsum;
+}
+
 /// Core tantan implementation using a pre-computed likelihood ratio matrix.
 fn mask_tantan_inner(
     seq: &mut [Letter],
@@ -190,55 +222,72 @@ fn mask_tantan_inner(
         e.push(ev);
     }
 
-    // Forward pass
+    // Forward-backward HMM with runtime SIMD dispatch.
+    // AVX2+FMA path matches C++ SIMD exactly (same hsum tree reduction, same FMA).
+    // Scalar path is the generic fallback.
+    let use_simd = super::tantan_simd::has_avx2_fma();
+
     let mut f = [0.0f32; WINDOW];
+    let mut d_arr = [0.0f32; WINDOW];
+    d_arr.copy_from_slice(&d);
     let mut pb = vec![0.0f32; len];
     let mut scale = vec![0.0f32; (len + 15) / 16];
     let mut b = 1.0f32;
     let mut f_sum = 0.0f32;
 
+    // Forward pass
     for i in 0..len {
         let ltr = (seq[i] & LETTER_MASK) as usize;
         if ltr >= n { continue; }
         let e_seg = &e[ltr][len - i..];
 
-        // Forward step — matches C++ SIMD processing order:
-        // C++ processes 48 elements in SIMD (6 chunks of 8), then 2 scalar.
-        // hsum within each chunk accumulates differently from sequential addition.
-        let b_old = b;
-        let mut f_sum_new = 0.0f32;
-        // Process in chunks of 8 to match SIMD hsum accumulation
-        for chunk_start in (0..48).step_by(8) {
-            let mut chunk_sum = 0.0f32;
-            for off in chunk_start..chunk_start + 8 {
-                let vf = f[off].mul_add(f2f, b_old * d[off]) * e_seg[off];
-                f[off] = vf;
-                chunk_sum += vf;
-            }
-            f_sum_new += chunk_sum;
+        #[cfg(target_arch = "x86_64")]
+        if use_simd {
+            // SAFETY: has_avx2_fma() confirmed AVX2+FMA support
+            f_sum = unsafe {
+                super::tantan_simd::forward_step_avx2(
+                    &mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b, f_sum,
+                )
+            };
+        } else {
+            forward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b, f_sum, &mut f_sum);
         }
-        // Scalar tail for last 2 elements (matching C++ lines 68-73)
-        for off in 48..WINDOW {
-            let vf = (f[off] * f2f + b_old * d[off]) * e_seg[off];
-            f[off] = vf;
-            f_sum_new += vf;
-        }
-        b = b_old * b2b + f_sum * P_REPEAT_END;
-        f_sum = f_sum_new;
+        #[cfg(not(target_arch = "x86_64"))]
+        forward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b, f_sum, &mut f_sum);
 
         // Rescale every 16 positions to avoid underflow
         if (i & 15) == 15 {
             let s = 1.0 / b;
             scale[i / 16] = s;
             b *= s;
+            #[cfg(target_arch = "x86_64")]
+            if use_simd {
+                unsafe { super::tantan_simd::scale_avx2(&mut f, s); }
+            } else {
+                for v in f.iter_mut() { *v *= s; }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
             for v in f.iter_mut() { *v *= s; }
             f_sum *= s;
+        }
+        if len >= 310 && len <= 330 && i >= 258 && i <= 268 {
+            eprintln!("  RUST_FWD[{}] len={}: b={:.10e} f_sum={:.10e}", i, len, b, f_sum);
         }
         pb[i] = b;
     }
 
     // Terminal probability
-    let z = b * b2b + f.iter().sum::<f32>() * P_REPEAT_END;
+    let f_total = {
+        #[cfg(target_arch = "x86_64")]
+        if use_simd {
+            unsafe { super::tantan_simd::sum_avx2(&f) }
+        } else {
+            f.iter().sum::<f32>()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        { f.iter().sum::<f32>() }
+    };
+    let z = b * b2b + f_total * P_REPEAT_END;
     let zinv = 1.0 / z;
 
     // Backward pass
@@ -252,6 +301,13 @@ fn mask_tantan_inner(
         if (i & 15) == 15 {
             let s = scale[i / 16];
             b *= s;
+            #[cfg(target_arch = "x86_64")]
+            if use_simd {
+                unsafe { super::tantan_simd::scale_avx2(&mut f, s); }
+            } else {
+                for v in f.iter_mut() { *v *= s; }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
             for v in f.iter_mut() { *v *= s; }
         }
 
@@ -259,30 +315,28 @@ fn mask_tantan_inner(
         if ltr >= n { continue; }
         let e_seg = &e[ltr][len - i..];
 
-        // Backward step — matches C++ SIMD processing order
-        let mut tsum = 0.0f32;
-        let c = P_REPEAT_END * b;
-        for chunk_start in (0..48).step_by(8) {
-            let mut chunk_sum = 0.0f32;
-            for off in chunk_start..chunk_start + 8 {
-                let vf = f[off] * e_seg[off];
-                chunk_sum += vf * d[off];
-                f[off] = vf.mul_add(f2f, c);
+        #[cfg(target_arch = "x86_64")]
+        if use_simd {
+            unsafe {
+                super::tantan_simd::backward_step_avx2(
+                    &mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b,
+                );
             }
-            tsum += chunk_sum;
+        } else {
+            backward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b);
         }
-        for off in 48..WINDOW {
-            let vf = f[off] * e_seg[off];
-            tsum += vf * d[off];
-            f[off] = vf * f2f + c;
-        }
-        b = b2b * b + tsum;
+        #[cfg(not(target_arch = "x86_64"))]
+        backward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b);
 
-        // Mask if posterior probability of repeat >= threshold
+        if len >= 310 && len <= 330 && i >= 255 && i <= 295 {
+            eprintln!("  RUST_BWD[{}] len={}: pf={:.10e} b={:.10e} {}", i, len, pf, b,
+                if pf >= min_mask_prob { "MASKED" } else { "" });
+        }
         if pf >= min_mask_prob {
             seq[i] |= SEED_MASK;
         }
     }
+
 
 }
 

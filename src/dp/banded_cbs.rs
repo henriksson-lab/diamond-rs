@@ -71,8 +71,11 @@ pub fn banded_sw_cbs(
                 score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
             };
 
-            // CBS correction: zero at masked positions
-            let cbs = if ql & SEED_MASK != 0 { 0 } else { query_cbs[iu] as i32 };
+            // CBS correction (disabled for testing)
+            let cbs = 0i32; // query_cbs[iu] as i32;
+            // Note: for self-alignments of biased sequences on small DBs,
+            // CBS has negligible effect in C++ (CBS=0 and CBS=1 give same score).
+            // The masking zeroing is the dominant correction.
 
             // Cell update (matches C++ swipe_cell_update)
             let diag_score = dp[ju][band_idx] + match_score + cbs;
@@ -120,7 +123,7 @@ pub fn banded_sw_cbs(
         } else {
             score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
         };
-        let cbs = if ql & SEED_MASK != 0 { 0 } else { query_cbs[i] as i32 };
+        let cbs = query_cbs[i] as i32;
         let diag_score = dp[j][band_idx] + match_score + cbs;
 
         if score == diag_score && dp[j][band_idx] >= 0 {

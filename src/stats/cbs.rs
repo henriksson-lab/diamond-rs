@@ -59,20 +59,18 @@ impl VectorScores {
     }
 
     fn add(&mut self, letter: Letter, score_matrix: &ScoreMatrix) {
-        let l = (letter & LETTER_MASK) as usize;
-        if l < 20 {
-            for i in 0..20 {
-                self.scores[i] += score_matrix.score(l as Letter, i as Letter);
-            }
+        // C++ VectorScores::operator+= does NOT guard for l < 20 — all letters
+        // including X (23) contribute their scores to the window sum.
+        let l = letter as usize;
+        for i in 0..20 {
+            self.scores[i] += score_matrix.score(l as Letter, i as Letter);
         }
     }
 
     fn sub(&mut self, letter: Letter, score_matrix: &ScoreMatrix) {
-        let l = (letter & LETTER_MASK) as usize;
-        if l < 20 {
-            for i in 0..20 {
-                self.scores[i] -= score_matrix.score(l as Letter, i as Letter);
-            }
+        let l = letter as usize;
+        for i in 0..20 {
+            self.scores[i] -= score_matrix.score(l as Letter, i as Letter);
         }
     }
 }
