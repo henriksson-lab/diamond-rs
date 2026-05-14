@@ -8,7 +8,6 @@ fn score_letters(q: Letter, s: Letter, sm: &ScoreMatrix) -> i32 {
     sm.score(q & LETTER_MASK, s & LETTER_MASK)
 }
 
-
 /// Result of a Smith-Waterman alignment.
 #[derive(Debug, Clone, Default)]
 pub struct SwResult {
@@ -220,8 +219,8 @@ pub fn smith_waterman_cbs(
     for j in 1..=slen {
         let mut vgap = i32::MIN / 2;
         for i in 1..=qlen {
-            let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix)
-                + query_cbs[i - 1] as i32; // CBS correction
+            let match_score =
+                score_letters(query[i - 1], subject[j - 1], score_matrix) + query_cbs[i - 1] as i32; // CBS correction
             let diag = dp.get(i - 1, j - 1) + match_score;
             let s = diag.max(vgap).max(hgap[i]).max(0);
 
@@ -252,8 +251,8 @@ pub fn smith_waterman_cbs(
 
     while dp.get(i, j) > 0 && i > 0 && j > 0 {
         let score = dp.get(i, j);
-        let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix)
-            + query_cbs[i - 1] as i32;
+        let match_score =
+            score_letters(query[i - 1], subject[j - 1], score_matrix) + query_cbs[i - 1] as i32;
         let diag = dp.get(i - 1, j - 1) + match_score;
 
         if score == diag {
@@ -313,36 +312,91 @@ pub fn needleman_wunsch(
     let slen = subject.len();
     let gap_open = score_matrix.gap_open() + score_matrix.gap_extend();
     let gap_extend = score_matrix.gap_extend();
+    let neg_inf = i32::MIN / 4;
+    let rows = qlen + 1;
+    let idx = |i: usize, j: usize| -> usize { j * rows + i };
 
-    let mut dp = DpMatrix::new(qlen, slen);
+    let mut h = vec![neg_inf; rows * (slen + 1)];
+    let mut e = vec![neg_inf; rows * (slen + 1)];
+    let mut f = vec![neg_inf; rows * (slen + 1)];
+    h[idx(0, 0)] = 0;
 
-    // Initialize first column and row with gap penalties
     for i in 1..=qlen {
-        dp.set(i, 0, -(gap_open + (i as i32 - 1) * gap_extend));
+        f[idx(i, 0)] = -gap_open - (i as i32 - 1) * gap_extend;
+        h[idx(i, 0)] = f[idx(i, 0)];
     }
     for j in 1..=slen {
-        dp.set(0, j, -(gap_open + (j as i32 - 1) * gap_extend));
+        e[idx(0, j)] = -gap_open - (j as i32 - 1) * gap_extend;
+        h[idx(0, j)] = e[idx(0, j)];
     }
 
-    let mut hgap = vec![i32::MIN / 2; qlen + 1];
-
     for j in 1..=slen {
-        let mut vgap = i32::MIN / 2;
         for i in 1..=qlen {
             let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix);
-            let diag = dp.get(i - 1, j - 1) + match_score;
-            let s = diag.max(vgap).max(hgap[i]);
-
-            let open = s - gap_open;
-            vgap = (vgap - gap_extend).max(open);
-            hgap[i] = (hgap[i] - gap_extend).max(open);
-
-            dp.set(i, j, s);
+            let current = idx(i, j);
+            e[current] = (h[idx(i, j - 1)] - gap_open).max(e[idx(i, j - 1)] - gap_extend);
+            f[current] = (h[idx(i - 1, j)] - gap_open).max(f[idx(i - 1, j)] - gap_extend);
+            h[current] = (h[idx(i - 1, j - 1)] + match_score)
+                .max(e[current])
+                .max(f[current]);
         }
     }
 
-    let final_score = dp.get(qlen, slen);
-    (final_score, Vec::new()) // NW traceback not implemented — use smith_waterman for traced alignments
+    let final_score = h[idx(qlen, slen)];
+    let mut i = qlen;
+    let mut j = slen;
+    let mut ops = Vec::new();
+
+    while i > 0 || j > 0 {
+        let current = idx(i, j);
+        if i > 0 && j > 0 {
+            let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix);
+            if h[current] == h[idx(i - 1, j - 1)] + match_score {
+                if (query[i - 1] & LETTER_MASK) == (subject[j - 1] & LETTER_MASK) {
+                    ops.push((EditOperation::Match, 1));
+                } else {
+                    ops.push((EditOperation::Substitution, 1));
+                }
+                i -= 1;
+                j -= 1;
+                continue;
+            }
+        }
+        if j > 0 && h[current] == e[current] {
+            let mut gap_len = 0i32;
+            loop {
+                gap_len += 1;
+                let e_score = e[idx(i, j)];
+                if e_score == h[idx(i, j - 1)] - gap_open {
+                    j -= 1;
+                    break;
+                }
+                j -= 1;
+                if j == 0 || e_score != e[idx(i, j)] - gap_extend {
+                    break;
+                }
+            }
+            ops.push((EditOperation::Deletion, gap_len));
+        } else if i > 0 {
+            let mut gap_len = 0i32;
+            loop {
+                gap_len += 1;
+                let f_score = f[idx(i, j)];
+                if f_score == h[idx(i - 1, j)] - gap_open {
+                    i -= 1;
+                    break;
+                }
+                i -= 1;
+                if i == 0 || f_score != f[idx(i, j)] - gap_extend {
+                    break;
+                }
+            }
+            ops.push((EditOperation::Insertion, gap_len));
+        }
+    }
+
+    ops.reverse();
+    (final_score, ops)
 }
 
 #[cfg(test)]
@@ -406,8 +460,34 @@ mod tests {
         let sm = make_test_matrix();
         let query = vec![0i8, 1, 2, 3];
         let subject = vec![0i8, 1, 2, 3];
-        let (score, _) = needleman_wunsch(&query, &subject, &sm);
+        let (score, ops) = needleman_wunsch(&query, &subject, &sm);
         // Same as SW for identical sequences with no gaps needed
         assert!(score > 0);
+        assert_eq!(ops, vec![(EditOperation::Match, 1); 4]);
+    }
+
+    #[test]
+    fn test_needleman_wunsch_traceback_with_gaps() {
+        let sm = make_test_matrix();
+        let query = vec![0i8, 1, 2, 3];
+        let subject = vec![0i8, 1, 3];
+        let (_score, ops) = needleman_wunsch(&query, &subject, &sm);
+        let aligned_query: i32 = ops
+            .iter()
+            .map(|(op, len)| match op {
+                EditOperation::Deletion => 0,
+                _ => *len,
+            })
+            .sum();
+        let aligned_subject: i32 = ops
+            .iter()
+            .map(|(op, len)| match op {
+                EditOperation::Insertion => 0,
+                _ => *len,
+            })
+            .sum();
+        assert_eq!(aligned_query, query.len() as i32);
+        assert_eq!(aligned_subject, subject.len() as i32);
+        assert!(ops.iter().any(|(op, _)| *op == EditOperation::Insertion));
     }
 }

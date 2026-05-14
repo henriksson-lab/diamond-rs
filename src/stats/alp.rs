@@ -67,7 +67,8 @@ impl AlignmentEvaluer {
         let p = &self.params;
 
         // Effective lengths with edge correction
-        let len_correction = p.alpha / p.lambda * (score.ln() + (p.k * query_len * subject_len).ln());
+        let len_correction =
+            p.alpha / p.lambda * (score.ln() + (p.k * query_len * subject_len).ln());
         let eff_query = (query_len - len_correction).max(1.0);
         let eff_subject = (subject_len - len_correction).max(1.0);
 
@@ -103,16 +104,30 @@ mod tests {
         use crate::stats::standard_matrix::Parameters;
         // BLOSUM62 with gap_open=11, gap_extend=1
         let gapped = Parameters {
-            gap_exist: 11.0, gap_extend: 1.0, reserved: 0.0,
-            lambda: 0.267, k: 0.041, h: 0.14,
-            alpha: 1.9, beta: -30.0, c: 0.66972,
-            alpha_v: 42.6028, sigma: 43.6362,
+            gap_exist: 11.0,
+            gap_extend: 1.0,
+            reserved: 0.0,
+            lambda: 0.267,
+            k: 0.041,
+            h: 0.14,
+            alpha: 1.9,
+            beta: -30.0,
+            c: 0.66972,
+            alpha_v: 42.6028,
+            sigma: 43.6362,
         };
         let ungapped = Parameters {
-            gap_exist: f64::MAX, gap_extend: f64::MAX, reserved: f64::MAX,
-            lambda: 0.3176, k: 0.134, h: 0.4012,
-            alpha: 0.7916, beta: -3.2, c: 0.623757,
-            alpha_v: 4.96466, sigma: 4.96466,
+            gap_exist: f64::MAX,
+            gap_extend: f64::MAX,
+            reserved: f64::MAX,
+            lambda: 0.3176,
+            k: 0.134,
+            h: 0.4012,
+            alpha: 0.7916,
+            beta: -3.2,
+            c: 0.623757,
+            alpha_v: 4.96466,
+            sigma: 4.96466,
         };
         AlignmentEvaluer::from_matrix(&gapped, &ungapped, 11, 1)
     }

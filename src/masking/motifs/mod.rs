@@ -93,9 +93,6 @@ mod tests {
         // F=13 R=1 K=11 Y=18 T=16 A=0 F=13 T=16
         let seq: Vec<Letter> = vec![0, 0, 13, 1, 11, 18, 16, 0, 13, 16, 0, 0];
         let positions = table.find_motifs(&seq);
-        assert!(
-            positions.contains(&2),
-            "Should find FRKYTAFT at position 2"
-        );
+        assert!(positions.contains(&2), "Should find FRKYTAFT at position 2");
     }
 }

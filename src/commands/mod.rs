@@ -4,5 +4,6 @@ pub mod cluster_cmd;
 pub mod dbinfo;
 pub mod getseq;
 pub mod makedb;
+pub mod merge_daa;
 pub mod test_cmd;
 pub mod view;

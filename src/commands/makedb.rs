@@ -50,10 +50,7 @@ mod tests {
 
     #[test]
     fn test_makedb_from_test_fasta() {
-        let input = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/diamond/src/test/1.faa"
-        );
+        let input = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/1.faa");
         let tmp = std::env::temp_dir().join("test_makedb.dmnd");
         let tmp_str = tmp.to_string_lossy().to_string();
 

@@ -24,7 +24,11 @@ impl PackedSequence {
 
         let bits_per_letter = match seq_type {
             SequenceType::Nucleotide => {
-                if has_n { 3 } else { 2 }
+                if has_n {
+                    3
+                } else {
+                    2
+                }
             }
             SequenceType::AminoAcid => 5,
         };

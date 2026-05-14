@@ -36,64 +36,60 @@ pub fn banded_sw_cbs(
     let slen = subject.len() as i32;
     let gap_open = score_matrix.gap_open() + score_matrix.gap_extend();
     let gap_extend = score_matrix.gap_extend();
+    let neg_inf = i32::MIN / 4;
 
     let diag = query_anchor as i32 - subject_anchor as i32;
-    let band_size = (2 * band_width + 1) as usize;
+    let rows = qlen as usize + 1;
+    let cols = slen as usize + 1;
+    let cell_count = rows * cols;
+    let idx = |i: usize, j: usize| -> usize { j * rows + i };
 
-    // DP matrix for traceback: dp[j][band_idx]
-    // Store full matrix so we can trace back
-    let cols = slen as usize;
-    let mut dp = vec![vec![0i32; band_size + 2]; cols + 1];
-    let mut hgap_store = vec![vec![i32::MIN / 2; band_size + 2]; cols + 1];
+    // H is the local-alignment score. E and F are affine gap states ending
+    // at the same cell after consuming subject or query characters.
+    let mut h = vec![0i32; cell_count];
+    let mut e = vec![neg_inf; cell_count];
+    let mut f = vec![neg_inf; cell_count];
 
     let mut best_score = 0i32;
-    let mut best_j = 0i32;
-    let mut best_band_idx = 0usize;
+    let mut best_i = 0usize;
+    let mut best_j = 0usize;
 
-    for j in 0..slen {
-        let ju = j as usize;
-        let mut vgap = i32::MIN / 2;
+    for j in 1..=slen as usize {
+        let subject_pos = j as i32 - 1;
+        let lower = (subject_pos + diag - band_width).max(0);
+        let upper = (subject_pos + diag + band_width).min(qlen - 1);
+        if lower > upper {
+            continue;
+        }
+        let i_begin = lower as usize + 1;
+        let i_end = upper as usize + 1;
 
-        for band_idx in 0..band_size {
-            let i = j + (diag - band_width) + band_idx as i32;
-            if i < 0 || i >= qlen {
-                dp[ju + 1][band_idx] = 0;
-                continue;
-            }
-            let iu = i as usize;
+        for i in i_begin..=i_end {
+            let query_pos = i - 1;
+            let subject_pos = j - 1;
 
             // Match score: zero if query is soft-masked (matches C++ SIMD zeroing)
-            let ql = query[iu];
-            let sl = subject[ju];
+            let ql = query[query_pos];
+            let sl = subject[subject_pos];
             let match_score = if ql & SEED_MASK != 0 {
                 0
             } else {
                 score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
             };
 
-            // CBS correction (disabled for testing)
-            let cbs = 0i32; // query_cbs[iu] as i32;
-            // Note: for self-alignments of biased sequences on small DBs,
-            // CBS has negligible effect in C++ (CBS=0 and CBS=1 give same score).
-            // The masking zeroing is the dominant correction.
-
             // Cell update (matches C++ swipe_cell_update)
-            let diag_score = dp[ju][band_idx] + match_score + cbs;
-            let from_hgap = hgap_store[ju + 1][band_idx];
-            let from_vgap = vgap;
+            let diag_score = h[idx(i - 1, j - 1)] + match_score + query_cbs[query_pos] as i32;
+            let e_idx = idx(i, j);
+            e[e_idx] = (h[idx(i, j - 1)] - gap_open).max(e[idx(i, j - 1)] - gap_extend);
+            f[e_idx] = (h[idx(i - 1, j)] - gap_open).max(f[idx(i - 1, j)] - gap_extend);
+            let s = diag_score.max(e[e_idx]).max(f[e_idx]).max(0);
 
-            let s = diag_score.max(from_hgap).max(from_vgap).max(0);
-
-            let open = s - gap_open;
-            vgap = (vgap - gap_extend).max(open);
-            hgap_store[ju + 1][band_idx + 1] = (hgap_store[ju + 1][band_idx + 1].max(i32::MIN / 2) - gap_extend).max(open);
-
-            dp[ju + 1][band_idx] = s;
+            h[e_idx] = s;
 
             if s > best_score {
                 best_score = s;
+                best_i = i;
                 best_j = j;
-                best_band_idx = band_idx;
             }
         }
     }
@@ -103,9 +99,8 @@ pub fn banded_sw_cbs(
     }
 
     // Traceback from best cell
-    let mut j = best_j as usize;
-    let mut band_idx = best_band_idx;
-    let mut i = (best_j + (diag - band_width) + band_idx as i32) as usize;
+    let mut i = best_i;
+    let mut j = best_j;
     let mut ops: Vec<(EditOperation, i32)> = Vec::new();
     let mut result = SwResult {
         score: best_score,
@@ -114,19 +109,21 @@ pub fn banded_sw_cbs(
         ..Default::default()
     };
 
-    while dp[j + 1][band_idx] > 0 && j < cols && i < query.len() as usize {
-        let score = dp[j + 1][band_idx];
-        let ql = query[i];
-        let sl = subject[j];
+    result.query_end = i as i32;
+    result.subject_end = j as i32;
+
+    while i > 0 && j > 0 && h[idx(i, j)] > 0 {
+        let score = h[idx(i, j)];
+        let ql = query[i - 1];
+        let sl = subject[j - 1];
         let match_score = if ql & SEED_MASK != 0 {
             0
         } else {
             score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
         };
-        let cbs = query_cbs[i] as i32;
-        let diag_score = dp[j][band_idx] + match_score + cbs;
+        let diag_score = h[idx(i - 1, j - 1)] + match_score + query_cbs[i - 1] as i32;
 
-        if score == diag_score && dp[j][band_idx] >= 0 {
+        if score == diag_score {
             // Diagonal move (match/substitution)
             if (ql & LETTER_MASK) == (sl & LETTER_MASK) {
                 ops.push((EditOperation::Match, 1));
@@ -136,45 +133,52 @@ pub fn banded_sw_cbs(
                 result.mismatches += 1;
             }
             result.length += 1;
-            if i == 0 || j == 0 { break; }
             i -= 1;
             j -= 1;
-            // band_idx stays the same on diagonal move
-        } else {
-            // Gap — check if horizontal or vertical
-            // Horizontal gap: move in j (insertion in subject)
-            // In banded coords: band_idx increases by 1 when j decreases
-            let hgap_score = if band_idx + 1 < band_size + 2 {
-                hgap_store[j + 1][band_idx]
-            } else {
-                i32::MIN / 2
-            };
-
-            if score == hgap_score {
-                ops.push((EditOperation::Insertion, 1));
-                result.gap_openings += 1;
-                result.gaps += 1;
-                result.length += 1;
-                if j == 0 { break; }
+        } else if score == e[idx(i, j)] {
+            // Gap in the query; consumes subject letters.
+            let mut gap_len = 0i32;
+            loop {
+                gap_len += 1;
+                let current = e[idx(i, j)];
+                if current == h[idx(i, j - 1)] - gap_open {
+                    j -= 1;
+                    break;
+                }
                 j -= 1;
-                band_idx += 1;
-                if band_idx >= band_size { break; }
-            } else {
-                // Vertical gap (deletion in subject)
-                ops.push((EditOperation::Deletion, 1));
-                result.gap_openings += 1;
-                result.gaps += 1;
-                result.length += 1;
-                if i == 0 { break; }
-                i -= 1;
-                if band_idx == 0 { break; }
-                band_idx -= 1;
+                if j == 0 || current != e[idx(i, j)] - gap_extend {
+                    break;
+                }
             }
+            ops.push((EditOperation::Deletion, gap_len));
+            result.gap_openings += 1;
+            result.gaps += gap_len;
+            result.length += gap_len;
+        } else {
+            // Gap in the subject; consumes query letters.
+            let mut gap_len = 0i32;
+            loop {
+                gap_len += 1;
+                let current = f[idx(i, j)];
+                if current == h[idx(i - 1, j)] - gap_open {
+                    i -= 1;
+                    break;
+                }
+                i -= 1;
+                if i == 0 || current != f[idx(i, j)] - gap_extend {
+                    break;
+                }
+            }
+            ops.push((EditOperation::Insertion, gap_len));
+            result.gap_openings += 1;
+            result.gaps += gap_len;
+            result.length += gap_len;
         }
     }
 
     result.query_begin = i as i32;
     result.subject_begin = j as i32;
+    ops.reverse();
     result.operations = ops;
     result
 }
@@ -199,8 +203,11 @@ mod tests {
         assert_eq!(result.gaps, 0);
         // Should match the full SW score
         let full = crate::dp::smith_waterman::smith_waterman(&query, &query, &sm);
-        assert_eq!(result.score, full.score,
-            "Banded CBS (zero cbs) should match full SW: {} vs {}", result.score, full.score);
+        assert_eq!(
+            result.score, full.score,
+            "Banded CBS (zero cbs) should match full SW: {} vs {}",
+            result.score, full.score
+        );
     }
 
     #[test]
@@ -216,10 +223,25 @@ mod tests {
         // So total score should be less than without masking
         let unmasked_query: Vec<Letter> = (0..20).map(|i| i as Letter).collect();
         let unmasked = banded_sw_cbs(&unmasked_query, &unmasked_query, 10, 10, 15, &sm, &cbs);
-        assert!(result.score < unmasked.score,
-            "Masked should score less: {} vs {}", result.score, unmasked.score);
+        assert!(
+            result.score < unmasked.score,
+            "Masked should score less: {} vs {}",
+            result.score,
+            unmasked.score
+        );
         // But alignment should still be 100% identity (banding prevents gaps)
         assert_eq!(result.identities, 20);
         assert_eq!(result.gaps, 0);
+    }
+
+    #[test]
+    fn test_banded_cbs_uses_bias() {
+        let sm = make_test_matrix();
+        let query: Vec<Letter> = (0..8).map(|i| i as Letter).collect();
+        let cbs = vec![1i8; 8];
+        let biased = banded_sw_cbs(&query, &query, 4, 4, 8, &sm, &cbs);
+        let unbiased = banded_sw_cbs(&query, &query, 4, 4, 8, &sm, &[0i8; 8]);
+        assert_eq!(biased.score, unbiased.score + 8);
+        assert_eq!(biased.identities, 8);
     }
 }

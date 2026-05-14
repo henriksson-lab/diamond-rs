@@ -32,10 +32,12 @@
 
 pub mod align;
 pub mod basic;
+pub mod chaining;
 pub mod cluster;
 pub mod commands;
 pub mod config;
 pub mod data;
+pub mod dna;
 pub mod dp;
 pub mod ffi;
 pub mod masking;
@@ -46,14 +48,14 @@ pub mod util;
 
 /// Convenient re-exports for common types.
 pub mod prelude {
-    pub use crate::basic::value::{Letter, Score, SequenceType};
+    pub use crate::align::hsp::{Hsp, Match};
     pub use crate::basic::sequence::Sequence;
+    pub use crate::basic::value::{Letter, Score, SequenceType};
     pub use crate::data::fasta::FastaRecord;
-    pub use crate::stats::score_matrix::ScoreMatrix;
     pub use crate::dp::smith_waterman::SwResult;
     pub use crate::dp::ungapped::DiagonalSegment;
-    pub use crate::align::hsp::{Hsp, Match};
     pub use crate::output::format::FieldId;
+    pub use crate::stats::score_matrix::ScoreMatrix;
 }
 
 /// Run DIAMOND with command-line arguments (FFI to C++ implementation).

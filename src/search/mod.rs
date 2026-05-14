@@ -1,5 +1,12 @@
+pub mod hamming;
 pub mod hit;
+pub mod kmer_ranking;
+pub mod left_most;
 pub mod parallel;
 pub mod seed_array;
+pub mod seed_complexity;
 pub mod seed_match;
 pub mod sensitivity;
+pub mod sse_dist;
+pub mod stage0;
+pub mod stage2;

@@ -18,7 +18,11 @@ fn run_diamond(args: &[&str]) -> i32 {
 #[test]
 fn builtin_regression_tests() {
     let code = run_diamond(&["diamond", "test"]);
-    assert_eq!(code, 0, "Built-in regression tests failed (diamond test returned {})", code);
+    assert_eq!(
+        code, 0,
+        "Built-in regression tests failed (diamond test returned {})",
+        code
+    );
 }
 
 /// Helper: run a diamond command, write output to a temp file, compare with reference.
@@ -43,13 +47,18 @@ fn run_and_compare(name: &str, args: &str) {
     assert_eq!(code, 0, "{}: diamond exited with code {}", name, code);
 
     let expected_path = td.join(format!("{}.out", name));
-    let expected = fs::read(&expected_path)
-        .unwrap_or_else(|e| panic!("{}: failed to read reference file {:?}: {}", name, expected_path, e));
+    let expected = fs::read(&expected_path).unwrap_or_else(|e| {
+        panic!(
+            "{}: failed to read reference file {:?}: {}",
+            name, expected_path, e
+        )
+    });
     let actual = fs::read(&out_file)
         .unwrap_or_else(|e| panic!("{}: failed to read output file {:?}: {}", name, out_file, e));
 
     assert_eq!(
-        actual, expected,
+        actual,
+        expected,
         "{}: output differs from reference.\nExpected {} bytes, got {} bytes",
         name,
         expected.len(),
@@ -62,10 +71,7 @@ fn run_and_compare(name: &str, args: &str) {
 
 #[test]
 fn ctest_blastp() {
-    run_and_compare(
-        "blastp",
-        "blastp -q ${TD}/1.faa -d ${TD}/2.faa -p1",
-    );
+    run_and_compare("blastp", "blastp -q ${TD}/1.faa -d ${TD}/2.faa -p1");
 }
 
 #[test]
@@ -78,10 +84,7 @@ fn ctest_blastp_mid_sens() {
 
 #[test]
 fn ctest_blastp_f0() {
-    run_and_compare(
-        "blastp-f0",
-        "blastp -q ${TD}/1.faa -d ${TD}/2.faa -f0 -p1",
-    );
+    run_and_compare("blastp-f0", "blastp -q ${TD}/1.faa -d ${TD}/2.faa -f0 -p1");
 }
 
 #[test]

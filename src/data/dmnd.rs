@@ -198,10 +198,7 @@ mod tests {
 
     #[test]
     fn test_read_real_db() {
-        let db_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/diamond/src/test/data.dmnd"
-        );
+        let db_path = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
         if let Ok(mut f) = std::fs::File::open(db_path) {
             let h = ReferenceHeader::read_from(&mut f).unwrap();
             assert_eq!(h.magic_number, MAGIC_NUMBER);

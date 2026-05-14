@@ -111,6 +111,31 @@ impl Reduction {
     pub fn reduce_seq(&self, seq: &[Letter]) -> Vec<Letter> {
         seq.iter().map(|&l| self.reduce(l) as Letter).collect()
     }
+
+    pub fn decode_seed(&self, seed: u64, len: usize) -> String {
+        let mut s = vec![b'-'; len];
+        let mut c = seed;
+        for i in 0..len {
+            s[len - i - 1] = AMINO_ACID_ALPHABET[(c % self.size as u64) as usize];
+            c /= self.size as u64;
+        }
+        String::from_utf8(s).unwrap()
+    }
+}
+
+impl std::fmt::Display for Reduction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for i in 0..self.size {
+            write!(f, "[")?;
+            for j in 0..20 {
+                if self.map[j] == i {
+                    write!(f, "{}", AMINO_ACID_ALPHABET[j] as char)?;
+                }
+            }
+            write!(f, "]")?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -132,5 +157,14 @@ mod tests {
         assert_eq!(r.reduce(0), 0);
         // K=11, R=1 should be in same group
         assert_eq!(r.reduce(11), r.reduce(1));
+    }
+
+    #[test]
+    fn test_reduction_display_and_decode_seed() {
+        let r = Reduction::default_reduction();
+        assert_eq!(format!("{}", r), "[A][RK][NDQE][C][G][H][ILMV][FWY][P][ST]");
+        assert_eq!(r.decode_seed(0, 3), "AAA");
+        assert_eq!(r.decode_seed(1, 3), "AAR");
+        assert_eq!(r.decode_seed(10, 3), "ARA");
     }
 }

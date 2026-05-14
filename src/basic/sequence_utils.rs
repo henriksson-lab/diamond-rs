@@ -158,7 +158,10 @@ mod tests {
     #[test]
     fn test_to_string() {
         let seq = vec![0i8, 1, 2, 3];
-        assert_eq!(to_string(&seq, crate::basic::value::AMINO_ACID_ALPHABET), "ARND");
+        assert_eq!(
+            to_string(&seq, crate::basic::value::AMINO_ACID_ALPHABET),
+            "ARND"
+        );
     }
 
     #[test]

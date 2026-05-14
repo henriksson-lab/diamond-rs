@@ -1,10 +1,15 @@
 pub mod cigar;
+pub mod consts;
+pub mod packed_loc;
 pub mod packed_sequence;
 pub mod packed_transcript;
 pub mod reduction;
 pub mod seed;
+pub mod seed_iterator;
 pub mod sequence;
 pub mod sequence_utils;
 pub mod shape;
+pub mod shape_config;
+pub mod statistics;
 pub mod translate;
 pub mod value;

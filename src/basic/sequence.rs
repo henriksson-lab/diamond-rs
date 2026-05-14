@@ -107,7 +107,10 @@ impl<'a> Sequence<'a> {
         }
         for ch in s.bytes() {
             let val = lookup[ch as usize];
-            if val == 0 && ch != alphabet[0] && (ch as char).to_ascii_lowercase() != alphabet[0] as char {
+            if val == 0
+                && ch != alphabet[0]
+                && (ch as char).to_ascii_lowercase() != alphabet[0] as char
+            {
                 result.push(mask_char);
             } else {
                 result.push(val);

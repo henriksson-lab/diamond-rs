@@ -3,6 +3,7 @@ use std::env;
 use diamond::commands::blastp::BlastpConfig;
 use diamond::commands::blastx::BlastxConfig;
 use diamond::commands::cluster_cmd::ClusterConfig;
+use diamond::commands::view::ViewConfig;
 use diamond::config::Sensitivity;
 
 fn main() {
@@ -106,6 +107,256 @@ fn main() {
             };
             run_or_exit(diamond::commands::cluster_cmd::run(&config));
         }
+        "merge-daa" if !has_flag(&args, "--legacy") => {
+            print_banner();
+            let input_files = get_all_args(&args, &["--in"]);
+            let output = get_arg(&args, &["-o", "--out"]);
+            if input_files.is_empty() {
+                eprintln!("Error: --in argument required");
+                std::process::exit(1);
+            }
+            if let Some(output) = output {
+                run_or_exit(diamond::commands::merge_daa::run(&input_files, &output));
+            } else {
+                eprintln!("Error: -o/--out argument required");
+                std::process::exit(1);
+            }
+        }
+        "view"
+            if !has_flag(&args, "--legacy")
+                && get_all_args(&args, &["-f", "--outfmt"])
+                    .first()
+                    .is_some_and(|f| f == "100" || f == "daa") =>
+        {
+            print_banner();
+            let daa_file = get_arg(&args, &["-a", "--daa"]).unwrap_or_default();
+            let output = get_arg(&args, &["-o", "--out"]).unwrap_or_default();
+            if daa_file.is_empty() {
+                eprintln!("Error: -a/--daa argument required");
+                std::process::exit(1);
+            }
+            if output.is_empty() {
+                eprintln!("Error: -o/--out argument required for native DAA view output");
+                std::process::exit(1);
+            }
+            run_or_exit(diamond::commands::view::run_daa(&ViewConfig {
+                daa_file,
+                output,
+                outfmt: get_all_args(&args, &["-f", "--outfmt"]),
+                max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
+                toppercent: get_arg(&args, &["--top"]).and_then(|s| s.parse().ok()),
+                forward_only: has_flag(&args, "--forwardonly"),
+                report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
+                sam_qlen_field: has_flag(&args, "--sam-query-len"),
+                invocation: args.join(" "),
+            }));
+        }
+        "view"
+            if !has_flag(&args, "--legacy") && {
+                let outfmt = get_all_args(&args, &["-f", "--outfmt"]);
+                outfmt.is_empty()
+                    || outfmt
+                        .first()
+                        .is_some_and(|f| f == "6" || f == "tab" || f == "104" || f == "json-flat")
+            } =>
+        {
+            print_banner();
+            let daa_file = get_arg(&args, &["-a", "--daa"]).unwrap_or_default();
+            let output = get_arg(&args, &["-o", "--out"]).unwrap_or_default();
+            if daa_file.is_empty() {
+                eprintln!("Error: -a/--daa argument required");
+                std::process::exit(1);
+            }
+            if output.is_empty() {
+                eprintln!("Error: -o/--out argument required for native tabular view output");
+                std::process::exit(1);
+            }
+            run_or_exit(diamond::commands::view::run_tabular(&ViewConfig {
+                daa_file,
+                output,
+                outfmt: get_all_args(&args, &["-f", "--outfmt"]),
+                max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
+                toppercent: get_arg(&args, &["--top"]).and_then(|s| s.parse().ok()),
+                forward_only: has_flag(&args, "--forwardonly"),
+                report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
+                sam_qlen_field: has_flag(&args, "--sam-query-len"),
+                invocation: args.join(" "),
+            }));
+        }
+        "view"
+            if !has_flag(&args, "--legacy")
+                && get_all_args(&args, &["-f", "--outfmt"])
+                    .first()
+                    .is_some_and(|f| f == "103" || f == "paf") =>
+        {
+            print_banner();
+            let daa_file = get_arg(&args, &["-a", "--daa"]).unwrap_or_default();
+            let output = get_arg(&args, &["-o", "--out"]).unwrap_or_default();
+            if daa_file.is_empty() {
+                eprintln!("Error: -a/--daa argument required");
+                std::process::exit(1);
+            }
+            if output.is_empty() {
+                eprintln!("Error: -o/--out argument required for native PAF view output");
+                std::process::exit(1);
+            }
+            run_or_exit(diamond::commands::view::run_paf(&ViewConfig {
+                daa_file,
+                output,
+                outfmt: get_all_args(&args, &["-f", "--outfmt"]),
+                max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
+                toppercent: get_arg(&args, &["--top"]).and_then(|s| s.parse().ok()),
+                forward_only: has_flag(&args, "--forwardonly"),
+                report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
+                sam_qlen_field: has_flag(&args, "--sam-query-len"),
+                invocation: args.join(" "),
+            }));
+        }
+        "view"
+            if !has_flag(&args, "--legacy")
+                && get_all_args(&args, &["-f", "--outfmt"])
+                    .first()
+                    .is_some_and(|f| f == "101" || f == "sam") =>
+        {
+            print_banner();
+            let daa_file = get_arg(&args, &["-a", "--daa"]).unwrap_or_default();
+            let output = get_arg(&args, &["-o", "--out"]).unwrap_or_default();
+            if daa_file.is_empty() {
+                eprintln!("Error: -a/--daa argument required");
+                std::process::exit(1);
+            }
+            if output.is_empty() {
+                eprintln!("Error: -o/--out argument required for native SAM view output");
+                std::process::exit(1);
+            }
+            run_or_exit(diamond::commands::view::run_sam(&ViewConfig {
+                daa_file,
+                output,
+                outfmt: get_all_args(&args, &["-f", "--outfmt"]),
+                max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
+                toppercent: get_arg(&args, &["--top"]).and_then(|s| s.parse().ok()),
+                forward_only: has_flag(&args, "--forwardonly"),
+                report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
+                sam_qlen_field: has_flag(&args, "--sam-query-len"),
+                invocation: args.join(" "),
+            }));
+        }
+        "view"
+            if !has_flag(&args, "--legacy")
+                && get_all_args(&args, &["-f", "--outfmt"])
+                    .first()
+                    .is_some_and(|f| f == "0") =>
+        {
+            print_banner();
+            let daa_file = get_arg(&args, &["-a", "--daa"]).unwrap_or_default();
+            let output = get_arg(&args, &["-o", "--out"]).unwrap_or_default();
+            if daa_file.is_empty() {
+                eprintln!("Error: -a/--daa argument required");
+                std::process::exit(1);
+            }
+            if output.is_empty() {
+                eprintln!("Error: -o/--out argument required for native pairwise view output");
+                std::process::exit(1);
+            }
+            run_or_exit(diamond::commands::view::run_pairwise(&ViewConfig {
+                daa_file,
+                output,
+                outfmt: get_all_args(&args, &["-f", "--outfmt"]),
+                max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
+                toppercent: get_arg(&args, &["--top"]).and_then(|s| s.parse().ok()),
+                forward_only: has_flag(&args, "--forwardonly"),
+                report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
+                sam_qlen_field: has_flag(&args, "--sam-query-len"),
+                invocation: args.join(" "),
+            }));
+        }
+        "view"
+            if !has_flag(&args, "--legacy")
+                && get_all_args(&args, &["-f", "--outfmt"])
+                    .first()
+                    .is_some_and(|f| f == "5" || f == "xml") =>
+        {
+            print_banner();
+            let daa_file = get_arg(&args, &["-a", "--daa"]).unwrap_or_default();
+            let output = get_arg(&args, &["-o", "--out"]).unwrap_or_default();
+            if daa_file.is_empty() {
+                eprintln!("Error: -a/--daa argument required");
+                std::process::exit(1);
+            }
+            if output.is_empty() {
+                eprintln!("Error: -o/--out argument required for native XML view output");
+                std::process::exit(1);
+            }
+            run_or_exit(diamond::commands::view::run_xml(&ViewConfig {
+                daa_file,
+                output,
+                outfmt: get_all_args(&args, &["-f", "--outfmt"]),
+                max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
+                toppercent: get_arg(&args, &["--top"]).and_then(|s| s.parse().ok()),
+                forward_only: has_flag(&args, "--forwardonly"),
+                report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
+                sam_qlen_field: has_flag(&args, "--sam-query-len"),
+                invocation: args.join(" "),
+            }));
+        }
+        "view"
+            if !has_flag(&args, "--legacy")
+                && get_all_args(&args, &["-f", "--outfmt"])
+                    .first()
+                    .is_some_and(|f| f == "null") =>
+        {
+            print_banner();
+            let daa_file = get_arg(&args, &["-a", "--daa"]).unwrap_or_default();
+            let output = get_arg(&args, &["-o", "--out"]).unwrap_or_default();
+            if daa_file.is_empty() {
+                eprintln!("Error: -a/--daa argument required");
+                std::process::exit(1);
+            }
+            if output.is_empty() {
+                eprintln!("Error: -o/--out argument required for native null view output");
+                std::process::exit(1);
+            }
+            run_or_exit(diamond::commands::view::run_null(&ViewConfig {
+                daa_file,
+                output,
+                outfmt: get_all_args(&args, &["-f", "--outfmt"]),
+                max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
+                toppercent: get_arg(&args, &["--top"]).and_then(|s| s.parse().ok()),
+                forward_only: has_flag(&args, "--forwardonly"),
+                report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
+                sam_qlen_field: has_flag(&args, "--sam-query-len"),
+                invocation: args.join(" "),
+            }));
+        }
+        "view"
+            if !has_flag(&args, "--legacy")
+                && get_all_args(&args, &["-f", "--outfmt"])
+                    .first()
+                    .is_some_and(|f| f == "edge") =>
+        {
+            print_banner();
+            let daa_file = get_arg(&args, &["-a", "--daa"]).unwrap_or_default();
+            let output = get_arg(&args, &["-o", "--out"]).unwrap_or_default();
+            if daa_file.is_empty() {
+                eprintln!("Error: -a/--daa argument required");
+                std::process::exit(1);
+            }
+            if output.is_empty() {
+                eprintln!("Error: -o/--out argument required for native edge view output");
+                std::process::exit(1);
+            }
+            run_or_exit(diamond::commands::view::run_edge(&ViewConfig {
+                daa_file,
+                output,
+                outfmt: get_all_args(&args, &["-f", "--outfmt"]),
+                max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
+                toppercent: get_arg(&args, &["--top"]).and_then(|s| s.parse().ok()),
+                forward_only: has_flag(&args, "--forwardonly"),
+                report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
+                sam_qlen_field: has_flag(&args, "--sam-query-len"),
+                invocation: args.join(" "),
+            }));
+        }
         "test" => {
             print_banner();
             run_or_exit(diamond::commands::test_cmd::run());
@@ -113,7 +364,8 @@ fn main() {
         _ => {
             // Fall back to C++ FFI for full compatibility
             // Filter out --legacy flag which is not known to C++
-            let filtered: Vec<&str> = args.iter()
+            let filtered: Vec<&str> = args
+                .iter()
                 .map(|s| s.as_str())
                 .filter(|s| *s != "--legacy")
                 .collect();
@@ -141,6 +393,7 @@ fn print_usage() {
     println!("  dbinfo     Print database info");
     println!("  getseq     Retrieve sequences from database");
     println!("  cluster    Cluster sequences");
+    println!("  merge-daa  Merge DAA files");
     println!("  version    Show version");
     println!("  test       Run regression tests");
     println!();
@@ -167,11 +420,12 @@ fn get_all_args(args: &[String], flags: &[&str]) -> Vec<String> {
     let mut i = 0;
     while i < args.len() {
         if flags.contains(&args[i].as_str()) {
-            if let Some(val) = args.get(i + 1) {
-                values.push(val.clone());
-                i += 2;
-                continue;
+            i += 1;
+            while i < args.len() && !args[i].starts_with('-') {
+                values.push(args[i].clone());
+                i += 1;
             }
+            continue;
         }
         i += 1;
     }
@@ -205,5 +459,32 @@ fn parse_sensitivity(args: &[String]) -> Sensitivity {
         Sensitivity::Faster
     } else {
         Sensitivity::Default
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_all_args_collects_outfmt_field_list() {
+        let args = vec![
+            "diamond".to_string(),
+            "view".to_string(),
+            "-f".to_string(),
+            "6".to_string(),
+            "qseqid".to_string(),
+            "sseqid".to_string(),
+            "--top".to_string(),
+            "10".to_string(),
+            "--outfmt".to_string(),
+            "104".to_string(),
+            "score".to_string(),
+        ];
+
+        assert_eq!(
+            get_all_args(&args, &["-f", "--outfmt"]),
+            ["6", "qseqid", "sseqid", "104", "score"]
+        );
     }
 }

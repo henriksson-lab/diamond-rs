@@ -2,6 +2,32 @@
 // This is the x64_128 variant used by DIAMOND for database hashing
 // and test output verification.
 
+pub fn hash64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    x
+}
+
+pub fn murmur_hash_u64(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    h
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MurmurHash;
+
+impl MurmurHash {
+    pub fn call(&self, h: u64) -> u64 {
+        murmur_hash_u64(h)
+    }
+}
+
 #[inline]
 fn rotl64(x: u64, r: u32) -> u64 {
     x.rotate_left(r)
@@ -164,6 +190,22 @@ mod tests {
         let seed = [0u8; 16];
         let result = murmurhash3_x64_128(b"test", &seed);
         assert_ne!(result, [0u8; 16]);
+    }
+
+    #[test]
+    fn test_hash64() {
+        assert_eq!(hash64(0), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(hash64(1), 0x910a_2dec_8902_5cc1);
+        assert_eq!(hash64(u64::MAX), 0xe4d9_7177_1b65_2c20);
+    }
+
+    #[test]
+    fn test_murmur_hash_u64() {
+        assert_eq!(murmur_hash_u64(0), 0);
+        assert_eq!(murmur_hash_u64(1), 0xb456_bcfc_34c2_cb2c);
+        assert_eq!(murmur_hash_u64(u64::MAX), 0x64b5_720b_4b82_5f21);
+        let h = MurmurHash;
+        assert_eq!(h.call(1), murmur_hash_u64(1));
     }
 
     #[test]

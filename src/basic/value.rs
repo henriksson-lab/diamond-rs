@@ -47,14 +47,70 @@ pub fn letter_mask(x: Letter) -> Letter {
 
 /// IUPACAA to standard amino acid encoding conversion table.
 pub const IUPACAA_TO_STD: [Letter; 32] = [
-    -1, 0, 20, 4, 3, 6, 13, 7, 8, 9, 21, 11, 10, 12, 2, MASK_LETTER,
-    14, 5, 1, 15, 16, MASK_LETTER, 19, 17, 23, 18, 22, -1, -1, -1, -1, 24,
+    -1,
+    0,
+    20,
+    4,
+    3,
+    6,
+    13,
+    7,
+    8,
+    9,
+    21,
+    11,
+    10,
+    12,
+    2,
+    MASK_LETTER,
+    14,
+    5,
+    1,
+    15,
+    16,
+    MASK_LETTER,
+    19,
+    17,
+    23,
+    18,
+    22,
+    -1,
+    -1,
+    -1,
+    -1,
+    24,
 ];
 
 /// NCBI to standard amino acid encoding conversion table.
 pub const NCBI_TO_STD: [Letter; 28] = [
-    MASK_LETTER, 0, 20, 4, 3, 6, 13, 7, 8, 9, 11, 10, 12, 2, 14, 5,
-    1, 15, 16, 19, 17, 23, 18, 22, MASK_LETTER, 24, MASK_LETTER, 21,
+    MASK_LETTER,
+    0,
+    20,
+    4,
+    3,
+    6,
+    13,
+    7,
+    8,
+    9,
+    11,
+    10,
+    12,
+    2,
+    14,
+    5,
+    1,
+    15,
+    16,
+    19,
+    17,
+    23,
+    18,
+    22,
+    MASK_LETTER,
+    24,
+    MASK_LETTER,
+    21,
 ];
 
 /// Converts characters to Letter values for a given alphabet.
@@ -102,7 +158,12 @@ pub struct ValueTraits {
 }
 
 impl ValueTraits {
-    pub fn new(alphabet: &'static [u8], mask_char: Letter, ignore: &[u8], seq_type: SequenceType) -> Self {
+    pub fn new(
+        alphabet: &'static [u8],
+        mask_char: Letter,
+        ignore: &[u8],
+        seq_type: SequenceType,
+    ) -> Self {
         ValueTraits {
             alphabet,
             alphabet_size: alphabet.len(),
@@ -202,8 +263,8 @@ mod tests {
 
     #[test]
     fn test_is_amino_acid() {
-        assert!(is_amino_acid(0));  // A
-        assert!(is_amino_acid(1));  // R
+        assert!(is_amino_acid(0)); // A
+        assert!(is_amino_acid(1)); // R
         assert!(!is_amino_acid(MASK_LETTER));
         assert!(!is_amino_acid(STOP_LETTER));
         assert!(!is_amino_acid(DELIMITER_LETTER));

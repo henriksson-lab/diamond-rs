@@ -2,12 +2,12 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
+use super::seed_array::{sort_merge_join, SeedArray};
+use super::seed_match::{self, SeedLoc, SeedMatch};
 use crate::basic::reduction::Reduction;
 use crate::basic::seed::PackedSeed;
 use crate::basic::shape::Shape;
 use crate::basic::value::Letter;
-use super::seed_array::{SeedArray, sort_merge_join};
-use super::seed_match::{self, SeedLoc, SeedMatch};
 
 /// Default number of seed partition bits.
 /// 4 bits = 16 partitions, matching C++ DIAMOND default.
@@ -163,8 +163,7 @@ mod tests {
 
         // Parallel
         let par_index = build_seed_index_parallel(&seqs, &shape, &reduction);
-        let par_matches =
-            find_seed_matches_parallel(&seqs, &par_index, &shape, &reduction);
+        let par_matches = find_seed_matches_parallel(&seqs, &par_index, &shape, &reduction);
 
         assert_eq!(
             serial_matches.len(),

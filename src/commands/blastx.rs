@@ -73,11 +73,7 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
             }
 
             let frame = translate::Frame::from_index(frame_idx as i32);
-            let frame_id = format!(
-                "{}_frame{}",
-                dna_rec.id,
-                frame.signed_frame()
-            );
+            let frame_id = format!("{}_frame{}", dna_rec.id, frame.signed_frame());
             let sequence: Vec<Letter> = frame_seq.iter().map(|&b| b as Letter).collect();
             protein_records.push(FastaRecord {
                 id: frame_id,
@@ -85,7 +81,10 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
             });
         }
     }
-    eprintln!("Translated frames: {} protein sequences", protein_records.len());
+    eprintln!(
+        "Translated frames: {} protein sequences",
+        protein_records.len()
+    );
 
     // Build a blastp config and delegate
     let blastp_config = BlastpConfig {

@@ -1,6 +1,11 @@
+pub mod anchored;
 pub mod banded;
+pub mod banded_3frame;
 pub mod banded_cbs;
+pub mod scan_diags;
+pub mod score_profile;
 pub mod simd_banded;
 pub mod simd_ungapped;
 pub mod smith_waterman;
+pub mod swipe;
 pub mod ungapped;

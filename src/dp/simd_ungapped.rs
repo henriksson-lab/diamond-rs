@@ -64,8 +64,7 @@ unsafe fn window_ungapped_sse41(
         let mut subject_letters = [0i8; 16];
         for (i, subj) in subjects[..subject_count].iter().enumerate() {
             if pos < subj.len() {
-                subject_letters[16 - subject_count + i] =
-                    subj[pos] & LETTER_MASK;
+                subject_letters[16 - subject_count + i] = subj[pos] & LETTER_MASK;
             }
         }
 
@@ -180,7 +179,10 @@ mod tests {
         let bad_subject: Vec<Letter> = vec![13; 20]; // All F (mismatches)
         let subjects: Vec<&[Letter]> = vec![&good_subject, &bad_subject];
         let scores = window_ungapped_multi(&query, &subjects, 20, &sm);
-        assert!(scores[0] > scores[1], "Matching subject should score higher");
+        assert!(
+            scores[0] > scores[1],
+            "Matching subject should score higher"
+        );
     }
 
     #[test]
@@ -213,7 +215,13 @@ mod tests {
         let subjects: Vec<&[Letter]> = vec![&subject1, &subject2];
         let multi = window_ungapped_multi(&query, &subjects, 15, &sm);
 
-        assert_eq!(multi[0], s1, "SIMD result should match scalar for subject 1");
-        assert_eq!(multi[1], s2, "SIMD result should match scalar for subject 2");
+        assert_eq!(
+            multi[0], s1,
+            "SIMD result should match scalar for subject 1"
+        );
+        assert_eq!(
+            multi[1], s2,
+            "SIMD result should match scalar for subject 2"
+        );
     }
 }

@@ -7,15 +7,11 @@ use std::path::Path;
 /// Test that the native dbinfo command produces the same output as FFI.
 #[test]
 fn test_dbinfo_equivalence() {
-    let db = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/diamond/src/test/data.dmnd"
-    );
+    let db = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
 
     // Verify the native Rust version reads the same data as the C++
     let mut file = fs::File::open(db).unwrap();
-    let header =
-        diamond::data::dmnd::ReferenceHeader::read_from(&mut file).unwrap();
+    let header = diamond::data::dmnd::ReferenceHeader::read_from(&mut file).unwrap();
     assert_eq!(header.sequences, 1);
     assert_eq!(header.letters, 426);
 }
@@ -24,12 +20,10 @@ fn test_dbinfo_equivalence() {
 #[test]
 fn test_dmnd_reader_matches_fasta() {
     // Read sequences from DMND database
-    let (_, dmnd_records) = diamond::data::dmnd_reader::read_dmnd(Path::new(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/diamond/src/test/data.dmnd"
-        ),
-    ))
+    let (_, dmnd_records) = diamond::data::dmnd_reader::read_dmnd(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/diamond/src/test/data.dmnd"
+    )))
     .unwrap();
 
     // Each sequence should have valid letter values
@@ -49,18 +43,15 @@ fn test_dmnd_reader_matches_fasta() {
 /// Test that scoring matrix values match between Rust and C++ conventions.
 #[test]
 fn test_scoring_matrix_consistency() {
-    let sm = diamond::stats::score_matrix::ScoreMatrix::new(
-        "blosum62", 11, 1, 0, 1, 0,
-    )
-    .unwrap();
+    let sm = diamond::stats::score_matrix::ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
 
     // Known BLOSUM62 scores
     let known_scores: Vec<(i8, i8, i32)> = vec![
-        (0, 0, 4),   // A-A
-        (0, 1, -1),  // A-R
-        (1, 1, 5),   // R-R
-        (4, 4, 9),   // C-C
-        (13, 13, 6), // F-F
+        (0, 0, 4),    // A-A
+        (0, 1, -1),   // A-R
+        (1, 1, 5),    // R-R
+        (4, 4, 9),    // C-C
+        (13, 13, 6),  // F-F
         (17, 17, 11), // W-W
     ];
 
@@ -106,7 +97,11 @@ fn test_seed_extraction_shape_consistency() {
         for &code in codes {
             let shape = diamond::basic::shape::Shape::from_code(code, &reduction);
             // Verify shape properties
-            assert!(shape.weight > 0, "Shape weight should be positive for {:?}", sens);
+            assert!(
+                shape.weight > 0,
+                "Shape weight should be positive for {:?}",
+                sens
+            );
             assert!(
                 shape.length >= shape.weight,
                 "Shape length >= weight for {:?}",
@@ -114,11 +109,11 @@ fn test_seed_extraction_shape_consistency() {
             );
 
             // Extract seeds from a test sequence
-            let seq: Vec<diamond::basic::value::Letter> =
-                (0..30).map(|i| (i % 20) as diamond::basic::value::Letter).collect();
+            let seq: Vec<diamond::basic::value::Letter> = (0..30)
+                .map(|i| (i % 20) as diamond::basic::value::Letter)
+                .collect();
             if seq.len() >= shape.length as usize {
-                let seeds =
-                    diamond::search::seed_match::extract_seeds(&seq, &shape, &reduction);
+                let seeds = diamond::search::seed_match::extract_seeds(&seq, &shape, &reduction);
                 assert!(
                     !seeds.is_empty(),
                     "Should extract seeds with shape {} for {:?}",
@@ -133,10 +128,7 @@ fn test_seed_extraction_shape_consistency() {
 /// Test that ungapped extension produces valid diagonal segments.
 #[test]
 fn test_ungapped_extension_validity() {
-    let sm = diamond::stats::score_matrix::ScoreMatrix::new(
-        "blosum62", 11, 1, 0, 1, 0,
-    )
-    .unwrap();
+    let sm = diamond::stats::score_matrix::ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
 
     // Create padded sequences
     let query: Vec<diamond::basic::value::Letter> = {
@@ -147,11 +139,12 @@ fn test_ungapped_extension_validity() {
     };
     let subject = query.clone();
 
-    let result = diamond::dp::ungapped::xdrop_ungapped(
-        &query, &subject, 25, 25, 12, &sm,
-    );
+    let result = diamond::dp::ungapped::xdrop_ungapped(&query, &subject, 25, 25, 12, &sm);
 
-    assert!(result.score > 0, "Self-alignment should have positive score");
+    assert!(
+        result.score > 0,
+        "Self-alignment should have positive score"
+    );
     assert!(result.len > 0, "Self-alignment should have positive length");
     assert!(result.i >= 0, "Query start should be non-negative");
     assert!(result.j >= 0, "Subject start should be non-negative");
@@ -160,10 +153,7 @@ fn test_ungapped_extension_validity() {
 /// Test that Smith-Waterman produces valid alignments.
 #[test]
 fn test_smith_waterman_validity() {
-    let sm = diamond::stats::score_matrix::ScoreMatrix::new(
-        "blosum62", 11, 1, 0, 1, 0,
-    )
-    .unwrap();
+    let sm = diamond::stats::score_matrix::ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
 
     // Read test sequences
     let records = diamond::data::fasta::read_fasta_file(
@@ -176,11 +166,7 @@ fn test_smith_waterman_validity() {
     .unwrap();
 
     for r in &records {
-        let result = diamond::dp::smith_waterman::smith_waterman(
-            &r.sequence,
-            &r.sequence,
-            &sm,
-        );
+        let result = diamond::dp::smith_waterman::smith_waterman(&r.sequence, &r.sequence, &sm);
 
         // Self-alignment invariants
         assert!(result.score > 0, "Self-alignment should score positive");
@@ -217,7 +203,7 @@ fn test_output_formatting_matches_cpp() {
 /// Test native blastp finds the same alignment as FFI.
 #[test]
 fn test_native_blastp_matches_ffi_scores() {
-    use diamond::commands::blastp::{BlastpConfig, run};
+    use diamond::commands::blastp::{run, BlastpConfig};
     use diamond::config::Sensitivity;
 
     let query = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/5.faa");
@@ -245,10 +231,17 @@ fn test_native_blastp_matches_ffi_scores() {
 
     // Run FFI
     diamond::ffi::run(&[
-        "diamond", "blastp",
-        "-q", query, "-d", db,
-        "-o", &ffi_out.to_string_lossy(),
-        "-p1", "--tmpdir", "/tmp",
+        "diamond",
+        "blastp",
+        "-q",
+        query,
+        "-d",
+        db,
+        "-o",
+        &ffi_out.to_string_lossy(),
+        "-p1",
+        "--tmpdir",
+        "/tmp",
     ]);
 
     // Parse outputs
@@ -256,7 +249,10 @@ fn test_native_blastp_matches_ffi_scores() {
     let ffi_output = fs::read_to_string(&ffi_out).unwrap();
 
     // Both should find alignments
-    assert!(!native_output.is_empty(), "Native blastp should produce output");
+    assert!(
+        !native_output.is_empty(),
+        "Native blastp should produce output"
+    );
     assert!(!ffi_output.is_empty(), "FFI blastp should produce output");
 
     // Parse first line of each
@@ -268,18 +264,28 @@ fn test_native_blastp_matches_ffi_scores() {
     assert_eq!(native_fields[1], ffi_fields[1], "Subject IDs should match");
 
     // Same percent identity
-    assert_eq!(native_fields[2], ffi_fields[2], "Percent identity should match");
+    assert_eq!(
+        native_fields[2], ffi_fields[2],
+        "Percent identity should match"
+    );
 
     // Same alignment length
-    assert_eq!(native_fields[3], ffi_fields[3], "Alignment length should match");
+    assert_eq!(
+        native_fields[3], ffi_fields[3],
+        "Alignment length should match"
+    );
 
     // Bit scores should be close (small CBS rounding differences allowed)
     let native_bs: f64 = native_fields[11].parse().unwrap_or(0.0);
     let ffi_bs: f64 = ffi_fields[11].parse().unwrap_or(0.0);
     let bs_diff = (native_bs - ffi_bs).abs();
-    assert!(bs_diff <= 5.0,
+    assert!(
+        bs_diff <= 5.0,
         "Bit scores too far apart: native={} ffi={} diff={}",
-        native_fields[11], ffi_fields[11], bs_diff);
+        native_fields[11],
+        ffi_fields[11],
+        bs_diff
+    );
 
     // Same coordinates
     assert_eq!(native_fields[6], ffi_fields[6], "qstart should match");
@@ -304,19 +310,32 @@ fn test_native_blastp_matches_ffi_scores() {
 fn test_native_blastp_repeat_sequence() {
     // Write Q6GZX3 as a FASTA query
     let query_path = std::env::temp_dir().join("test_q6gzx3.fasta");
-    fs::write(&query_path, ">sp|Q6GZX3|002L_FRG3G\n\
+    fs::write(
+        &query_path,
+        ">sp|Q6GZX3|002L_FRG3G\n\
         MSIIGATRLQNDKSDTYSAGPCYAGGCSAFTPRGTCGKDWDLGEQTCASGFCTSQPLCA\n\
         RIKKTQVCGLRYSSKGKDPLVSAEWDSRGAPYVRCTYDADLIDTQAQVDQFVSMFGESP\n\
         SLAERYCMRGVKNTAGELVSRVSSDADPAGGWCRKWYSAHRGPDQDAALGSFCIKNPGA\n\
         ADCKCINRASDPVYQKVKTLHAYPDQCWYVPCAADVGELKMGTQRDTPTNCPTQVCQIV\n\
         FNMLDDGSVTMDDVKNTINCDFSKYVPPPPPPKPTPPTPPTPPTPPTPPTPPTPPTPRP\n\
-        VHNRKVMFFVAGAVLVAILISTVRW\n").unwrap();
+        VHNRKVMFFVAGAVLVAILISTVRW\n",
+    )
+    .unwrap();
 
     // Build DB from the same sequence using C++ diamond
     let db_path = std::env::temp_dir().join("test_q6gzx3");
-    let status = std::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/build/diamond"))
-        .args(["makedb", "--in", query_path.to_str().unwrap(), "--db", db_path.to_str().unwrap()])
-        .output();
+    let status = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/diamond/build/diamond"
+    ))
+    .args([
+        "makedb",
+        "--in",
+        query_path.to_str().unwrap(),
+        "--db",
+        db_path.to_str().unwrap(),
+    ])
+    .output();
     if status.is_err() || !status.as_ref().unwrap().status.success() {
         eprintln!("Skipping: C++ diamond not built");
         let _ = fs::remove_file(&query_path);
@@ -327,21 +346,43 @@ fn test_native_blastp_repeat_sequence() {
 
     // Run C++
     let cpp_out = std::env::temp_dir().join("test_q6gzx3_cpp.tsv");
-    let cpp_status = std::process::Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/build/diamond"))
-        .args(["blastp", "--query", query_path.to_str().unwrap(),
-               "--db", dmnd_path.to_str().unwrap(),
-               "--out", cpp_out.to_str().unwrap(),
-               "--outfmt", "6", "--threads", "1"])
-        .output().unwrap();
+    let cpp_status = std::process::Command::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/diamond/build/diamond"
+    ))
+    .args([
+        "blastp",
+        "--query",
+        query_path.to_str().unwrap(),
+        "--db",
+        dmnd_path.to_str().unwrap(),
+        "--out",
+        cpp_out.to_str().unwrap(),
+        "--outfmt",
+        "6",
+        "--threads",
+        "1",
+    ])
+    .output()
+    .unwrap();
     assert!(cpp_status.status.success(), "C++ blastp failed");
 
     let cpp_output = fs::read_to_string(&cpp_out).unwrap();
     let cpp_fields: Vec<&str> = cpp_output.trim().split('\t').collect();
-    let cpp_bs: f64 = cpp_fields.get(11).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let cpp_pident: f64 = cpp_fields.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let cpp_bs: f64 = cpp_fields
+        .get(11)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let cpp_pident: f64 = cpp_fields
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let cpp_len: i32 = cpp_fields.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    eprintln!("C++ Q6GZX3: pident={} len={} bitscore={}", cpp_pident, cpp_len, cpp_bs);
+    eprintln!(
+        "C++ Q6GZX3: pident={} len={} bitscore={}",
+        cpp_pident, cpp_len, cpp_bs
+    );
     assert_eq!(cpp_pident, 100.0, "C++ should find 100% identity self-hit");
     assert_eq!(cpp_len, 320, "C++ alignment length should be 320");
 
@@ -366,12 +407,24 @@ fn test_native_blastp_repeat_sequence() {
     let rust_output = fs::read_to_string(&rust_out).unwrap();
     assert!(!rust_output.is_empty(), "Rust should find self-hit");
     let rust_fields: Vec<&str> = rust_output.trim().split('\t').collect();
-    let rust_bs: f64 = rust_fields.get(11).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let rust_pident: f64 = rust_fields.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let rust_bs: f64 = rust_fields
+        .get(11)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let rust_pident: f64 = rust_fields
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     let rust_len: i32 = rust_fields.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    eprintln!("Rust Q6GZX3: pident={} len={} bitscore={}", rust_pident, rust_len, rust_bs);
-    assert_eq!(rust_pident, 100.0, "Rust should find 100% identity self-hit");
+    eprintln!(
+        "Rust Q6GZX3: pident={} len={} bitscore={}",
+        rust_pident, rust_len, rust_bs
+    );
+    assert_eq!(
+        rust_pident, 100.0,
+        "Rust should find 100% identity self-hit"
+    );
     assert_eq!(rust_len, 320, "Rust alignment length should be 320");
 
     // Bitscore comparison: Rust banded SW with masking zeroing + CBS.
@@ -380,10 +433,17 @@ fn test_native_blastp_repeat_sequence() {
     // causing ~4 boundary positions to differ in masking decisions.
     // Non-repeat sequences match within 1 point.
     let bs_diff = (rust_bs - cpp_bs).abs();
-    eprintln!("Bitscore diff: {} (Rust={}, C++={})", bs_diff, rust_bs, cpp_bs);
-    assert!(bs_diff <= 11.0,
+    eprintln!(
+        "Bitscore diff: {} (Rust={}, C++={})",
+        bs_diff, rust_bs, cpp_bs
+    );
+    assert!(
+        bs_diff <= 11.0,
         "Bit scores too far apart: rust={} cpp={} diff={}",
-        rust_bs, cpp_bs, bs_diff);
+        rust_bs,
+        cpp_bs,
+        bs_diff
+    );
 
     // Cleanup
     let _ = fs::remove_file(&query_path);

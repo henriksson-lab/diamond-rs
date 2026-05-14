@@ -1,4 +1,6 @@
-use clap::{Parser, Subcommand, Args};
+use clap::{Args, Parser, Subcommand};
+
+use crate::util::io::Compressor;
 
 /// DIAMOND protein aligner — Rust port
 #[derive(Parser, Debug)]
@@ -309,11 +311,15 @@ pub enum Sensitivity {
     Faster = 0,
     Fast = 1,
     Default = 2,
-    MidSensitive = 3,
-    Sensitive = 4,
-    MoreSensitive = 5,
-    VerySensitive = 6,
-    UltraSensitive = 7,
+    Linclust40 = 3,
+    Linclust20 = 4,
+    Shapes6x10 = 5,
+    Shapes30x10 = 6,
+    MidSensitive = 7,
+    Sensitive = 8,
+    MoreSensitive = 9,
+    VerySensitive = 10,
+    UltraSensitive = 11,
 }
 
 impl AlignArgs {
@@ -339,6 +345,102 @@ impl AlignArgs {
     }
 }
 
+pub fn block_size(
+    memory_limit: i64,
+    db_letters: i64,
+    sensitivity: Sensitivity,
+    lin: bool,
+    thread_count: i32,
+) -> (f64, i32) {
+    const AVG_SEQ_LENGTH_EST: f64 = 200.0;
+    let reduction = crate::basic::reduction::Reduction::default_reduction();
+    let traits = crate::search::sensitivity::get_traits(sensitivity);
+    let m = memory_limit as f64 / 1e9;
+    let min = traits.minimizer_window;
+    let sketch_size = traits.sketch_size;
+    let max_c = if min > 0 || sketch_size > 0 {
+        1
+    } else if lin {
+        16
+    } else {
+        4
+    };
+    let shape_weight = crate::basic::shape::Shape::from_code(
+        crate::search::sensitivity::get_shape_codes(sensitivity)[0],
+        &reduction,
+    )
+    .weight;
+    let max_b = if lin {
+        32768.0
+    } else if sensitivity <= Sensitivity::Default {
+        12.0
+    } else if sensitivity <= Sensitivity::MoreSensitive {
+        6.0
+    } else {
+        1.6
+    };
+
+    assert!(min == 0 || sketch_size == 0);
+    let mut c = 0;
+    let mut b;
+    loop {
+        c += 1;
+        let mut seeds_per_letter = if sketch_size > 0 {
+            sketch_size as f64 / AVG_SEQ_LENGTH_EST
+        } else {
+            1.0
+        } / c as f64;
+        if min > 0 {
+            seeds_per_letter /= min as f64 / 2.0;
+        }
+        let seedp_bits =
+            crate::search::sensitivity::seedp_bits(shape_weight, thread_count, c, &reduction);
+        let seedp_per_chunk = crate::basic::seed::seedp_count(seedp_bits) / c as u64;
+        let hash_join_factor = 1.0 + thread_count as f64 / seedp_per_chunk as f64;
+        let seed_array_entry_size = 18.0 * hash_join_factor;
+        b = m / (seed_array_entry_size * seeds_per_letter + 2.0);
+        if !((b as i64) * 1_000_000_000 < db_letters && b < max_b && c < max_c) {
+            break;
+        }
+    }
+    b = b.min(max_b);
+    (b.max(0.001), c)
+}
+
+pub fn set_string_option<T>(s: &str, name: &str, values: &[(&str, T)]) -> Result<T, String>
+where
+    T: Copy + Default,
+{
+    if s.is_empty() {
+        return Ok(T::default());
+    }
+    for (key, value) in values {
+        if s == *key {
+            return Ok(*value);
+        }
+    }
+    let allowed = values.iter().fold(String::new(), |mut acc, (key, _)| {
+        acc.push(' ');
+        acc.push_str(key);
+        acc
+    });
+    Err(format!(
+        "Invalid argument for option {name}. Allowed values are:{allowed}"
+    ))
+}
+
+pub fn compressor(compression: &str) -> Result<Compressor, String> {
+    if compression.is_empty() || compression == "0" {
+        Ok(Compressor::None)
+    } else if compression == "1" {
+        Ok(Compressor::Zlib)
+    } else if compression == "zstd" {
+        Ok(Compressor::Zstd)
+    } else {
+        Err(format!("Invalid compression algorithm: {compression}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,7 +454,14 @@ mod tests {
     #[test]
     fn test_cli_parse_blastp() {
         let cli = Cli::try_parse_from([
-            "diamond", "blastp", "-q", "query.faa", "-d", "db", "-o", "out.txt",
+            "diamond",
+            "blastp",
+            "-q",
+            "query.faa",
+            "-d",
+            "db",
+            "-o",
+            "out.txt",
         ]);
         assert!(cli.is_ok());
         if let Command::Blastp(args) = cli.unwrap().command {
@@ -366,7 +475,13 @@ mod tests {
     #[test]
     fn test_cli_parse_sensitivity() {
         let cli = Cli::try_parse_from([
-            "diamond", "blastp", "-q", "q.faa", "-d", "db", "--more-sensitive",
+            "diamond",
+            "blastp",
+            "-q",
+            "q.faa",
+            "-d",
+            "db",
+            "--more-sensitive",
         ]);
         if let Command::Blastp(args) = cli.unwrap().command {
             assert_eq!(args.sensitivity(), Sensitivity::MoreSensitive);
@@ -375,9 +490,40 @@ mod tests {
 
     #[test]
     fn test_cli_parse_makedb() {
-        let cli = Cli::try_parse_from([
-            "diamond", "makedb", "--in", "ref.faa", "-d", "db",
-        ]);
+        let cli = Cli::try_parse_from(["diamond", "makedb", "--in", "ref.faa", "-d", "db"]);
         assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_block_size_calculation() {
+        assert_eq!(block_size(0, 0, Sensitivity::Default, false, 1), (0.001, 1));
+        let (b, c) = block_size(8_000_000_000, 5_000_000_000, Sensitivity::Default, false, 4);
+        assert!(b > 0.0);
+        assert!((1..=4).contains(&c));
+        let (_, lin_c) = block_size(8_000_000_000, 5_000_000_000, Sensitivity::Default, true, 4);
+        assert!((1..=16).contains(&lin_c));
+    }
+
+    #[test]
+    fn test_set_string_option() {
+        let values = [("one", 1_i32), ("two", 2_i32)];
+        assert_eq!(set_string_option("", "mode", &values).unwrap(), 0);
+        assert_eq!(set_string_option("two", "mode", &values).unwrap(), 2);
+        assert_eq!(
+            set_string_option("three", "mode", &values).unwrap_err(),
+            "Invalid argument for option mode. Allowed values are: one two"
+        );
+    }
+
+    #[test]
+    fn test_compressor() {
+        assert_eq!(compressor("").unwrap(), Compressor::None);
+        assert_eq!(compressor("0").unwrap(), Compressor::None);
+        assert_eq!(compressor("1").unwrap(), Compressor::Zlib);
+        assert_eq!(compressor("zstd").unwrap(), Compressor::Zstd);
+        assert_eq!(
+            compressor("gzip").unwrap_err(),
+            "Invalid compression algorithm: gzip"
+        );
     }
 }

@@ -23,7 +23,9 @@ pub fn run(database_path: &str) -> io::Result<()> {
     })?;
 
     let header = ReferenceHeader::read_from(&mut file)?;
-    header.validate().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    header
+        .validate()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let db_type = "Diamond database";
     println!("{:>22}  {db_type}", "Database type");
@@ -41,10 +43,7 @@ mod tests {
 
     #[test]
     fn test_dbinfo_test_db() {
-        let db_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/diamond/src/test/data.dmnd"
-        );
+        let db_path = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
         let result = run(db_path);
         assert!(result.is_ok());
     }

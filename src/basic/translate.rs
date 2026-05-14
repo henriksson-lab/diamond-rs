@@ -8,12 +8,11 @@ pub enum Strand {
 }
 
 /// Reading frame for translated sequences.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Frame {
     pub offset: i32,
     pub strand: Strand,
 }
-
 
 impl Frame {
     pub fn new(strand: Strand, offset: i32) -> Self {
@@ -53,6 +52,151 @@ impl Frame {
     }
 }
 
+/// Position in a translated query context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranslatedPosition {
+    pub frame: Frame,
+    pub translated: i32,
+}
+
+impl TranslatedPosition {
+    pub fn new(translated: i32, frame: Frame) -> Self {
+        TranslatedPosition { frame, translated }
+    }
+
+    pub fn from_in_strand(in_strand: i32, strand: Strand, query_translated: bool) -> Self {
+        TranslatedPosition {
+            frame: Frame::new(strand, in_strand % 3),
+            translated: Self::in_strand_to_translated(in_strand, query_translated),
+        }
+    }
+
+    pub fn shift_forward(&mut self) {
+        self.frame.offset += 1;
+        if self.frame.offset == 3 {
+            self.frame.offset = 0;
+            self.translated += 1;
+        }
+    }
+
+    pub fn shift_back(&mut self) {
+        self.frame.offset -= 1;
+        if self.frame.offset == -1 {
+            self.frame.offset = 2;
+            self.translated -= 1;
+        }
+    }
+
+    pub fn shift_forward_by(&mut self, mut k: i32) {
+        while k > 0 {
+            self.shift_forward();
+            k -= 1;
+        }
+    }
+
+    pub fn frame_shift(&self, x: &TranslatedPosition) -> i32 {
+        const FRAME_SHIFT: [[i32; 3]; 3] = [[0, 1, -1], [-1, 0, 1], [1, -1, 0]];
+        FRAME_SHIFT[self.frame.offset as usize][x.frame.offset as usize]
+    }
+
+    pub fn absolute(&self, dna_len: i32, query_translated: bool, blastn: bool) -> i32 {
+        if self.frame.offset == 0 && blastn {
+            return dna_len - 1 - self.translated;
+        }
+        if !query_translated && self.frame.strand == Strand::Forward {
+            return self.translated;
+        }
+        Self::oriented_position(self.in_strand(query_translated), self.frame.strand, dna_len)
+    }
+
+    pub fn absolute_interval(
+        begin: TranslatedPosition,
+        end: TranslatedPosition,
+        dna_len: i32,
+        query_translated: bool,
+    ) -> crate::util::interval::Interval {
+        if begin.frame.strand == Strand::Forward {
+            crate::util::interval::Interval::new(
+                begin.in_strand(query_translated),
+                end.in_strand(query_translated),
+            )
+        } else {
+            crate::util::interval::Interval::new(
+                Self::oriented_position(
+                    end.in_strand(query_translated) - 1,
+                    Strand::Reverse,
+                    dna_len,
+                ),
+                Self::oriented_position(
+                    begin.in_strand(query_translated) - 1,
+                    Strand::Reverse,
+                    dna_len,
+                ),
+            )
+        }
+    }
+
+    pub fn in_strand_to_translated(in_strand: i32, query_translated: bool) -> i32 {
+        if query_translated {
+            in_strand / 3
+        } else {
+            in_strand
+        }
+    }
+
+    pub fn translated_to_in_strand(translated: i32, frame: Frame, query_translated: bool) -> i32 {
+        if query_translated {
+            frame.offset + 3 * translated
+        } else {
+            translated
+        }
+    }
+
+    pub fn in_strand(&self, query_translated: bool) -> i32 {
+        Self::translated_to_in_strand(self.translated, self.frame, query_translated)
+    }
+
+    pub fn oriented_position(pos: i32, strand: Strand, dna_len: i32) -> i32 {
+        if strand == Strand::Forward {
+            pos
+        } else {
+            dna_len - pos - 1
+        }
+    }
+
+    pub fn absolute_to_translated(src: i32, frame: Frame, dna_len: i32, translated: bool) -> i32 {
+        if !translated {
+            src
+        } else {
+            Self::in_strand_to_translated(Self::oriented_position(src, frame.strand, dna_len), true)
+        }
+    }
+
+    pub fn translated_to_absolute(translated: i32, frame: Frame, dna_len: i32) -> i32 {
+        Self::oriented_position(
+            Self::translated_to_in_strand(translated, frame, true),
+            frame.strand,
+            dna_len,
+        )
+    }
+}
+
+impl std::ops::Add<i32> for TranslatedPosition {
+    type Output = TranslatedPosition;
+
+    fn add(self, rhs: i32) -> Self::Output {
+        TranslatedPosition::new(self.translated + rhs, self.frame)
+    }
+}
+
+impl std::ops::Sub<i32> for TranslatedPosition {
+    type Output = TranslatedPosition;
+
+    fn sub(self, rhs: i32) -> Self::Output {
+        TranslatedPosition::new(self.translated - rhs, self.frame)
+    }
+}
+
 /// Standard genetic code (NCBI translation table 1).
 /// Maps codon triplets (4^3 = 64 entries) to amino acid letters.
 static STANDARD_GENETIC_CODE: [u8; 64] = [
@@ -68,10 +212,10 @@ static STANDARD_GENETIC_CODE: [u8; 64] = [
     // L=10 K=11 M=12 F=13 P=14 S=15 T=16 W=17 Y=18 V=19
 
     // Codon index = base1*16 + base2*4 + base3, where A=0 C=1 G=2 T=3
-    11, 2, 11, 2,   16, 16, 16, 16,   1, 15, 1, 15,   9, 9, 12, 9,   // A**
-    5, 8, 5, 8,     14, 14, 14, 14,   1, 1, 1, 1,     10, 10, 10, 10, // C**
-    6, 3, 6, 3,     0, 0, 0, 0,       7, 7, 7, 7,     19, 19, 19, 19, // G**
-    24, 18, 24, 18, 15, 15, 15, 15,   24, 4, 17, 4,   10, 13, 10, 13, // T**
+    11, 2, 11, 2, 16, 16, 16, 16, 1, 15, 1, 15, 9, 9, 12, 9, // A**
+    5, 8, 5, 8, 14, 14, 14, 14, 1, 1, 1, 1, 10, 10, 10, 10, // C**
+    6, 3, 6, 3, 0, 0, 0, 0, 7, 7, 7, 7, 19, 19, 19, 19, // G**
+    24, 18, 24, 18, 15, 15, 15, 15, 24, 4, 17, 4, 10, 13, 10, 13, // T**
 ];
 
 /// Translate a DNA codon (3 nucleotide letters) to an amino acid letter.
@@ -187,5 +331,67 @@ mod tests {
     #[test]
     fn test_strand_default() {
         assert_eq!(Strand::default(), Strand::Forward);
+    }
+
+    #[test]
+    fn test_translated_position_forward_absolute_interval() {
+        let frame = Frame::new(Strand::Forward, 1);
+        let begin = TranslatedPosition::new(2, frame);
+        let end = TranslatedPosition::new(5, frame);
+
+        assert_eq!(begin.in_strand(true), 7);
+        assert_eq!(begin.absolute(30, true, false), 7);
+        assert_eq!(
+            TranslatedPosition::absolute_interval(begin, end, 30, true),
+            crate::util::interval::Interval::new(7, 16)
+        );
+    }
+
+    #[test]
+    fn test_translated_position_reverse_absolute_interval() {
+        let frame = Frame::new(Strand::Reverse, 2);
+        let begin = TranslatedPosition::new(1, frame);
+        let end = TranslatedPosition::new(4, frame);
+
+        assert_eq!(begin.in_strand(true), 5);
+        assert_eq!(begin.absolute(30, true, false), 24);
+        assert_eq!(
+            TranslatedPosition::absolute_interval(begin, end, 30, true),
+            crate::util::interval::Interval::new(16, 25)
+        );
+    }
+
+    #[test]
+    fn test_translated_position_shift_and_conversion() {
+        let mut pos = TranslatedPosition::new(10, Frame::new(Strand::Forward, 1));
+        pos.shift_forward();
+        assert_eq!(
+            pos,
+            TranslatedPosition::new(10, Frame::new(Strand::Forward, 2))
+        );
+        pos.shift_forward();
+        assert_eq!(
+            pos,
+            TranslatedPosition::new(11, Frame::new(Strand::Forward, 0))
+        );
+        pos.shift_back();
+        assert_eq!(
+            pos,
+            TranslatedPosition::new(10, Frame::new(Strand::Forward, 2))
+        );
+
+        assert_eq!(
+            TranslatedPosition::absolute_to_translated(
+                24,
+                Frame::new(Strand::Reverse, 2),
+                30,
+                true
+            ),
+            1
+        );
+        assert_eq!(
+            TranslatedPosition::translated_to_absolute(1, Frame::new(Strand::Reverse, 2), 30),
+            24
+        );
     }
 }

@@ -86,7 +86,10 @@ impl PackedOperation {
 
     /// Create a forward frameshift operation.
     pub fn frameshift_forward() -> Self {
-        Self::from_op_letter(EditOperation::Substitution, (AMINO_ACID_COUNT + 1) as Letter)
+        Self::from_op_letter(
+            EditOperation::Substitution,
+            (AMINO_ACID_COUNT + 1) as Letter,
+        )
     }
 
     /// Create a reverse frameshift operation.
@@ -165,6 +168,11 @@ impl PackedTranscript {
         self.data.reverse();
     }
 
+    /// Matches C++ PackedTranscript::reverse(size_t begin).
+    pub fn reverse_from(&mut self, begin: usize) {
+        self.data[begin..].reverse();
+    }
+
     /// Add a terminator.
     pub fn push_terminator(&mut self) {
         self.data.push(PackedOperation::terminator());
@@ -182,9 +190,39 @@ impl PackedTranscript {
         &self.data
     }
 
+    pub fn reserve(&mut self, n: usize) {
+        self.data.reserve(n);
+    }
+
+    /// Matches C++ PackedTranscript::push_back(const Sequence&).
+    pub fn push_deletions(&mut self, s: &[Letter]) {
+        for &letter in s {
+            self.push_with_letter(EditOperation::Deletion, letter);
+        }
+    }
+
+    /// Matches C++ PackedTranscript::push_back(const Sequence&, const Reversed&).
+    pub fn push_deletions_reversed(&mut self, s: &[Letter]) {
+        for &letter in s.iter().rev() {
+            self.push_with_letter(EditOperation::Deletion, letter);
+        }
+    }
+
     /// Iterate over combined operations (consecutive same-type ops are merged).
     pub fn iter(&self) -> TranscriptIterator<'_> {
         TranscriptIterator::new(&self.data)
+    }
+
+    /// Read packed operation bytes through the first terminator.
+    pub fn read(&mut self, bytes: &[u8]) -> usize {
+        self.data.clear();
+        for (i, &code) in bytes.iter().enumerate() {
+            self.data.push(PackedOperation::new(code));
+            if PackedOperation::new(code).is_terminator() {
+                return i + 1;
+            }
+        }
+        bytes.len()
     }
 
     /// Read a transcript from raw bytes.
@@ -308,5 +346,43 @@ mod tests {
         assert_eq!(ops[0].count, 5);
         assert_eq!(ops[1].op, EditOperation::Substitution);
         assert_eq!(ops[2].count, 3);
+    }
+
+    #[test]
+    fn test_transcript_sequence_deletions_and_reverse_from() {
+        let mut t = PackedTranscript::new();
+        t.reserve(8);
+        t.push_with_count(EditOperation::Match, 2);
+        t.push_deletions(&[5, 6]);
+        t.push_deletions_reversed(&[7, 8]);
+
+        let ops: Vec<_> = t.iter().collect();
+        assert_eq!(ops.len(), 5);
+        assert_eq!(ops[0].op, EditOperation::Match);
+        assert_eq!(ops[1].letter, 5);
+        assert_eq!(ops[2].letter, 6);
+        assert_eq!(ops[3].letter, 8);
+        assert_eq!(ops[4].letter, 7);
+
+        t.reverse_from(1);
+        let letters: Vec<_> = t.iter().skip(1).map(|op| op.letter).collect();
+        assert_eq!(letters, vec![7, 8, 6, 5]);
+    }
+
+    #[test]
+    fn test_transcript_read_stops_at_terminator() {
+        let mut t = PackedTranscript::new();
+        let bytes = [
+            PackedOperation::from_op_count(EditOperation::Match, 3).code,
+            PackedOperation::terminator().code,
+            PackedOperation::from_op_count(EditOperation::Insertion, 2).code,
+        ];
+
+        assert_eq!(t.read(&bytes), 2);
+        assert_eq!(t.raw_length(), 2);
+        let ops: Vec<_> = t.iter().collect();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, EditOperation::Match);
+        assert_eq!(ops[0].count, 3);
     }
 }

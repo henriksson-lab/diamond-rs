@@ -72,13 +72,17 @@ pub fn run() -> io::Result<()> {
     eprintln!();
     eprintln!(
         "#Test cases passed: {}/{} ({:.1}s)",
-        passed, total,
+        passed,
+        total,
         start.elapsed().as_secs_f64()
     );
 
     if passed == total {
         Ok(())
     } else {
-        Err(io::Error::other(format!("{} test(s) failed", total - passed)))
+        Err(io::Error::other(format!(
+            "{} test(s) failed",
+            total - passed
+        )))
     }
 }

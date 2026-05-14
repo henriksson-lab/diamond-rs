@@ -114,9 +114,7 @@ fn write_dmnd(
     let pos_array_offset = header1_size + header2_total + current_pos;
     drop(writer);
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(output_path)?;
+    let mut file = std::fs::OpenOptions::new().write(true).open(output_path)?;
     // pos_array_offset is at offset 32 in header1
     file.seek(SeekFrom::Start(32))?;
     file.write_all(&pos_array_offset.to_le_bytes())?;
@@ -147,12 +145,8 @@ mod tests {
         ];
 
         let tmp = std::env::temp_dir().join("test_diamond.dmnd");
-        let stats = build_db_from_records(
-            &records,
-            tmp.to_str().unwrap(),
-            SequenceType::AminoAcid,
-        )
-        .unwrap();
+        let stats = build_db_from_records(&records, tmp.to_str().unwrap(), SequenceType::AminoAcid)
+            .unwrap();
 
         assert_eq!(stats.sequences, 2);
         assert_eq!(stats.letters, 7);

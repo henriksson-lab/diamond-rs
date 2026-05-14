@@ -199,10 +199,7 @@ pub struct JoinResult {
 ///
 /// Sort both sides by key, then walk through matching keys.
 /// For each matching key, emit the cross product of query and ref locations.
-pub fn sort_merge_join(
-    query_part: &mut [SeedEntry],
-    ref_part: &mut [SeedEntry],
-) -> JoinResult {
+pub fn sort_merge_join(query_part: &mut [SeedEntry], ref_part: &mut [SeedEntry]) -> JoinResult {
     if query_part.is_empty() || ref_part.is_empty() {
         return JoinResult {
             query_locs: Vec::new(),
@@ -276,14 +273,38 @@ mod tests {
     fn test_sort_merge_join() {
         // Create two small partitions with some matching keys
         let mut query = vec![
-            SeedEntry { key: 5, seq_id: 0, pos: 10 },
-            SeedEntry { key: 3, seq_id: 0, pos: 20 },
-            SeedEntry { key: 5, seq_id: 1, pos: 30 },
+            SeedEntry {
+                key: 5,
+                seq_id: 0,
+                pos: 10,
+            },
+            SeedEntry {
+                key: 3,
+                seq_id: 0,
+                pos: 20,
+            },
+            SeedEntry {
+                key: 5,
+                seq_id: 1,
+                pos: 30,
+            },
         ];
         let mut refs = vec![
-            SeedEntry { key: 5, seq_id: 0, pos: 100 },
-            SeedEntry { key: 7, seq_id: 0, pos: 200 },
-            SeedEntry { key: 3, seq_id: 1, pos: 300 },
+            SeedEntry {
+                key: 5,
+                seq_id: 0,
+                pos: 100,
+            },
+            SeedEntry {
+                key: 7,
+                seq_id: 0,
+                pos: 200,
+            },
+            SeedEntry {
+                key: 3,
+                seq_id: 1,
+                pos: 300,
+            },
         ];
 
         let result = sort_merge_join(&mut query, &mut refs);

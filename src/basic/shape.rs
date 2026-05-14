@@ -1,12 +1,14 @@
 use super::reduction::Reduction;
 use super::seed::{PackedSeed, MAX_SEED_WEIGHT};
-use super::value::{is_amino_acid, Letter, LETTER_MASK, MASK_LETTER, STOP_LETTER, DELIMITER_LETTER};
+use super::value::{
+    is_amino_acid, Letter, DELIMITER_LETTER, LETTER_MASK, MASK_LETTER, STOP_LETTER,
+};
 
 /// A spaced seed shape/pattern used for seed extraction.
 ///
 /// Pattern is a string of '1' and '0' characters, where '1' indicates
 /// a position that contributes to the seed value.
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Shape {
     pub length: i32,
     pub weight: i32,

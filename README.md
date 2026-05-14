@@ -4,6 +4,7 @@ Rust port of the [DIAMOND](https://github.com/bbuchfink/diamond) protein sequenc
 
 DIAMOND is a high-performance sequence aligner for protein and translated DNA searches, designed for big sequence data analysis. This crate provides both a CLI binary and a library API.
 
+**This crate is under translation. Do not use it. Do not trust any text below**
 
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code!

@@ -1,5 +1,7 @@
 use std::io::{self, Write};
 
+use crate::align::hsp::HspContext;
+use crate::basic::translate::{Strand, TranslatedPosition};
 use crate::basic::value::{Letter, AMINO_ACID_ALPHABET, LETTER_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
 
@@ -126,9 +128,152 @@ pub fn write_pairwise<W: Write>(
     Ok(())
 }
 
+/// Matches C++ PairwiseFormat::print_match(const HspContext&).
+pub fn print_match_context<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    score_matrix: &ScoreMatrix,
+    query_translated: bool,
+    blastn_command: bool,
+) -> io::Result<()> {
+    const WIDTH: usize = 60;
+    let dna_len = r.query_source_len;
+    let strand = if blastn_command {
+        if r.frame() != 0 {
+            Strand::Forward
+        } else {
+            Strand::Reverse
+        }
+    } else if r.frame() < 3 {
+        Strand::Forward
+    } else {
+        Strand::Reverse
+    };
+    let target_title = r.target_title.replace('\x01', " ");
+    writeln!(writer, ">{}", target_title)?;
+    writeln!(writer, "Length={}", r.subject_len)?;
+    writeln!(writer)?;
+    write!(
+        writer,
+        " Score = {} bits ({}),  Expect = ",
+        r.bit_score(),
+        r.score()
+    )?;
+    writeln!(
+        writer,
+        "{}",
+        crate::output::format::format_evalue(r.evalue())
+    )?;
+
+    let pct = |n: u32, d: u32| -> u32 {
+        if d == 0 {
+            0
+        } else {
+            ((n as f64) * 100.0 / (d as f64)).round() as u32
+        }
+    };
+    writeln!(
+        writer,
+        " Identities = {}/{} ({}%), Positives = {}/{} ({}%), Gaps = {}/{} ({}%)",
+        r.identities(),
+        r.length(),
+        pct(r.identities(), r.length()),
+        r.positives(),
+        r.length(),
+        pct(r.positives(), r.length()),
+        r.gaps(),
+        r.length(),
+        pct(r.gaps(), r.length()),
+    )?;
+    if query_translated {
+        writeln!(writer, " Frame = {}", r.blast_query_frame(query_translated))?;
+    }
+    if blastn_command {
+        write!(writer, " Strand = ")?;
+        if r.frame() != 0 {
+            write!(writer, "Plus/")?;
+        } else {
+            write!(writer, "Minus/")?;
+        }
+        writeln!(writer, "Plus")?;
+    }
+    writeln!(writer)?;
+
+    let digits = r
+        .subject_range()
+        .end
+        .max(r.query_source_range().end)
+        .max(1)
+        .to_string()
+        .len();
+    let mut qi = r.begin();
+    let mut mi = r.begin();
+    let mut si = r.begin();
+    while qi.good() {
+        write!(
+            writer,
+            "Query  {:>width$}  ",
+            qi.query_pos().absolute(dna_len, query_translated, false) + 1,
+            width = digits
+        )?;
+        for _ in 0..WIDTH {
+            if !qi.good() {
+                break;
+            }
+            write!(writer, "{}", qi.query_char())?;
+            qi.advance();
+        }
+        write!(
+            writer,
+            " {}",
+            TranslatedPosition::oriented_position(
+                qi.query_pos().in_strand(query_translated) - 1,
+                strand,
+                dna_len,
+            ) + 1
+        )?;
+        writeln!(writer)?;
+
+        for _ in 0..digits + 9 {
+            write!(writer, " ")?;
+        }
+        for _ in 0..WIDTH {
+            if !mi.good() {
+                break;
+            }
+            write!(
+                writer,
+                "{}",
+                mi.midline_char(score_matrix.score(mi.query(), mi.subject()))
+            )?;
+            mi.advance();
+        }
+        writeln!(writer)?;
+
+        write!(
+            writer,
+            "Sbjct  {:>width$}  ",
+            si.subject_pos() + 1,
+            width = digits
+        )?;
+        for _ in 0..WIDTH {
+            if !si.good() {
+                break;
+            }
+            write!(writer, "{}", si.subject_char())?;
+            si.advance();
+        }
+        writeln!(writer, " {}", si.subject_pos())?;
+        writeln!(writer)?;
+    }
+
+    Ok(())
+}
+
 /// Write the BLAST pairwise header.
 pub fn write_header<W: Write>(writer: &mut W) -> io::Result<()> {
     writeln!(writer, "BLASTP 2.3.0+")?;
+    writeln!(writer)?;
     writeln!(writer)?;
     Ok(())
 }
@@ -144,6 +289,36 @@ pub fn write_query_header<W: Write>(
     writeln!(writer)?;
     writeln!(writer, "Length={}", query_len)?;
     writeln!(writer)?;
+    Ok(())
+}
+
+/// Matches C++ PairwiseFormat::print_query_intro().
+pub fn print_query_intro<W: Write>(
+    writer: &mut W,
+    query_title: &str,
+    query_len: i32,
+    unaligned: bool,
+) -> io::Result<()> {
+    writeln!(writer, "Query= {}", query_title)?;
+    writeln!(writer)?;
+    writeln!(writer, "Length={}", query_len)?;
+    writeln!(writer)?;
+    if unaligned {
+        writeln!(writer)?;
+        writeln!(writer, "***** No hits found *****")?;
+        writeln!(writer)?;
+        writeln!(writer)?;
+    }
+    Ok(())
+}
+
+/// Matches C++ PairwiseFormat::print_query_epilog().
+pub fn print_query_epilog<W: Write>(_writer: &mut W) -> io::Result<()> {
+    Ok(())
+}
+
+/// Matches C++ PairwiseFormat::print_footer().
+pub fn print_footer<W: Write>(_writer: &mut W) -> io::Result<()> {
     Ok(())
 }
 
@@ -185,5 +360,72 @@ mod tests {
         assert!(output.contains(">s1"));
         assert!(output.contains("Score = 30 bits"));
         assert!(output.contains("ARND"));
+    }
+
+    #[test]
+    fn test_print_match_context() {
+        use crate::align::hsp::{Hsp, HspContext};
+        use crate::basic::packed_transcript::EditOperation;
+        use crate::util::interval::Interval;
+
+        let sm = ScoreMatrix::new("blosum62", 11, 1, -1, 1, 1000).unwrap();
+        let mut hsp = Hsp::new();
+        hsp.score = 42;
+        hsp.bit_score = 21.0;
+        hsp.evalue = 1e-6;
+        hsp.frame = 0;
+        hsp.identities = 1;
+        hsp.positives = 2;
+        hsp.gaps = 1;
+        hsp.length = 3;
+        hsp.query_range = Interval::new(0, 3);
+        hsp.query_source_range = Interval::new(0, 3);
+        hsp.subject_range = Interval::new(5, 8);
+        hsp.transcript.push_with_count(EditOperation::Match, 1);
+        hsp.transcript
+            .push_with_letter(EditOperation::Substitution, 1);
+        hsp.transcript.push_with_letter(EditOperation::Deletion, 3);
+
+        let ctx = HspContext::new(
+            hsp,
+            0,
+            0,
+            vec![vec![0, 1, 4]],
+            3,
+            "query",
+            0,
+            100,
+            "subject title",
+            0,
+            0,
+            Vec::new(),
+            0.0,
+            0.0,
+        );
+
+        let mut buf = Vec::new();
+        print_match_context(&mut buf, &ctx, &sm, false, false).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains(">subject title"));
+        assert!(output.contains("Length=100"));
+        assert!(output.contains("Score = 21 bits (42),  Expect = 1.00e-6"));
+        assert!(output.contains("Identities = 1/3 (33%), Positives = 2/3 (67%), Gaps = 1/3 (33%)"));
+        assert!(output.contains("Query  1  AR- 2"));
+        assert!(output.contains("A+ "));
+        assert!(output.contains("Sbjct  6  ARD 8"));
+    }
+
+    #[test]
+    fn test_print_query_intro_epilog_footer() {
+        let mut buf = Vec::new();
+        print_query_intro(&mut buf, "query one", 12, true).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("Query= query one\n\nLength=12\n\n"));
+        assert!(output.contains("***** No hits found *****"));
+
+        let mut buf = Vec::new();
+        print_query_epilog(&mut buf).unwrap();
+        print_footer(&mut buf).unwrap();
+        assert!(buf.is_empty());
     }
 }

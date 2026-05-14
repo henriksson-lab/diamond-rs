@@ -58,13 +58,10 @@ pub fn build_seed_index(
     for (seq_id, seq) in seqs.iter().enumerate() {
         let seeds = extract_seeds(seq, shape, reduction);
         for (seed, pos) in seeds {
-            index
-                .entry(seed)
-                .or_default()
-                .push(SeedLoc {
-                    seq_id: seq_id as u32,
-                    pos,
-                });
+            index.entry(seed).or_default().push(SeedLoc {
+                seq_id: seq_id as u32,
+                pos,
+            });
         }
     }
 
@@ -163,7 +160,11 @@ mod tests {
         let matches = find_seed_matches(&query_seqs, &index, &shape, &r);
 
         // "01" appears in both query (pos 0) and reference (pos 0, 4)
-        assert!(matches.len() >= 2, "Expected at least 2 matches, got {}", matches.len());
+        assert!(
+            matches.len() >= 2,
+            "Expected at least 2 matches, got {}",
+            matches.len()
+        );
     }
 
     #[test]

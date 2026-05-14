@@ -2,9 +2,9 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::basic::value::Letter;
 use super::dmnd::ReferenceHeader;
 use super::fasta::FastaRecord;
+use crate::basic::value::Letter;
 
 /// Read all sequences from a DIAMOND database file.
 ///
@@ -88,10 +88,7 @@ mod tests {
 
     #[test]
     fn test_read_test_dmnd() {
-        let db_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/diamond/src/test/data.dmnd"
-        );
+        let db_path = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
         let (header, records) = read_dmnd(Path::new(db_path)).unwrap();
         assert_eq!(header.sequences, 1);
         assert_eq!(header.letters, 426);
@@ -117,10 +114,7 @@ mod tests {
 
     #[test]
     fn test_read_auto_extension() {
-        let db_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/diamond/src/test/data"
-        );
+        let db_path = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data");
         let result = read_dmnd_auto(db_path);
         assert!(result.is_ok());
         let (_, records) = result.unwrap();

@@ -24,8 +24,12 @@ pub fn simd_banded_score(
         if is_x86_feature_detected!("sse4.1") {
             return unsafe {
                 simd_banded_sse41(
-                    query, subject, query_anchor, subject_anchor,
-                    band_width, score_matrix,
+                    query,
+                    subject,
+                    query_anchor,
+                    subject_anchor,
+                    band_width,
+                    score_matrix,
                 )
             };
         }
@@ -33,10 +37,16 @@ pub fn simd_banded_score(
 
     // Scalar fallback
     let result = super::banded::banded_smith_waterman(
-        query, subject, query_anchor, subject_anchor,
-        band_width, score_matrix,
+        query,
+        subject,
+        query_anchor,
+        subject_anchor,
+        band_width,
+        score_matrix,
     );
-    SimdBandedResult { score: result.score }
+    SimdBandedResult {
+        score: result.score,
+    }
 }
 
 /// SSE4.1 banded DP: processes 16 band cells in parallel.
@@ -130,16 +140,15 @@ mod tests {
         let query: Vec<Letter> = (0..15).map(|i| (i % 20) as Letter).collect();
         let subject: Vec<Letter> = (0..15).map(|i| ((i + 2) % 20) as Letter).collect();
 
-        let scalar = super::super::banded::banded_smith_waterman(
-            &query, &subject, 7, 7, 5, &sm,
-        );
+        let scalar = super::super::banded::banded_smith_waterman(&query, &subject, 7, 7, 5, &sm);
         let simd = simd_banded_score(&query, &subject, 7, 7, 5, &sm);
 
         // Scores should be very close (may differ slightly due to i8 saturation)
         assert!(
             (scalar.score - simd.score).abs() <= 1,
             "Scalar {} vs SIMD {}",
-            scalar.score, simd.score
+            scalar.score,
+            simd.score
         );
     }
 }

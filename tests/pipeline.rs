@@ -5,12 +5,11 @@ use std::path::Path;
 
 #[test]
 fn test_dmnd_reader() {
-    let (header, records) =
-        diamond::data::dmnd_reader::read_dmnd(Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/diamond/src/test/data.dmnd"
-        )))
-        .unwrap();
+    let (header, records) = diamond::data::dmnd_reader::read_dmnd(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/diamond/src/test/data.dmnd"
+    )))
+    .unwrap();
     assert_eq!(header.sequences, 1);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].id, "d1ivsa4");
@@ -56,8 +55,7 @@ fn test_self_alignment_scoring() {
     .unwrap();
 
     for r in &records {
-        let result =
-            diamond::dp::smith_waterman::smith_waterman(&r.sequence, &r.sequence, &sm);
+        let result = diamond::dp::smith_waterman::smith_waterman(&r.sequence, &r.sequence, &sm);
         assert_eq!(
             result.identities, result.length,
             "Self-alignment of {} should have 100% identity",
@@ -87,8 +85,7 @@ fn test_seed_matching_self() {
     let index = diamond::search::seed_match::build_seed_index(&seqs, &shape, &reduction);
 
     // Self-matching should find matches for every sequence
-    let matches =
-        diamond::search::seed_match::find_seed_matches(&seqs, &index, &shape, &reduction);
+    let matches = diamond::search::seed_match::find_seed_matches(&seqs, &index, &shape, &reduction);
     assert!(
         !matches.is_empty(),
         "Self-matching should produce seed matches"
@@ -121,8 +118,18 @@ fn test_evalue_computation() {
     let e1 = sm.evalue(20, 500, 50000);
     let e2 = sm.evalue(30, 500, 50000);
     let e3 = sm.evalue(40, 500, 50000);
-    assert!(e1 > e2, "Higher score should give lower e-value: {} vs {}", e1, e2);
-    assert!(e2 > e3, "Higher score should give lower e-value: {} vs {}", e2, e3);
+    assert!(
+        e1 > e2,
+        "Higher score should give lower e-value: {} vs {}",
+        e1,
+        e2
+    );
+    assert!(
+        e2 > e3,
+        "Higher score should give lower e-value: {} vs {}",
+        e2,
+        e3
+    );
 
     // E-values should be non-negative
     assert!(e1 >= 0.0);

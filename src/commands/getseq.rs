@@ -30,11 +30,7 @@ pub fn run(database: &str, seq_ids: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
-fn write_fasta_record<W: Write>(
-    writer: &mut W,
-    id: &str,
-    sequence: &[i8],
-) -> io::Result<()> {
+fn write_fasta_record<W: Write>(writer: &mut W, id: &str, sequence: &[i8]) -> io::Result<()> {
     writeln!(writer, ">{}", id)?;
     for chunk in sequence.chunks(60) {
         for &letter in chunk {
@@ -56,10 +52,7 @@ mod tests {
 
     #[test]
     fn test_getseq() {
-        let db = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/diamond/src/test/data.dmnd"
-        );
+        let db = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
         // Should succeed without error
         let result = run(db, Some("d1ivsa4"));
         assert!(result.is_ok());

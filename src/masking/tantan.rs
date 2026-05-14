@@ -35,7 +35,9 @@ fn compute_lambda_flat(scores: &[i8], stride: usize, n: usize) -> f64 {
     for i in 0..n {
         let mut r_max = f64::MIN;
         for j in 0..n {
-            if mat[i][j] > r_max { r_max = mat[i][j]; }
+            if mat[i][j] > r_max {
+                r_max = mat[i][j];
+            }
         }
         if r_max > 0.0 && r_max < r_max_min {
             r_max_min = r_max;
@@ -61,25 +63,34 @@ fn compute_lambda_flat(scores: &[i8], stride: usize, n: usize) -> f64 {
         }
         // Invert using Gauss-Jordan
         let mut inv: Vec<Vec<f64>> = vec![vec![0.0; n]; n];
-        for i in 0..n { inv[i][i] = 1.0; }
+        for i in 0..n {
+            inv[i][i] = 1.0;
+        }
         let mut a = em;
         for col in 0..n {
             // Partial pivot
             let mut max_row = col;
             let mut max_val = a[col][col].abs();
-            for row in col+1..n {
+            for row in col + 1..n {
                 if a[row][col].abs() > max_val {
                     max_val = a[row][col].abs();
                     max_row = row;
                 }
             }
-            if max_val < 1e-15 { return None; }
+            if max_val < 1e-15 {
+                return None;
+            }
             a.swap(col, max_row);
             inv.swap(col, max_row);
             let pivot = a[col][col];
-            for j in 0..n { a[col][j] /= pivot; inv[col][j] /= pivot; }
+            for j in 0..n {
+                a[col][j] /= pivot;
+                inv[col][j] /= pivot;
+            }
             for row in 0..n {
-                if row == col { continue; }
+                if row == col {
+                    continue;
+                }
                 let factor = a[row][col];
                 for j in 0..n {
                     a[row][j] -= factor * a[col][j];
@@ -99,7 +110,9 @@ fn compute_lambda_flat(scores: &[i8], stride: usize, n: usize) -> f64 {
 
     for _ in 0..100 {
         let mid = (lo + hi) / 2.0;
-        if mid == lo || mid == hi { break; }
+        if mid == lo || mid == hi {
+            break;
+        }
         let mid_sum = inv_sum(mid).unwrap_or(f64::MAX);
         if (lo_sum < 1.0 && mid_sum >= 1.0) || (lo_sum > 1.0 && mid_sum <= 1.0) {
             hi = mid;
@@ -129,7 +142,10 @@ impl TantanMasker {
                 lr_matrix[i][j] = (lambda * sm.scores[i * aa_count + j] as f64).exp() as f32;
             }
         }
-        TantanMasker { lr_matrix, min_mask_prob }
+        TantanMasker {
+            lr_matrix,
+            min_mask_prob,
+        }
     }
 
     /// Mask a sequence using the pre-computed likelihood ratio matrix.
@@ -142,9 +158,8 @@ impl TantanMasker {
 fn default_masker() -> &'static TantanMasker {
     use std::sync::OnceLock;
     static MASKER: OnceLock<TantanMasker> = OnceLock::new();
-    MASKER.get_or_init(|| {
-        TantanMasker::new(&crate::stats::matrices::BLOSUM62, DEFAULT_MIN_MASK_PROB)
-    })
+    MASKER
+        .get_or_init(|| TantanMasker::new(&crate::stats::matrices::BLOSUM62, DEFAULT_MIN_MASK_PROB))
 }
 
 /// Apply tantan masking to a sequence using default BLOSUM62 parameters.
@@ -154,9 +169,15 @@ pub fn mask_tantan(seq: &mut [Letter]) {
 
 /// Scalar forward step (generic fallback).
 fn forward_step_scalar(
-    f: &mut [f32; 50], d: &[f32; 50], e_seg: &[f32],
-    b: &mut f32, f2f: f32, p_repeat_end: f32, b2b: f32,
-    f_sum_prev: f32, f_sum_out: &mut f32,
+    f: &mut [f32; 50],
+    d: &[f32; 50],
+    e_seg: &[f32],
+    b: &mut f32,
+    f2f: f32,
+    p_repeat_end: f32,
+    b2b: f32,
+    f_sum_prev: f32,
+    f_sum_out: &mut f32,
 ) {
     let b_old = *b;
     let mut f_sum_new = 0.0f32;
@@ -171,8 +192,13 @@ fn forward_step_scalar(
 
 /// Scalar backward step (generic fallback).
 fn backward_step_scalar(
-    f: &mut [f32; 50], d: &[f32; 50], e_seg: &[f32],
-    b: &mut f32, f2f: f32, p_repeat_end: f32, b2b: f32,
+    f: &mut [f32; 50],
+    d: &[f32; 50],
+    e_seg: &[f32],
+    b: &mut f32,
+    f2f: f32,
+    p_repeat_end: f32,
+    b2b: f32,
 ) {
     let mut tsum = 0.0f32;
     let c = p_repeat_end * *b;
@@ -185,13 +211,11 @@ fn backward_step_scalar(
 }
 
 /// Core tantan implementation using a pre-computed likelihood ratio matrix.
-fn mask_tantan_inner(
-    seq: &mut [Letter],
-    lr_matrix: &[Vec<f32>],
-    min_mask_prob: f32,
-) {
+fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: f32) {
     let len = seq.len();
-    if len == 0 { return; }
+    if len == 0 {
+        return;
+    }
 
     let n = TRUE_AA as usize;
 
@@ -203,7 +227,7 @@ fn mask_tantan_inner(
     // Repeat-state entry distribution (geometric decay over window positions)
     let mut d = [0.0f32; WINDOW];
     d[WINDOW - 1] = b2f0;
-    for i in (0..WINDOW-1).rev() {
+    for i in (0..WINDOW - 1).rev() {
         d[i] = d[i + 1] * REPEAT_GROWTH;
     }
 
@@ -238,7 +262,9 @@ fn mask_tantan_inner(
     // Forward pass
     for i in 0..len {
         let ltr = (seq[i] & LETTER_MASK) as usize;
-        if ltr >= n { continue; }
+        if ltr >= n {
+            continue;
+        }
         let e_seg = &e[ltr][len - i..];
 
         #[cfg(target_arch = "x86_64")]
@@ -246,14 +272,41 @@ fn mask_tantan_inner(
             // SAFETY: has_avx2_fma() confirmed AVX2+FMA support
             f_sum = unsafe {
                 super::tantan_simd::forward_step_avx2(
-                    &mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b, f_sum,
+                    &mut f,
+                    &d_arr,
+                    e_seg,
+                    &mut b,
+                    f2f,
+                    P_REPEAT_END,
+                    b2b,
+                    f_sum,
                 )
             };
         } else {
-            forward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b, f_sum, &mut f_sum);
+            forward_step_scalar(
+                &mut f,
+                &d_arr,
+                e_seg,
+                &mut b,
+                f2f,
+                P_REPEAT_END,
+                b2b,
+                f_sum,
+                &mut f_sum,
+            );
         }
         #[cfg(not(target_arch = "x86_64"))]
-        forward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b, f_sum, &mut f_sum);
+        forward_step_scalar(
+            &mut f,
+            &d_arr,
+            e_seg,
+            &mut b,
+            f2f,
+            P_REPEAT_END,
+            b2b,
+            f_sum,
+            &mut f_sum,
+        );
 
         // Rescale every 16 positions to avoid underflow
         if (i & 15) == 15 {
@@ -262,16 +315,25 @@ fn mask_tantan_inner(
             b *= s;
             #[cfg(target_arch = "x86_64")]
             if use_simd {
-                unsafe { super::tantan_simd::scale_avx2(&mut f, s); }
+                unsafe {
+                    super::tantan_simd::scale_avx2(&mut f, s);
+                }
             } else {
-                for v in f.iter_mut() { *v *= s; }
+                for v in f.iter_mut() {
+                    *v *= s;
+                }
             }
             #[cfg(not(target_arch = "x86_64"))]
-            for v in f.iter_mut() { *v *= s; }
+            for v in f.iter_mut() {
+                *v *= s;
+            }
             f_sum *= s;
         }
         if len >= 310 && len <= 330 && i >= 258 && i <= 268 {
-            eprintln!("  RUST_FWD[{}] len={}: b={:.10e} f_sum={:.10e}", i, len, b, f_sum);
+            eprintln!(
+                "  RUST_FWD[{}] len={}: b={:.10e} f_sum={:.10e}",
+                i, len, b, f_sum
+            );
         }
         pb[i] = b;
     }
@@ -285,7 +347,9 @@ fn mask_tantan_inner(
             f.iter().sum::<f32>()
         }
         #[cfg(not(target_arch = "x86_64"))]
-        { f.iter().sum::<f32>() }
+        {
+            f.iter().sum::<f32>()
+        }
     };
     let z = b * b2b + f_total * P_REPEAT_END;
     let zinv = 1.0 / z;
@@ -303,23 +367,37 @@ fn mask_tantan_inner(
             b *= s;
             #[cfg(target_arch = "x86_64")]
             if use_simd {
-                unsafe { super::tantan_simd::scale_avx2(&mut f, s); }
+                unsafe {
+                    super::tantan_simd::scale_avx2(&mut f, s);
+                }
             } else {
-                for v in f.iter_mut() { *v *= s; }
+                for v in f.iter_mut() {
+                    *v *= s;
+                }
             }
             #[cfg(not(target_arch = "x86_64"))]
-            for v in f.iter_mut() { *v *= s; }
+            for v in f.iter_mut() {
+                *v *= s;
+            }
         }
 
         let ltr = (seq[i] & LETTER_MASK) as usize;
-        if ltr >= n { continue; }
+        if ltr >= n {
+            continue;
+        }
         let e_seg = &e[ltr][len - i..];
 
         #[cfg(target_arch = "x86_64")]
         if use_simd {
             unsafe {
                 super::tantan_simd::backward_step_avx2(
-                    &mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b,
+                    &mut f,
+                    &d_arr,
+                    e_seg,
+                    &mut b,
+                    f2f,
+                    P_REPEAT_END,
+                    b2b,
                 );
             }
         } else {
@@ -329,15 +407,19 @@ fn mask_tantan_inner(
         backward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b);
 
         if len >= 310 && len <= 330 && i >= 255 && i <= 295 {
-            eprintln!("  RUST_BWD[{}] len={}: pf={:.10e} b={:.10e} {}", i, len, pf, b,
-                if pf >= min_mask_prob { "MASKED" } else { "" });
+            eprintln!(
+                "  RUST_BWD[{}] len={}: pf={:.10e} b={:.10e} {}",
+                i,
+                len,
+                pf,
+                b,
+                if pf >= min_mask_prob { "MASKED" } else { "" }
+            );
         }
         if pf >= min_mask_prob {
             seq[i] |= SEED_MASK;
         }
     }
-
-
 }
 
 #[cfg(test)]
@@ -372,7 +454,10 @@ mod tests {
         let mut seq = vec![0i8; 100];
         mask_tantan(&mut seq);
         let masked_count = seq.iter().filter(|&&l| l & SEED_MASK != 0).count();
-        assert!(masked_count > 0, "No positions masked in repetitive sequence");
+        assert!(
+            masked_count > 0,
+            "No positions masked in repetitive sequence"
+        );
     }
 
     #[test]
@@ -380,29 +465,91 @@ mod tests {
         // Q6GZX3 has a PPTPPT repeat near the end that C++ masks (~12 positions)
         let seq_str = b"MSIIGATRLQNDKSDTYSAGPCYAGGCSAFTPRGTCGKDWDLGEQTCASGFCTSQPLCARIKKTQVCGLRYSSKGKDPLVSAEWDSRGAPYVRCTYDADLIDTQAQVDQFVSMFGESPSLAERYCMRGVKNTAGELVSRVSSDADPAGGWCRKWYSAHRGPDQDAALGSFCIKNPGAADCKCINRASDPVYQKVKTLHAYPDQCWYVPCAADVGELKMGTQRDTPTNCPTQVCQIVFNMLDDGSVTMDDVKNTINCDFSKYVPPPPPPKPTPPTPPTPPTPPTPPTPPTPPTPRPVHNRKVMFFVAGAVLVAILISTVRW";
         let letter_map: std::collections::HashMap<u8, i8> = [
-            (b'A',0),(b'R',1),(b'N',2),(b'D',3),(b'C',4),(b'Q',5),(b'E',6),(b'G',7),
-            (b'H',8),(b'I',9),(b'L',10),(b'K',11),(b'M',12),(b'F',13),(b'P',14),
-            (b'S',15),(b'T',16),(b'W',17),(b'Y',18),(b'V',19),
-        ].iter().cloned().collect();
-        let mut seq: Vec<Letter> = seq_str.iter().map(|&c| *letter_map.get(&c).unwrap_or(&23)).collect();
+            (b'A', 0),
+            (b'R', 1),
+            (b'N', 2),
+            (b'D', 3),
+            (b'C', 4),
+            (b'Q', 5),
+            (b'E', 6),
+            (b'G', 7),
+            (b'H', 8),
+            (b'I', 9),
+            (b'L', 10),
+            (b'K', 11),
+            (b'M', 12),
+            (b'F', 13),
+            (b'P', 14),
+            (b'S', 15),
+            (b'T', 16),
+            (b'W', 17),
+            (b'Y', 18),
+            (b'V', 19),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+        let mut seq: Vec<Letter> = seq_str
+            .iter()
+            .map(|&c| *letter_map.get(&c).unwrap_or(&23))
+            .collect();
 
         mask_tantan(&mut seq);
-        let masked: Vec<usize> = seq.iter().enumerate()
+        let masked: Vec<usize> = seq
+            .iter()
+            .enumerate()
             .filter(|(_, &l)| l & SEED_MASK != 0)
             .map(|(i, _)| i)
             .collect();
         let diag: std::collections::HashMap<u8, i32> = [
-            (b'A',4),(b'R',5),(b'N',6),(b'D',6),(b'C',9),(b'Q',5),(b'E',5),(b'G',6),
-            (b'H',8),(b'I',4),(b'L',4),(b'K',5),(b'M',5),(b'F',6),(b'P',7),
-            (b'S',4),(b'T',5),(b'W',11),(b'Y',7),(b'V',4),
-        ].iter().cloned().collect();
-        let deficit: i32 = masked.iter().map(|&i| diag.get(&seq_str[i]).copied().unwrap_or(0)).sum();
-        eprintln!("Q6GZX3 masked {} of {} positions, score deficit={}", masked.len(), seq.len(), deficit);
+            (b'A', 4),
+            (b'R', 5),
+            (b'N', 6),
+            (b'D', 6),
+            (b'C', 9),
+            (b'Q', 5),
+            (b'E', 5),
+            (b'G', 6),
+            (b'H', 8),
+            (b'I', 4),
+            (b'L', 4),
+            (b'K', 5),
+            (b'M', 5),
+            (b'F', 6),
+            (b'P', 7),
+            (b'S', 4),
+            (b'T', 5),
+            (b'W', 11),
+            (b'Y', 7),
+            (b'V', 4),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+        let deficit: i32 = masked
+            .iter()
+            .map(|&i| diag.get(&seq_str[i]).copied().unwrap_or(0))
+            .sum();
+        eprintln!(
+            "Q6GZX3 masked {} of {} positions, score deficit={}",
+            masked.len(),
+            seq.len(),
+            deficit
+        );
         eprintln!("  Masked positions: {:?}", &masked);
-        eprintln!("  Masked region: {}", masked.iter().map(|&i| seq_str[i] as char).collect::<String>());
+        eprintln!(
+            "  Masked region: {}",
+            masked
+                .iter()
+                .map(|&i| seq_str[i] as char)
+                .collect::<String>()
+        );
         // C++ masks ~12 positions in the PPTPPT repeat (around pos 259-295)
         // Rust should mask a similar number
-        assert!(masked.len() > 0, "Q6GZX3 repeat region should have some masking");
+        assert!(
+            masked.len() > 0,
+            "Q6GZX3 repeat region should have some masking"
+        );
     }
 
     #[test]
@@ -410,8 +557,11 @@ mod tests {
         let sm = &crate::stats::matrices::BLOSUM62;
         let lambda = compute_lambda_flat(&sm.scores, crate::basic::value::AMINO_ACID_COUNT, 20);
         // BLOSUM62 lambda should be ~0.324
-        assert!((lambda - 0.324).abs() < 0.01,
-            "Lambda should be ~0.324, got {:.6}", lambda);
+        assert!(
+            (lambda - 0.324).abs() < 0.01,
+            "Lambda should be ~0.324, got {:.6}",
+            lambda
+        );
     }
 
     #[test]
@@ -422,13 +572,16 @@ mod tests {
         let records = crate::data::fasta::read_fasta_file(
             std::path::Path::new(fasta_path),
             crate::basic::value::SequenceType::AminoAcid,
-        ).unwrap();
+        )
+        .unwrap();
         let rec = records.iter().find(|r| r.id.contains("d1ivsa4")).unwrap();
         let mut seq = rec.sequence.clone();
         assert_eq!(seq.len(), 426);
 
         mask_tantan(&mut seq);
-        let masked: Vec<usize> = seq.iter().enumerate()
+        let masked: Vec<usize> = seq
+            .iter()
+            .enumerate()
             .filter(|(_, &l)| l & SEED_MASK != 0)
             .map(|(i, _)| i)
             .collect();
@@ -437,6 +590,11 @@ mod tests {
             eprintln!("  Masked: {:?}", &masked[..masked.len().min(20)]);
         }
         // C++ masks 0 positions for this sequence
-        assert_eq!(masked.len(), 0, "d1ivsa4 should have 0 masked positions (C++ masks 0), got {}", masked.len());
+        assert_eq!(
+            masked.len(),
+            0,
+            "d1ivsa4 should have 0 masked positions (C++ masks 0), got {}",
+            masked.len()
+        );
     }
 }

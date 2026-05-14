@@ -35,14 +35,16 @@ impl StandardMatrix {
     }
 
     /// Get the statistical parameters for the given gap penalties.
-    /// Returns the ungapped parameters if no matching gap penalties are found.
-    pub fn constants(&self, gap_exist: i32, gap_extend: i32) -> &Parameters {
-        for p in self.parameters.iter().skip(1) {
+    pub fn constants(&self, gap_exist: i32, gap_extend: i32) -> Result<&Parameters, String> {
+        for p in self.parameters {
             if p.gap_exist as i32 == gap_exist && p.gap_extend as i32 == gap_extend {
-                return p;
+                return Ok(p);
             }
         }
-        &self.parameters[0]
+        Err(
+            "Gap penalty settings are outside the supported range for this scoring matrix."
+                .to_string(),
+        )
     }
 
     /// Get the ungapped statistical parameters (first entry).

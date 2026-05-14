@@ -8,8 +8,8 @@ use crate::basic::shape::Shape;
 use crate::basic::value::{Letter, SequenceType, DELIMITER_LETTER};
 use crate::config::Sensitivity;
 use crate::data::fasta;
-use crate::dp::ungapped;
 use crate::dp::smith_waterman;
+use crate::dp::ungapped;
 use crate::output::format::{self, FieldId, Hsp as OutputHsp};
 use crate::search::{parallel, seed_match, sensitivity};
 use crate::stats::score_matrix::ScoreMatrix;
@@ -111,15 +111,23 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         "Sensitivity: {:?}, shapes: {} (weights: {})",
         config.sensitivity,
         shapes.len(),
-        shapes.iter().map(|s| s.weight.to_string()).collect::<Vec<_>>().join(",")
+        shapes
+            .iter()
+            .map(|s| s.weight.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     );
 
     // Build partitioned seed arrays and join for each shape (parallel)
     let db_seqs: Vec<&[Letter]> = db_records.iter().map(|r| r.sequence.as_slice()).collect();
-    let query_seqs: Vec<&[Letter]> = query_records.iter().map(|r| r.sequence.as_slice()).collect();
+    let query_seqs: Vec<&[Letter]> = query_records
+        .iter()
+        .map(|r| r.sequence.as_slice())
+        .collect();
     let mut all_seed_matches = Vec::new();
     for shape in &shapes {
-        let matches = parallel::find_seed_matches_partitioned(&query_seqs, &db_seqs, shape, &reduction);
+        let matches =
+            parallel::find_seed_matches_partitioned(&query_seqs, &db_seqs, shape, &reduction);
         all_seed_matches.extend(matches);
     }
     eprintln!("Total seed matches: {}", all_seed_matches.len());
@@ -173,18 +181,23 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         // C++ default is comp-based-stats=1 (Hauser correction, window=40).
         // C++ computes Hauser from the HARD-MASKED query (masked positions = X/23).
         // Convert soft masks to hard masks for CBS computation only.
-        let query_hardmasked: Vec<Letter> = query.iter().map(|&l| {
-            if l & crate::basic::value::SEED_MASK != 0 {
-                crate::basic::value::MASK_LETTER
-            } else {
-                l
-            }
-        }).collect();
+        let query_hardmasked: Vec<Letter> = query
+            .iter()
+            .map(|&l| {
+                if l & crate::basic::value::SEED_MASK != 0 {
+                    crate::basic::value::MASK_LETTER
+                } else {
+                    l
+                }
+            })
+            .collect();
         let query_cbs = crate::stats::cbs::hauser_correction(&query_hardmasked, &score_matrix);
 
         // Get seed matches for this query
         let empty_matches = Vec::new();
-        let query_seed_matches = query_matches.get(&(query_idx as u32)).unwrap_or(&empty_matches);
+        let query_seed_matches = query_matches
+            .get(&(query_idx as u32))
+            .unwrap_or(&empty_matches);
 
         // Group by target
         let mut target_hits: HashMap<u32, Vec<&&seed_match::SeedMatch>> = HashMap::new();
@@ -229,16 +242,24 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             // Matches C++ banded_swipe.h: band constrains alignment near seed diagonal,
             // soft-masked query positions score 0 (matching SIMD zeroing), CBS added.
             // Use the best seed hit position as the anchor for banding.
-            let best_hit = hits.iter().max_by_key(|h| {
-                let qa = h.query_pos as usize;
-                let sa = h.ref_pos as usize;
-                if qa < query.len() && sa < target.len() {
-                    score_matrix.score(query[qa] & crate::basic::value::LETTER_MASK,
-                                       target[sa] & crate::basic::value::LETTER_MASK)
-                } else { 0 }
-            }).unwrap();
+            let best_hit = hits
+                .iter()
+                .max_by_key(|h| {
+                    let qa = h.query_pos as usize;
+                    let sa = h.ref_pos as usize;
+                    if qa < query.len() && sa < target.len() {
+                        score_matrix.score(
+                            query[qa] & crate::basic::value::LETTER_MASK,
+                            target[sa] & crate::basic::value::LETTER_MASK,
+                        )
+                    } else {
+                        0
+                    }
+                })
+                .unwrap();
             let sw = crate::dp::banded_cbs::banded_sw_cbs(
-                query, target,
+                query,
+                target,
                 best_hit.query_pos as usize,
                 best_hit.ref_pos as usize,
                 30, // band_width matching C++ default
@@ -347,7 +368,11 @@ mod tests {
         };
 
         let result = run(&config);
-        assert!(result.is_ok(), "blastp with DMND failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "blastp with DMND failed: {:?}",
+            result.err()
+        );
 
         let output = std::fs::read_to_string(&output_path).unwrap();
         assert!(!output.is_empty(), "blastp produced no output");
@@ -356,10 +381,7 @@ mod tests {
 
     #[test]
     fn test_blastp_self() {
-        let fasta_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/diamond/src/test/1.faa"
-        );
+        let fasta_path = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/1.faa");
         let output_path = std::env::temp_dir().join("test_blastp_self.out");
 
         let config = BlastpConfig {
