@@ -494,7 +494,7 @@ pub fn anchored_swipe(targets: &mut Targets, cfg: &AnchoredSwipeConfig<'_>) -> V
                 hsp.subject_range = Interval::new(j0, j1);
                 hsp.subject_source_range = hsp.subject_range;
                 hsp.target_seq = t.seq.clone();
-                hsp.approx_id = approx_id;
+                hsp.approx_id = hsp.approx_id_percent(cfg.query, &t.seq);
                 out.push(hsp);
             }
         }
@@ -640,5 +640,40 @@ mod tests {
         assert!(out[0].query_range.end >= 5);
         assert!(out[0].subject_range.end >= 5);
         assert!(out[0].score > 30);
+    }
+
+    #[test]
+    fn test_anchored_swipe_exact_identity_approx_id_is_percent_identity() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query: Vec<Letter> = vec![0, 1, 2];
+        let mut targets = swipe::targets();
+        let mut target = DpTarget::new(
+            query.clone(),
+            query.len() as i32,
+            -1,
+            2,
+            17,
+            query.len() as i32,
+            Default::default(),
+            Default::default(),
+        );
+        target.anchor = Anchor {
+            query_begin: 0,
+            query_end: 3,
+            subject_begin: 0,
+            subject_end: 3,
+            d_min_left: -1,
+            d_max_left: 2,
+            d_min_right: -1,
+            d_max_right: 2,
+            prefix_score: 0,
+            score: 1,
+        };
+        targets[0].push_back(target);
+        let cfg = AnchoredSwipeConfig::new(&query, &sm);
+        let out = anchored_swipe(&mut targets, &cfg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].approx_id, 100.0);
+        assert!(stats::approx_id(out[0].score, 3, 3) < 100.0);
     }
 }

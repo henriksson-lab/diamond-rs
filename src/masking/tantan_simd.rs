@@ -6,10 +6,14 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Check if AVX2 + FMA are available at runtime.
+/// Check if AVX2 is available at runtime. Does NOT require FMA — the SIMD
+/// path is deliberately FMA-free to match C++'s AVX2 build (no `-mfma`), so
+/// gating on FMA would needlessly fall back to scalar on AVX2-only CPUs and
+/// (with a different rounding mode) drift parity. See `forward_step_avx2`
+/// for the no-FMA mul+add pattern.
 #[cfg(target_arch = "x86_64")]
 pub fn has_avx2_fma() -> bool {
-    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    is_x86_feature_detected!("avx2")
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -34,9 +38,13 @@ unsafe fn hsum_avx2(a: __m256) -> f32 {
 /// AVX2 forward step: matches C++ forward_step() exactly.
 ///
 /// Processes f[0..48] with AVX2 (6 chunks of 8), then f[48..50] scalar.
-/// Uses FMA: fmadd(f, f2f, b_old * d) * e_seg
+///
+/// The C++ build compiles arch_avx2 with `-mavx2` but **not** `-mfma`, so its
+/// `fmadd(a, b, c)` macro falls back to `add(mul(a, b), c)` (vector8_avx2.h:135).
+/// We must do the same here: fused multiply-add would differ by 1 ULP and flip
+/// mask decisions at the p_mask boundary.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
+#[target_feature(enable = "avx2")]
 pub unsafe fn forward_step_avx2(
     f: &mut [f32; 50],
     d: &[f32; 50],
@@ -57,9 +65,8 @@ pub unsafe fn forward_step_avx2(
         let vf = _mm256_loadu_ps(f.as_ptr().add(off));
         let vd = _mm256_loadu_ps(d.as_ptr().add(off));
         let ve = _mm256_loadu_ps(e_seg.as_ptr().add(off));
-        // tmp = fmadd(vf, vf2f, vb_old * vd) = vf * f2f + b_old * d
-        let tmp = _mm256_fmadd_ps(vf, vf2f, _mm256_mul_ps(vb_old, vd));
-        // vf = tmp * e_seg
+        // tmp = (vf * vf2f) + (vb_old * vd)  — separate mul+add, NOT FMA.
+        let tmp = _mm256_add_ps(_mm256_mul_ps(vf, vf2f), _mm256_mul_ps(vb_old, vd));
         let vf_new = _mm256_mul_ps(tmp, ve);
         _mm256_storeu_ps(f.as_mut_ptr().add(off), vf_new);
         f_sum_new += hsum_avx2(vf_new);
@@ -77,8 +84,9 @@ pub unsafe fn forward_step_avx2(
 }
 
 /// AVX2 backward step: matches C++ backward_step() exactly.
+/// See forward_step_avx2 for the reason FMA is avoided.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
+#[target_feature(enable = "avx2")]
 pub unsafe fn backward_step_avx2(
     f: &mut [f32; 50],
     d: &[f32; 50],
@@ -96,13 +104,11 @@ pub unsafe fn backward_step_avx2(
         let vf = _mm256_loadu_ps(f.as_ptr().add(off));
         let ve = _mm256_loadu_ps(e_seg.as_ptr().add(off));
         let vd = _mm256_loadu_ps(d.as_ptr().add(off));
-        // vf = vf * e_seg
         let vf_e = _mm256_mul_ps(vf, ve);
-        // tsum += vf * d
         let vt = _mm256_mul_ps(vf_e, vd);
         tsum += hsum_avx2(vt);
-        // f[off] = fmadd(vf_e, f2f, c)
-        let vf_new = _mm256_fmadd_ps(vf_e, vf2f, vc);
+        // f[off] = (vf_e * vf2f) + vc  — separate mul+add, NOT FMA.
+        let vf_new = _mm256_add_ps(_mm256_mul_ps(vf_e, vf2f), vc);
         _mm256_storeu_ps(f.as_mut_ptr().add(off), vf_new);
     }
 

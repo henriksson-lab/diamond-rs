@@ -1,6 +1,8 @@
 pub mod edge;
 pub mod format;
 pub mod intermediate;
+pub mod join_blocks;
+pub mod output_sink;
 pub mod paf;
 pub mod pairwise;
 pub mod sam;

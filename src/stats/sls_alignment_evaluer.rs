@@ -1,5 +1,8 @@
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 
+use std::fmt;
+use std::str::FromStr;
+
 use crate::stats::alp_localmaxstat_matrix::LocalMaxStatMatrix;
 use crate::stats::pvalues::{pvalues, ALP_set_of_parameters};
 use crate::stats::sls_alp_data::{alp_data, struct_for_randomization};
@@ -980,6 +983,31 @@ impl AlignmentEvaluer {
     }
 }
 
+impl fmt::Display for AlignmentEvaluer {
+    fn fmt(&self, s_: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !pvalues::assert_Gumbel_parameters(&self.d_params) || !self.isGood() {
+            return Err(fmt::Error);
+        }
+        write!(s_, "{}", self.d_params)
+    }
+}
+
+impl FromStr for AlignmentEvaluer {
+    type Err = Error;
+
+    fn from_str(s_: &str) -> Result<Self, Self::Err> {
+        let mut g_ = Self::new();
+        g_.d_params.d_params_flag = false;
+        g_.d_params = s_.parse::<ALP_set_of_parameters>()?;
+        g_.d_params.d_params_flag = true;
+        pvalues::compute_intercepts(&mut g_.d_params)?;
+        if !pvalues::assert_Gumbel_parameters(&g_.d_params) || !g_.isGood() {
+            g_.d_params.d_params_flag = false;
+        }
+        Ok(g_)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,6 +1047,26 @@ mod tests {
         assert_eq!(ev.evaluePerArea(50.0), 0.041 * (-0.267f64 * 50.0).exp());
         assert!(ev.bitScore(50.0) > 0.0);
         assert!(AlignmentEvaluer::pvalue(0.5) > 0.0);
+    }
+
+    #[test]
+    fn test_original_alignment_evaluer_stream_roundtrip() {
+        let mut ev = AlignmentEvaluer::new();
+        ev.initParameters(&parameters()).unwrap();
+
+        let text = ev.to_string();
+        let parsed: AlignmentEvaluer = text.parse().unwrap();
+
+        assert!(parsed.isGood());
+        assert_eq!(parsed.parameters().lambda, ev.parameters().lambda);
+        assert_eq!(parsed.parameters().K, ev.parameters().K);
+        assert_eq!(parsed.parameters().m_LambdaSbs, ev.parameters().m_LambdaSbs);
+        assert_eq!(
+            parsed.parameters().m_TauSbs.len(),
+            parsed.parameters().m_LambdaSbs.len()
+        );
+
+        assert!("bad".parse::<AlignmentEvaluer>().is_err());
     }
 
     #[test]

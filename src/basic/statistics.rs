@@ -106,7 +106,7 @@ pub struct Statistics {
 }
 
 impl Statistics {
-    /// Matches C++ `Statistics::Statistics`.
+    /// Matches C++ `Statistics::Statistics()`.
     pub fn new() -> Self {
         let mut value = Self {
             data: [0; StatValue::COUNT],
@@ -115,12 +115,12 @@ impl Statistics {
         value
     }
 
-    /// Matches C++ `Statistics::reset`.
+    /// Matches C++ `Statistics::reset()`.
     pub fn reset(&mut self) {
         self.data.fill(0);
     }
 
-    /// Matches C++ `Statistics::operator+=`.
+    /// Matches C++ `Statistics::operator+=(rhs)`.
     pub fn add_assign_statistics(&mut self, rhs: &Statistics) -> &mut Self {
         for i in 0..StatValue::COUNT {
             self.data[i] += rhs.data[i];
@@ -128,17 +128,17 @@ impl Statistics {
         self
     }
 
-    /// Matches C++ `Statistics::inc`.
+    /// Matches C++ `Statistics::inc(v, n)`.
     pub fn inc(&mut self, v: StatValue, n: StatType) {
         self.data[v as usize] += n;
     }
 
-    /// Matches C++ `Statistics::max`.
+    /// Matches C++ `Statistics::max(v, n)`.
     pub fn max(&mut self, v: StatValue, n: StatType) {
         self.data[v as usize] = self.data[v as usize].max(n);
     }
 
-    /// Matches C++ `Statistics::get`.
+    /// Matches C++ `Statistics::get(v)`.
     pub fn get(&self, v: StatValue) -> StatType {
         self.data[v as usize]
     }

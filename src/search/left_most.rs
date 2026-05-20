@@ -17,7 +17,7 @@ pub struct Context<'a> {
     pub reduction: &'a Reduction,
 }
 
-/// Matches C++ `verify_hit`.
+/// Matches C++ `verify_hit(...)`.
 pub fn verify_hit(
     q: &[Letter],
     s: &[Letter],
@@ -52,7 +52,7 @@ pub fn verify_hit(
     fq.match_count(&fs) >= hamming_filter_id
 }
 
-/// Matches C++ `verify_hits`.
+/// Matches C++ `verify_hits(...)`.
 pub fn verify_hits(
     mut mask: u32,
     q: &[Letter],
@@ -92,7 +92,7 @@ pub fn verify_hits(
     false
 }
 
-/// Matches C++ `left_most_filter`.
+/// Matches C++ `left_most_filter(...)`.
 pub fn left_most_filter(
     query: &[Letter],
     subject: &[Letter],

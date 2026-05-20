@@ -10,7 +10,6 @@ unsafe extern "C" {
 }
 
 const DEFAULT_FILE_BUFFER_SIZE: usize = 1 << 20;
-const COMPRESSED_STREAM_CHUNK_SIZE: usize = 1 << 20;
 pub const MEGABYTES: usize = 1 << 20;
 pub const GIGABYTES: usize = 1 << 30;
 pub const KILOBYTES: usize = 1 << 10;
@@ -990,78 +989,118 @@ impl<S: StreamEntity> StreamEntity for InputStreamBuffer<S> {
     }
 }
 
-#[derive(Debug, Clone)]
+struct PrevReader<S: StreamEntity>(InputStreamBuffer<S>);
+
+impl<S: StreamEntity> std::io::Read for PrevReader<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0
+            .read(buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))
+    }
+}
+
+type PeekChain<S> = std::io::Chain<std::io::Cursor<Vec<u8>>, PrevReader<S>>;
+
+enum ZlibInner<S: StreamEntity> {
+    Gz(flate2::read::MultiGzDecoder<PeekChain<S>>),
+    Zl(flate2::read::ZlibDecoder<PeekChain<S>>),
+}
+
+impl<S: StreamEntity> ZlibInner<S> {
+    fn into_prev(self) -> InputStreamBuffer<S> {
+        let chain = match self {
+            ZlibInner::Gz(d) => d.into_inner(),
+            ZlibInner::Zl(d) => d.into_inner(),
+        };
+        let (_cursor, prev_reader) = chain.into_inner();
+        prev_reader.0
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::Read as _;
+        match self {
+            ZlibInner::Gz(d) => d.read(buf),
+            ZlibInner::Zl(d) => d.read(buf),
+        }
+    }
+}
+
+fn zlib_wrap<S: StreamEntity>(mut prev: InputStreamBuffer<S>) -> IoResult<ZlibInner<S>> {
+    use std::io::Read as _;
+    let mut peek = [0u8; 2];
+    let n = prev.read(&mut peek)?;
+    let peeked = peek[..n].to_vec();
+    let is_gz = n >= 2 && peeked[0] == 0x1f && peeked[1] == 0x8b;
+    let chain = std::io::Cursor::new(peeked).chain(PrevReader(prev));
+    if is_gz {
+        Ok(ZlibInner::Gz(flate2::read::MultiGzDecoder::new(chain)))
+    } else {
+        Ok(ZlibInner::Zl(flate2::read::ZlibDecoder::new(chain)))
+    }
+}
+
 pub struct ZlibSource<S: StreamEntity> {
-    prev: InputStreamBuffer<S>,
-    data: Vec<u8>,
-    pos: usize,
+    inner: Option<ZlibInner<S>>,
     eos: bool,
+    file_name_cache: String,
 }
 
 impl<S: StreamEntity> ZlibSource<S> {
-    pub const CHUNK_SIZE: usize = 1 << 20;
-
     pub fn new(prev: InputStreamBuffer<S>) -> IoResult<Self> {
-        let mut out = Self {
-            prev,
-            data: Vec::new(),
-            pos: 0,
+        let file_name_cache = prev.file_name().to_string();
+        let inner = zlib_wrap(prev)?;
+        Ok(Self {
+            inner: Some(inner),
             eos: false,
-        };
-        out.init()?;
-        Ok(out)
-    }
-
-    pub fn init(&mut self) -> IoResult<()> {
-        self.eos = false;
-        self.pos = 0;
-        let mut compressed = Vec::new();
-        let mut buf = [0u8; COMPRESSED_STREAM_CHUNK_SIZE];
-        loop {
-            let n = self.prev.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            compressed.extend_from_slice(&buf[..n]);
-        }
-        let mut capacity = compressed.len().saturating_mul(4).max(1024);
-        let mut decoded = Vec::new();
-        loop {
-            decoded.resize(capacity, 0);
-            match zlib_decompress(&compressed, &mut decoded) {
-                Ok(n) => {
-                    decoded.truncate(n);
-                    break;
-                }
-                Err(IoError::Other(msg)) if msg.contains("output buffer too small") => {
-                    capacity = capacity.saturating_mul(2);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        self.data = decoded;
-        Ok(())
+            file_name_cache,
+        })
     }
 }
 
 impl<S: StreamEntity> StreamEntity for ZlibSource<S> {
     fn read(&mut self, ptr: &mut [u8]) -> IoResult<usize> {
-        let n = ptr.len().min(self.data.len().saturating_sub(self.pos));
-        ptr[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
-        self.pos += n;
-        if n == 0 || self.pos == self.data.len() {
-            self.eos = true;
+        if self.eos {
+            return Ok(0);
         }
-        Ok(n)
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| IoError::Other("ZlibSource closed".to_string()))?;
+        let mut total = 0;
+        while total < ptr.len() {
+            let n = inner.read(&mut ptr[total..]).map_err(|_| {
+                IoError::Other(format!(
+                    "Error reading gzip-compressed input file. The file may be corrupted: {}",
+                    self.file_name_cache
+                ))
+            })?;
+            if n == 0 {
+                self.eos = true;
+                break;
+            }
+            total += n;
+        }
+        Ok(total)
     }
 
     fn close(&mut self) -> IoResult<()> {
-        self.prev.close()
+        if let Some(inner) = self.inner.take() {
+            let mut prev = inner.into_prev();
+            prev.close()?;
+        }
+        Ok(())
     }
 
     fn rewind(&mut self) -> IoResult<()> {
-        self.prev.rewind()?;
-        self.init()
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| IoError::Other("ZlibSource closed".to_string()))?;
+        let mut prev = inner.into_prev();
+        prev.rewind()?;
+        self.inner = Some(zlib_wrap(prev)?);
+        self.eos = false;
+        Ok(())
     }
 
     fn eof(&mut self) -> IoResult<bool> {
@@ -1069,66 +1108,73 @@ impl<S: StreamEntity> StreamEntity for ZlibSource<S> {
     }
 
     fn file_name(&self) -> &str {
-        self.prev.file_name()
+        &self.file_name_cache
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct ZstdSource<S: StreamEntity> {
-    prev: InputStreamBuffer<S>,
-    data: Vec<u8>,
-    pos: usize,
+    inner: Option<zstd::stream::Decoder<'static, std::io::BufReader<PrevReader<S>>>>,
     eos: bool,
+    file_name_cache: String,
 }
 
 impl<S: StreamEntity> ZstdSource<S> {
     pub fn new(prev: InputStreamBuffer<S>) -> IoResult<Self> {
-        let mut out = Self {
-            prev,
-            data: Vec::new(),
-            pos: 0,
-            eos: false,
-        };
-        out.init()?;
-        Ok(out)
-    }
-
-    pub fn init(&mut self) -> IoResult<()> {
-        self.eos = false;
-        self.pos = 0;
-        let mut compressed = Vec::new();
-        let mut buf = [0u8; COMPRESSED_STREAM_CHUNK_SIZE];
-        loop {
-            let n = self.prev.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            compressed.extend_from_slice(&buf[..n]);
-        }
-        self.data = zstd::stream::decode_all(std::io::Cursor::new(&compressed))
+        let file_name_cache = prev.file_name().to_string();
+        let dec = zstd::stream::Decoder::new(PrevReader(prev))
             .map_err(|e| IoError::Other(format!("ZSTD_decompressStream: {e}")))?;
-        Ok(())
+        Ok(Self {
+            inner: Some(dec),
+            eos: false,
+            file_name_cache,
+        })
     }
 }
 
 impl<S: StreamEntity> StreamEntity for ZstdSource<S> {
     fn read(&mut self, ptr: &mut [u8]) -> IoResult<usize> {
-        let n = ptr.len().min(self.data.len().saturating_sub(self.pos));
-        ptr[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
-        self.pos += n;
-        if n == 0 || self.pos == self.data.len() {
-            self.eos = true;
+        if self.eos {
+            return Ok(0);
         }
-        Ok(n)
+        use std::io::Read as _;
+        let dec = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| IoError::Other("ZstdSource closed".to_string()))?;
+        let mut total = 0;
+        while total < ptr.len() {
+            let n = dec
+                .read(&mut ptr[total..])
+                .map_err(|e| IoError::Other(format!("ZSTD_decompressStream: {e}")))?;
+            if n == 0 {
+                self.eos = true;
+                break;
+            }
+            total += n;
+        }
+        Ok(total)
     }
 
     fn close(&mut self) -> IoResult<()> {
-        self.prev.close()
+        if let Some(dec) = self.inner.take() {
+            let mut prev = dec.finish().into_inner().0;
+            prev.close()?;
+        }
+        Ok(())
     }
 
     fn rewind(&mut self) -> IoResult<()> {
-        self.prev.rewind()?;
-        self.init()
+        let dec = self
+            .inner
+            .take()
+            .ok_or_else(|| IoError::Other("ZstdSource closed".to_string()))?;
+        let mut prev = dec.finish().into_inner().0;
+        prev.rewind()?;
+        let new_dec = zstd::stream::Decoder::new(PrevReader(prev))
+            .map_err(|e| IoError::Other(format!("ZSTD_decompressStream: {e}")))?;
+        self.inner = Some(new_dec);
+        self.eos = false;
+        Ok(())
     }
 
     fn eof(&mut self) -> IoResult<bool> {
@@ -1136,7 +1182,7 @@ impl<S: StreamEntity> StreamEntity for ZstdSource<S> {
     }
 
     fn file_name(&self) -> &str {
-        self.prev.file_name()
+        &self.file_name_cache
     }
 }
 
@@ -1362,33 +1408,39 @@ impl<S: StreamEntity> Serializer<S> {
         }
     }
 
+    // The C++ `Serializer::operator<<` writes scalars in NATIVE endianness
+    // (`util/io/serializer.h:89-102`). The `big_endian_byteswap` helper there
+    // is misnamed — it actually maps to `psnip_endian_le16/32/64` which is a
+    // no-op on x86_64 LE. We must emit native bytes too, or any `.dmnd`/.daa
+    // written via `Serializer` (e.g. `taxonomy.save`) is non-interoperable
+    // with C++.
     pub fn write_i32(&mut self, x: i32) -> IoResult<&mut Self> {
-        self.write_raw(&x.to_be_bytes())?;
+        self.write_raw(&x.to_ne_bytes())?;
         Ok(self)
     }
 
     pub fn write_i16(&mut self, x: i16) -> IoResult<&mut Self> {
-        self.write_raw(&x.to_be_bytes())?;
+        self.write_raw(&x.to_ne_bytes())?;
         Ok(self)
     }
 
     pub fn write_u16(&mut self, x: u16) -> IoResult<&mut Self> {
-        self.write_raw(&x.to_be_bytes())?;
+        self.write_raw(&x.to_ne_bytes())?;
         Ok(self)
     }
 
     pub fn write_i64(&mut self, x: i64) -> IoResult<&mut Self> {
-        self.write_raw(&x.to_be_bytes())?;
+        self.write_raw(&x.to_ne_bytes())?;
         Ok(self)
     }
 
     pub fn write_u32(&mut self, x: u32) -> IoResult<&mut Self> {
-        self.write_raw(&x.to_be_bytes())?;
+        self.write_raw(&x.to_ne_bytes())?;
         Ok(self)
     }
 
     pub fn write_u64(&mut self, x: u64) -> IoResult<&mut Self> {
-        self.write_raw(&x.to_be_bytes())?;
+        self.write_raw(&x.to_ne_bytes())?;
         Ok(self)
     }
 
@@ -1550,40 +1602,44 @@ impl<S: StreamEntity> Deserializer<S> {
         self.buffer.close()
     }
 
+    // C++ `Deserializer::operator>>` reads NATIVE endianness (matches the
+    // native-write side in `Serializer`). The previous big-endian read here
+    // would silently flip bytes on every scalar, producing garbage when
+    // reading any non-Rust-written file. See `write_u32` above.
     pub fn read_u32(&mut self) -> IoResult<u32> {
         let mut b = [0u8; 4];
         self.read_exact(&mut b)?;
-        Ok(u32::from_be_bytes(b))
+        Ok(u32::from_ne_bytes(b))
     }
 
     pub fn read_i32(&mut self) -> IoResult<i32> {
         let mut b = [0u8; 4];
         self.read_exact(&mut b)?;
-        Ok(i32::from_be_bytes(b))
+        Ok(i32::from_ne_bytes(b))
     }
 
     pub fn read_i16(&mut self) -> IoResult<i16> {
         let mut b = [0u8; 2];
         self.read_exact(&mut b)?;
-        Ok(i16::from_be_bytes(b))
+        Ok(i16::from_ne_bytes(b))
     }
 
     pub fn read_u16(&mut self) -> IoResult<u16> {
         let mut b = [0u8; 2];
         self.read_exact(&mut b)?;
-        Ok(u16::from_be_bytes(b))
+        Ok(u16::from_ne_bytes(b))
     }
 
     pub fn read_i64(&mut self) -> IoResult<i64> {
         let mut b = [0u8; 8];
         self.read_exact(&mut b)?;
-        Ok(i64::from_be_bytes(b))
+        Ok(i64::from_ne_bytes(b))
     }
 
     pub fn read_u64(&mut self) -> IoResult<u64> {
         let mut b = [0u8; 8];
         self.read_exact(&mut b)?;
-        Ok(u64::from_be_bytes(b))
+        Ok(u64::from_ne_bytes(b))
     }
 
     pub fn read_f64(&mut self) -> IoResult<f64> {
@@ -2874,6 +2930,8 @@ mod tests {
             let mut buf = [0u8; 11];
             assert_eq!(zlib.read(&mut buf).unwrap(), 11);
             assert_eq!(&buf, b"stream-zlib");
+            let mut tail = [0u8; 1];
+            assert_eq!(zlib.read(&mut tail).unwrap(), 0);
             assert!(zlib.eof().unwrap());
             zlib.rewind().unwrap();
             let mut head = [0u8; 6];
@@ -2899,6 +2957,8 @@ mod tests {
             let mut buf = [0u8; 11];
             assert_eq!(zstd.read(&mut buf).unwrap(), 11);
             assert_eq!(&buf, b"stream-zstd");
+            let mut tail = [0u8; 1];
+            assert_eq!(zstd.read(&mut tail).unwrap(), 0);
             assert!(zstd.eof().unwrap());
         }
 

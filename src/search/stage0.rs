@@ -8,7 +8,7 @@ pub enum SearchShapeSeedLocKind {
     PackedLocId,
 }
 
-/// Matches C++ `seed_join_worker`.
+/// Matches C++ `seed_join_worker(...)`.
 pub fn seed_join_worker<SeedLoc>(
     query_seeds: &SeedArray<SeedLoc>,
     ref_seeds: &SeedArray<SeedLoc>,
@@ -38,7 +38,7 @@ where
     Ok(())
 }
 
-/// Matches the control-flow loop in C++ `search_worker`.
+/// Matches C++ `search_worker(...)`.
 pub fn search_worker<SeedLoc, F>(
     stop: bool,
     seedp_begin: usize,
@@ -63,7 +63,7 @@ where
     processed
 }
 
-/// Matches C++ `search_shape(unsigned...)` seed-location dispatch.
+/// Matches C++ `search_shape(unsigned...)`.
 pub fn search_shape_seed_loc_kind(keep_target_id: bool) -> SearchShapeSeedLocKind {
     if keep_target_id {
         SearchShapeSeedLocKind::PackedLocId

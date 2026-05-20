@@ -21,7 +21,7 @@ pub enum SeqFileFormat {
     Fastq,
 }
 
-/// Matches the C++ `read_fasta` template: callback receives full title, raw sequence, and file offset.
+/// Matches C++ `read_fasta(reader, f)`.
 pub fn read_fasta<R, F>(reader: &mut R, mut f: F) -> io::Result<()>
 where
     R: BufRead,
@@ -101,11 +101,36 @@ pub fn read_fasta_nucleotide<R: Read>(reader: R) -> io::Result<Vec<FastaRecord>>
 
 /// Read FASTA records from a file path.
 pub fn read_fasta_file(path: &Path, seq_type: SequenceType) -> io::Result<Vec<FastaRecord>> {
-    let file = std::fs::File::open(path)?;
+    use std::io::Seek;
+    let mut file = std::fs::File::open(path)?;
 
-    // Check for gzip
-    let reader: Box<dyn Read> = if path.extension().is_some_and(|ext| ext == "gz") {
-        Box::new(flate2::read::GzDecoder::new(file))
+    // C++ `detect_compressor` (`diamond/src/util/io/input_file.cpp:52-61`)
+    // sniffs the gzip magic `\x1F\x8B` from the first two bytes of the file,
+    // regardless of file extension. A gzip-compressed query named
+    // `query.fasta` (no `.gz`) would decompress fine in C++ but used to be
+    // read as binary garbage here. Peek the first two bytes to detect gzip
+    // magic before falling back to the extension check.
+    let mut magic = [0u8; 2];
+    let is_gzip = match file.read_exact(&mut magic) {
+        Ok(()) => {
+            // Rewind so the actual reader sees the whole file.
+            file.seek(std::io::SeekFrom::Start(0))?;
+            magic == [0x1F, 0x8B]
+        }
+        Err(_) => {
+            // File shorter than 2 bytes — fall back to extension check.
+            file.seek(std::io::SeekFrom::Start(0))?;
+            path.extension().is_some_and(|ext| ext == "gz")
+        }
+    };
+
+    // Use `MultiGzDecoder` so concatenated gzip members (e.g.
+    // `cat a.fa.gz b.fa.gz > combined.fa.gz`) decompress past the first
+    // member — `GzDecoder` stops at the first member's EOF and silently
+    // truncates the rest. C++ uses zlib which decompresses all members by
+    // default.
+    let reader: Box<dyn Read> = if is_gzip {
+        Box::new(flate2::read::MultiGzDecoder::new(file))
     } else {
         Box::new(file)
     };
@@ -124,8 +149,20 @@ fn read_fasta_with_encoding<R: Read>(
     let mut records = Vec::new();
     {
         let buf = buf_reader.fill_buf()?;
+        if buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Error detecting input file format. Input file seems to be empty.",
+            ));
+        }
         if buf.first().copied() == Some(b'>') {
             read_fasta(&mut buf_reader, |id, seq, _start| {
+                if seq.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Missing fields in input line",
+                    ));
+                }
                 let mut sequence = Vec::with_capacity(seq.len());
                 for ch in seq.bytes() {
                     sequence.push(
@@ -141,6 +178,12 @@ fn read_fasta_with_encoding<R: Read>(
                 Ok(())
             })?;
             return Ok(records);
+        }
+        if buf.first().copied() != Some(b'@') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Error detecting input file format. First line must begin with '>' (FASTA) or '@' (FASTQ).",
+            ));
         }
     }
 
@@ -192,14 +235,20 @@ fn read_fasta_with_encoding<R: Read>(
         } else if is_fastq {
             match fastq_state {
                 1 => {
-                    // Sequence line(s) — continue until we hit a '+' line
+                    // Sequence line(s) — continue until we hit a '+' line.
+                    // Bail on invalid characters like C++ does (its
+                    // `CharRepresentation::operator()` throws on unknown
+                    // chars). The previous `if let Ok(letter)` silently
+                    // dropped invalid bytes — that's a faithfulness gap that
+                    // also masks real data corruption from the user.
                     if line.starts_with('+') {
                         fastq_state = 3; // skip quality line next
                     } else {
                         for ch in line.bytes() {
-                            if let Ok(letter) = encoding.convert(ch) {
-                                current_seq.push(letter);
-                            }
+                            let letter = encoding.convert(ch).map_err(|e| {
+                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                            })?;
+                            current_seq.push(letter);
                         }
                     }
                 }
@@ -214,11 +263,12 @@ fn read_fasta_with_encoding<R: Read>(
                 _ => {}
             }
         } else {
-            // FASTA sequence line
+            // FASTA sequence line — error on invalid chars (matches C++).
             for ch in line.bytes() {
-                if let Ok(letter) = encoding.convert(ch) {
-                    current_seq.push(letter);
-                }
+                let letter = encoding
+                    .convert(ch)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                current_seq.push(letter);
             }
         }
     }
@@ -314,6 +364,33 @@ mod tests {
             err.to_string(),
             "FASTA format error: empty id at file offset 0"
         );
+    }
+
+    #[test]
+    fn test_read_fasta_with_encoding_detects_empty_input_like_cpp() {
+        let err = read_fasta_amino_acid(&b""[..]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "Error detecting input file format. Input file seems to be empty."
+        );
+    }
+
+    #[test]
+    fn test_read_fasta_with_encoding_rejects_unknown_format_like_cpp() {
+        let err = read_fasta_amino_acid(&b"seq\n"[..]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "Error detecting input file format. First line must begin with '>' (FASTA) or '@' (FASTQ)."
+        );
+    }
+
+    #[test]
+    fn test_read_fasta_with_encoding_rejects_empty_sequence_like_cpp() {
+        let err = read_fasta_amino_acid(&b">seq\n"[..]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "Missing fields in input line");
     }
 
     #[test]

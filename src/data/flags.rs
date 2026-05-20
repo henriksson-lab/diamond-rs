@@ -14,7 +14,7 @@ pub enum SeedEncoding {
 pub struct NoFilter;
 
 impl NoFilter {
-    /// Matches C++ `NoFilter::contains`.
+    /// Matches C++ `NoFilter::contains(seed, shape)`.
     pub fn contains(&self, _seed: u64, _shape: u64) -> bool {
         true
     }
@@ -38,7 +38,7 @@ impl PackedLocId {
         Self { pos, block_id }
     }
 
-    /// Matches C++ `operator uint64_t`.
+    /// Matches C++ `PackedLocId::operator uint64_t()`.
     pub fn as_u64(self) -> u64 {
         self.pos.as_u64()
     }
@@ -71,12 +71,12 @@ impl From<PackedLocId> for u64 {
     }
 }
 
-/// Matches C++ `block_id(PackedLocId i)`.
+/// Matches C++ `block_id(i)`.
 pub fn block_id_packed_loc_id(i: PackedLocId) -> u32 {
     i.block_id
 }
 
-/// Matches C++ `block_id(PackedLoc i)`.
+/// Matches C++ `block_id(i)`.
 pub fn block_id_packed_loc(_i: PackedLoc) -> u32 {
     panic!("Unsupported");
 }

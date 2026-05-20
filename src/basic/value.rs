@@ -193,6 +193,9 @@ impl AlignMode {
     pub const BLASTP: i32 = 2;
     pub const BLASTX: i32 = 3;
     pub const BLASTN: i32 = 4;
+    pub const COMMAND_BLASTP: u32 = 1;
+    pub const COMMAND_BLASTX: u32 = 2;
+    pub const COMMAND_BLASTN: u32 = 49;
 
     pub fn new(mode: i32) -> Self {
         match mode {
@@ -216,11 +219,34 @@ impl AlignMode {
                 sequence_type: SequenceType::Nucleotide,
                 input_sequence_type: SequenceType::Nucleotide,
                 mode,
-                query_contexts: 2,
+                query_contexts: 1,
                 query_len_factor: 1,
                 query_translated: false,
             },
-            _ => panic!("Invalid alignment mode: {}", mode),
+            _ => AlignMode {
+                sequence_type: SequenceType::AminoAcid,
+                input_sequence_type: SequenceType::AminoAcid,
+                mode,
+                query_contexts: 1,
+                query_len_factor: 1,
+                query_translated: false,
+            },
+        }
+    }
+
+    pub fn from_command(command: u32) -> i32 {
+        match command {
+            Self::COMMAND_BLASTX => Self::BLASTX,
+            Self::COMMAND_BLASTN => Self::BLASTN,
+            _ => Self::BLASTP,
+        }
+    }
+
+    pub fn check_context(&self, i: i32) -> Result<i32, String> {
+        if i >= self.query_contexts {
+            Err("Sequence context is out of bounds.".to_string())
+        } else {
+            Ok(i)
         }
     }
 
@@ -229,7 +255,7 @@ impl AlignMode {
             Self::BLASTP => "blastp",
             Self::BLASTX => "blastx",
             Self::BLASTN => "blastn",
-            _ => unreachable!(),
+            _ => panic!("Invalid alignment mode: {}", self.mode),
         }
     }
 }
@@ -294,5 +320,39 @@ mod tests {
         let mode = AlignMode::new(AlignMode::BLASTX);
         assert_eq!(mode.query_contexts, 6);
         assert!(mode.query_translated);
+
+        let mode = AlignMode::new(AlignMode::BLASTN);
+        assert_eq!(mode.sequence_type, SequenceType::Nucleotide);
+        assert_eq!(mode.input_sequence_type, SequenceType::Nucleotide);
+        assert_eq!(mode.query_contexts, 1);
+        assert!(!mode.query_translated);
+        assert_eq!(mode.to_string(), "blastn");
+    }
+
+    #[test]
+    fn test_align_mode_from_command_and_context() {
+        assert_eq!(
+            AlignMode::from_command(AlignMode::COMMAND_BLASTX),
+            AlignMode::BLASTX
+        );
+        assert_eq!(
+            AlignMode::from_command(AlignMode::COMMAND_BLASTN),
+            AlignMode::BLASTN
+        );
+        assert_eq!(
+            AlignMode::from_command(AlignMode::COMMAND_BLASTP),
+            AlignMode::BLASTP
+        );
+        assert_eq!(
+            AlignMode::from_command(AlignMode::COMMAND_BLASTP + 1000),
+            AlignMode::BLASTP
+        );
+
+        let mode = AlignMode::new(AlignMode::BLASTP);
+        assert_eq!(mode.check_context(0).unwrap(), 0);
+        assert_eq!(
+            mode.check_context(1).unwrap_err(),
+            "Sequence context is out of bounds."
+        );
     }
 }

@@ -10,7 +10,7 @@ use crate::output::format::{print_tabular_footer, print_tabular_header, Header, 
 use crate::output::{pairwise, sam, xml};
 use crate::stats::score_matrix::ScoreMatrix;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ViewConfig {
     pub daa_file: String,
     pub output: String,
@@ -21,6 +21,22 @@ pub struct ViewConfig {
     pub report_unaligned: bool,
     pub sam_qlen_field: bool,
     pub invocation: String,
+    /// --header value (`simple` / `verbose` / unset).
+    pub header: Vec<String>,
+}
+
+/// Parse the `--header` flag value (as a Vec<String> coming from CLI parsing).
+/// Mirrors C++ behavior: missing flag → `None`, `--header` with no value → `Simple`,
+/// `--header simple` → `Simple`, `--header verbose` → `Verbose`.
+fn parse_header_arg(header: &[String]) -> Header {
+    if header.is_empty() {
+        return Header::None;
+    }
+    let val = header[0].trim();
+    if val.is_empty() {
+        return Header::Simple;
+    }
+    Header::parse(val).unwrap_or(Header::Simple)
 }
 
 /// Run the view command — show DAA file metadata.
@@ -149,7 +165,8 @@ pub fn run_tabular(config: &ViewConfig) -> io::Result<()> {
     eprintln!("DB letters = {}", daa.db_letters());
 
     let mut out = File::create(&config.output)?;
-    let header = print_tabular_header(&format.fields, Header::None, format.is_json, "", "")
+    let header_mode = parse_header_arg(&config.header);
+    let header = print_tabular_header(&format.fields, header_mode, format.is_json, "", "")
         .map_err(io::Error::other)?;
     out.write_all(header.as_bytes())?;
     while let Some((buf, query_num)) = daa.read_query_buffer()? {
@@ -522,6 +539,7 @@ mod tests {
             forward_only: false,
             report_unaligned: false,
             sam_qlen_field: false,
+            header: vec![],
             invocation: String::new(),
         })
         .unwrap();
@@ -636,6 +654,7 @@ mod tests {
             forward_only: false,
             report_unaligned: false,
             sam_qlen_field: false,
+            header: vec![],
             invocation: String::new(),
         })
         .unwrap();
@@ -657,6 +676,7 @@ mod tests {
             forward_only: false,
             report_unaligned: false,
             sam_qlen_field: false,
+            header: vec![],
             invocation: String::new(),
         })
         .unwrap();
@@ -676,6 +696,7 @@ mod tests {
             forward_only: false,
             report_unaligned: false,
             sam_qlen_field: false,
+            header: vec![],
             invocation: String::new(),
         })
         .unwrap();
@@ -693,6 +714,7 @@ mod tests {
             forward_only: false,
             report_unaligned: false,
             sam_qlen_field: true,
+            header: vec![],
             invocation: "diamond view -f sam".to_string(),
         })
         .unwrap();
@@ -713,6 +735,7 @@ mod tests {
             forward_only: false,
             report_unaligned: false,
             sam_qlen_field: false,
+            header: vec![],
             invocation: String::new(),
         })
         .unwrap();
@@ -734,6 +757,7 @@ mod tests {
             forward_only: false,
             report_unaligned: false,
             sam_qlen_field: false,
+            header: vec![],
             invocation: String::new(),
         })
         .unwrap();
@@ -757,6 +781,7 @@ mod tests {
             forward_only: false,
             report_unaligned: false,
             sam_qlen_field: false,
+            header: vec![],
             invocation: String::new(),
         })
         .unwrap();
@@ -772,6 +797,7 @@ mod tests {
             forward_only: false,
             report_unaligned: false,
             sam_qlen_field: false,
+            header: vec![],
             invocation: String::new(),
         })
         .unwrap();

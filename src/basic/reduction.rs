@@ -2,7 +2,7 @@ use super::value::{
     Letter, AMINO_ACID_ALPHABET, DELIMITER_LETTER, MASK_LETTER, STOP_LETTER, TRUE_AA,
 };
 
-/// Default reduction definition: maps 20 amino acids to 8 groups.
+/// Default reduction definition: maps 20 amino acids to 10 Murphy groups.
 pub const DEFAULT_REDUCTION: &str = "A KR EDNQ C G H ILVM FYW P ST";
 
 /// Alphabet reduction mapping amino acids to fewer groups for seed computation.

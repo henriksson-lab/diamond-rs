@@ -12,6 +12,7 @@ pub mod interval;
 pub mod intrin;
 pub mod io;
 pub mod kmer;
+pub mod log_erfc;
 pub mod log_stream;
 pub mod math;
 pub mod memory;

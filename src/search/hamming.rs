@@ -1,5 +1,5 @@
 use crate::basic::packed_loc::PackedLoc;
-use crate::basic::value::{letter_mask, Letter, LETTER_MASK};
+use crate::basic::value::{letter_mask, Letter, DELIMITER_LETTER, LETTER_MASK};
 use crate::data::sequence_set::SequenceSet;
 use crate::search::kmer_ranking::{KmerRanking, PackedLocId};
 use crate::util::math::bit_length;
@@ -112,7 +112,7 @@ pub fn stage1_dispatch_packed_loc(cfg: &Stage1DispatchConfig) -> Stage1KernelKin
     }
 }
 
-/// Matches C++ `keep_target_id`.
+/// Matches C++ `keep_target_id(const Search::Config*)`.
 pub fn keep_target_id(cfg: &Stage1DispatchConfig) -> bool {
     cfg.hit_keep_target_id
         || cfg.min_length_ratio != 0.0
@@ -201,18 +201,23 @@ impl FingerPrint {
 
     pub fn from_seq_center(q: &[Letter], center: usize) -> Self {
         let mut r = [0; 48];
-        r.copy_from_slice(&q[center - 16..center + 32]);
+        Self::load(q, center, &mut r);
         Self { r }
     }
 
     pub fn load(q: &[Letter], center: usize, dst: &mut [Letter; 48]) {
-        dst.copy_from_slice(&q[center - 16..center + 32]);
+        for (i, out) in dst.iter_mut().enumerate() {
+            let pos = center as isize + i as isize - 16;
+            *out = if pos < 0 || pos as usize >= q.len() {
+                DELIMITER_LETTER
+            } else {
+                letter_mask(q[pos as usize]) & LETTER_MASK
+            };
+        }
     }
 
     pub fn load_masked(q: &[Letter], center: usize, dst: &mut [Letter; 48]) {
-        for (out, &letter) in dst.iter_mut().zip(&q[center - 16..center + 32]) {
-            *out = letter_mask(letter) & LETTER_MASK;
-        }
+        Self::load(q, center, dst);
     }
 
     pub fn match_count(&self, rhs: &FingerPrint) -> u32 {
@@ -384,7 +389,7 @@ pub fn load_fps<L: SeedLoc>(seed_locs: &[L], seqs: &SequenceSet, out: &mut Conta
     }
 }
 
-/// Matches C++ `stage1`.
+/// Matches C++ `stage1(...)`.
 pub fn stage1<L, F>(
     q: &[L],
     s: &[L],
@@ -422,7 +427,7 @@ where
     (q.len() * s.len()) as u64
 }
 
-/// Matches C++ `stage1_self`.
+/// Matches C++ `stage1_self(...)`.
 pub fn stage1_self<L, F>(
     s: &[L],
     target_seqs: &SequenceSet,
@@ -458,7 +463,7 @@ where
     (s.len() * (s.len().saturating_sub(1)) / 2) as u64
 }
 
-/// Matches C++ `stage1_query_lin`.
+/// Matches C++ `stage1_query_lin(...)`.
 pub fn stage1_query_lin<F>(
     q: &[PackedLoc],
     s: &[PackedLoc],
@@ -489,7 +494,7 @@ where
     s.len() as u64
 }
 
-/// Matches C++ `stage1_query_lin_ranked`.
+/// Matches C++ `stage1_query_lin_ranked(...)`.
 pub fn stage1_query_lin_ranked<F>(
     q: &[PackedLocId],
     s: &[PackedLocId],
@@ -522,7 +527,7 @@ where
     s.len() as u64
 }
 
-/// Matches C++ `stage1_target_lin`.
+/// Matches C++ `stage1_target_lin(...)`.
 pub fn stage1_target_lin<L, F>(
     q: &[L],
     s: &[L],
@@ -554,7 +559,7 @@ where
     q.len() as u64
 }
 
-/// Matches C++ `stage1_longest_combo_lin`.
+/// Matches C++ `stage1_longest_combo_lin(...)`.
 pub fn stage1_longest_combo_lin<F>(
     q: &[PackedLocId],
     s: &[PackedLocId],
@@ -621,7 +626,7 @@ where
     }
 }
 
-/// Matches C++ `stage1_mutual_cov`.
+/// Matches C++ `stage1_mutual_cov(...)`.
 pub fn stage1_mutual_cov<F>(
     q: &[PackedLocId],
     s: &[PackedLocId],
@@ -675,7 +680,7 @@ where
     (q.len() * s.len()) as u64
 }
 
-/// Matches C++ `stage1_self_mutual_cov`.
+/// Matches C++ `stage1_self_mutual_cov(...)`.
 pub fn stage1_self_mutual_cov<F>(
     s: &[PackedLocId],
     target_seqs: &SequenceSet,
@@ -705,7 +710,7 @@ where
     seed_hits
 }
 
-/// Matches C++ `stage1_mutual_cov_query_lin`.
+/// Matches C++ `stage1_mutual_cov_query_lin(...)`.
 pub fn stage1_mutual_cov_query_lin<F>(
     q: &[PackedLocId],
     s: &[PackedLocId],
@@ -766,7 +771,7 @@ where
     seed_hits
 }
 
-/// Matches C++ `stage1_mutual_cov_target_lin`.
+/// Matches C++ `stage1_mutual_cov_target_lin(...)`.
 pub fn stage1_mutual_cov_target_lin<F>(
     q: &[PackedLocId],
     s: &[PackedLocId],
@@ -868,6 +873,17 @@ mod tests {
     }
 
     #[test]
+    fn test_fingerprint_load_masks_and_pads_boundaries() {
+        let mut seq: Vec<Letter> = (0..20).map(|i| (i % 20) as Letter).collect();
+        seq[0] = -128 | 5;
+        let mut a = [0; 48];
+        FingerPrint::load(&seq, 0, &mut a);
+        assert!(a[..16].iter().all(|&x| x == DELIMITER_LETTER));
+        assert_eq!(a[16], 5);
+        assert!(a[36..].iter().all(|&x| x == DELIMITER_LETTER));
+    }
+
+    #[test]
     fn test_all_vs_all_sets_matching_targets() {
         let a = [fp(1), fp(2), fp(3), fp(4), fp(5)];
         let mut b = [fp(1), fp(9), fp(5)];
@@ -929,7 +945,7 @@ mod tests {
         let mut out = Vec::new();
         load_fps(&[p0, p1], &seqs, &mut out);
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0][0], seqs.data()[p0 - 16]);
+        assert_eq!(out[0][0], letter_mask(seqs.data()[p0 - 16]) & LETTER_MASK);
         assert_eq!(out[1][47], seqs.data()[p1 + 31]);
     }
 

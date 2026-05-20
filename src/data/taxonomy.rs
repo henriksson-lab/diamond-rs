@@ -422,7 +422,7 @@ impl TaxonomyTree {
         1 // root
     }
 
-    /// Matches C++ SequenceFile::lineage(): root-to-taxid, excluding root.
+    /// Matches C++ `SequenceFile::lineage(taxid)`.
     pub fn lineage_root_to_taxid(&self, taxid: TaxId) -> Vec<TaxId> {
         let mut out = Vec::new();
         let mut current = taxid;
@@ -441,7 +441,7 @@ impl TaxonomyTree {
         out
     }
 
-    /// Matches SequenceFile::taxon_scientific_name fallback semantics.
+    /// Matches C++ `SequenceFile::taxon_scientific_name(taxid)`.
     pub fn taxon_scientific_name(&self, taxid: TaxId) -> String {
         self.nodes
             .iter()
@@ -457,7 +457,7 @@ impl TaxonomyTree {
             .map(|node| node.rank.as_str())
     }
 
-    /// Matches C++ SequenceFile::rank_taxid(TaxId, Rank).
+    /// Matches C++ `SequenceFile::rank_taxid(taxid, rank)`.
     pub fn rank_taxid(&self, mut taxid: TaxId, rank: &str) -> TaxId {
         const MAX_LINEAGE: usize = 64;
         let mut n = 0usize;
@@ -476,7 +476,7 @@ impl TaxonomyTree {
         }
     }
 
-    /// Matches C++ SequenceFile::rank_taxid(const vector<TaxId>&, Rank).
+    /// Matches C++ `SequenceFile::rank_taxid(taxids, rank)`.
     pub fn rank_taxids(&self, taxids: &[TaxId], rank: &str) -> std::collections::BTreeSet<TaxId> {
         let mut out = std::collections::BTreeSet::new();
         for &taxid in taxids {

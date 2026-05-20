@@ -1,4 +1,5 @@
 pub mod hamming;
+pub mod hamming_filter;
 pub mod hit;
 pub mod kmer_ranking;
 pub mod left_most;

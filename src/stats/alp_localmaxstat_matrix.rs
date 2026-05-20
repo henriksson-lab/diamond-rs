@@ -1,5 +1,7 @@
 #![allow(non_snake_case)]
 
+use std::fmt;
+
 use crate::stats::alp_localmaxstat::LocalMaxStat;
 use crate::stats::alp_localmaxstat_util;
 
@@ -275,6 +277,12 @@ impl LocalMaxStatMatrix {
     }
 }
 
+impl fmt::Display for LocalMaxStatMatrix {
+    fn fmt(&self, ostr_: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(ostr_, "{}", self.out())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +293,8 @@ mod tests {
     fn test_local_max_stat_matrix_empty_and_copy_base() {
         let matrix = LocalMaxStatMatrix::new(0, None, None, None, 0, 0.0);
         assert!(!matrix.bool_());
+        assert_eq!(matrix.out(), "");
+        assert_eq!(format!("{}", matrix), "");
 
         let base = LocalMaxStat::new(0, None, None);
         let scores = vec![vec![-1, 2]];

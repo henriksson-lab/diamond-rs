@@ -33,35 +33,30 @@ pub fn write_pairwise<W: Write>(
     writeln!(writer, "Length={}", data.subject_len)?;
     writeln!(writer)?;
 
-    // Score line
+    // Score line — matches C++ blast_pairwise_format.cpp:32.
     write!(
         writer,
         " Score = {} bits ({}),  Expect = ",
-        data.bit_score.floor() as i64,
+        crate::output::format::format_double(data.bit_score),
         data.score
     )?;
-    if data.evalue == 0.0 {
-        writeln!(writer, "0.0")?;
-    } else {
-        writeln!(writer, "{:.2e}", data.evalue)?;
-    }
+    writeln!(
+        writer,
+        "{}",
+        crate::output::format::format_evalue(data.evalue)
+    )?;
 
-    // Statistics line
-    let id_pct = if data.length > 0 {
-        (100.0 * data.identities as f64 / data.length as f64).round() as i32
-    } else {
-        0
+    // C++ `percentage<unsigned, unsigned>` is integer division — truncates.
+    let pct_int = |n: u32, d: i32| -> i32 {
+        if d <= 0 {
+            0
+        } else {
+            (n as i32) * 100 / d
+        }
     };
-    let pos_pct = if data.length > 0 {
-        (100.0 * data.positives as f64 / data.length as f64).round() as i32
-    } else {
-        0
-    };
-    let gap_pct = if data.length > 0 {
-        (100.0 * data.gaps as f64 / data.length as f64).round() as i32
-    } else {
-        0
-    };
+    let id_pct = pct_int(data.identities as u32, data.length);
+    let pos_pct = pct_int(data.positives as u32, data.length);
+    let gap_pct = pct_int(data.gaps as u32, data.length);
     writeln!(
         writer,
         " Identities = {}/{} ({}%), Positives = {}/{} ({}%), Gaps = {}/{} ({}%)",
@@ -128,7 +123,7 @@ pub fn write_pairwise<W: Write>(
     Ok(())
 }
 
-/// Matches C++ PairwiseFormat::print_match(const HspContext&).
+/// Matches C++ `PairwiseFormat::print_match(const HspContext&)`.
 pub fn print_match_context<W: Write>(
     writer: &mut W,
     r: &HspContext,
@@ -149,14 +144,20 @@ pub fn print_match_context<W: Write>(
     } else {
         Strand::Reverse
     };
-    let target_title = r.target_title.replace('\x01', " ");
+    // C++ `OutputFormat::print_title(out, target_title, true, true, " ")`
+    // (`diamond/src/output/blast_pairwise_format.cpp:30`) tokenizes on BOTH
+    // `\x01` AND the FASTA `" >"` header separator and joins surviving
+    // titles with a space. A naive `replace('\x01', ' ')` only handles the
+    // `\x01` case, so multi-seqid headers with `" >"` separators would
+    // print verbatim instead of joined-by-space.
+    let target_title = crate::output::format::print_title(&r.target_title, true, true, " ", false);
     writeln!(writer, ">{}", target_title)?;
     writeln!(writer, "Length={}", r.subject_len)?;
     writeln!(writer)?;
     write!(
         writer,
         " Score = {} bits ({}),  Expect = ",
-        r.bit_score(),
+        crate::output::format::format_double(r.bit_score()),
         r.score()
     )?;
     writeln!(
@@ -165,11 +166,13 @@ pub fn print_match_context<W: Write>(
         crate::output::format::format_evalue(r.evalue())
     )?;
 
+    // C++ uses `percentage<unsigned, unsigned>(x, y) = x * 100 / y` (integer
+    // division — truncates), not rounded. See diamond/src/util/util.h.
     let pct = |n: u32, d: u32| -> u32 {
         if d == 0 {
             0
         } else {
-            ((n as f64) * 100.0 / (d as f64)).round() as u32
+            n * 100 / d
         }
     };
     writeln!(
@@ -199,13 +202,13 @@ pub fn print_match_context<W: Write>(
     }
     writeln!(writer)?;
 
-    let digits = r
-        .subject_range()
-        .end
-        .max(r.query_source_range().end)
-        .max(1)
-        .to_string()
-        .len();
+    // Matches C++ blast_pairwise_format.cpp:49 exactly:
+    //   digits = max(ceil(log10(subject_end)), ceil(log10(query_end)))
+    // Note this gives 3 for end=1000 (log10 == 3.0), not 4 — different from
+    // x.to_string().len() at exact powers of 10.
+    let s_end = r.subject_range().end.max(1) as f64;
+    let q_end = r.query_source_range().end.max(1) as f64;
+    let digits = s_end.log10().ceil().max(q_end.log10().ceil()) as usize;
     let mut qi = r.begin();
     let mut mi = r.begin();
     let mut si = r.begin();
@@ -292,7 +295,7 @@ pub fn write_query_header<W: Write>(
     Ok(())
 }
 
-/// Matches C++ PairwiseFormat::print_query_intro().
+/// Matches C++ `PairwiseFormat::print_query_intro()`.
 pub fn print_query_intro<W: Write>(
     writer: &mut W,
     query_title: &str,
@@ -312,12 +315,12 @@ pub fn print_query_intro<W: Write>(
     Ok(())
 }
 
-/// Matches C++ PairwiseFormat::print_query_epilog().
+/// Matches C++ `PairwiseFormat::print_query_epilog()`.
 pub fn print_query_epilog<W: Write>(_writer: &mut W) -> io::Result<()> {
     Ok(())
 }
 
-/// Matches C++ PairwiseFormat::print_footer().
+/// Matches C++ `PairwiseFormat::print_footer()`.
 pub fn print_footer<W: Write>(_writer: &mut W) -> io::Result<()> {
     Ok(())
 }
@@ -358,7 +361,7 @@ mod tests {
         write_pairwise(&mut buf, &data, &sm).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains(">s1"));
-        assert!(output.contains("Score = 30 bits"));
+        assert!(output.contains("Score = 30.0 bits"));
         assert!(output.contains("ARND"));
     }
 
@@ -408,8 +411,9 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains(">subject title"));
         assert!(output.contains("Length=100"));
-        assert!(output.contains("Score = 21 bits (42),  Expect = 1.00e-6"));
-        assert!(output.contains("Identities = 1/3 (33%), Positives = 2/3 (67%), Gaps = 1/3 (33%)"));
+        assert!(output.contains("Score = 21.0 bits (42),  Expect = 1.00e-06"));
+        // C++ truncates: 2*100/3 = 66 (not rounded to 67).
+        assert!(output.contains("Identities = 1/3 (33%), Positives = 2/3 (66%), Gaps = 1/3 (33%)"));
         assert!(output.contains("Query  1  AR- 2"));
         assert!(output.contains("A+ "));
         assert!(output.contains("Sbjct  6  ARD 8"));

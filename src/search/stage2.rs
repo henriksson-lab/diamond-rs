@@ -12,7 +12,7 @@ use crate::util::sequence;
 /// Matches C++ `SHORT_QUERY_LEN`.
 pub const SHORT_QUERY_LEN: i32 = 85;
 
-/// Matches C++ `ungapped_cutoff`.
+/// Matches C++ `ungapped_cutoff(...)`.
 pub fn ungapped_cutoff<FShort, FLong>(
     query_len: i32,
     ungapped_evalue: f64,
@@ -37,7 +37,7 @@ where
     }
 }
 
-/// Matches C++ `ungapped_window`.
+/// Matches C++ `ungapped_window(int, bool)`.
 pub fn ungapped_window(
     query_len: i32,
     query_translated: bool,
@@ -97,7 +97,7 @@ pub struct SearchQueryOffsetResult {
     pub hits: Vec<SearchQueryOffsetHit>,
 }
 
-/// Matches C++ `search_query_offset`.
+/// Matches C++ `search_query_offset(...)`.
 pub fn search_query_offset<SeedLoc>(
     q: SeedLoc,
     s: &[SeedLoc],
@@ -210,7 +210,7 @@ where
     out
 }
 
-/// Matches C++ `search_tile`.
+/// Matches C++ `search_tile(...)`.
 pub fn search_tile<SeedLoc, F>(
     hits: &mut HitField,
     query_begin: i32,

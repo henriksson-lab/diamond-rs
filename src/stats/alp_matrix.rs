@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::str::FromStr;
 use std::sync::Mutex;
 
@@ -431,6 +431,28 @@ where
     }
 }
 
+impl<T> fmt::Display for Matrix<T>
+where
+    T: Clone + Default + Display + FromStr + PartialEq,
+{
+    fn fmt(&self, ostr_: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(ostr_, "{}", self.out())
+    }
+}
+
+impl<T> FromStr for Matrix<T>
+where
+    T: Clone + Default + Display + FromStr + PartialEq,
+{
+    type Err = String;
+
+    fn from_str(istr_: &str) -> Result<Self, Self::Err> {
+        let mut matrix_ = Self::new();
+        matrix_.in_(istr_);
+        Ok(matrix_)
+    }
+}
+
 pub fn copy<S, T>(matrix_: &mut Matrix<S>, matrix0_: &Matrix<T>)
 where
     S: Clone + Default + From<T>,
@@ -505,6 +527,14 @@ mod tests {
         setFormat(Format::GENERAL);
         parsed.in_("5 6\n7 8\n");
         assert_eq!(parsed.getMatrix(), &[vec![5, 6], vec![7, 8]]);
+
+        alp_ioutil::setFormat(alp_ioutil::Format::MACHINE);
+        setFormat(Format::GENERAL);
+        assert_eq!(format!("{}", m), "1\t2\n3\t4");
+        alp_ioutil::setFormat(alp_ioutil::Format::MACHINE);
+        setFormat(Format::GENERAL);
+        let parsed_from_stream: Matrix<i32> = "9 8\n7 6\n".parse().unwrap();
+        assert_eq!(parsed_from_stream.getMatrix(), &[vec![9, 8], vec![7, 6]]);
     }
 
     #[test]

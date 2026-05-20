@@ -23,7 +23,7 @@ pub struct FrequentSeedsBuildStats {
 impl FrequentSeeds {
     pub const HASH_TABLE_FACTOR: f64 = 1.3;
 
-    /// Matches C++ `compute_sd`.
+    /// Matches C++ `compute_sd(range, query_seed_hits, ref_seed_hits)`.
     pub fn compute_sd<SeedLoc>(
         range: &SeedPartitionRange,
         query_seed_hits: &[DoubleArray],
@@ -52,7 +52,7 @@ impl FrequentSeeds {
         (ref_out, query_out)
     }
 
-    /// Matches C++ `FrequentSeeds::build_worker`.
+    /// Matches C++ `FrequentSeeds::build_worker(rel_seedp, query_seed_hits, ref_seed_hits, query_seqs, ref_max_n, query_max_n, counts)`.
     pub fn build_worker<SeedLoc>(
         rel_seedp: usize,
         query_seed_hits: &mut [DoubleArray],
@@ -85,7 +85,7 @@ impl FrequentSeeds {
         counts[rel_seedp] = n;
     }
 
-    /// Matches C++ `FrequentSeeds::build`.
+    /// Matches C++ `FrequentSeeds::build(sid, range, query_seed_hits, ref_seed_hits, query_seqs, freq_sd)`.
     pub fn build<SeedLoc>(
         _sid: u32,
         range: &SeedPartitionRange,
@@ -162,7 +162,7 @@ impl FrequentSeeds {
         )
     }
 
-    /// Matches C++ `FrequentSeeds::clear_masking`.
+    /// Matches C++ `FrequentSeeds::clear_masking(seqs)`.
     pub fn clear_masking(seqs: &mut SequenceSet) {
         for i in 0..seqs.len() {
             let seq = seqs.get_mut(i);

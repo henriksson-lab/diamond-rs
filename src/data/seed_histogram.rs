@@ -27,32 +27,32 @@ impl SeedPartitionRange {
         Self { begin, end }
     }
 
-    /// Matches C++ `SeedPartitionRange::contains`.
+    /// Matches C++ `SeedPartitionRange::contains(i)`.
     pub fn contains(&self, i: SeedPartition) -> bool {
         i >= self.begin && i < self.end
     }
 
-    /// Matches C++ `SeedPartitionRange::begin`.
+    /// Matches C++ `SeedPartitionRange::begin()`.
     pub fn begin(&self) -> SeedPartition {
         self.begin
     }
 
-    /// Matches C++ `SeedPartitionRange::end`.
+    /// Matches C++ `SeedPartitionRange::end()`.
     pub fn end(&self) -> SeedPartition {
         self.end
     }
 
-    /// Matches C++ `SeedPartitionRange::lower`.
+    /// Matches C++ `SeedPartitionRange::lower(i)`.
     pub fn lower(&self, i: SeedPartition) -> bool {
         i < self.begin
     }
 
-    /// Matches C++ `SeedPartitionRange::lower_or_equal`.
+    /// Matches C++ `SeedPartitionRange::lower_or_equal(i)`.
     pub fn lower_or_equal(&self, i: SeedPartition) -> bool {
         i < self.end
     }
 
-    /// Matches C++ `SeedPartitionRange::size`.
+    /// Matches C++ `SeedPartitionRange::size()`.
     pub fn size(&self) -> SeedPartition {
         self.end - self.begin
     }
@@ -60,7 +60,7 @@ impl SeedPartitionRange {
 
 pub static CURRENT_RANGE: Mutex<SeedPartitionRange> = Mutex::new(SeedPartitionRange::new());
 
-/// Matches C++ `partition_size`.
+/// Matches C++ `partition_size(hst, p)`.
 pub fn partition_size(hst: &ShapeHistogram, p: usize) -> usize {
     let mut s = 0usize;
     for row in hst {
@@ -69,7 +69,7 @@ pub fn partition_size(hst: &ShapeHistogram, p: usize) -> usize {
     s
 }
 
-/// Matches C++ `hst_size`.
+/// Matches C++ `hst_size(hst, range)`.
 pub fn hst_size(hst: &ShapeHistogram, range: &SeedPartitionRange) -> usize {
     let mut s = 0usize;
     for i in range.begin()..range.end() {
@@ -84,7 +84,7 @@ pub struct SeedHistogram {
 }
 
 impl SeedHistogram {
-    /// Matches C++ `SeedHistogram::SeedHistogram`.
+    /// Matches C++ `SeedHistogram::SeedHistogram()`.
     pub fn new() -> Self {
         Self {
             p: Vec::new(),
@@ -92,7 +92,7 @@ impl SeedHistogram {
         }
     }
 
-    /// Matches C++ `SeedHistogram::SeedHistogram`.
+    /// Matches C++ `SeedHistogram::SeedHistogram(seqs, serial, filter, enum_cfg, seedp_bits, threads, shapes, reduction, min_query_len, query_contexts)`.
     pub fn from_block<Filter>(
         seqs: &mut Block,
         serial: bool,
@@ -159,12 +159,12 @@ impl SeedHistogram {
         Ok(Self { p, data })
     }
 
-    /// Matches C++ `SeedHistogram::get`.
+    /// Matches C++ `SeedHistogram::get(sid)`.
     pub fn get(&self, sid: usize) -> &ShapeHistogram {
         &self.data[sid]
     }
 
-    /// Matches C++ `SeedHistogram::max_chunk_size`.
+    /// Matches C++ `SeedHistogram::max_chunk_size(index_chunks)`.
     pub fn max_chunk_size(&self, index_chunks: i32) -> usize {
         let mut max = 0usize;
         let p = Partition::new(self.seedp() as usize, index_chunks as usize);
@@ -182,12 +182,12 @@ impl SeedHistogram {
         max
     }
 
-    /// Matches C++ `SeedHistogram::partition`.
+    /// Matches C++ `SeedHistogram::partition()`.
     pub fn partition(&self) -> &Vec<u32> {
         &self.p
     }
 
-    /// Matches C++ `SeedHistogram::seedp`.
+    /// Matches C++ `SeedHistogram::seedp()`.
     pub fn seedp(&self) -> i32 {
         self.data[0][0].len() as i32
     }

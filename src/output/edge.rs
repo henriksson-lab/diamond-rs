@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use crate::align::hsp::HspContext;
 use crate::basic::value::OId;
 
-/// Matches C++ `Output::Format::Edge::Data`.
+/// Rust translation of C++ `Output::Format::Edge::Data`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EdgeData {
     pub query: OId,
@@ -36,7 +36,7 @@ impl EdgeData {
     }
 }
 
-/// Matches C++ `Output::Format::Edge::print_match()`.
+/// Matches C++ `Output::Format::Edge::print_match(r)`.
 pub fn print_match<W: Write>(writer: &mut W, r: &HspContext) -> io::Result<()> {
     EdgeData::from_context(r).write(writer)
 }

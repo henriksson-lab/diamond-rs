@@ -234,6 +234,16 @@ pub struct SequenceSet {
     data: Vec<Letter>,
     /// Offsets into data where each sequence starts.
     /// offsets[i] is the start of sequence i, offsets[i+1]-1 is the end (exclusive of delimiter).
+    ///
+    /// NOTE: C++ `StringSetBase<Letter, DELIMITER, 1>` carries a 256-byte
+    /// PERIMETER_PADDING on both ends so SIMD score-profile loaders can
+    /// over-read by up to 32 bytes. The simple Rust SequenceSet does NOT
+    /// have that padding. Today's live blastp pipeline survives because
+    /// every SIMD consumer copies sequences into a fresh `Vec` before
+    /// loading (see `swipe_set`, `WorkTarget::new`, `make_profile8` callers
+    /// in `gapped_filter`). If any future caller passes `block.seqs().get(i)`
+    /// directly into a SIMD profile builder or `_mm256_loadu_si256`, it can
+    /// read uninitialised memory. See [[block-set-padding]] in memory.
     offsets: Vec<usize>,
 }
 
@@ -252,7 +262,7 @@ impl SequenceSet {
         self.offsets.push(self.data.len());
     }
 
-    /// Matches C++ `StringSetBase::fill`.
+    /// Matches C++ `StringSetBase::fill(n, value)`.
     pub fn fill(&mut self, n: usize, value: Letter) {
         self.data.extend(std::iter::repeat_n(value, n));
         self.data.push(DELIMITER_LETTER);
@@ -280,22 +290,27 @@ impl SequenceSet {
         (self.offsets[i + 1] - 1 - self.offsets[i]) as Loc
     }
 
-    /// Matches C++ `StringSetBase::length`.
+    /// Matches C++ `StringSetBase::length(i)`.
     pub fn length(&self, i: usize) -> Loc {
         self.seq_length(i)
     }
 
-    /// Matches C++ `StringSetBase::ptr`.
+    /// Matches C++ `StringSetBase::ptr(i)`.
     pub fn ptr(&self, i: usize) -> usize {
         self.offsets[i]
     }
 
-    /// Matches C++ `StringSetBase::position`.
+    /// Matches C++ `StringSetBase::limits_begin()`.
+    pub fn offsets(&self) -> &[usize] {
+        &self.offsets
+    }
+
+    /// Matches C++ `StringSetBase::position(i, j)`.
     pub fn position(&self, i: usize, j: usize) -> usize {
         self.offsets[i] + j
     }
 
-    /// Matches C++ `StringSetBase::local_position`.
+    /// Matches C++ `StringSetBase::local_position(p)`.
     pub fn local_position(&self, p: usize) -> (usize, usize) {
         let i = match self.offsets.binary_search(&p) {
             Ok(i) => i,
@@ -305,7 +320,7 @@ impl SequenceSet {
         (i, p - self.offsets[i])
     }
 
-    /// Matches C++ `SequenceSet::len_bounds`.
+    /// Matches C++ `SequenceSet::len_bounds(min_len)`.
     pub fn len_bounds(&self, min_len: Loc) -> (Loc, Loc) {
         let mut min = Loc::MAX;
         let mut max = 0;
@@ -320,7 +335,7 @@ impl SequenceSet {
         (min, max)
     }
 
-    /// Matches C++ `SequenceSet::max_len`.
+    /// Matches C++ `SequenceSet::max_len(begin, end)`.
     pub fn max_len(&self, begin: u32, end: u32) -> Loc {
         let mut max_len = 0;
         for i in begin..end {
@@ -329,12 +344,12 @@ impl SequenceSet {
         max_len
     }
 
-    /// Matches C++ `SequenceSet::partition`.
+    /// Matches C++ `SequenceSet::partition(n_part, shortened, context_reduced)`.
     pub fn partition(&self, n_part: u32, shortened: bool, context_reduced: bool) -> Vec<u32> {
         self.partition_with_contexts(n_part, shortened, context_reduced, 1)
     }
 
-    /// Matches C++ `SequenceSet::partition`; `query_contexts` is the translated-mode global.
+    /// Matches C++ `SequenceSet::partition(n_part, shortened, context_reduced)`.
     pub fn partition_with_contexts(
         &self,
         n_part: u32,
@@ -370,7 +385,7 @@ impl SequenceSet {
         partitions
     }
 
-    /// Matches C++ `SequenceSet::reverse_translated_len`.
+    /// Matches C++ `SequenceSet::reverse_translated_len(i)`.
     pub fn reverse_translated_len(&self, i: usize) -> Loc {
         let j = i - i % 6;
         let l = self.seq_length(j);
@@ -383,12 +398,12 @@ impl SequenceSet {
         }
     }
 
-    /// Matches C++ `SequenceSet::avg_len`.
+    /// Matches C++ `SequenceSet::avg_len()`.
     pub fn avg_len(&self) -> usize {
         self.letters() as usize / self.len()
     }
 
-    /// Matches C++ `SequenceSet::lengths`.
+    /// Matches C++ `SequenceSet::lengths()`.
     pub fn lengths(&self) -> Vec<(Loc, u32)> {
         let mut v = Vec::with_capacity(self.len());
         for i in 0..self.len() {
@@ -397,12 +412,12 @@ impl SequenceSet {
         v
     }
 
-    /// Matches C++ `SequenceSet::source_length`.
+    /// Matches C++ `SequenceSet::source_length(i)`.
     pub fn source_length(&self, i: usize) -> Loc {
         self.source_length_with_contexts(i, 1)
     }
 
-    /// Matches C++ `SequenceSet::source_length`; `query_contexts` is the translated-mode global.
+    /// Matches C++ `SequenceSet::source_length(i)`.
     pub fn source_length_with_contexts(&self, i: usize, query_contexts: usize) -> Loc {
         if query_contexts == 1 {
             self.seq_length(i)
@@ -426,12 +441,12 @@ impl SequenceSet {
         &self.data
     }
 
-    /// Matches C++ `StringSetBase::data`.
+    /// Matches C++ `StringSetBase::data(p)`.
     pub fn data_at(&self, p: u64) -> &[Letter] {
         &self.data[p as usize..]
     }
 
-    /// Matches C++ `StringSetBase::data`.
+    /// Matches C++ `StringSetBase::data(p)`.
     pub fn data_mut_at(&mut self, p: u64) -> &mut [Letter] {
         &mut self.data[p as usize..]
     }

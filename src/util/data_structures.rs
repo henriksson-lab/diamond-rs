@@ -97,8 +97,14 @@ where
     }
 
     pub fn contains(&self, key: u64) -> bool {
-        let (found, _) = self.get_entry(key).expect("hash table overflow");
-        found
+        let hash = H::hash(key);
+        let p = M::modulo(hash >> 8, self.size as u64) as usize;
+        let window = &self.table[p..p + Self::PADDING];
+        if !window.iter().any(|&x| x == 0) {
+            return true;
+        }
+        let f = Self::finger_print(hash);
+        window.iter().any(|&x| x == f)
     }
 
     pub fn insert(&mut self, key: u64) {
@@ -1693,7 +1699,7 @@ pub struct ReorderQueue<T> {
     next: usize,
     size: usize,
     max_size: usize,
-    backlog: BTreeMap<usize, T>,
+    backlog: BTreeMap<usize, Option<T>>,
 }
 
 impl<T> ReorderQueue<T> {
@@ -1733,11 +1739,11 @@ where
         F: FnMut(T),
     {
         if n != self.next {
-            if let Some(value) = value {
+            if let Some(value) = value.as_ref() {
                 self.size += value.alloc_size();
                 self.max_size = self.max_size.max(self.size);
-                self.backlog.insert(n, value);
             }
+            self.backlog.insert(n, value);
         } else {
             self.flush(value, &mut f);
         }
@@ -1752,9 +1758,11 @@ where
             f(value);
         }
         while let Some(value) = self.backlog.remove(&n) {
-            let size = value.alloc_size();
-            f(value);
-            self.size -= size;
+            if let Some(value) = value {
+                let size = value.alloc_size();
+                f(value);
+                self.size -= size;
+            }
             n += 1;
         }
         self.next = n;
@@ -1811,6 +1819,21 @@ mod tests {
         let mut set3 = HashSet::<Modulo, crate::util::hash::MurmurHash>::new(8);
         set3.insert(0x1234);
         assert!(set3.contains(0x1234));
+    }
+
+    #[test]
+    fn test_hash_set_contains_matches_padded_window() {
+        let mut set = HashSet::<NoModulo, Identity>::new(16);
+        for slot in set.table_mut()[4..4 + HashSet::<NoModulo, Identity>::PADDING].iter_mut() {
+            *slot = 7;
+        }
+
+        assert!(set.contains(4 << 8));
+
+        set.table_mut()[10] = 0;
+        assert!(!set.contains(4 << 8));
+        set.table_mut()[9] = 9;
+        assert!(set.contains((4 << 8) | 9));
     }
 
     #[test]
@@ -2176,6 +2199,39 @@ mod tests {
             |x| out.push(x.value),
         );
         assert_eq!(out, vec![10, 11, 12]);
+        assert_eq!(q.next(), 13);
+        assert_eq!(q.size(), 0);
+    }
+
+    #[test]
+    fn test_reorder_queue_keeps_out_of_order_none_sentinel() {
+        let mut q = ReorderQueue::new(10);
+        let mut out = Vec::new();
+        q.push(12, None, |x: SizedItem| out.push(x.value));
+        assert_eq!(out, Vec::<i32>::new());
+        assert_eq!(q.next(), 10);
+        assert_eq!(q.size(), 0);
+
+        q.push(
+            10,
+            Some(SizedItem {
+                value: 10,
+                bytes: 1,
+            }),
+            |x| out.push(x.value),
+        );
+        assert_eq!(out, vec![10]);
+        assert_eq!(q.next(), 11);
+
+        q.push(
+            11,
+            Some(SizedItem {
+                value: 11,
+                bytes: 2,
+            }),
+            |x| out.push(x.value),
+        );
+        assert_eq!(out, vec![10, 11]);
         assert_eq!(q.next(), 13);
         assert_eq!(q.size(), 0);
     }

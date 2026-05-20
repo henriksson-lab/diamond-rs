@@ -1,7 +1,7 @@
 use crate::basic::reduction::Reduction;
 use crate::basic::value::{is_amino_acid, letter_mask, Letter, SEED_MASK};
 
-/// Scalar counterpart of C++ `reduce_seq_generic`.
+/// Matches C++ `reduce_seq_generic(const Letter*, const Letter*)`.
 pub fn reduce_seq_generic(seq: &[Letter], map: &[Letter]) -> [Letter; 16] {
     let mut d = [0; 16];
     for i in 0..16 {
@@ -10,12 +10,12 @@ pub fn reduce_seq_generic(seq: &[Letter], map: &[Letter]) -> [Letter; 16] {
     d
 }
 
-/// Matches C++ `reduce_seq`.
+/// Matches C++ `reduce_seq(const Letter*, const Letter*)`.
 pub fn reduce_seq(seq: &[Letter], map: &[Letter]) -> [Letter; 16] {
     reduce_seq_generic(seq, map)
 }
 
-/// Scalar counterpart of C++ `match_block_reduced`.
+/// Matches C++ `match_block_reduced(const Letter*, const Letter*, const Reduction&)`.
 pub fn match_block_reduced(x: &[Letter], y: &[Letter], reduction: &Reduction) -> u32 {
     let mut r = 0u32;
     for i in (0..16).rev() {
@@ -32,7 +32,7 @@ pub fn match_block_reduced(x: &[Letter], y: &[Letter], reduction: &Reduction) ->
     r
 }
 
-/// Matches C++ `reduced_match32`.
+/// Matches C++ `reduced_match32(const Letter*, const Letter*, unsigned, const Reduction&)`.
 pub fn reduced_match32(q: &[Letter], s: &[Letter], len: u32, reduction: &Reduction) -> u64 {
     let mut x = ((match_block_reduced(&q[16..], &s[16..], reduction) as u64) << 16)
         | match_block_reduced(q, s, reduction) as u64;
@@ -42,7 +42,7 @@ pub fn reduced_match32(q: &[Letter], s: &[Letter], len: u32, reduction: &Reducti
     x
 }
 
-/// Matches C++ `reduced_match`.
+/// Matches C++ `reduced_match(const Letter*, const Letter*, int, const Reduction&)`.
 pub fn reduced_match(q: &[Letter], s: &[Letter], len: i32, reduction: &Reduction) -> u64 {
     assert!(len <= 64);
     if len < 64 {
@@ -69,7 +69,7 @@ pub fn reduced_match(q: &[Letter], s: &[Letter], len: i32, reduction: &Reduction
     }
 }
 
-/// Matches C++ `seed_mask`.
+/// Matches C++ `seed_mask(const Letter*, int)`.
 pub fn seed_mask(s: &[Letter], len: i32) -> u64 {
     assert!(len <= 64);
     let mut mask = 0u64;

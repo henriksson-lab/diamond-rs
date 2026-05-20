@@ -9,6 +9,7 @@
 
 use crate::align::hsp::Hsp;
 use crate::basic::packed_transcript::EditOperation;
+use crate::basic::translate::{Frame, TranslatedPosition};
 use crate::basic::value::{Letter, LETTER_MASK, SEED_MASK};
 use crate::data::sequence_set::SequenceSet;
 use crate::dp::smith_waterman::SwResult;
@@ -380,7 +381,7 @@ impl<'a> Params<'a> {
             band_bin: 16,
             col_bin: 16,
             cutoff_score_8bit: i8::MAX as i32,
-            max_swipe_dp: i64::MAX,
+            max_swipe_dp: 1_000_000,
             approx_backtrace: false,
             max_evalue: f64::MAX,
             query_cover: 0.0,
@@ -546,9 +547,9 @@ pub fn dispatch_swipe(
         } else {
             sw.score * p.cbs_matrix_scale
         };
-        let evalue = p
-            .score_matrix
-            .evalue(score, p.query.len() as u32, target.seq.len() as u32);
+        let evalue =
+            p.score_matrix
+                .evalue(score, p.query.len() as u32, target.true_target_len as u32);
         if evalue > p.max_evalue {
             continue;
         }
@@ -556,10 +557,20 @@ pub fn dispatch_swipe(
         hsp.backtraced = true;
         hsp.score = score;
         hsp.bit_score = p.score_matrix.bitscore(score as f64);
+        hsp.corrected_bit_score = p.score_matrix.bitscore_corrected(
+            score,
+            p.query.len() as u32,
+            target.true_target_len as u32,
+        );
         hsp.evalue = evalue;
         hsp.frame = p.frame;
-        hsp.length = sw.length + target.carry_over.len;
-        hsp.identities = sw.identities + target.carry_over.ident;
+        if target.carry_over.i1 == 0 {
+            hsp.length = sw.length;
+            hsp.identities = sw.identities;
+        } else {
+            hsp.length = target.carry_over.len;
+            hsp.identities = target.carry_over.ident;
+        }
         hsp.mismatches = sw.mismatches;
         hsp.gap_openings = sw.gap_openings;
         hsp.gaps = hsp.length - hsp.identities - hsp.mismatches;
@@ -576,22 +587,74 @@ pub fn dispatch_swipe(
             hsp.d_begin = -target.d_end + qlen - tlen + 1;
             hsp.d_end = -target.d_begin + qlen - tlen + 1;
         }
-        hsp.query_source_range = hsp.query_range;
+        hsp.query_source_range = TranslatedPosition::absolute_interval(
+            TranslatedPosition::new(hsp.query_range.begin, Frame::from_index(p.frame)),
+            TranslatedPosition::new(hsp.query_range.end, Frame::from_index(p.frame)),
+            p.query_source_len,
+            true,
+        );
         hsp.subject_source_range = hsp.subject_range;
         hsp.target_seq = target.seq.clone();
         hsp.matrix = target.matrix.clone();
         hsp.swipe_target = target.target_idx as i32;
         hsp.swipe_bin = p.swipe_bin;
-        hsp.approx_id = stats::approx_id(
-            hsp.score,
-            hsp.query_range.length(),
-            hsp.subject_range.length(),
-        );
+        let mut qi = sw.query_begin as usize;
+        let mut sj = sw.subject_begin as usize;
         for (op, len) in sw.operations {
-            for _ in 0..len {
-                hsp.transcript.push(op);
+            match op {
+                EditOperation::Match => {
+                    hsp.transcript
+                        .push_with_count(EditOperation::Match, len as u32);
+                    hsp.positives += len;
+                    qi += len as usize;
+                    sj += len as usize;
+                }
+                EditOperation::Substitution => {
+                    for _ in 0..len {
+                        let ql = p.query[qi];
+                        let sl = target_seq[sj];
+                        // C++ `Sequence::operator[]` strips query soft masks
+                        // before SWIPE scoring. A masked subject/profile lane
+                        // still scores as zero.
+                        let match_score = if sl & SEED_MASK != 0 {
+                            0
+                        } else if let Some(matrix) = target.matrix.as_deref() {
+                            matrix.scores
+                                [(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize]
+                                as i32
+                        } else {
+                            p.score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
+                        };
+                        if match_score > 0 {
+                            hsp.positives += 1;
+                        }
+                        hsp.transcript
+                            .push_with_letter(EditOperation::Substitution, sl);
+                        qi += 1;
+                        sj += 1;
+                    }
+                }
+                EditOperation::Insertion => {
+                    hsp.transcript
+                        .push_with_count(EditOperation::Insertion, len as u32);
+                    qi += len as usize;
+                }
+                EditOperation::Deletion => {
+                    for _ in 0..len {
+                        hsp.transcript
+                            .push_with_letter(EditOperation::Deletion, target_seq[sj]);
+                        sj += 1;
+                    }
+                }
+                EditOperation::FrameshiftForward | EditOperation::FrameshiftReverse => {
+                    for _ in 0..len {
+                        hsp.transcript.push(op);
+                    }
+                }
             }
         }
+        hsp.transcript.push_terminator();
+        hsp.approx_id = hsp.approx_id_percent(p.query, target_seq);
         out.push(hsp);
     }
     out
@@ -704,11 +767,10 @@ pub fn recompute_reversed(hsps: &mut [Hsp], p: &mut Params<'_>) -> Vec<Hsp> {
 
     let mut reversed_query = p.query.to_vec();
     reversed_query.reverse();
-    let mut reversed_bias;
+    let reversed_bias;
     let composition_bias = match p.composition_bias {
         Some(bias) => {
-            reversed_bias = bias.to_vec();
-            reversed_bias.reverse();
+            reversed_bias = reversed_composition_bias(bias, p.query.len());
             Some(reversed_bias.as_slice())
         }
         None => None,
@@ -756,6 +818,13 @@ pub fn recompute_reversed(hsps: &mut [Hsp], p: &mut Params<'_>) -> Vec<Hsp> {
     if let Some(overflow_targets) = overflow_targets {
         out.extend(swipe(&overflow_targets, p));
     }
+    out
+}
+
+fn reversed_composition_bias(bias: &[i8], query_len: usize) -> Vec<i8> {
+    let mut out: Vec<i8> = bias[..query_len.min(bias.len())].to_vec();
+    out.reverse();
+    out.extend(std::iter::repeat_n(0, 32));
     out
 }
 
@@ -850,6 +919,10 @@ fn banded_sw_cbs_range(
     let mut h = vec![0i32; rows * (slen + 1)];
     let mut e = vec![neg_inf; rows * (slen + 1)];
     let mut f = vec![neg_inf; rows * (slen + 1)];
+    let mut gap_v = vec![false; rows * (slen + 1)];
+    let mut gap_h = vec![false; rows * (slen + 1)];
+    let mut open_v = vec![false; rows * (slen + 1)];
+    let mut open_h = vec![false; rows * (slen + 1)];
     let mut best_score = 0i32;
     let mut best_i = 0usize;
     let mut best_j = 0usize;
@@ -866,7 +939,10 @@ fn banded_sw_cbs_range(
             let spos = j - 1;
             let ql = query[qpos];
             let sl = subject[spos];
-            let match_score = if ql & SEED_MASK != 0 {
+            // C++ `Sequence::operator[]` strips query soft masks before
+            // SWIPE scoring. A masked subject/profile lane still scores as
+            // zero.
+            let match_score = if sl & SEED_MASK != 0 {
                 0
             } else if let Some(matrix) = target_matrix {
                 matrix.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize] as i32
@@ -880,11 +956,28 @@ fn banded_sw_cbs_range(
                 query_cbs[qpos] as i32
             };
             let diag_score = h[idx(i - 1, j - 1)] + match_score + cbs;
-            e[current] = (h[idx(i, j - 1)] - gap_open).max(e[idx(i, j - 1)] - gap_extend);
-            f[current] = (h[idx(i - 1, j)] - gap_open).max(f[idx(i - 1, j)] - gap_extend);
-            let score = diag_score.max(e[current]).max(f[current]).max(0);
+            let e_in = e[idx(i, j - 1)];
+            let f_in = f[idx(i - 1, j)];
+            let score = diag_score.max(e_in).max(f_in).max(0);
             h[current] = score;
-            if score > best_score {
+            gap_v[current] = score == f_in;
+            gap_h[current] = score == e_in;
+
+            let e_extend = e_in - gap_extend;
+            let f_extend = f_in - gap_extend;
+            let open = score - gap_open;
+            e[current] = e_extend.max(open);
+            f[current] = f_extend.max(open);
+            open_h[current] = e[current] == open;
+            open_v[current] = f[current] == open;
+            // Best-cell tie-breaking: within a column, the LATEST tied row wins
+            // (matches C++ `VectorRowCounter::inc` in `cell_update.h:45-47`:
+            //  `i_max = blend(i_max, i, best == current_cell)` overwrites on
+            //  equality). Between columns, the earliest tied column wins
+            //  (strict `>` on the column-max in `banded_swipe.h:323`). So
+            //  update when the score is strictly greater, OR when it ties
+            //  the current best AND we're still in the same column.
+            if score > best_score || (score == best_score && j == best_j) {
                 best_score = score;
                 best_i = i;
                 best_j = j;
@@ -910,7 +1003,8 @@ fn banded_sw_cbs_range(
         let score = h[idx(i, j)];
         let ql = query[i - 1];
         let sl = subject[j - 1];
-        let match_score = if ql & SEED_MASK != 0 {
+        // Match the forward-pass mask check above.
+        let match_score = if sl & SEED_MASK != 0 {
             0
         } else if let Some(matrix) = target_matrix {
             matrix.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize] as i32
@@ -923,7 +1017,42 @@ fn banded_sw_cbs_range(
             query_cbs[i - 1] as i32
         };
         let diag_score = h[idx(i - 1, j - 1)] + match_score + cbs;
-        if score == diag_score {
+
+        // Match C++ TracebackVectorMatrix::walk_gap(): prefer vertical gap
+        // masks, then horizontal masks, then diagonal.
+        if gap_v[idx(i, j)] {
+            let mut gap_len = 0i32;
+            loop {
+                gap_len += 1;
+                if i == 0 {
+                    break;
+                }
+                i -= 1;
+                if open_v[idx(i, j)] || i == 0 {
+                    break;
+                }
+            }
+            ops.push((EditOperation::Insertion, gap_len));
+            result.gap_openings += 1;
+            result.gaps += gap_len;
+            result.length += gap_len;
+        } else if gap_h[idx(i, j)] {
+            let mut gap_len = 0i32;
+            loop {
+                gap_len += 1;
+                if j == 0 {
+                    break;
+                }
+                j -= 1;
+                if open_h[idx(i, j)] || j == 0 {
+                    break;
+                }
+            }
+            ops.push((EditOperation::Deletion, gap_len));
+            result.gap_openings += 1;
+            result.gaps += gap_len;
+            result.length += gap_len;
+        } else if score == diag_score {
             if (ql & LETTER_MASK) == (sl & LETTER_MASK) {
                 ops.push((EditOperation::Match, 1));
                 result.identities += 1;
@@ -934,42 +1063,8 @@ fn banded_sw_cbs_range(
             result.length += 1;
             i -= 1;
             j -= 1;
-        } else if score == e[idx(i, j)] {
-            let mut gap_len = 0i32;
-            loop {
-                gap_len += 1;
-                let current = e[idx(i, j)];
-                if current == h[idx(i, j - 1)] - gap_open {
-                    j -= 1;
-                    break;
-                }
-                j -= 1;
-                if j == 0 || current != e[idx(i, j)] - gap_extend {
-                    break;
-                }
-            }
-            ops.push((EditOperation::Deletion, gap_len));
-            result.gap_openings += 1;
-            result.gaps += gap_len;
-            result.length += gap_len;
         } else {
-            let mut gap_len = 0i32;
-            loop {
-                gap_len += 1;
-                let current = f[idx(i, j)];
-                if current == h[idx(i - 1, j)] - gap_open {
-                    i -= 1;
-                    break;
-                }
-                i -= 1;
-                if i == 0 || current != f[idx(i, j)] - gap_extend {
-                    break;
-                }
-            }
-            ops.push((EditOperation::Insertion, gap_len));
-            result.gap_openings += 1;
-            result.gaps += gap_len;
-            result.length += gap_len;
+            break;
         }
     }
 
@@ -1128,5 +1223,206 @@ mod tests {
         assert!(out[0].matrix.is_some());
         assert_eq!(out[0].identities, 3);
         assert_eq!(out[0].gaps, 0);
+    }
+
+    #[test]
+    fn test_swipe_uses_true_target_len_for_statistics() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query: Vec<Letter> = vec![0, 1, 2];
+        let true_target_len = 100;
+        let target = DpTarget::new(
+            query.clone(),
+            true_target_len,
+            -1,
+            2,
+            0,
+            query.len() as i32,
+            CarryOver::default(),
+            Anchor::default(),
+        );
+        let mut params = Params::new(&query, &sm);
+        params.v = HspValues::TRANSCRIPT | HspValues::COORDS;
+        let mut overflow = TargetVec::default();
+        let out = dispatch_swipe(&[target], &mut overflow, &params);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].evalue,
+            sm.evalue(out[0].score, query.len() as u32, true_target_len as u32)
+        );
+        assert_eq!(
+            out[0].corrected_bit_score,
+            sm.bitscore_corrected(out[0].score, query.len() as u32, true_target_len as u32)
+        );
+    }
+
+    #[test]
+    fn test_traceback_transcript_stores_substitution_subject_letter() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query: Vec<Letter> = vec![0, 1, 2];
+        let subject: Vec<Letter> = vec![0, 3, 2];
+        let mut scores = vec![-20i8; 32 * AMINO_ACID_COUNT];
+        for i in 0..AMINO_ACID_COUNT {
+            scores[i * 32 + i] = 20;
+        }
+        scores[3 * 32 + 1] = 7;
+        let matrix = Arc::new(TargetMatrix::new(scores, -20, 20));
+        let target = DpTarget::new(
+            subject.clone(),
+            subject.len() as i32,
+            -1,
+            2,
+            0,
+            query.len() as i32,
+            CarryOver::default(),
+            Anchor::default(),
+        )
+        .with_matrix(matrix, 1);
+        let mut params = Params::new(&query, &sm);
+        params.v = HspValues::TRANSCRIPT | HspValues::COORDS;
+        let mut overflow = TargetVec::default();
+        let out = dispatch_swipe(&[target], &mut overflow, &params);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].positives, 3);
+
+        let ops: Vec<_> = out[0].transcript.iter().collect();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0].op, EditOperation::Match);
+        assert_eq!(ops[0].count, 1);
+        assert_eq!(ops[1].op, EditOperation::Substitution);
+        assert_eq!(ops[1].letter, 3);
+        assert_eq!(ops[2].op, EditOperation::Match);
+        assert_eq!(ops[2].count, 1);
+    }
+
+    #[test]
+    fn test_traceback_positives_respect_masked_subject_letter() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query: Vec<Letter> = vec![0, 1, 2];
+        let subject: Vec<Letter> = vec![0, 3 | SEED_MASK, 2];
+        let mut scores = vec![-20i8; 32 * AMINO_ACID_COUNT];
+        for i in 0..AMINO_ACID_COUNT {
+            scores[i * 32 + i] = 20;
+        }
+        scores[3 * 32 + 1] = 7;
+        let matrix = Arc::new(TargetMatrix::new(scores, -20, 20));
+        let target = DpTarget::new(
+            subject,
+            query.len() as i32,
+            -1,
+            2,
+            0,
+            query.len() as i32,
+            CarryOver::default(),
+            Anchor::default(),
+        )
+        .with_matrix(matrix, 1);
+        let mut params = Params::new(&query, &sm);
+        params.v = HspValues::TRANSCRIPT | HspValues::COORDS;
+        let mut overflow = TargetVec::default();
+        let out = dispatch_swipe(&[target], &mut overflow, &params);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].identities, 2);
+        assert_eq!(out[0].positives, 2);
+    }
+
+    #[test]
+    fn test_traceback_transcript_stores_deletion_subject_letter() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query: Vec<Letter> = vec![0, 1];
+        let subject: Vec<Letter> = vec![0, 2, 1];
+        let mut scores = vec![-20i8; 32 * AMINO_ACID_COUNT];
+        for i in 0..AMINO_ACID_COUNT {
+            scores[i * 32 + i] = 20;
+        }
+        let matrix = Arc::new(TargetMatrix::new(scores, -20, 20));
+        let target = DpTarget::new(
+            subject.clone(),
+            subject.len() as i32,
+            -2,
+            2,
+            0,
+            query.len() as i32,
+            CarryOver::default(),
+            Anchor::default(),
+        )
+        .with_matrix(matrix, 1);
+        let mut params = Params::new(&query, &sm);
+        params.v = HspValues::TRANSCRIPT | HspValues::COORDS;
+        let mut overflow = TargetVec::default();
+        let out = dispatch_swipe(&[target], &mut overflow, &params);
+        assert_eq!(out.len(), 1);
+
+        let ops: Vec<_> = out[0].transcript.iter().collect();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0].op, EditOperation::Match);
+        assert_eq!(ops[1].op, EditOperation::Deletion);
+        assert_eq!(ops[1].letter, 2);
+        assert_eq!(ops[2].op, EditOperation::Match);
+    }
+
+    #[test]
+    fn test_swipe_exact_identity_approx_id_is_percent_identity() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query: Vec<Letter> = vec![0, 1, 2];
+        let mut scores = vec![-5i8; 32 * AMINO_ACID_COUNT];
+        for i in 0..AMINO_ACID_COUNT {
+            scores[i * 32 + i] = 1;
+        }
+        let matrix = Arc::new(TargetMatrix::new(scores, -5, 1));
+        let target = DpTarget::new(
+            query.clone(),
+            query.len() as i32,
+            -5,
+            1,
+            0,
+            query.len() as i32,
+            CarryOver::default(),
+            Anchor::default(),
+        )
+        .with_matrix(matrix, 1);
+        let mut params = Params::new(&query, &sm);
+        params.v = HspValues::TRANSCRIPT | HspValues::COORDS;
+        let mut overflow = TargetVec::default();
+        let out = dispatch_swipe(&[target], &mut overflow, &params);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].score, 3);
+        assert_eq!(out[0].approx_id, 100.0);
+        assert!(stats::approx_id(out[0].score, 3, 3) < 100.0);
+    }
+
+    #[test]
+    fn test_swipe_query_source_range_uses_translated_frame() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query: Vec<Letter> = vec![0, 1, 2];
+        let target = DpTarget::new(
+            query.clone(),
+            query.len() as i32,
+            -1,
+            2,
+            0,
+            query.len() as i32,
+            CarryOver::default(),
+            Anchor::default(),
+        );
+        let mut params = Params::new(&query, &sm);
+        params.frame = 1;
+        params.query_source_len = 12;
+        params.v = HspValues::TRANSCRIPT | HspValues::COORDS;
+        let mut overflow = TargetVec::default();
+        let out = dispatch_swipe(&[target], &mut overflow, &params);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].query_range, Interval::new(0, 3));
+        assert_eq!(out[0].query_source_range, Interval::new(1, 10));
+        assert_eq!(out[0].subject_source_range, out[0].subject_range);
+    }
+
+    #[test]
+    fn test_reversed_composition_bias_preserves_tail_padding() {
+        let mut bias = vec![1, 2, 3];
+        bias.extend(std::iter::repeat_n(0, 32));
+        let reversed = reversed_composition_bias(&bias, 3);
+        assert_eq!(&reversed[..3], &[3, 2, 1]);
+        assert_eq!(reversed.len(), 35);
+        assert!(reversed[3..].iter().all(|&x| x == 0));
     }
 }

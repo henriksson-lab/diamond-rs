@@ -1,10 +1,18 @@
 use crate::basic::packed_transcript::EditOperation;
-use crate::basic::value::{Letter, LETTER_MASK};
+use crate::basic::value::{Letter, LETTER_MASK, SEED_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
 
-/// Score a pair of letters, stripping soft-mask bits.
+/// Score a pair of letters. If either residue carries the soft-mask bit
+/// (high bit / `SEED_MASK`), the match score is zeroed — this matches
+/// C++ DIAMOND's banded swipe score profile, which uses `_mm256_shuffle_epi8`
+/// with the high bit set to make masked positions produce 0 scores. This is
+/// essential for sequences with tantan-masked repeats so that the repeat
+/// region doesn't artificially inflate self-similarity scores.
 #[inline]
 fn score_letters(q: Letter, s: Letter, sm: &ScoreMatrix) -> i32 {
+    if ((q | s) & SEED_MASK) != 0 {
+        return 0;
+    }
     sm.score(q & LETTER_MASK, s & LETTER_MASK)
 }
 
@@ -123,13 +131,17 @@ pub fn smith_waterman(
     let mut j = max_j;
     let mut ops = Vec::new();
 
+    // Traceback priority matches C++ scalar `smith_waterman`
+    // (`diamond/src/dp/scalar/smith_waterman.cpp:245-271`): try diagonal
+    // first, then hgap, then vgap. On ties this picks the match edge over
+    // a gap, which differs from the SIMD banded swipe traceback (which is
+    // governed by SIMD blend semantics, not by this scalar code).
     while dp.get(i, j) > 0 && i > 0 && j > 0 {
         let score = dp.get(i, j);
         let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix);
         let diag = dp.get(i - 1, j - 1) + match_score;
 
         if score == diag {
-            // Match or substitution
             if (query[i - 1] & LETTER_MASK) == (subject[j - 1] & LETTER_MASK) {
                 ops.push((EditOperation::Match, 1));
                 result.identities += 1;
@@ -140,40 +152,22 @@ pub fn smith_waterman(
             result.length += 1;
             i -= 1;
             j -= 1;
-        } else if has_hgap(&dp, i, j, gap_open, gap_extend) {
-            // Horizontal gap (deletion in query, insertion in subject)
-            let mut gap_len = 1;
-            let expected = dp.get(i, j - 1) - gap_open;
-            if score == expected {
-                // gap of length 1
-            } else {
-                // Find gap length
-                for k in 2..=j {
-                    if score == dp.get(i, j - k) - gap_open - (k as i32 - 1) * gap_extend {
-                        gap_len = k as i32;
-                        break;
-                    }
-                }
-            }
+        } else if let Some(gap_len) = hgap_length(&dp, i, j, gap_open, gap_extend) {
             ops.push((EditOperation::Deletion, gap_len));
             result.length += gap_len;
             result.gaps += gap_len;
             result.gap_openings += 1;
             j -= gap_len as usize;
-        } else {
-            // Vertical gap (insertion in query, deletion in subject)
-            let mut gap_len = 1i32;
-            for k in 2..=i {
-                if score == dp.get(i - k, j) - gap_open - (k as i32 - 1) * gap_extend {
-                    gap_len = k as i32;
-                    break;
-                }
-            }
+        } else if let Some(gap_len) = vgap_length(&dp, i, j, gap_open, gap_extend) {
             ops.push((EditOperation::Insertion, gap_len));
             result.length += gap_len;
             result.gaps += gap_len;
             result.gap_openings += 1;
             i -= gap_len as usize;
+        } else {
+            // No path reconstructable — should be unreachable for a valid DP
+            // matrix at this cell; bail out of the trace.
+            break;
         }
     }
 
@@ -184,18 +178,36 @@ pub fn smith_waterman(
     result
 }
 
-fn has_hgap(dp: &DpMatrix, i: usize, j: usize, gap_open: i32, gap_extend: i32) -> bool {
+/// Return the length of a horizontal gap that reconstructs the score at (i, j),
+/// or None if no such gap exists. Matches C++ swipe `walk_gap` for the
+/// hgap branch.
+fn hgap_length(dp: &DpMatrix, i: usize, j: usize, gap_open: i32, gap_extend: i32) -> Option<i32> {
     let score = dp.get(i, j);
     for k in 1..=j {
         let expected = dp.get(i, j - k) - gap_open - (k as i32 - 1) * gap_extend;
         if score == expected {
-            return true;
+            return Some(k as i32);
         }
         if expected < 0 {
             break;
         }
     }
-    false
+    None
+}
+
+/// Same as `hgap_length` for vertical gaps.
+fn vgap_length(dp: &DpMatrix, i: usize, j: usize, gap_open: i32, gap_extend: i32) -> Option<i32> {
+    let score = dp.get(i, j);
+    for k in 1..=i {
+        let expected = dp.get(i - k, j) - gap_open - (k as i32 - 1) * gap_extend;
+        if score == expected {
+            return Some(k as i32);
+        }
+        if expected < 0 {
+            break;
+        }
+    }
+    None
 }
 
 /// Local Smith-Waterman with composition-based statistics (Hauser correction).
@@ -249,6 +261,8 @@ pub fn smith_waterman_cbs(
     let mut j = max_j;
     let mut ops = Vec::new();
 
+    // See `smith_waterman` above: diagonal → hgap → vgap to match C++
+    // scalar `smith_waterman` (`diamond/src/dp/scalar/smith_waterman.cpp:245-271`).
     while dp.get(i, j) > 0 && i > 0 && j > 0 {
         let score = dp.get(i, j);
         let match_score =
@@ -266,32 +280,20 @@ pub fn smith_waterman_cbs(
             result.length += 1;
             i -= 1;
             j -= 1;
-        } else if has_hgap(&dp, i, j, gap_open, gap_extend) {
-            let mut gap_len = 1i32;
-            for k in 2..=j {
-                if score == dp.get(i, j - k) - gap_open - (k as i32 - 1) * gap_extend {
-                    gap_len = k as i32;
-                    break;
-                }
-            }
+        } else if let Some(gap_len) = hgap_length(&dp, i, j, gap_open, gap_extend) {
             ops.push((EditOperation::Deletion, gap_len));
             result.length += gap_len;
             result.gaps += gap_len;
             result.gap_openings += 1;
             j -= gap_len as usize;
-        } else {
-            let mut gap_len = 1i32;
-            for k in 2..=i {
-                if score == dp.get(i - k, j) - gap_open - (k as i32 - 1) * gap_extend {
-                    gap_len = k as i32;
-                    break;
-                }
-            }
+        } else if let Some(gap_len) = vgap_length(&dp, i, j, gap_open, gap_extend) {
             ops.push((EditOperation::Insertion, gap_len));
             result.length += gap_len;
             result.gaps += gap_len;
             result.gap_openings += 1;
             i -= gap_len as usize;
+        } else {
+            break;
         }
     }
 

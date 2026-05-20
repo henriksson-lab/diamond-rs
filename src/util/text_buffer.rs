@@ -42,6 +42,10 @@ impl TextBuffer {
         &self.data
     }
 
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     pub fn clear(&mut self) {
         self.data.clear();
     }
@@ -129,11 +133,32 @@ impl TextBuffer {
     }
 
     pub fn print_e(&mut self, x: f64) -> &mut Self {
+        // C++ `TextBuffer::print_e` (`util/text_buffer.h:249-257`) emits
+        // `snprintf("%.2e", x)` which has an explicit `+`/`-` exponent sign
+        // and pads single-digit exponents to two digits (`1.23e-05`, not
+        // `1.23e-5`). Rust's `{:.2e}` omits the sign on positive exponents
+        // and the leading zero — fix it up here to match C printf.
         if x == 0.0 {
-            self.append_str("0.0")
-        } else {
-            self.append_str(&format!("{:.2e}", x))
+            return self.append_str("0.0");
         }
+        let s = format!("{:.2e}", x);
+        let bytes = s.as_bytes();
+        let Some(epos) = bytes.iter().position(|&b| b == b'e') else {
+            return self.append_str(&s);
+        };
+        let (mantissa, exp_part) = s.split_at(epos);
+        let exp = &exp_part[1..];
+        let (sign, digits) = match exp.as_bytes().first() {
+            Some(b'-') => ("-", &exp[1..]),
+            Some(b'+') => ("+", &exp[1..]),
+            _ => ("+", exp),
+        };
+        let formatted = if digits.len() == 1 {
+            format!("{}e{}0{}", mantissa, sign, digits)
+        } else {
+            format!("{}e{}{}", mantissa, sign, digits)
+        };
+        self.append_str(&formatted)
     }
 
     pub fn print(&mut self, i: u32, width: usize) -> &mut Self {

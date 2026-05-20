@@ -168,7 +168,7 @@ impl PackedTranscript {
         self.data.reverse();
     }
 
-    /// Matches C++ PackedTranscript::reverse(size_t begin).
+    /// Matches C++ `PackedTranscript::reverse(begin)`.
     pub fn reverse_from(&mut self, begin: usize) {
         self.data[begin..].reverse();
     }
@@ -194,14 +194,14 @@ impl PackedTranscript {
         self.data.reserve(n);
     }
 
-    /// Matches C++ PackedTranscript::push_back(const Sequence&).
+    /// Matches C++ `PackedTranscript::push_back(s)`.
     pub fn push_deletions(&mut self, s: &[Letter]) {
         for &letter in s {
             self.push_with_letter(EditOperation::Deletion, letter);
         }
     }
 
-    /// Matches C++ PackedTranscript::push_back(const Sequence&, const Reversed&).
+    /// Matches C++ `PackedTranscript::push_back(s, Reversed())`.
     pub fn push_deletions_reversed(&mut self, s: &[Letter]) {
         for &letter in s.iter().rev() {
             self.push_with_letter(EditOperation::Deletion, letter);

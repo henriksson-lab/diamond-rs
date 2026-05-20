@@ -29,6 +29,7 @@ impl DiagonalNode {
     pub const ESTIMATE: i32 = 0;
     pub const FINISHED: i32 = 1;
 
+    /// Matches C++ `DiagonalNode::DiagonalNode(Loc, Loc, Loc, int, int)`.
     pub fn new(query_pos: i32, subject_pos: i32, len: i32, score: i32, link_idx: i32) -> Self {
         Self::from_segment_with_link(
             DiagonalSegment::new(query_pos, subject_pos, len, score),
@@ -36,10 +37,12 @@ impl DiagonalNode {
         )
     }
 
+    /// Matches C++ `DiagonalNode::DiagonalNode(const DiagonalSegment&)`.
     pub fn from_segment(segment: DiagonalSegment) -> Self {
         Self::from_segment_with_link(segment, -1)
     }
 
+    /// Matches C++ `DiagonalNode::DiagonalNode(const DiagonalSegment&, int)`.
     pub fn from_segment_with_link(segment: DiagonalSegment, link_idx: i32) -> Self {
         let score = segment.score;
         Self {
@@ -51,10 +54,12 @@ impl DiagonalNode {
         }
     }
 
+    /// Matches C++ `DiagonalNode::deactivate()`.
     pub fn deactivate(&mut self) {
         self.link_idx = 0;
     }
 
+    /// Matches C++ `DiagonalNode::reset()`.
     pub fn reset(&mut self) {
         self.link_idx = -1;
         self.prefix_score = self.segment.score;
@@ -62,10 +67,12 @@ impl DiagonalNode {
         self.path_min = self.segment.score;
     }
 
+    /// Matches C++ `DiagonalNode::is_maximum()`.
     pub fn is_maximum(&self) -> bool {
         self.path_max == self.prefix_score
     }
 
+    /// Matches C++ `DiagonalNode::rel_score()`.
     pub fn rel_score(&self) -> i32 {
         if self.prefix_score == self.path_max {
             self.prefix_score
@@ -74,10 +81,12 @@ impl DiagonalNode {
         }
     }
 
+    /// Matches C++ `DiagonalNode::cmp_prefix_score(const DiagonalNode&, const DiagonalNode&)`.
     pub fn cmp_prefix_score(x: &DiagonalNode, y: &DiagonalNode) -> bool {
         x.prefix_score > y.prefix_score
     }
 
+    /// Matches C++ `DiagonalNode::cmp_rel_score(const DiagonalNode&, const DiagonalNode&)`.
     pub fn cmp_rel_score(x: &DiagonalNode, y: &DiagonalNode) -> bool {
         x.rel_score() > y.rel_score()
     }
@@ -109,6 +118,7 @@ pub struct Edge {
 }
 
 impl Edge {
+    /// Matches C++ `Edge::Edge(int, int, Loc, unsigned, unsigned, int, int)`.
     pub fn new(
         prefix_score: i32,
         path_max: i32,
@@ -137,15 +147,18 @@ pub struct DiagGraph {
 }
 
 impl DiagGraph {
+    /// Matches C++ `DiagGraph::DiagGraph()`.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Matches C++ `DiagGraph::init()`.
     pub fn init(&mut self) {
         self.nodes.clear();
         self.edges.clear();
     }
 
+    /// Matches C++ `DiagGraph::init_node(unsigned)`.
     pub fn init_node(&mut self, node: usize) -> Result<(), String> {
         if self.edges.len() >= i32::MAX as usize {
             return Err("Too many edges.".to_string());
@@ -154,6 +167,7 @@ impl DiagGraph {
         Ok(())
     }
 
+    /// Matches C++ `DiagGraph::load(const vector<DiagonalSegment>&)`.
     pub fn load(&mut self, segments: &[DiagonalSegment]) {
         let mut d = i32::MIN;
         let mut max_j_end = d;
@@ -170,6 +184,7 @@ impl DiagGraph {
         }
     }
 
+    /// Matches C++ `DiagGraph::clear_edges()`.
     pub fn clear_edges(&mut self) {
         self.edges.clear();
         for node in &mut self.nodes {
@@ -177,11 +192,13 @@ impl DiagGraph {
         }
     }
 
+    /// Matches C++ `DiagGraph::sort()`.
     pub fn sort(&mut self) {
         self.nodes
             .sort_by(|x, y| x.j.cmp(&y.j).then_with(|| x.i.cmp(&y.i)));
     }
 
+    /// Matches C++ `DiagGraph::prune()`.
     pub fn prune(&mut self) {
         let mut finished = Vec::new();
         let mut window: Vec<DiagonalNode> = Vec::new();
@@ -209,6 +226,7 @@ impl DiagGraph {
         self.nodes = finished;
     }
 
+    /// Matches C++ `DiagGraph::add_edge(const Edge&)`.
     pub fn add_edge(&mut self, edge: Edge) -> usize {
         for j in edge.node_in as usize + 1..self.nodes.len() {
             if self.nodes[j].link_idx == -1 {
@@ -228,6 +246,7 @@ impl DiagGraph {
         insert
     }
 
+    /// Matches C++ `DiagGraph::get_edge(unsigned, Loc)`.
     pub fn get_edge(&self, node: usize, j: i32) -> Option<usize> {
         let d = &self.nodes[node];
         if d.score == 0 {
@@ -253,6 +272,7 @@ impl DiagGraph {
         max_i
     }
 
+    /// Matches C++ `DiagGraph::prefix_score(unsigned, Loc)`.
     pub fn prefix_score(&self, node: usize, j: i32) -> (i32, i32, i32) {
         if let Some(i) = self.get_edge(node, j) {
             let edge = &self.edges[i];
@@ -267,6 +287,7 @@ impl DiagGraph {
         }
     }
 
+    /// Matches C++ `DiagGraph::top_node()`.
     pub fn top_node(&self) -> usize {
         let mut top_score = 0;
         let mut top_node = END;
@@ -304,6 +325,7 @@ impl Default for Link {
 }
 
 impl Link {
+    /// Matches C++ `Link::Link(unsigned, Loc, Loc, int, int)`.
     pub fn new(_target: u32, query_pos: i32, subject_pos: i32, score1: i32, score2: i32) -> Self {
         Self {
             subject_pos1: subject_pos,
@@ -315,12 +337,14 @@ impl Link {
         }
     }
 
+    /// Matches C++ `Link::transpose()`.
     pub fn transpose(&mut self) -> &mut Self {
         std::mem::swap(&mut self.subject_pos1, &mut self.query_pos1);
         std::mem::swap(&mut self.subject_pos2, &mut self.query_pos2);
         self
     }
 
+    /// Matches C++ `Link::reset()`.
     pub fn reset(&mut self) {
         self.subject_pos1 = -1;
         self.score1 = 0;
@@ -328,6 +352,7 @@ impl Link {
     }
 }
 
+/// Matches C++ `get_hgap_link(const DiagonalSegment&, const DiagonalSegment&, const Sequence&, const Sequence&, Link&, Loc, const ScoreMatrix&)`.
 pub fn get_hgap_link(
     d1: &DiagonalSegment,
     d2: &DiagonalSegment,
@@ -421,6 +446,7 @@ pub fn get_hgap_link(
     max_score
 }
 
+/// Matches C++ `get_vgap_link(const DiagonalSegment&, const DiagonalSegment&, const Sequence&, const Sequence&, Link&, Loc, const ScoreMatrix&)`.
 pub fn get_vgap_link(
     d1: &DiagonalSegment,
     d2: &DiagonalSegment,
@@ -443,6 +469,7 @@ pub fn get_vgap_link(
     s
 }
 
+/// Matches C++ `get_link(const DiagonalSegment&, const DiagonalSegment&, const Sequence&, const Sequence&, Link&, Loc, const ScoreMatrix&)`.
 pub fn get_link(
     d1: &DiagonalSegment,
     d2: &DiagonalSegment,
@@ -459,6 +486,7 @@ pub fn get_link(
     }
 }
 
+/// Matches C++ `merge_score(const Hsp&, const Hsp&)`.
 pub fn merge_score(h1: &ApproxHsp, h2: &ApproxHsp) -> i32 {
     const GAP_PENALTY: f64 = 0.5;
     let gq = h2.query_range.begin - h1.query_range.end;
@@ -474,6 +502,7 @@ pub fn merge_score(h1: &ApproxHsp, h2: &ApproxHsp) -> i32 {
     }
 }
 
+/// Matches C++ `merge(const Hsp&, const Hsp&)`.
 pub fn merge(h1: &ApproxHsp, h2: &ApproxHsp) -> ApproxHsp {
     let mut h = ApproxHsp::new(h1.frame as u32, 0);
     h.d_max = h1.d_max.max(h2.d_max);
@@ -495,6 +524,7 @@ pub fn merge(h1: &ApproxHsp, h2: &ApproxHsp) -> ApproxHsp {
     h
 }
 
+/// Matches C++ `merge_hsps(vector<Hsp>&)`.
 pub fn merge_hsps(hsps: &mut Vec<ApproxHsp>) {
     let mut it = 0usize;
     while it < hsps.len() {
@@ -685,6 +715,7 @@ pub struct Aligner<'a> {
 }
 
 impl<'a> Aligner<'a> {
+    /// Matches C++ `Aligner::Aligner(const Sequence&, const Sequence&, bool, int, const ScoreMatrix&)`.
     pub fn new(
         query: &'a [Letter],
         subject: &'a [Letter],
@@ -703,6 +734,7 @@ impl<'a> Aligner<'a> {
         }
     }
 
+    /// Matches C++ `Aligner::get_approximate_link(unsigned, unsigned, double, Loc)`.
     pub fn get_approximate_link(
         &mut self,
         d_idx: usize,
@@ -802,6 +834,7 @@ impl<'a> Aligner<'a> {
         prefix_score
     }
 
+    /// Matches C++ `Aligner::forward_pass(iterator, iterator, bool, double)`.
     pub fn forward_pass<I>(&mut self, iter: I, init: bool, space_penalty: f64)
     where
         I: IntoIterator<Item = usize>,
@@ -874,6 +907,7 @@ impl<'a> Aligner<'a> {
         }
     }
 
+    /// Matches C++ `Aligner::backtrace_old(unsigned, Loc, Hsp&, int, int, Loc, unsigned&)`.
     pub fn backtrace_old(
         &self,
         node: usize,
@@ -960,6 +994,7 @@ impl<'a> Aligner<'a> {
         true
     }
 
+    /// Matches C++ `Aligner::backtrace(unsigned, Hsp&, Loc, unsigned&, Loc)`.
     pub fn backtrace(
         &self,
         top_node: usize,
@@ -989,6 +1024,7 @@ impl<'a> Aligner<'a> {
         *t = traits;
     }
 
+    /// Matches C++ `Aligner::backtrace(unsigned, vector<Hsp>&, vector<Hsp>::iterator&, int, Loc)`.
     pub fn backtrace_top(
         &self,
         top_node: usize,
@@ -1023,6 +1059,7 @@ impl<'a> Aligner<'a> {
         max_score
     }
 
+    /// Matches C++ `Aligner::backtrace(vector<Hsp>&, int, Loc)`.
     pub fn backtrace_all(&self, ts: &mut Vec<ApproxHsp>, cutoff: i32, max_shift: i32) -> i32 {
         let mut top_nodes: Vec<usize> = self
             .diags
@@ -1048,6 +1085,7 @@ impl<'a> Aligner<'a> {
         max_score
     }
 
+    /// Matches C++ `Aligner::run(vector<Hsp>&, double, int, Loc)`.
     pub fn run(
         &mut self,
         ts: &mut Vec<ApproxHsp>,
@@ -1055,12 +1093,38 @@ impl<'a> Aligner<'a> {
         cutoff: i32,
         max_shift: i32,
     ) -> i32 {
+        // C++ `Aligner::run` pre-trims the diagonal-node list when it's too
+        // dense (`greedy_align.cpp:371-381`). With `chaining_min_nodes = 200`
+        // and `chaining_len_cap = 2.0` (defaults), if more than 200 nodes
+        // exist it sorts by score and truncates the tail once the cumulative
+        // segment length exceeds `query.len() * 2.0`. Skipping this trim
+        // means heavy-repeat targets feed extra low-score diagonals into
+        // `forward_pass`, which can change which nodes survive as final HSPs.
+        const CHAINING_LEN_CAP: f64 = 2.0;
+        const CHAINING_MIN_NODES: usize = 200;
+        if CHAINING_LEN_CAP > 0.0 && self.diags.nodes.len() > CHAINING_MIN_NODES {
+            self.diags
+                .nodes
+                .sort_by(|a, b| b.segment.score.cmp(&a.segment.score));
+            let cap = self.query.len() as f64 * CHAINING_LEN_CAP;
+            let mut total_len = 0.0_f64;
+            let mut idx = 0usize;
+            while idx < self.diags.nodes.len() && total_len < cap {
+                total_len += self.diags.nodes[idx].segment.len as f64;
+                idx += 1;
+            }
+            let cut = idx.max(CHAINING_MIN_NODES);
+            if cut < self.diags.nodes.len() {
+                self.diags.nodes.truncate(cut);
+            }
+        }
         self.diags.sort();
         self.diags.prune();
         self.forward_pass(0..self.diags.nodes.len(), true, space_penalty);
         self.backtrace_all(ts, cutoff, max_shift)
     }
 
+    /// Matches C++ `Aligner::run(const vector<DiagonalSegment>&, Loc)`.
     pub fn run_segments(
         &mut self,
         ts: &mut Vec<ApproxHsp>,
@@ -1073,6 +1137,7 @@ impl<'a> Aligner<'a> {
     }
 }
 
+/// Matches C++ `run(const Sequence&, const Sequence&, const vector<DiagonalSegment>&, bool, int, Loc, const ScoreMatrix&, bool)`.
 pub fn run(
     query: &[Letter],
     subject: &[Letter],

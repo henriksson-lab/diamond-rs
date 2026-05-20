@@ -106,7 +106,11 @@ pub struct DaaHeader2 {
 impl Default for DaaHeader2 {
     fn default() -> Self {
         DaaHeader2 {
-            diamond_build: 0,
+            // C++ `DAA_header2()` (`daa_file.h:53-58`) initializes
+            // `diamond_build(Const::build_version)`. Rust used to write 0 at
+            // file offset 32, byte-diverging from any C++-produced DAA and
+            // misleading downstream `view` clients keying on build version.
+            diamond_build: crate::data::dmnd::BUILD_VERSION as u64,
             db_seqs: 0,
             db_seqs_used: 0,
             db_letters: 0,
@@ -136,7 +140,7 @@ impl DaaHeader2 {
         Self::default()
     }
 
-    /// Matches C++ `DAA_header2::DAA_header2(...)`.
+    /// Matches C++ `DAA_header2::DAA_header2(db_seqs, db_letters, gap_open, gap_extend, reward, penalty, k, lambda, evalue, score_matrix, mode)`.
     #[allow(clippy::too_many_arguments)]
     pub fn with_params(
         db_seqs: u64,
@@ -168,7 +172,7 @@ impl DaaHeader2 {
         h
     }
 
-    /// Matches C++ `DAA_header2::DAA_header2(const DAAFile&)`.
+    /// Matches C++ `DAA_header2::DAA_header2(daa)`.
     pub fn from_daa_file(daa: &DaaFile) -> Self {
         let mut h = Self::with_params(
             daa.db_seqs(),
@@ -288,7 +292,7 @@ impl DaaHeader2 {
     }
 }
 
-/// Matches C++ `DAAFile`.
+/// Reader state for a DAA file.
 pub struct DaaFile {
     reader: BufReader<File>,
     query_count: usize,
@@ -299,7 +303,7 @@ pub struct DaaFile {
 }
 
 impl DaaFile {
-    /// Matches C++ `DAAFile::DAAFile`.
+    /// Matches C++ `DAAFile::DAAFile(file_name)`.
     pub fn open<P: AsRef<Path>>(file_name: P) -> io::Result<Self> {
         let mut reader = BufReader::new(File::open(file_name)?);
         let h1 = DaaHeader1::read_from(&mut reader)?;
@@ -352,97 +356,97 @@ impl DaaFile {
         })
     }
 
-    /// Matches C++ `DAAFile::diamond_build`.
+    /// Matches C++ `DAAFile::diamond_build()`.
     pub fn diamond_build(&self) -> u64 {
         self.h2.diamond_build
     }
 
-    /// Matches C++ `DAAFile::db_seqs`.
+    /// Matches C++ `DAAFile::db_seqs()`.
     pub fn db_seqs(&self) -> u64 {
         self.h2.db_seqs
     }
 
-    /// Matches C++ `DAAFile::db_seqs_used`.
+    /// Matches C++ `DAAFile::db_seqs_used()`.
     pub fn db_seqs_used(&self) -> u64 {
         self.h2.db_seqs_used
     }
 
-    /// Matches C++ `DAAFile::db_letters`.
+    /// Matches C++ `DAAFile::db_letters()`.
     pub fn db_letters(&self) -> u64 {
         self.h2.db_letters
     }
 
-    /// Matches C++ `DAAFile::score_matrix`.
+    /// Matches C++ `DAAFile::score_matrix()`.
     pub fn score_matrix(&self) -> String {
         self.h2.matrix_name()
     }
 
-    /// Matches C++ `DAAFile::gap_open_penalty`.
+    /// Matches C++ `DAAFile::gap_open_penalty()`.
     pub fn gap_open_penalty(&self) -> i32 {
         self.h2.gap_open
     }
 
-    /// Matches C++ `DAAFile::gap_extension_penalty`.
+    /// Matches C++ `DAAFile::gap_extension_penalty()`.
     pub fn gap_extension_penalty(&self) -> i32 {
         self.h2.gap_extend
     }
 
-    /// Matches C++ `DAAFile::match_reward`.
+    /// Matches C++ `DAAFile::match_reward()`.
     pub fn match_reward(&self) -> i32 {
         self.h2.reward
     }
 
-    /// Matches C++ `DAAFile::mismatch_penalty`.
+    /// Matches C++ `DAAFile::mismatch_penalty()`.
     pub fn mismatch_penalty(&self) -> i32 {
         self.h2.penalty
     }
 
-    /// Matches C++ `DAAFile::query_records`.
+    /// Matches C++ `DAAFile::query_records()`.
     pub fn query_records(&self) -> u64 {
         self.h2.query_records
     }
 
-    /// Matches C++ `DAAFile::mode`.
+    /// Matches C++ `DAAFile::mode()`.
     pub fn mode(&self) -> u32 {
         self.h2.mode as u32
     }
 
-    /// Matches C++ `DAAFile::ref_name`.
+    /// Matches C++ `DAAFile::ref_name(i)`.
     pub fn ref_name(&self, i: usize) -> &str {
         &self.ref_name[i]
     }
 
-    /// Matches C++ `DAAFile::ref_len`.
+    /// Matches C++ `DAAFile::ref_len(i)`.
     pub fn ref_len_at(&self, i: usize) -> u32 {
         self.ref_len[i]
     }
 
-    /// Matches C++ `DAAFile::lambda`.
+    /// Matches C++ `DAAFile::lambda()`.
     pub fn lambda(&self) -> f64 {
         self.h2.lambda
     }
 
-    /// Matches C++ `DAAFile::kappa`.
+    /// Matches C++ `DAAFile::kappa()`.
     pub fn kappa(&self) -> f64 {
         self.h2.k
     }
 
-    /// Matches C++ `DAAFile::evalue`.
+    /// Matches C++ `DAAFile::evalue()`.
     pub fn evalue(&self) -> f64 {
         self.h2.evalue
     }
 
-    /// Matches C++ `DAAFile::block_size`.
+    /// Matches C++ `DAAFile::block_size(i)`.
     pub fn block_size(&self, i: usize) -> u64 {
         self.h2.block_size[i]
     }
 
-    /// Matches C++ `DAAFile::ref_len`.
+    /// Matches C++ `DAAFile::ref_len()`.
     pub fn ref_len(&self) -> &[u32] {
         &self.ref_len
     }
 
-    /// Matches C++ `DAAFile::read_query_buffer`.
+    /// Matches C++ `DAAFile::read_query_buffer()`.
     pub fn read_query_buffer(&mut self) -> io::Result<Option<(Vec<u8>, usize)>> {
         let mut size_buf = [0u8; 4];
         self.reader.read_exact(&mut size_buf)?;
@@ -470,7 +474,7 @@ pub const DAA_HEADER1_SIZE: usize = 16;
 pub const DAA_HEADER2_SIZE: usize = 2432;
 pub const DAA_ID_DELIMITERS: &str = " \x07\x08\x0c\n\r\t\x0b\x01";
 
-/// Matches the initialized state of C++ `DAA_query_record`.
+/// Query record decoded from a DAA alignment block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaaQueryRecord {
     pub query_name: String,
@@ -482,7 +486,7 @@ pub struct DaaQueryRecord {
 }
 
 impl DaaQueryRecord {
-    /// Matches C++ `DAA_query_record::DAA_query_record` and `init`.
+    /// Matches C++ `DAA_query_record::DAA_query_record(file, buf, query_num)`.
     pub fn from_buffer(file: &DaaFile, buf: &[u8], query_num: usize) -> Result<Self, String> {
         let mut it = BinaryBufferIterator::new(buf);
         let query_len = it.read::<u32>()? as usize;
@@ -520,17 +524,17 @@ impl DaaQueryRecord {
         })
     }
 
-    /// Matches C++ `DAA_query_record::begin` at the raw record level.
+    /// Matches C++ `DAA_query_record::begin()`.
     pub fn raw_matches(&self) -> &[u8] {
         &self.raw_matches
     }
 
-    /// Matches C++ `DAA_query_record::raw_begin`.
+    /// Matches C++ `DAA_query_record::raw_begin()`.
     pub fn raw_begin(&self) -> BinaryBufferIterator<'_> {
         BinaryBufferIterator::new(&self.raw_matches)
     }
 
-    /// Matches C++ `DAA_query_record::begin`.
+    /// Matches C++ `DAA_query_record::begin(file, score_matrix)`.
     pub fn begin<'a>(
         &'a self,
         file: &'a DaaFile,
@@ -539,7 +543,7 @@ impl DaaQueryRecord {
         DaaMatchIterator::new(self, file, score_matrix)
     }
 
-    /// Matches C++ `DAA_query_record::query_len`.
+    /// Matches C++ `DAA_query_record::query_len()`.
     pub fn query_len(&self) -> usize {
         if self.mode == 3 {
             self.source_seq.len()
@@ -565,7 +569,7 @@ impl DaaQueryRecord {
     }
 }
 
-/// Matches C++ `DAA_query_record::Match`.
+/// Decoded DAA match.
 #[derive(Debug, Clone)]
 pub struct DaaMatch {
     pub hsp: Hsp,
@@ -577,7 +581,7 @@ pub struct DaaMatch {
 }
 
 impl DaaMatch {
-    /// Matches C++ `DAA_query_record::Match::context`.
+    /// Matches C++ `DAA_query_record::Match::context(parent)`.
     pub fn context(&self, parent: &DaaQueryRecord) -> HspContext {
         HspContext::new(
             self.hsp.clone(),
@@ -598,7 +602,7 @@ impl DaaMatch {
     }
 }
 
-/// Matches C++ `DAA_query_record::Match_iterator`.
+/// Iterator over decoded DAA matches.
 pub struct DaaMatchIterator<'a> {
     parent: &'a DaaQueryRecord,
     file: &'a DaaFile,
@@ -735,7 +739,7 @@ impl DaaRawMatch {
     }
 }
 
-/// Matches C++ `copy_match_record_raw`.
+/// Matches C++ `copy_match_record_raw(it, out, subject_map)`.
 pub fn copy_match_record_raw(
     it: &mut BinaryBufferIterator<'_>,
     out: &mut Vec<u8>,
@@ -771,7 +775,7 @@ impl Default for DaaViewConfig {
     }
 }
 
-/// Matches C++ `Config::output_range`.
+/// Matches C++ `Config::output_range(n_target_seq, score, top_score, max_target_seqs, toppercent)`.
 pub fn output_range(
     n_target_seq: u32,
     score: i32,
@@ -786,7 +790,7 @@ pub fn output_range(
     }
 }
 
-/// Matches the DAA-output branch of C++ `view_query`.
+/// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
 pub fn view_query_daa(
     r: &DaaQueryRecord,
     file: &DaaFile,
@@ -822,7 +826,7 @@ pub fn view_query_daa(
     Ok(())
 }
 
-/// Matches the tabular-output branch of C++ `view_query`.
+/// Matches C++ `view_query(r, file, out, score_matrix, format, cfg, report_unaligned)`.
 pub fn view_query_tabular(
     r: &DaaQueryRecord,
     file: &DaaFile,
@@ -884,7 +888,7 @@ pub fn view_query_tabular(
     Ok(())
 }
 
-/// Matches the PAF-output branch of C++ `view_query`.
+/// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
 pub fn view_query_paf(
     r: &DaaQueryRecord,
     file: &DaaFile,
@@ -915,7 +919,7 @@ pub fn view_query_paf(
     Ok(())
 }
 
-/// Matches the SAM-output branch of C++ `view_query`.
+/// Matches C++ `view_query(r, file, out, score_matrix, cfg, sam_qlen_field)`.
 pub fn view_query_sam(
     r: &DaaQueryRecord,
     file: &DaaFile,
@@ -942,13 +946,13 @@ pub fn view_query_sam(
             break;
         }
         let context = m.context(r);
-        sam::print_match_context(out, &context, score_matrix, sam_qlen_field)
+        sam::print_match_context(out, &context, score_matrix, true, true, sam_qlen_field)
             .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
-/// Matches the pairwise-output branch of C++ `view_query`.
+/// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
 pub fn view_query_pairwise(
     r: &DaaQueryRecord,
     file: &DaaFile,
@@ -982,7 +986,7 @@ pub fn view_query_pairwise(
     Ok(())
 }
 
-/// Matches the XML-output branch of C++ `view_query`.
+/// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
 pub fn view_query_xml(
     r: &DaaQueryRecord,
     file: &DaaFile,
@@ -1024,7 +1028,7 @@ pub fn view_query_xml(
     Ok(())
 }
 
-/// Matches the null-output branch of C++ `view_query`.
+/// Matches C++ `view_query(r, file, score_matrix, cfg)`.
 pub fn view_query_null(
     r: &DaaQueryRecord,
     file: &DaaFile,
@@ -1051,7 +1055,7 @@ pub fn view_query_null(
     Ok(())
 }
 
-/// Matches the edge-output branch of C++ `view_query`.
+/// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
 pub fn view_query_edge(
     r: &DaaQueryRecord,
     file: &DaaFile,
@@ -1081,7 +1085,7 @@ pub fn view_query_edge(
     Ok(())
 }
 
-/// Matches C++ `build_mapping`.
+/// Matches C++ `build_mapping(acc2oid, seq_ids, seq_lens, f)`.
 pub fn build_mapping(
     acc2oid: &mut HashMap<String, u32>,
     seq_ids: &mut Vec<String>,
@@ -1102,7 +1106,7 @@ pub fn build_mapping(
     r
 }
 
-/// Matches C++ `write_file`.
+/// Matches C++ `write_file(f, out, subject_map)`.
 pub fn write_file<W: Write>(
     f: &mut DaaFile,
     out: &mut W,
@@ -1132,7 +1136,7 @@ pub fn write_file<W: Write>(
     Ok(last_query_num.map_or(0, |query_num| query_num as i64 + 1))
 }
 
-/// Matches C++ `merge_daa` without command-line global state.
+/// Matches C++ `merge_daa(input_files, output_file)`.
 pub fn merge_daa_files<P: AsRef<Path>>(input_files: &[P], output_file: P) -> io::Result<i64> {
     if input_files.is_empty() {
         return Err(io::Error::new(
@@ -1168,7 +1172,7 @@ pub fn merge_daa_files<P: AsRef<Path>>(input_files: &[P], output_file: P) -> io:
     Ok(query_count)
 }
 
-/// Matches C++ `write_daa_query_record`.
+/// Matches C++ `write_daa_query_record(buf, query_name, query, input_sequence_type)`.
 pub fn write_daa_query_record(
     buf: &mut Vec<u8>,
     query_name: &str,
@@ -1187,13 +1191,13 @@ pub fn write_daa_query_record(
     seek_pos
 }
 
-/// Matches C++ `finish_daa_query_record`.
+/// Matches C++ `finish_daa_query_record(buf, seek_pos)`.
 pub fn finish_daa_query_record(buf: &mut [u8], seek_pos: usize) {
     let size = (buf.len() - seek_pos - std::mem::size_of::<u32>()) as u32;
     buf[seek_pos..seek_pos + std::mem::size_of::<u32>()].copy_from_slice(&size.to_ne_bytes());
 }
 
-/// Matches C++ `write_daa_record(TextBuffer&, const IntermediateRecord&)`.
+/// Matches C++ `write_daa_record(buf, r)`.
 pub fn write_daa_record_intermediate(buf: &mut Vec<u8>, r: &IntermediateRecord) {
     buf.extend_from_slice(&(r.target_dict_id as u32).to_ne_bytes());
     buf.push(r.flag);
@@ -1205,7 +1209,7 @@ pub fn write_daa_record_intermediate(buf: &mut Vec<u8>, r: &IntermediateRecord) 
     }
 }
 
-/// Matches C++ `write_daa_record(TextBuffer&, const Hsp&, uint32_t)`.
+/// Matches C++ `write_daa_record(buf, hsp, subject_id)`.
 pub fn write_daa_record_hsp(buf: &mut Vec<u8>, hsp: &Hsp, subject_id: u32) {
     let oriented_range = hsp.oriented_range();
     buf.extend_from_slice(&subject_id.to_ne_bytes());
@@ -1218,26 +1222,26 @@ pub fn write_daa_record_hsp(buf: &mut Vec<u8>, hsp: &Hsp, subject_id: u32) {
     }
 }
 
-/// Matches C++ `init_daa`.
+/// Matches C++ `init_daa(writer)`.
 pub fn init_daa<W: Write>(writer: &mut W) -> io::Result<()> {
     DaaHeader1::new().write_to(writer)?;
     DaaHeader2::new().write_to(writer)
 }
 
-/// Matches C++ `terminate_aln_block`.
+/// Matches C++ `terminate_aln_block(writer, h2)`.
 pub fn terminate_aln_block<W: Write + Seek>(writer: &mut W, h2: &mut DaaHeader2) -> io::Result<()> {
     writer.write_all(&0u32.to_ne_bytes())?;
     h2.block_size[0] = writer.stream_position()? - (DAA_HEADER1_SIZE + DAA_HEADER2_SIZE) as u64;
     Ok(())
 }
 
-/// Matches C++ `write_header2`.
+/// Matches C++ `write_header2(writer, h2)`.
 pub fn write_header2<W: Write + Seek>(writer: &mut W, h2: &DaaHeader2) -> io::Result<()> {
     writer.seek(SeekFrom::Start(DAA_HEADER1_SIZE as u64))?;
     h2.write_to(writer)
 }
 
-/// Matches C++ `finish_daa(OutputFile&, DAAFile&)`.
+/// Matches C++ `finish_daa(writer, daa_in)`.
 pub fn finish_daa_from_file<W: Write + Seek>(writer: &mut W, daa_in: &DaaFile) -> io::Result<()> {
     let mut h2 = DaaHeader2::from_daa_file(daa_in);
     terminate_aln_block(writer, &mut h2)?;
@@ -1259,7 +1263,7 @@ pub fn finish_daa_from_file<W: Write + Seek>(writer: &mut W, daa_in: &DaaFile) -
     write_header2(writer, &h2)
 }
 
-/// Matches C++ `finish_daa(OutputFile&, DAAFile&, const StringSet&, const vector<uint32_t>&, int64_t)`.
+/// Matches C++ `finish_daa(writer, daa_in, seq_ids, seq_lens, query_count)`.
 pub fn finish_daa_from_refs<W: Write + Seek>(
     writer: &mut W,
     daa_in: &DaaFile,

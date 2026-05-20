@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use super::format::{format_evalue, print_title_xml};
+use super::format::{format_double, format_evalue, print_title_xml};
 use crate::align::hsp::HspContext;
 use crate::basic::consts::VERSION_STRING;
 use crate::basic::value::{Letter, AMINO_ACID_ALPHABET, LETTER_MASK};
@@ -55,7 +55,7 @@ pub fn write_xml_header<W: Write>(writer: &mut W, program: &str, database: &str)
     Ok(())
 }
 
-/// Matches C++ XMLFormat::print_header().
+/// Matches C++ `XMLFormat::print_header()`.
 pub fn print_header<W: Write>(
     writer: &mut W,
     mode: u32,
@@ -184,7 +184,7 @@ pub fn write_iteration_end<W: Write>(writer: &mut W) -> io::Result<()> {
     Ok(())
 }
 
-/// Matches C++ XMLFormat::print_query_intro().
+/// Matches C++ `XMLFormat::print_query_intro()`.
 pub fn print_query_intro<W: Write>(
     writer: &mut W,
     query_oid: u64,
@@ -216,7 +216,7 @@ pub fn print_query_intro<W: Write>(
     Ok(())
 }
 
-/// Matches C++ XMLFormat::print_query_epilog().
+/// Matches C++ `XMLFormat::print_query_epilog()`.
 pub fn print_query_epilog<W: Write>(
     writer: &mut W,
     unaligned: bool,
@@ -247,14 +247,15 @@ pub fn print_query_epilog<W: Write>(
         writer,
         "      <Statistics_eff-space>0</Statistics_eff-space>"
     )?;
+    // C++ uses iostream default (6 significant digits via %f).
     writeln!(
         writer,
-        "      <Statistics_kappa>{}</Statistics_kappa>",
+        "      <Statistics_kappa>{:.6}</Statistics_kappa>",
         kappa
     )?;
     writeln!(
         writer,
-        "      <Statistics_lambda>{}</Statistics_lambda>",
+        "      <Statistics_lambda>{:.6}</Statistics_lambda>",
         lambda
     )?;
     writeln!(writer, "      <Statistics_entropy>0</Statistics_entropy>")?;
@@ -264,7 +265,7 @@ pub fn print_query_epilog<W: Write>(
     Ok(())
 }
 
-/// Matches C++ XMLFormat::print_footer().
+/// Matches C++ `XMLFormat::print_footer()`.
 pub fn print_footer<W: Write>(writer: &mut W) -> io::Result<()> {
     writeln!(writer, "</BlastOutput_iterations>")?;
     write!(writer, "</BlastOutput>")?;
@@ -297,7 +298,7 @@ pub fn write_hit<W: Write>(writer: &mut W, hit: &XmlHit<'_>) -> io::Result<()> {
     Ok(())
 }
 
-/// Matches C++ XMLFormat::print_match(const HspContext&).
+/// Matches C++ `XMLFormat::print_match(const HspContext&)`.
 pub fn print_match_context<W: Write>(
     writer: &mut W,
     r: &HspContext,
@@ -349,7 +350,7 @@ pub fn print_match_context<W: Write>(
     writeln!(
         writer,
         "      <Hsp_bit-score>{}</Hsp_bit-score>",
-        r.bit_score()
+        format_double(r.bit_score())
     )?;
     writeln!(writer, "      <Hsp_score>{}</Hsp_score>", r.score())?;
     writeln!(
@@ -678,7 +679,7 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(output.starts_with("  </Hit_hsps>\n</Hit>\n</Iteration_hits>"));
         assert!(output.contains("<Statistics_db-num>7</Statistics_db-num>"));
-        assert!(output.contains("<Statistics_lambda>0.2</Statistics_lambda>"));
+        assert!(output.contains("<Statistics_lambda>0.200000</Statistics_lambda>"));
 
         let mut buf = Vec::new();
         print_footer(&mut buf).unwrap();

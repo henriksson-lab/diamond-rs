@@ -1,11 +1,8 @@
 use crate::basic::value::{Letter, LETTER_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
 
-/// SIMD-accelerated ungapped window scoring for multiple subjects.
-///
-/// Scores `subject_count` subjects against the same query window simultaneously.
-/// Falls back to scalar on platforms without SSE4.1.
-pub fn window_ungapped_multi(
+/// Matches C++ `window_ungapped_best(...)`.
+pub fn window_ungapped_best(
     query: &[Letter],
     subjects: &[&[Letter]],
     window: usize,
@@ -13,31 +10,102 @@ pub fn window_ungapped_multi(
 ) -> Vec<i32> {
     let subject_count = subjects.len();
     let mut out = vec![0i32; subject_count];
+    window_ungapped_best_into(query, subjects, window, score_matrix, &mut out);
+    out
+}
 
-    // Try SIMD on x86
+/// Matches C++ `window_ungapped(...)`.
+pub fn window_ungapped(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+) -> Vec<i32> {
+    let subject_count = subjects.len();
+    let mut out = vec![0i32; subject_count];
+    window_ungapped_into(query, subjects, window, score_matrix, &mut out);
+    out
+}
+
+/// Backwards-compatible Rust entry point for stage2 callers.
+pub fn window_ungapped_multi(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+) -> Vec<i32> {
+    window_ungapped_best(query, subjects, window, score_matrix)
+}
+
+fn window_ungapped_best_into(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+    out: &mut [i32],
+) {
+    if subjects.len() < 4 {
+        for (i, subject) in subjects.iter().enumerate() {
+            out[i] = super::ungapped::ungapped_window(query, subject, window, score_matrix);
+        }
+    } else {
+        window_ungapped_into(query, subjects, window, score_matrix, out);
+    }
+}
+
+fn window_ungapped_into(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+    out: &mut [i32],
+) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("sse4.1") && subject_count >= 4 {
-            unsafe {
-                window_ungapped_sse41(query, subjects, window, score_matrix, &mut out);
+        if is_x86_feature_detected!("avx2") {
+            let mut offset = 0usize;
+            while offset < subjects.len() {
+                let end = (offset + 32).min(subjects.len());
+                unsafe {
+                    window_ungapped_avx2(
+                        query,
+                        &subjects[offset..end],
+                        window,
+                        score_matrix,
+                        &mut out[offset..end],
+                    );
+                }
+                offset = end;
             }
-            return out;
+            return;
+        }
+        if is_x86_feature_detected!("sse4.1") {
+            let mut offset = 0usize;
+            while offset < subjects.len() {
+                let end = (offset + 16).min(subjects.len());
+                unsafe {
+                    window_ungapped_sse41(
+                        query,
+                        &subjects[offset..end],
+                        window,
+                        score_matrix,
+                        &mut out[offset..end],
+                    );
+                }
+                offset = end;
+            }
+            return;
         }
     }
-
-    // Scalar fallback
     for (i, subject) in subjects.iter().enumerate() {
         out[i] = super::ungapped::ungapped_window(query, subject, window, score_matrix);
     }
-    out
 }
 
 /// SSE4.1 implementation of multi-subject ungapped scoring.
 ///
 /// Processes 16 subjects simultaneously using 128-bit SIMD vectors of int8.
-/// Note: Uses saturating i8 arithmetic (clips at 127), matching C++ DIAMOND behavior.
-/// This is intentional — SIMD ungapped scoring is a fast pre-filter; accurate scoring
-/// uses wider types in the gapped alignment phase.
+/// Uses the same `SCHAR_MIN` shifted saturating i8 representation as C++ DIAMOND.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 unsafe fn window_ungapped_sse41(
@@ -52,10 +120,9 @@ unsafe fn window_ungapped_sse41(
     let subject_count = subjects.len().min(16);
     let matrix8 = score_matrix.matrix8();
 
-    // Initialize score and best vectors to zero
-    let mut score = _mm_setzero_si128();
-    let mut best = _mm_setzero_si128();
-    let zero = _mm_setzero_si128();
+    let min = _mm_set1_epi8(i8::MIN);
+    let mut score = min;
+    let mut best = min;
 
     for pos in 0..window.min(query.len()) {
         let ql = (query[pos] & LETTER_MASK) as usize;
@@ -81,11 +148,7 @@ unsafe fn window_ungapped_sse41(
 
         let match_scores = _mm_loadu_si128(scores_arr.as_ptr() as *const __m128i);
 
-        // score = max(score + match_scores, 0)
         score = _mm_adds_epi8(score, match_scores);
-        score = _mm_max_epi8(score, zero);
-
-        // best = max(best, score)
         best = _mm_max_epi8(best, score);
     }
 
@@ -95,7 +158,7 @@ unsafe fn window_ungapped_sse41(
 
     let offset = 16 - subject_count;
     for i in 0..subject_count {
-        out[i] = best_arr[offset + i] as i32;
+        out[i] = best_arr[offset + i] as i32 - i8::MIN as i32;
     }
 }
 
@@ -117,9 +180,9 @@ unsafe fn window_ungapped_avx2(
     let subject_count = subjects.len().min(32);
     let matrix8 = score_matrix.matrix8();
 
-    let mut score = _mm256_setzero_si256();
-    let mut best = _mm256_setzero_si256();
-    let zero = _mm256_setzero_si256();
+    let min = _mm256_set1_epi8(i8::MIN);
+    let mut score = min;
+    let mut best = min;
 
     for pos in 0..window.min(query.len()) {
         let ql = (query[pos] & LETTER_MASK) as usize;
@@ -138,7 +201,6 @@ unsafe fn window_ungapped_avx2(
         let match_scores = _mm256_loadu_si256(scores_arr.as_ptr() as *const __m256i);
 
         score = _mm256_adds_epi8(score, match_scores);
-        score = _mm256_max_epi8(score, zero);
         best = _mm256_max_epi8(best, score);
     }
 
@@ -147,7 +209,7 @@ unsafe fn window_ungapped_avx2(
 
     let offset = 32 - subject_count;
     for i in 0..subject_count {
-        out[i] = best_arr[offset + i] as i32;
+        out[i] = best_arr[offset + i] as i32 - i8::MIN as i32;
     }
 }
 
@@ -223,5 +285,33 @@ mod tests {
             multi[1], s2,
             "SIMD result should match scalar for subject 2"
         );
+    }
+
+    #[test]
+    fn test_window_ungapped_best_uses_scalar_for_small_batches() {
+        let sm = make_test_matrix();
+        let query: Vec<Letter> = vec![17; 40];
+        let subject: Vec<Letter> = vec![17; 40];
+        let subjects: Vec<&[Letter]> = vec![&subject, &subject, &subject];
+        let scores = window_ungapped_best(&query, &subjects, 40, &sm);
+        let scalar = super::super::ungapped::ungapped_window(&query, &subject, 40, &sm);
+        assert_eq!(scores, vec![scalar; 3]);
+        assert!(scalar > 255);
+    }
+
+    #[test]
+    fn test_window_ungapped_simd_shifted_saturates_like_cpp() {
+        let sm = make_test_matrix();
+        let query: Vec<Letter> = vec![17; 40];
+        let subjects_data = [vec![17; 40], vec![17; 40], vec![17; 40], vec![17; 40]];
+        let subjects: Vec<&[Letter]> = subjects_data.iter().map(|s| s.as_slice()).collect();
+        let scores = window_ungapped(&query, &subjects, 40, &sm);
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("sse4.1") {
+            assert_eq!(scores, vec![255; 4]);
+            return;
+        }
+        let scalar = super::super::ungapped::ungapped_window(&query, subjects[0], 40, &sm);
+        assert_eq!(scores, vec![scalar; 4]);
     }
 }

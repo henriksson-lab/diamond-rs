@@ -27,12 +27,14 @@ pub fn run(database_path: &str) -> io::Result<()> {
         .validate()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+    // Matches C++ sequence_file.cpp:898 — `setw(25) << "Database type  "`
+    // (label + 2-space separator inside the field).
     let db_type = "Diamond database";
-    println!("{:>22}  {db_type}", "Database type");
-    println!("{:>22}  {}", "Database format version", header.db_version);
-    println!("{:>22}  {}", "Diamond build", header.build);
-    println!("{:>22}  {}", "Sequences", header.sequences);
-    println!("{:>22}  {}", "Letters", header.letters);
+    println!("{:>23}  {db_type}", "Database type");
+    println!("{:>23}  {}", "Database format version", header.db_version);
+    println!("{:>23}  {}", "Diamond build", header.build);
+    println!("{:>23}  {}", "Sequences", header.sequences);
+    println!("{:>23}  {}", "Letters", header.letters);
 
     Ok(())
 }

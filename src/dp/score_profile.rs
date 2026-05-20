@@ -3,7 +3,7 @@
 //! Direct Rust counterpart of `diamond/src/dp/score_profile.h` for scalar
 //! profile construction.
 
-use crate::basic::value::{Letter, AMINO_ACID_COUNT};
+use crate::basic::value::{letter_mask, Letter, AMINO_ACID_COUNT};
 use crate::stats::cbs::TargetMatrix;
 use crate::stats::score_matrix::ScoreMatrix;
 
@@ -60,13 +60,23 @@ pub fn make_profile8(
 ) -> LongScoreProfile<i8> {
     let mut profile = LongScoreProfile::new(padding);
     let len = seq.len() + 2 * profile.padding;
+    // Fill padding cells with -1 to match C++ `make_profile`
+    // (`diamond/src/dp/score_profile.cpp:51,73`: `insert(end, p.padding, -1)`).
+    // Reading past the unpadded region inside a SIMD shuffle would pick up
+    // a `0` sentinel here, which then adds to the running score instead of
+    // depressing it as C++'s `-1` would; SWIPE-style runs would silently
+    // over-score near sequence ends.
     for row in &mut profile.data {
-        row.resize(len, 0);
+        row.resize(len, -1);
     }
     for letter in 0..AMINO_ACID_COUNT {
         for (i, &subject) in seq.iter().enumerate() {
             let bias = cbs.and_then(|b| b.get(i)).copied().unwrap_or(0) as i32;
-            let score = matrix.score(letter as Letter, subject) + bias;
+            // Strip SEED_MASK before the score lookup. C++ `score_vector_int8.h:249`
+            // applies `letter_mask` to the subject vector before `_mm256_shuffle_epi8`.
+            // Without this, a subject byte of `SEED_MASK | l` is a negative i8 →
+            // sign-extends through `as usize` and indexes far past the 32-row matrix.
+            let score = matrix.score(letter as Letter, letter_mask(subject)) + bias;
             profile.data[letter][i + profile.padding] =
                 score.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
         }
@@ -82,13 +92,15 @@ pub fn make_profile16(
 ) -> LongScoreProfile<i16> {
     let mut profile = LongScoreProfile::new(padding);
     let len = seq.len() + 2 * profile.padding;
+    // See `make_profile8` above: padding cells must be -1 (C++ value).
     for row in &mut profile.data {
-        row.resize(len, 0);
+        row.resize(len, -1);
     }
     for letter in 0..AMINO_ACID_COUNT {
         for (i, &subject) in seq.iter().enumerate() {
             let bias = cbs.and_then(|b| b.get(i)).copied().unwrap_or(0) as i32;
-            let score = matrix.score(letter as Letter, subject) + bias;
+            // See make_profile8 above for the letter_mask rationale.
+            let score = matrix.score(letter as Letter, letter_mask(subject)) + bias;
             profile.data[letter][i + profile.padding] =
                 score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
@@ -103,13 +115,16 @@ pub fn make_profile16_target_matrix(
 ) -> LongScoreProfile<i16> {
     let mut profile = LongScoreProfile::new(padding);
     let len = seq.len() + 2 * profile.padding;
+    // See `make_profile8` above: padding cells must be -1 (C++ value).
     for row in &mut profile.data {
-        row.resize(len, 0);
+        row.resize(len, -1);
     }
     for letter in 0..AMINO_ACID_COUNT {
         let row = &matrix.scores[letter << 5..];
         for (i, &subject) in seq.iter().enumerate() {
-            profile.data[letter][i + profile.padding] = row[subject as usize] as i16;
+            // See make_profile8 above for the letter_mask rationale: a raw
+            // `subject as usize` with the high bit set indexes past the 32-entry row.
+            profile.data[letter][i + profile.padding] = row[letter_mask(subject) as usize] as i16;
         }
     }
     profile

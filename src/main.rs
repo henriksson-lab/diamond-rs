@@ -55,7 +55,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        "blastp" if !has_flag(&args, "--legacy") => {
+        "blastp" if !has_flag(&args, "--legacy") && !route_blastp_to_legacy(&args) => {
             // Native Rust blastp pipeline
             print_banner();
             let config = BlastpConfig {
@@ -68,13 +68,32 @@ fn main() {
                 max_evalue: parse_arg_or(&args, &["-e", "--evalue"], 0.001),
                 max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
                 min_id: parse_arg_or(&args, &["--id"], 0.0),
-                threads: parse_arg_or(&args, &["-p", "--threads"], 1),
+                // C++ defaults `--threads` to `std::thread::hardware_concurrency()`
+                // (`config.cpp:783`). Match that — `0` here is interpreted by
+                // `rayon::ThreadPoolBuilder` as "all cores".
+                threads: parse_arg_or(&args, &["-p", "--threads"], 0),
                 outfmt: get_all_args(&args, &["-f", "--outfmt"]),
                 sensitivity: parse_sensitivity(&args),
+                masking: diamond::masking::MaskingMode::parse(
+                    &get_arg(&args, &["--masking"]).unwrap_or_else(|| "tantan".into()),
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }),
+                motif_masking: get_arg(&args, &["--motif-masking"]).unwrap_or_default(),
+                min_query_len: parse_arg_or(&args, &["--min-query-len"], 0usize),
+                query_cover: parse_arg_or(&args, &["--query-cover"], 0.0),
+                subject_cover: parse_arg_or(&args, &["--subject-cover"], 0.0),
+                comp_based_stats: diamond::stats::cbs::CbsMode::parse(
+                    &get_arg(&args, &["--comp-based-stats"]).unwrap_or_else(|| "1".into()),
+                ),
+                no_self_hits: has_flag(&args, "--no-self-hits"),
+                ungapped_xdrop_bits: parse_arg_or(&args, &["-x", "--xdrop"], 12.3),
             };
             run_or_exit(diamond::commands::blastp::run(&config));
         }
-        "blastx" if !has_flag(&args, "--legacy") => {
+        "blastx" if !has_flag(&args, "--legacy") && !route_blastx_to_legacy(&args) => {
             print_banner();
             let config = BlastxConfig {
                 query_files: get_all_args(&args, &["-q", "--query"]),
@@ -86,12 +105,31 @@ fn main() {
                 max_evalue: parse_arg_or(&args, &["-e", "--evalue"], 0.001),
                 max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
                 min_id: parse_arg_or(&args, &["--id"], 0.0),
-                threads: parse_arg_or(&args, &["-p", "--threads"], 1),
+                // C++ defaults `--threads` to `std::thread::hardware_concurrency()`.
+                threads: parse_arg_or(&args, &["-p", "--threads"], 0),
                 outfmt: get_all_args(&args, &["-f", "--outfmt"]),
                 sensitivity: parse_sensitivity(&args),
                 query_gencode: parse_arg_or(&args, &["--query-gencode"], 1),
                 strand: get_arg(&args, &["--strand"]).unwrap_or_else(|| "both".into()),
                 min_orf: get_arg(&args, &["--min-orf"]).and_then(|s| s.parse().ok()),
+                // Forward `--masking` / `--motif-masking` to the inner blastp
+                // pipeline. Without this blastx silently overrode the user's
+                // choice to `Tantan`/empty.
+                masking: diamond::masking::MaskingMode::parse(
+                    &get_arg(&args, &["--masking"]).unwrap_or_else(|| "tantan".into()),
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }),
+                motif_masking: get_arg(&args, &["--motif-masking"]).unwrap_or_default(),
+                query_cover: parse_arg_or(&args, &["--query-cover"], 0.0),
+                subject_cover: parse_arg_or(&args, &["--subject-cover"], 0.0),
+                comp_based_stats: diamond::stats::cbs::CbsMode::parse(
+                    &get_arg(&args, &["--comp-based-stats"]).unwrap_or_else(|| "1".into()),
+                ),
+                no_self_hits: has_flag(&args, "--no-self-hits"),
+                ungapped_xdrop_bits: parse_arg_or(&args, &["-x", "--xdrop"], 12.3),
             };
             run_or_exit(diamond::commands::blastx::run(&config));
         }
@@ -149,6 +187,7 @@ fn main() {
                 report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
                 sam_qlen_field: has_flag(&args, "--sam-query-len"),
                 invocation: args.join(" "),
+                header: get_all_args(&args, &["--header"]),
             }));
         }
         "view"
@@ -181,6 +220,7 @@ fn main() {
                 report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
                 sam_qlen_field: has_flag(&args, "--sam-query-len"),
                 invocation: args.join(" "),
+                header: get_all_args(&args, &["--header"]),
             }));
         }
         "view"
@@ -210,6 +250,7 @@ fn main() {
                 report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
                 sam_qlen_field: has_flag(&args, "--sam-query-len"),
                 invocation: args.join(" "),
+                header: get_all_args(&args, &["--header"]),
             }));
         }
         "view"
@@ -239,6 +280,7 @@ fn main() {
                 report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
                 sam_qlen_field: has_flag(&args, "--sam-query-len"),
                 invocation: args.join(" "),
+                header: get_all_args(&args, &["--header"]),
             }));
         }
         "view"
@@ -268,6 +310,7 @@ fn main() {
                 report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
                 sam_qlen_field: has_flag(&args, "--sam-query-len"),
                 invocation: args.join(" "),
+                header: get_all_args(&args, &["--header"]),
             }));
         }
         "view"
@@ -297,6 +340,7 @@ fn main() {
                 report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
                 sam_qlen_field: has_flag(&args, "--sam-query-len"),
                 invocation: args.join(" "),
+                header: get_all_args(&args, &["--header"]),
             }));
         }
         "view"
@@ -326,6 +370,7 @@ fn main() {
                 report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
                 sam_qlen_field: has_flag(&args, "--sam-query-len"),
                 invocation: args.join(" "),
+                header: get_all_args(&args, &["--header"]),
             }));
         }
         "view"
@@ -355,6 +400,7 @@ fn main() {
                 report_unaligned: parse_arg_or(&args, &["--unal"], 0) != 0,
                 sam_qlen_field: has_flag(&args, "--sam-query-len"),
                 invocation: args.join(" "),
+                header: get_all_args(&args, &["--header"]),
             }));
         }
         "test" => {
@@ -434,6 +480,21 @@ fn get_all_args(args: &[String], flags: &[&str]) -> Vec<String> {
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
+}
+
+fn route_blastp_to_legacy(args: &[String]) -> bool {
+    get_all_args(args, &["-f", "--outfmt"])
+        .first()
+        .is_some_and(|f| f == "100" || f == "daa")
+        || get_arg(args, &["--masking"]).is_some_and(|m| m.eq_ignore_ascii_case("seg"))
+        || get_arg(args, &["--max-hsps"]).is_some_and(|m| m != "1")
+        || get_arg(args, &["--comp-based-stats"]).is_some_and(|m| m != "0" && m != "1")
+}
+
+fn route_blastx_to_legacy(args: &[String]) -> bool {
+    route_blastp_to_legacy(args)
+        || get_arg(args, &["-F", "--frameshift"]).is_some_and(|f| f != "0")
+        || has_flag(args, "--swipe")
 }
 
 fn parse_arg_or<T: std::str::FromStr>(args: &[String], flags: &[&str], default: T) -> T {

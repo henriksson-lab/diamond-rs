@@ -4,7 +4,7 @@ use crate::align::hsp::HspContext;
 use crate::basic::consts::VERSION_STRING;
 use crate::basic::packed_transcript::EditOperation;
 use crate::basic::translate::Frame;
-use crate::basic::value::{Letter, AMINO_ACID_ALPHABET, LETTER_MASK};
+use crate::basic::value::{Letter, AMINO_ACID_ALPHABET};
 use crate::output::format::{format_evalue, print_title};
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::sequence::ID_DELIMITERS;
@@ -28,7 +28,15 @@ pub fn write_sam_record<W: Write>(writer: &mut W, r: &SamRecord<'_>) -> io::Resu
     let seq_str: String = r
         .query_seq
         .iter()
-        .map(|&l| AMINO_ACID_ALPHABET[(l & LETTER_MASK) as usize] as char)
+        .map(|&l| {
+            let x = l as i32;
+            let c = AMINO_ACID_ALPHABET[(x & 127) as usize] as char;
+            if (x & 128) == 0 {
+                c
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
         .collect();
 
     writeln!(
@@ -112,11 +120,13 @@ pub fn print_cigar(r: &HspContext) -> String {
     buf
 }
 
-/// Matches C++ SamFormat::print_match(const HspContext&).
+/// Matches C++ `SamFormat::print_match(const HspContext&)`.
 pub fn print_match_context<W: Write>(
     writer: &mut W,
     r: &HspContext,
     score_matrix: &ScoreMatrix,
+    full_titles: bool,
+    all_titles: bool,
     sam_qlen_field: bool,
 ) -> io::Result<()> {
     let query_id = r
@@ -124,17 +134,34 @@ pub fn print_match_context<W: Write>(
         .split(|c: char| ID_DELIMITERS.contains(c))
         .next()
         .unwrap_or("");
-    let target_title = print_title(&r.target_title, true, true, "<>", false);
+    let target_title = print_title(&r.target_title, full_titles, all_titles, "<>", false);
     let frame = Frame::from_index(r.frame() as i32);
     let query_range = r.query_range();
     let query = r.query_index(r.hsp.frame);
-    let begin = query_range.begin.max(0) as usize;
-    let end = query_range.end.max(query_range.begin).max(0) as usize;
+    if query_range.begin < 0
+        || query_range.end < query_range.begin
+        || query_range.end as usize > query.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "query range out of bounds",
+        ));
+    }
+    let begin = query_range.begin as usize;
+    let end = query_range.end as usize;
     let seq_str: String = query
-        .get(begin..end.min(query.len()))
-        .unwrap_or(&[])
+        .get(begin..end)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "query range out of bounds"))?
         .iter()
-        .map(|&l| AMINO_ACID_ALPHABET[(l & LETTER_MASK) as usize] as char)
+        .map(|&l| {
+            let x = l as i32;
+            let c = AMINO_ACID_ALPHABET[(x & 127) as usize] as char;
+            if (x & 128) == 0 {
+                c
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
         .collect();
 
     write!(
@@ -161,7 +188,7 @@ pub fn print_match_context<W: Write>(
     writeln!(writer)
 }
 
-/// Matches C++ SamFormat::print_query_intro().
+/// Matches C++ `SamFormat::print_query_intro()`.
 pub fn print_query_intro<W: Write>(
     writer: &mut W,
     query_title: &str,
@@ -177,7 +204,7 @@ pub fn print_query_intro<W: Write>(
     Ok(())
 }
 
-/// Matches C++ SamFormat::print_header().
+/// Matches C++ `SamFormat::print_header()`.
 pub fn print_header<W: Write>(writer: &mut W, mode: u32, invocation: &str) -> io::Result<()> {
     let mode_str = match mode {
         2 => "BlastP",
@@ -221,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_write_sam_record() {
-        let query = vec![0i8, 1, 2, 3];
+        let query = vec![0i8, -127, 2, 3];
         let r = SamRecord {
             query_id: "q1",
             subject_id: "s1",
@@ -237,7 +264,7 @@ mod tests {
         write_sam_record(&mut buf, &r).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("q1"));
-        assert!(output.contains("ARND"));
+        assert!(output.contains("ArND"));
         assert!(output.contains("4M"));
         assert!(output.contains("AS:i:50"));
     }
@@ -343,10 +370,75 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        print_match_context(&mut buf, &ctx, &score_matrix, true).unwrap();
+        print_match_context(&mut buf, &ctx, &score_matrix, true, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(output.starts_with("query\t0\ttarget title<>extra title\t21\t255\t4M"));
+        assert!(output.contains("\tRNDC\t"));
         assert!(output.contains("\tZL:i:200\tZR:i:80\t"));
         assert!(output.contains("\tZI:i:75\tZF:i:1\tZS:i:2\tMD:Z:4\tZQ:i:6\n"));
+    }
+
+    #[test]
+    fn test_print_match_context_title_policy_and_range_validation() {
+        use crate::util::interval::Interval;
+
+        let score_matrix = ScoreMatrix::new("blosum62", 11, 1, -1, 1, 1000).unwrap();
+        let mut hsp = Hsp::new();
+        hsp.score = 80;
+        hsp.evalue = 1e-12;
+        hsp.frame = 0;
+        hsp.identities = 3;
+        hsp.length = 4;
+        hsp.query_range = Interval::new(1, 5);
+        hsp.query_source_range = Interval::new(1, 5);
+        hsp.subject_range = Interval::new(20, 24);
+        hsp.transcript.push_with_count(EditOperation::Match, 4);
+        let ctx = HspContext::new(
+            hsp.clone(),
+            0,
+            0,
+            vec![vec![0, -127, 2, 3, 4, 5]],
+            6,
+            "query one",
+            0,
+            200,
+            "target title\x01extra title",
+            0,
+            0,
+            Vec::new(),
+            0.0,
+            0.0,
+        );
+
+        let mut buf = Vec::new();
+        print_match_context(&mut buf, &ctx, &score_matrix, false, false, false).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.starts_with("query\t0\ttarget\t21\t255\t4M"));
+        assert!(output.contains("\trNDC\t"));
+
+        let mut bad = hsp;
+        bad.query_range = Interval::new(1, 99);
+        let bad_ctx = HspContext::new(
+            bad,
+            0,
+            0,
+            vec![vec![0, 1, 2]],
+            3,
+            "query one",
+            0,
+            200,
+            "target title",
+            0,
+            0,
+            Vec::new(),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            print_match_context(&mut Vec::new(), &bad_ctx, &score_matrix, true, true, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

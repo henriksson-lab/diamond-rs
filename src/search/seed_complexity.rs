@@ -46,7 +46,7 @@ impl SeedLocBytes for PackedLocId {
     }
 }
 
-/// Matches C++ `Search::seed_is_complex`.
+/// Matches C++ `Search::seed_is_complex(...)`.
 pub fn seed_is_complex(seq: &[Letter], shape: &Shape, cut: f64, reduction: &Reduction) -> bool {
     let mut count = [0u32; TRUE_AA as usize];
     for i in 0..shape.weight as usize {
@@ -63,7 +63,7 @@ pub fn seed_is_complex(seq: &[Letter], shape: &Shape, cut: f64, reduction: &Redu
     entropy >= cut
 }
 
-/// Matches C++ `Search::seed_is_complex_unreduced`.
+/// Matches C++ `Search::seed_is_complex_unreduced(...)`.
 pub fn seed_is_complex_unreduced(
     seq: &mut [Letter],
     shape: &Shape,
@@ -97,7 +97,7 @@ pub fn seed_is_complex_unreduced(
     true
 }
 
-/// Matches C++ `Search::mask_seeds`.
+/// Matches C++ `Search::mask_seeds(...)`.
 pub fn mask_seeds<SeedLoc>(
     shape: &Shape,
     range: &SeedPartitionRange,

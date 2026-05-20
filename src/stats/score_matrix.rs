@@ -72,9 +72,18 @@ impl ScoreMatrix {
 
         let params = standard_matrix.constants(go, ge)?;
 
-        // Build the 32x32 matrices from the AMINO_ACID_COUNT x AMINO_ACID_COUNT scores
+        // Build the 32x32 matrices from the AMINO_ACID_COUNT x AMINO_ACID_COUNT scores.
+        // C++ `Scores<T>::Scores` (`diamond/src/stats/score_matrix.h:38-46`) fills
+        // out-of-range cells (i >= n || j >= n) with `SCHAR_MIN` cast to T.
+        // For T=int8_t that's `i8::MIN = -128` (same as Rust);
+        // for T=int32_t that's `-128` (NOT `i32::MIN`);
+        // for T=uint8_t that's `(uint8_t)(-128) = 128`.
+        // The earlier Rust used `i32::MIN` for matrix32 and `0` for matrix8u,
+        // both off vs C++. SIMD profile loads that index by a delimiter / pad
+        // letter (e.g. DELIMITER_LETTER=31 in a padded SWIPE lane) saw scores
+        // that were ~2 billion / 128 units off and silently corrupted DP.
         let n = AMINO_ACID_COUNT as i32;
-        let mut matrix32 = [i32::MIN; 32 * 32];
+        let mut matrix32 = [-128i32; 32 * 32];
         let mut matrix8 = [i8::MIN; 32 * 32];
 
         for i in 0..32 {
@@ -102,8 +111,9 @@ impl ScoreMatrix {
             .unwrap_or(0);
         let bias = if min_score < 0 { -min_score } else { 0 };
 
-        // Build unsigned biased matrix
-        let mut matrix8u = [0u8; 32 * 32];
+        // Build unsigned biased matrix. Out-of-range cells must match C++:
+        // `(uint8_t)SCHAR_MIN = 128` — NOT the biased value, NOT 0.
+        let mut matrix8u = [128u8; 32 * 32];
         for i in 0..32 {
             for j in 0..32 {
                 if i < n as usize && j < n as usize {
@@ -154,6 +164,12 @@ impl ScoreMatrix {
         let b_val = 2.0 * g * (ungapped.alpha - params.alpha);
         let beta_val = 2.0 * g * (ungapped.alpha_v - params.alpha_v);
         let tau_val = 2.0 * g * (ungapped.alpha_v - params.sigma);
+        // Thresholds from sls_pvalues.cpp:353-355 (compute_tmp_values).
+        // Both alpha_i and alpha_j map to params.alpha_v.
+        let nat = super::pvalues::NAT_CUT_OFF_IN_MAX;
+        let vi_y_thr = (nat * params.alpha_v / params.lambda).max(0.0);
+        let vj_y_thr = vi_y_thr;
+        let c_y_thr = (nat * params.sigma / params.lambda).max(0.0);
         let area_params = super::pvalues::AreaParams {
             a_i: a_val,
             b_i: b_val,
@@ -165,6 +181,9 @@ impl ScoreMatrix {
             beta_j: beta_val,
             sigma: params.sigma,
             tau: tau_val,
+            vi_y_thr,
+            vj_y_thr,
+            c_y_thr,
         };
 
         Ok(ScoreMatrix {
@@ -188,22 +207,34 @@ impl ScoreMatrix {
     }
 
     /// Score for aligning two letters.
+    ///
+    /// Strip `SEED_MASK` (bit 7) before indexing: a Letter with the high
+    /// bit set (i.e. tantan soft-masked) is negative as `i8`, and `as usize`
+    /// sign-extends through `i64`, indexing far past the 32×32 = 1024-entry
+    /// matrix. C++ `Sequence::operator[]` (`diamond/src/basic/sequence.h:87-94`)
+    /// applies the same mask whenever `SEQ_MASK` is defined (the default
+    /// build flag), so callers there never see the high bit reach this
+    /// lookup; mirror that behavior here.
     #[inline]
     pub fn score(&self, a: Letter, b: Letter) -> i32 {
-        self.matrix32[(a as usize) * 32 + (b as usize)]
+        let ai = (a & crate::basic::value::LETTER_MASK) as usize;
+        let bi = (b & crate::basic::value::LETTER_MASK) as usize;
+        self.matrix32[ai * 32 + bi]
     }
 
     /// Get a row of the 32-bit score matrix.
     #[inline]
     pub fn row(&self, a: Letter) -> &[i32] {
-        let start = (a as usize) * 32;
+        let start = ((a & crate::basic::value::LETTER_MASK) as usize) * 32;
         &self.matrix32[start..start + 32]
     }
 
     /// Unsigned biased score.
     #[inline]
     pub fn biased_score(&self, a: Letter, b: Letter) -> u8 {
-        self.matrix8u[(a as usize) * 32 + (b as usize)]
+        let ai = (a & crate::basic::value::LETTER_MASK) as usize;
+        let bi = (b & crate::basic::value::LETTER_MASK) as usize;
+        self.matrix8u[ai * 32 + bi]
     }
 
     /// Convert raw alignment score to bit score (simple, no length correction).
@@ -214,16 +245,20 @@ impl ScoreMatrix {
 
     /// Convert raw alignment score to bit score with ALP area correction.
     ///
-    /// Matches C++ ScoreMatrix::bitscore_corrected():
-    ///   (lambda * raw_score - ln(K) - ln(area)) / ln(2)
+    /// Matches C++ `ScoreMatrix::bitscore_corrected(int, unsigned, unsigned)`.
+    ///   (lambda * raw_score - ln(K) - log_area) / ln(2)
+    /// where `log_area` comes from `evaluer.log_area(...)` directly.
+    /// Going through `compute_area(...).ln()` (= exp-then-ln) underflows for
+    /// large query×subject products (area → inf → log = inf) and snaps to 0
+    /// for tiny areas via the `if area > 0.0` guard — both modes silently
+    /// lose multiple bits vs C++.
     pub fn bitscore_corrected(&self, raw_score: i32, query_len: u32, subject_len: u32) -> f64 {
-        let area = super::pvalues::compute_area(
+        let log_area = super::pvalues::compute_log_area(
             &self.area_params,
             raw_score as f64,
             query_len as f64,
             subject_len as f64,
         );
-        let log_area = if area > 0.0 { area.ln() } else { 0.0 };
         (self.lambda * raw_score as f64 - self.ln_k - log_area) / LN_2
     }
 
@@ -238,18 +273,23 @@ impl ScoreMatrix {
 
     /// Compute the minimum ungapped raw score for a given query length and e-value threshold.
     ///
-    /// Matches C++ CutoffTable: finds the minimum raw score S such that
-    /// K * query_len * 1e9 * exp(-lambda * S) <= evalue_threshold.
-    /// The factor 1e9 / subject_len normalizes per-residue (C++ evalue_norm), with
-    /// subject_len approximated as 1e9 for the table.
+    /// Matches C++ `Util::Scores::CutoffTable::operator()(unsigned)`.
+    /// the table is precomputed at `m = 1 << (b - 1)` for each bit `b`, and
+    /// `operator()` indexes by `b = 32 - clz(query_len)`. The effective `m`
+    /// is therefore the **largest power of 2 ≤ query_len** — NOT the actual
+    /// query length. For `query_len = 250`, C++ uses `m = 128`; using 250
+    /// gives a stricter cutoff that rejects seeds C++ would accept.
     pub fn ungapped_cutoff(&self, query_len: usize, evalue_threshold: f64) -> i32 {
-        if evalue_threshold <= 0.0 {
+        if evalue_threshold <= 0.0 || query_len == 0 {
             return 0;
         }
-        // E = K * m * n * exp(-lambda * S), with n normalized to 1e9
-        // S = -(ln(E / (K * m * 1e9))) / lambda
-        let m = query_len as f64;
-        let inner = evalue_threshold / (self.k * m * 1e9);
+        // Snap to floor power of 2 (largest power of 2 ≤ query_len).
+        // `bits = 32 - leading_zeros(query_len as u32)` matches C++'s
+        // `b = 32 - clz(query_len)`; the table cell is precomputed at
+        // `1 << (b - 1)`.
+        let bits = 32 - (query_len as u32).leading_zeros();
+        let m_binned = (1u32 << (bits - 1)) as f64;
+        let inner = evalue_threshold / (self.k * m_binned * 1e9);
         if inner <= 0.0 {
             return 0;
         }
@@ -280,14 +320,19 @@ impl ScoreMatrix {
     /// Compute E-value from raw score and lengths.
     ///
     /// Uses the ALP pvalues finite-size correction with actual matrix parameters.
-    /// Matches C++ ScoreMatrix::evalue():
-    ///   evaluer.evalue(raw/scale, qlen, slen) * db_letters / slen
+    /// Matches C++ `ScoreMatrix::evalue(int, unsigned, unsigned)`.
+    ///   evaluer.evalue((double)raw_score / scale_, qlen, slen) * db_letters / slen
     pub fn evalue(&self, raw_score: i32, query_len: u32, subject_len: u32) -> f64 {
+        // C++ divides raw_score by `scale_` before handing it to the ALP
+        // evaluer (`score_matrix.cpp:222`). For `scale = 1.0` (default) this
+        // is a no-op, but a scaled matrix (matrix adjustment / CBS rescaling)
+        // would otherwise see inflated scores and produce evalues off by a
+        // power of `exp(lambda * (scale-1) * raw)`.
         let pairwise = super::pvalues::evalue_with_area(
             self.lambda,
             self.k,
             &self.area_params,
-            raw_score as f64,
+            raw_score as f64 / self.scale,
             query_len as f64,
             subject_len as f64,
         );
@@ -301,7 +346,7 @@ impl ScoreMatrix {
 
     /// Normalized E-value using a database size of 1e9.
     ///
-    /// Matches C++ ScoreMatrix::evalue_norm(int, unsigned, unsigned).
+    /// Matches C++ `ScoreMatrix::evalue_norm(int, unsigned, unsigned)`.
     pub fn evalue_norm(&self, raw_score: i32, query_len: u32, subject_len: u32) -> f64 {
         let pairwise = super::pvalues::evalue_with_area(
             self.lambda,
@@ -320,7 +365,7 @@ impl ScoreMatrix {
 
     /// Normalized E-value approximation for a query length only.
     ///
-    /// Matches C++ ScoreMatrix::evalue_norm(int raw_score, int query_len).
+    /// Matches C++ `ScoreMatrix::evalue_norm(int, int)`.
     pub fn evalue_norm_query_len(&self, raw_score: i32, query_len: i32) -> f64 {
         1e9 * query_len as f64 * 2.0f64.powf(-self.bitscore(raw_score as f64 * self.scale))
     }
@@ -537,6 +582,12 @@ mod tests {
         let rs = sm.rawscore(bs);
         assert!((rs - 50.0).abs() < 0.01);
         assert_eq!(sm.rawscore_int(bs), 50);
+    }
+
+    #[test]
+    fn test_default_ungapped_xdrop_bits_to_raw_score() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        assert_eq!(sm.rawscore_int(12.3), 20);
     }
 
     #[test]

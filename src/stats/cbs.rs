@@ -346,14 +346,19 @@ impl VectorScores {
     fn add(&mut self, letter: Letter, score_matrix: &ScoreMatrix) {
         // C++ VectorScores::operator+= does NOT guard for l < 20 — all letters
         // including X (23) contribute their scores to the window sum.
-        let l = letter as usize;
+        // C++ derives `l` via `Sequence::operator[]` which applies `LETTER_MASK`
+        // under SEQ_MASK (`diamond/CMakeLists.txt:71` makes SEQ_MASK on by
+        // default). Mask here too so a raw SEED_MASK-bearing byte (0x80 / -128)
+        // doesn't sign-extend through `as usize` into a wild index.
+        let l = (letter & crate::basic::value::LETTER_MASK) as usize;
         for i in 0..20 {
             self.scores[i] += score_matrix.score(l as Letter, i as Letter);
         }
     }
 
     fn sub(&mut self, letter: Letter, score_matrix: &ScoreMatrix) {
-        let l = letter as usize;
+        // See `add` for the LETTER_MASK rationale.
+        let l = (letter & crate::basic::value::LETTER_MASK) as usize;
         for i in 0..20 {
             self.scores[i] -= score_matrix.score(l as Letter, i as Letter);
         }
@@ -1037,17 +1042,27 @@ pub fn hauser_correction_window(
         m += 1;
     }
 
-    // Convert to i8 with rounding (matching C++)
-    corrections
-        .iter()
-        .map(|&f| {
-            if f < 0.0 {
-                (f - 0.5) as i8
-            } else {
-                (f + 0.5) as i8
-            }
-        })
-        .collect()
+    // Convert to i8 with rounding (matching C++). Append 32 zero bytes of
+    // trailing padding so SIMD score-profile loaders downstream can over-read
+    // up to one AVX2 vector past `len` without UB. C++ does this explicitly
+    // (`diamond/src/stats/hauser_correction.cpp:107-110`: `reserve(len + PADDING)`
+    // followed by `for (Loc i=0; i<PADDING; ++i) int8.push_back(0)`, with
+    // `PADDING = 32`). Without it, SIMD `bias` lane reads past `int8.size()`
+    // hit either uninitialised heap memory or panic on bounds-checked indexing.
+    //
+    // Callers that index the slice positionally (the current `query_cbs[qi]`
+    // pattern in blastp.rs) get the same numerical result either way since
+    // they only touch `0..len`; the padding is purely for over-read safety.
+    const PADDING: usize = 32;
+    let mut out: Vec<i8> = Vec::with_capacity(len + PADDING);
+    for &f in &corrections {
+        let v = if f < 0.0 { f - 0.5 } else { f + 0.5 };
+        out.push(v as i8);
+    }
+    for _ in 0..PADDING {
+        out.push(0);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1069,7 +1084,12 @@ mod tests {
         let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
         let seq: Vec<Letter> = (0..100).map(|i| (i % 20) as Letter).collect();
         let corr = hauser_correction(&seq, &sm);
-        assert_eq!(corr.len(), 100);
+        // C++ appends 32 zero bytes of SIMD over-read padding after `len`
+        // (`hauser_correction.cpp:107-110`); Rust mirrors that, so the
+        // returned slice is `len + 32` long. The numerically meaningful
+        // values are in `corr[..seq.len()]`; the padding is all zero.
+        assert_eq!(corr.len(), 100 + 32);
+        assert!(corr[100..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -1084,7 +1104,8 @@ mod tests {
         let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
         let seq = vec![0i8, 1, 2];
         let corr = hauser_correction(&seq, &sm);
-        assert_eq!(corr.len(), 3);
+        assert_eq!(corr.len(), 3 + 32);
+        assert!(corr[3..].iter().all(|&b| b == 0));
     }
 
     #[test]

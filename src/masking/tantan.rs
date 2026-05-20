@@ -7,7 +7,7 @@
 //! Uses a 50-position window HMM with forward-backward algorithm to compute
 //! per-position posterior probability of being in a repeat state.
 
-use crate::basic::value::{Letter, LETTER_MASK, SEED_MASK, TRUE_AA};
+use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK, SEED_MASK, TRUE_AA};
 
 /// Default tantan parameters matching C++ DIAMOND.
 const P_REPEAT: f32 = 0.005;
@@ -30,7 +30,6 @@ fn compute_lambda_flat(scores: &[i8], stride: usize, n: usize) -> f64 {
     }
 
     // Find upper bound
-    let mut ub = 0.0f64;
     let mut r_max_min = f64::MAX;
     for i in 0..n {
         let mut r_max = f64::MIN;
@@ -46,7 +45,7 @@ fn compute_lambda_flat(scores: &[i8], stride: usize, n: usize) -> f64 {
     if r_max_min == f64::MAX || r_max_min <= 0.0 {
         return 0.3176; // fallback to standard BLOSUM62 lambda
     }
-    ub = 1.1 * (n as f64).ln() / r_max_min;
+    let ub = 1.1 * (n as f64).ln() / r_max_min;
 
     // Bisection: find lambda where sum(inv(exp(lambda * M))) ≈ 1
     let lb = ub * 1e-6;
@@ -133,12 +132,20 @@ pub struct TantanMasker {
 impl TantanMasker {
     /// Create a masker from a standard matrix (typically BLOSUM62).
     pub fn new(sm: &crate::stats::standard_matrix::StandardMatrix, min_mask_prob: f32) -> Self {
+        // Lambda is computed on the 20x20 standard-AA submatrix to match C++'s
+        // LambdaCalculator (masking.cpp:Masking ctor uses int_matrix[20][20]).
         let n = TRUE_AA as usize;
-        let aa_count = crate::basic::value::AMINO_ACID_COUNT;
+        let aa_count = AMINO_ACID_COUNT;
         let lambda = compute_lambda_flat(&sm.scores, aa_count, n);
-        let mut lr_matrix = vec![vec![0.0f32; n]; n];
-        for i in 0..n {
-            for j in 0..n {
+        // Likelihood ratio matrix covers the full 26-letter alphabet (incl.
+        // B, J, Z, X, *, _). C++ Masking::Masking populates
+        // `likelihoodRatioMatrixf_[i][j]` for `i,j < value_traits.alphabet_size`
+        // (= 26 for amino acid). If we only fill the 20x20 sub-block, X-letter
+        // positions emit 0 while C++ emits exp(lambda*score(aa,X)) ≈ 0.7 —
+        // flipping mask decisions at the p_mask boundary.
+        let mut lr_matrix = vec![vec![0.0f32; aa_count]; aa_count];
+        for i in 0..aa_count {
+            for j in 0..aa_count {
                 lr_matrix[i][j] = (lambda * sm.scores[i * aa_count + j] as f64).exp() as f32;
             }
         }
@@ -217,7 +224,12 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         return;
     }
 
-    let n = TRUE_AA as usize;
+    let alphabet_size = AMINO_ACID_COUNT;
+    // letter_mask strips to 5 bits → idx in 0..32. Allocate emission rows for
+    // the full 32-row range so we can index `e[ltr]` safely; rows beyond
+    // AMINO_ACID_COUNT stay zero (matching C++'s typically-zero UB on the
+    // uninitialized tail of likelihoodRatioMatrixf_).
+    let emission_rows = (LETTER_MASK as usize) + 1;
 
     // Tantan HMM parameters
     let b2b = 1.0f32 - P_REPEAT;
@@ -231,24 +243,28 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         d[i] = d[i + 1] * REPEAT_GROWTH;
     }
 
-    // Pre-compute emission vectors matching C++ tantan.cpp lines 152-164:
-    //   e[aa][len-1-j] = likelihoodRatioMatrix[aa][letter_mask(seq[j])]
-    // Reversed so e[aa][len - i] gives emission for position i during forward pass.
-    let mut e: Vec<Vec<f32>> = Vec::with_capacity(n);
-    for aa in 0..n {
+    // Pre-compute emission vectors matching C++ tantan.cpp:152-164. C++ fills an
+    // `e[aa]` row for every aa in 0..AMINO_ACID_COUNT (=26), and writes
+    // `L[letter_mask(seq[j])]` without bounds-checking idx — meaning ambiguous
+    // letters (B/J/Z/X/*/_, ids 20..25) DO contribute non-zero emissions via the
+    // populated 26x26 lr_matrix block. Only DELIMITER (31) and similarly-stripped
+    // values read past the 26-column initialized region (C++ UB, typically zero).
+    let mut e: Vec<Vec<f32>> = Vec::with_capacity(emission_rows);
+    for aa in 0..emission_rows {
         let mut ev = vec![0.0f32; len + WINDOW];
-        for j in 0..len {
-            let idx = (seq[j] & LETTER_MASK) as usize;
-            if idx < n {
-                ev[len - 1 - j] = lr_matrix[aa][idx];
+        if aa < alphabet_size {
+            for j in 0..len {
+                let idx = (seq[j] & LETTER_MASK) as usize;
+                if idx < alphabet_size {
+                    ev[len - 1 - j] = lr_matrix[aa][idx];
+                }
             }
         }
         e.push(ev);
     }
 
-    // Forward-backward HMM with runtime SIMD dispatch.
-    // AVX2+FMA path matches C++ SIMD exactly (same hsum tree reduction, same FMA).
-    // Scalar path is the generic fallback.
+    // Forward-backward HMM with runtime SIMD dispatch. The AVX2 path avoids FMA
+    // to match DIAMOND's AVX2 build and keep rounding parity with C++.
     let use_simd = super::tantan_simd::has_avx2_fma();
 
     let mut f = [0.0f32; WINDOW];
@@ -262,9 +278,6 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
     // Forward pass
     for i in 0..len {
         let ltr = (seq[i] & LETTER_MASK) as usize;
-        if ltr >= n {
-            continue;
-        }
         let e_seg = &e[ltr][len - i..];
 
         #[cfg(target_arch = "x86_64")]
@@ -329,12 +342,6 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
             }
             f_sum *= s;
         }
-        if len >= 310 && len <= 330 && i >= 258 && i <= 268 {
-            eprintln!(
-                "  RUST_FWD[{}] len={}: b={:.10e} f_sum={:.10e}",
-                i, len, b, f_sum
-            );
-        }
         pb[i] = b;
     }
 
@@ -382,9 +389,6 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         }
 
         let ltr = (seq[i] & LETTER_MASK) as usize;
-        if ltr >= n {
-            continue;
-        }
         let e_seg = &e[ltr][len - i..];
 
         #[cfg(target_arch = "x86_64")]
@@ -406,16 +410,6 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         #[cfg(not(target_arch = "x86_64"))]
         backward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b);
 
-        if len >= 310 && len <= 330 && i >= 255 && i <= 295 {
-            eprintln!(
-                "  RUST_BWD[{}] len={}: pf={:.10e} b={:.10e} {}",
-                i,
-                len,
-                pf,
-                b,
-                if pf >= min_mask_prob { "MASKED" } else { "" }
-            );
-        }
         if pf >= min_mask_prob {
             seq[i] |= SEED_MASK;
         }

@@ -15,6 +15,10 @@ pub const MIN_DB_VERSION: u32 = 2;
 /// Minimum compatible build version.
 pub const MIN_BUILD_VERSION: u32 = 74;
 
+/// Build version stamped into .dmnd headers. Matches C++ `Const::build_version`
+/// in diamond/src/basic/const.h.
+pub const BUILD_VERSION: u32 = 178;
+
 /// DIAMOND database file header (first 40 bytes).
 #[derive(Debug, Clone)]
 pub struct ReferenceHeader {
@@ -30,7 +34,7 @@ impl Default for ReferenceHeader {
     fn default() -> Self {
         ReferenceHeader {
             magic_number: MAGIC_NUMBER,
-            build: 0,
+            build: BUILD_VERSION,
             db_version: CURRENT_DB_VERSION_PROT,
             sequences: 0,
             letters: 0,
@@ -70,6 +74,13 @@ impl ReferenceHeader {
     }
 
     /// Validate this header is a valid DIAMOND database.
+    ///
+    /// Matches C++ `ReferenceHeader::init()`.
+    ///
+    // C++ `init()` (`diamond/src/data/dmnd/dmnd.cpp:159-164`) also rejects
+    // too-old builds (pre-v74 layout differs), too-new db versions
+    // (forward-incompatible writes), and the `sequences == 0` sentinel that
+    // marks an incomplete database build.
     pub fn validate(&self) -> Result<(), String> {
         if self.magic_number != MAGIC_NUMBER {
             return Err("Database file is not a DIAMOND database.".into());
@@ -79,6 +90,26 @@ impl ReferenceHeader {
                 "Database version {} is not supported (minimum: {})",
                 self.db_version, MIN_DB_VERSION
             ));
+        }
+        let max_db_version = CURRENT_DB_VERSION_PROT.max(CURRENT_DB_VERSION_NUCL);
+        if self.db_version > max_db_version {
+            return Err(format!(
+                "Database version {} is newer than this build supports (max: {}). \
+                 Please use a newer DIAMOND version.",
+                self.db_version, max_db_version
+            ));
+        }
+        if self.build < MIN_BUILD_VERSION {
+            return Err(format!(
+                "Database was built with build version {} which is too old (minimum: {}). \
+                 Please rebuild the database.",
+                self.build, MIN_BUILD_VERSION
+            ));
+        }
+        if self.sequences == 0 {
+            return Err(
+                "Incomplete database file. Database building did not complete successfully.".into(),
+            );
         }
         Ok(())
     }
@@ -178,12 +209,34 @@ mod tests {
 
     #[test]
     fn test_header_validation() {
+        // `ReferenceHeader::new()` builds an INCOMPLETE header (sequences=0)
+        // that the writer fills in. Validating it should fail, matching C++
+        // which rejects `sequences == 0` as the incomplete-database sentinel.
         let h = ReferenceHeader::new();
-        assert!(h.validate().is_ok());
+        assert!(h.validate().is_err());
 
+        // A complete header (sequences > 0) passes.
+        let mut complete = ReferenceHeader::new();
+        complete.sequences = 1;
+        assert!(complete.validate().is_ok());
+
+        // Bad magic fails.
         let mut bad = ReferenceHeader::new();
         bad.magic_number = 0;
+        bad.sequences = 1;
         assert!(bad.validate().is_err());
+
+        // Future db_version fails.
+        let mut newer = ReferenceHeader::new();
+        newer.sequences = 1;
+        newer.db_version = 999;
+        assert!(newer.validate().is_err());
+
+        // Old build fails.
+        let mut old = ReferenceHeader::new();
+        old.sequences = 1;
+        old.build = 1;
+        assert!(old.validate().is_err());
     }
 
     #[test]

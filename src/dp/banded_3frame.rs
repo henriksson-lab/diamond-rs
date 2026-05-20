@@ -7,6 +7,7 @@
 
 use crate::align::hsp::Hsp;
 use crate::basic::packed_transcript::EditOperation;
+use crate::basic::translate::{Frame, TranslatedPosition};
 use crate::basic::value::{Letter, LETTER_MASK};
 use crate::dp::smith_waterman::SwResult;
 use crate::dp::swipe::DpTarget;
@@ -881,6 +882,7 @@ pub fn banded_3frame_swipe_targets(
     stat: &mut DpStat,
     _parallel: bool,
     overflow: &mut Vec<DpTarget>,
+    dna_len: i32,
 ) -> Vec<Hsp> {
     let mut out = Vec::new();
     for target in targets {
@@ -904,7 +906,14 @@ pub fn banded_3frame_swipe_targets(
             continue;
         }
         stat.net_cells += result.sw.length.max(0) as usize;
-        out.push(traceback_to_hsp(result, target, score_only, score_matrix));
+        out.push(traceback_to_hsp(
+            result,
+            query,
+            target,
+            score_only,
+            score_matrix,
+            dna_len,
+        ));
     }
     out
 }
@@ -926,6 +935,7 @@ pub fn banded_3frame_swipe_worker(
         &mut stat,
         true,
         overflow,
+        (query[0].len() * 3) as i32,
     ));
 }
 
@@ -948,6 +958,7 @@ pub fn banded_3frame_swipe_target_range(
         stat,
         parallel,
         &mut overflow16,
+        (query[0].len() * 3) as i32,
     );
     out.extend(banded_3frame_swipe_targets(
         query,
@@ -957,15 +968,18 @@ pub fn banded_3frame_swipe_target_range(
         stat,
         false,
         &mut overflow32,
+        (query[0].len() * 3) as i32,
     ));
     out
 }
 
 fn traceback_to_hsp(
     result: ThreeFrameSwResult,
+    query: [&[Letter]; 3],
     target: &DpTarget,
     score_only: bool,
     score_matrix: &ScoreMatrix,
+    dna_len: i32,
 ) -> Hsp {
     let mut hsp = Hsp::new();
     hsp.backtraced = !score_only;
@@ -976,7 +990,7 @@ fn traceback_to_hsp(
         result.sw.query_end.max(1) as u32,
         target.seq.len() as u32,
     );
-    hsp.frame = result.frame_end as i32;
+    hsp.frame = result.frame_begin as i32;
     hsp.length = result.sw.length;
     hsp.identities = result.sw.identities;
     hsp.mismatches = result.sw.mismatches;
@@ -984,18 +998,73 @@ fn traceback_to_hsp(
     hsp.gaps = result.sw.gaps;
     hsp.query_range = Interval::new(result.sw.query_begin, result.sw.query_end);
     hsp.subject_range = Interval::new(result.sw.subject_begin, result.sw.subject_end);
-    hsp.query_source_range = hsp.query_range;
+    hsp.query_source_range = TranslatedPosition::absolute_interval(
+        TranslatedPosition::new(hsp.query_range.begin, Frame::from_index(hsp.frame)),
+        TranslatedPosition::new(hsp.query_range.end, Frame::from_index(hsp.frame)),
+        dna_len,
+        true,
+    );
     hsp.subject_source_range = hsp.subject_range;
     hsp.target_seq = target.seq.clone();
     hsp.swipe_target = target.target_idx as i32;
     hsp.d_begin = target.d_begin;
     hsp.d_end = target.d_end;
     if !score_only {
+        let mut query_pos = TranslatedPosition::new(
+            result.sw.query_begin,
+            Frame::from_index(result.frame_begin as i32),
+        );
+        let mut subject_pos = result.sw.subject_begin as usize;
         for (op, len) in result.sw.operations {
-            for _ in 0..len {
-                hsp.transcript.push(op);
+            match op {
+                EditOperation::Match => {
+                    hsp.transcript
+                        .push_with_count(EditOperation::Match, len as u32);
+                    hsp.positives += len;
+                    query_pos.translated += len;
+                    subject_pos += len as usize;
+                }
+                EditOperation::Substitution => {
+                    for _ in 0..len {
+                        let frame = query_pos.frame.offset as usize;
+                        let q = query[frame][query_pos.translated as usize];
+                        let s = target.seq[subject_pos];
+                        if score_matrix.score(q & LETTER_MASK, s & LETTER_MASK) > 0 {
+                            hsp.positives += 1;
+                        }
+                        hsp.transcript
+                            .push_with_letter(EditOperation::Substitution, s);
+                        query_pos.translated += 1;
+                        subject_pos += 1;
+                    }
+                }
+                EditOperation::Insertion => {
+                    hsp.transcript
+                        .push_with_count(EditOperation::Insertion, len as u32);
+                    query_pos.translated += len;
+                }
+                EditOperation::Deletion => {
+                    for _ in 0..len {
+                        hsp.transcript
+                            .push_with_letter(EditOperation::Deletion, target.seq[subject_pos]);
+                        subject_pos += 1;
+                    }
+                }
+                EditOperation::FrameshiftForward => {
+                    for _ in 0..len {
+                        hsp.transcript.push(EditOperation::FrameshiftForward);
+                        query_pos.shift_forward();
+                    }
+                }
+                EditOperation::FrameshiftReverse => {
+                    for _ in 0..len {
+                        hsp.transcript.push(EditOperation::FrameshiftReverse);
+                        query_pos.shift_back();
+                    }
+                }
             }
         }
+        hsp.transcript.push_terminator();
     }
     hsp
 }
@@ -1072,12 +1141,99 @@ mod tests {
             &mut stat,
             false,
             &mut overflow,
+            (q0.len() * 3) as i32,
         );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].swipe_target, 42);
         assert!(out[0].backtraced);
+        assert_eq!(out[0].frame, 0);
+        assert_eq!(out[0].positives, q0.len() as i32);
+        assert!(out[0].transcript.data().last().unwrap().is_terminator());
         assert!(overflow.is_empty());
         assert!(stat.gross_cells > 0);
+    }
+
+    #[test]
+    fn test_banded_3frame_traceback_transcript_stores_subject_letters() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 1000, 1, 0).unwrap();
+        let q0: Vec<Letter> = vec![0, 1];
+        let q1: Vec<Letter> = vec![13; 2];
+        let q2: Vec<Letter> = vec![17; 2];
+        let target = DpTarget::new(
+            vec![0, 2, 1],
+            3,
+            -2,
+            2,
+            42,
+            q0.len() as i32,
+            CarryOver::default(),
+            Anchor::default(),
+        );
+        let result = ThreeFrameSwResult {
+            sw: SwResult {
+                score: 1,
+                query_begin: 0,
+                query_end: 2,
+                subject_begin: 0,
+                subject_end: 3,
+                length: 3,
+                identities: 2,
+                gaps: 1,
+                gap_openings: 1,
+                operations: vec![
+                    (EditOperation::Match, 1),
+                    (EditOperation::Deletion, 1),
+                    (EditOperation::Match, 1),
+                ],
+                ..Default::default()
+            },
+            frame_begin: 0,
+            frame_end: 0,
+        };
+        let hsp = traceback_to_hsp(result, [&q0, &q1, &q2], &target, false, &sm, 6);
+        let ops: Vec<_> = hsp.transcript.iter().collect();
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[1].op, EditOperation::Deletion);
+        assert_eq!(ops[1].letter, 2);
+        assert_eq!(hsp.positives, 2);
+        assert_eq!(hsp.frame, 0);
+    }
+
+    #[test]
+    fn test_banded_3frame_query_source_range_uses_begin_frame() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 1000, 1, 0).unwrap();
+        let q0: Vec<Letter> = vec![13; 3];
+        let q1: Vec<Letter> = vec![0, 1, 2];
+        let q2: Vec<Letter> = vec![17; 3];
+        let target = DpTarget::new(
+            q1.clone(),
+            q1.len() as i32,
+            -1,
+            2,
+            42,
+            q1.len() as i32,
+            CarryOver::default(),
+            Anchor::default(),
+        );
+        let result = ThreeFrameSwResult {
+            sw: SwResult {
+                score: 3,
+                query_begin: 0,
+                query_end: 3,
+                subject_begin: 0,
+                subject_end: 3,
+                length: 3,
+                identities: 3,
+                operations: vec![(EditOperation::Match, 3)],
+                ..Default::default()
+            },
+            frame_begin: 1,
+            frame_end: 1,
+        };
+        let hsp = traceback_to_hsp(result, [&q0, &q1, &q2], &target, false, &sm, 12);
+        assert_eq!(hsp.frame, 1);
+        assert_eq!(hsp.query_range, Interval::new(0, 3));
+        assert_eq!(hsp.query_source_range, Interval::new(1, 10));
     }
 
     #[test]

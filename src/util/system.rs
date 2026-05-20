@@ -113,6 +113,8 @@ pub fn get_peak_rss() -> usize {
 const RUSAGE_SELF: c_int = 0;
 #[cfg(target_os = "linux")]
 const _SC_PAGESIZE: c_int = 30;
+#[cfg(target_os = "linux")]
+const _SC_LEVEL3_CACHE_SIZE: c_int = 194;
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
@@ -252,10 +254,12 @@ pub fn unmap_file(ptr: *mut u8, size: usize, fd: i32) {
 pub fn l3_cache_size() -> usize {
     #[cfg(target_os = "linux")]
     {
-        fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index3/size")
-            .ok()
-            .and_then(|s| parse_cache_size(s.trim()))
-            .unwrap_or(0)
+        let s = unsafe { sysconf(_SC_LEVEL3_CACHE_SIZE) };
+        if s == -1 {
+            0
+        } else {
+            s as usize
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -502,19 +506,6 @@ fn narrow_utf8(w: &[u16]) -> String {
     }
 }
 
-fn parse_cache_size(s: &str) -> Option<usize> {
-    let (digits, suffix) = s
-        .trim()
-        .split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
-    let n = digits.parse::<usize>().ok()?;
-    match suffix.trim().to_ascii_uppercase().as_str() {
-        "K" | "KB" => Some(n * 1024),
-        "M" | "MB" => Some(n * 1024 * 1024),
-        "" => Some(n),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,8 +549,7 @@ mod tests {
         assert!(exists("Cargo.toml"));
         assert!(file_size("Cargo.toml") > 0);
         assert_eq!(file_size("definitely_missing"), usize::MAX);
-        assert_eq!(parse_cache_size("32K"), Some(32 * 1024));
-        assert_eq!(parse_cache_size("2M"), Some(2 * 1024 * 1024));
+        let _ = l3_cache_size();
         log_rss().unwrap();
     }
 

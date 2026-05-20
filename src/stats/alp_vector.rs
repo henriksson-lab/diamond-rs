@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::str::FromStr;
 
 use crate::stats::alp_ioutil;
@@ -198,6 +198,28 @@ where
     }
 }
 
+impl<T> fmt::Display for Vector<T>
+where
+    T: Clone + Default + Display + FromStr,
+{
+    fn fmt(&self, ostr_: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(ostr_, "{}", self.out())
+    }
+}
+
+impl<T> FromStr for Vector<T>
+where
+    T: Clone + Default + Display + FromStr,
+{
+    type Err = String;
+
+    fn from_str(istr_: &str) -> Result<Self, Self::Err> {
+        let mut vector_ = Self::new();
+        vector_.in_(istr_);
+        Ok(vector_)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +260,11 @@ mod tests {
         alp_ioutil::setFormat(alp_ioutil::Format::MACHINE);
         parsed.in_("4\n5\n6\n");
         assert_eq!(parsed.getVector(), &[4, 5, 6]);
+
+        alp_ioutil::setFormat(alp_ioutil::Format::MACHINE);
+        assert_eq!(format!("{}", v), "1\n2\n3");
+        alp_ioutil::setFormat(alp_ioutil::Format::MACHINE);
+        let parsed_from_stream: Vector<i32> = "7\n8\n9\n".parse().unwrap();
+        assert_eq!(parsed_from_stream.getVector(), &[7, 8, 9]);
     }
 }

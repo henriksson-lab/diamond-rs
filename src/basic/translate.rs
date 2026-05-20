@@ -172,9 +172,14 @@ impl TranslatedPosition {
         }
     }
 
-    pub fn translated_to_absolute(translated: i32, frame: Frame, dna_len: i32) -> i32 {
+    pub fn translated_to_absolute(
+        translated: i32,
+        frame: Frame,
+        dna_len: i32,
+        query_translated: bool,
+    ) -> i32 {
         Self::oriented_position(
-            Self::translated_to_in_strand(translated, frame, true),
+            Self::translated_to_in_strand(translated, frame, query_translated),
             frame.strand,
             dna_len,
         )
@@ -197,13 +202,39 @@ impl std::ops::Sub<i32> for TranslatedPosition {
     }
 }
 
+const GENETIC_CODES: [&str; 27] = [
+    "",
+    "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNKKSS**VVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CCWWTTTTPPPPHHQQRRRRIIMMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNKKSSSSVVVVAAAADDEEGGGG",
+    "FFLLSSSSYYQQCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "",
+    "",
+    "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNNKSSSSVVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CCCWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CC*WLLLSPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNKKSSGGVVVVAAAADDEEGGGG",
+    "FFLLSSSSYYY*CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNNKSSSSVVVVAAAADDEEGGGG",
+    "",
+    "FFLLSSSSYY*LCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "",
+    "",
+    "",
+    "",
+    "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNNKSSSSVVVVAAAADDEEGGGG",
+    "FFLLSS*SYY*LCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "FF*LSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSSKVVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CCGWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+    "FFLLSSSSYY**CC*WLLLAPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+];
+
 /// Standard genetic code (NCBI translation table 1).
 /// Maps codon triplets (4^3 = 64 entries) to amino acid letters.
 static STANDARD_GENETIC_CODE: [u8; 64] = [
-    // TTT TTC TTA TTG TCT TCC TCA TCG TAT TAC TAA TAG TGT TGC TGA TGG
-    // CTT CTC CTA CTG CCT CCC CCA CCG CAT CAC CAA CAG CGT CGC CGA CGG
-    // ATT ATC ATA ATG ACT ACC ACA ACG AAT AAC AAA AAG AGT AGC AGA AGG
-    // GTT GTC GTA GTG GCT GCC GCA GCG GAT GAC GAA GAG GGT GGC GGA GGG
     // K  N  K  N  T  T  T  T  R  S  R  S  I  I  M  I
     // Q  H  Q  H  P  P  P  P  R  R  R  R  L  L  L  L
     // E  D  E  D  A  A  A  A  G  G  G  G  V  V  V  V
@@ -218,21 +249,67 @@ static STANDARD_GENETIC_CODE: [u8; 64] = [
     24, 18, 24, 18, 15, 15, 15, 15, 24, 4, 17, 4, 10, 13, 10, 13, // T**
 ];
 
+fn aa_from_char(c: u8) -> u8 {
+    crate::basic::value::AMINO_ACID_ALPHABET
+        .iter()
+        .position(|&aa| aa == c)
+        .map(|i| i as u8)
+        .unwrap_or(23)
+}
+
+fn genetic_code_table(id: u32) -> Option<[u8; 64]> {
+    let code = GENETIC_CODES.get(id as usize).copied()?;
+    if code.is_empty() {
+        return None;
+    }
+    let bytes = code.as_bytes();
+    let idx = [2usize, 1, 3, 0];
+    let mut table = [23u8; 64];
+    for a in 0..4 {
+        for b in 0..4 {
+            for c in 0..4 {
+                table[a * 16 + b * 4 + c] = aa_from_char(bytes[idx[a] * 16 + idx[b] * 4 + idx[c]]);
+            }
+        }
+    }
+    Some(table)
+}
+
 /// Translate a DNA codon (3 nucleotide letters) to an amino acid letter.
 ///
 /// Nucleotide encoding: A=0, C=1, G=2, T=3, N=4
-/// Returns the amino acid letter, or MASK_LETTER (23) for codons with N.
+/// Returns the amino acid letter, or MASK_LETTER (23) for ambiguous codons.
 pub fn translate_codon(a: u8, b: u8, c: u8) -> u8 {
-    if a >= 4 || b >= 4 || c >= 4 {
+    translate_codon_with_table(a, b, c, &STANDARD_GENETIC_CODE)
+}
+
+fn translate_codon_with_table(a: u8, b: u8, c: u8, table: &[u8; 64]) -> u8 {
+    if a >= 4 || b >= 4 {
         return 23; // MASK_LETTER for ambiguous
     }
-    STANDARD_GENETIC_CODE[(a as usize) * 16 + (b as usize) * 4 + c as usize]
+    if c >= 4 {
+        let first = table[(a as usize) * 16 + (b as usize) * 4];
+        if (1..4).all(|k| table[(a as usize) * 16 + (b as usize) * 4 + k] == first) {
+            return first;
+        }
+        return 23;
+    }
+    table[(a as usize) * 16 + (b as usize) * 4 + c as usize]
 }
 
 /// Translate a DNA sequence into all 6 reading frames.
 ///
 /// Returns 6 amino acid sequences: frames 0-2 are forward, 3-5 are reverse.
 pub fn translate_6_frames(dna: &[u8]) -> [Vec<u8>; 6] {
+    translate_6_frames_with_genetic_code(dna, 1).expect("standard genetic code is valid")
+}
+
+pub fn translate_6_frames_with_genetic_code(
+    dna: &[u8],
+    genetic_code: u32,
+) -> Result<[Vec<u8>; 6], String> {
+    let table = genetic_code_table(genetic_code)
+        .ok_or_else(|| format!("Invalid genetic code id: {}", genetic_code))?;
     let len = dna.len();
     let mut frames = [
         Vec::new(),
@@ -258,7 +335,12 @@ pub fn translate_6_frames(dna: &[u8]) -> [Vec<u8>; 6] {
     for (offset, frame) in frames[..3].iter_mut().enumerate() {
         let mut i = offset;
         while i + 2 < len {
-            frame.push(translate_codon(dna[i], dna[i + 1], dna[i + 2]));
+            frame.push(translate_codon_with_table(
+                dna[i],
+                dna[i + 1],
+                dna[i + 2],
+                &table,
+            ));
             i += 3;
         }
     }
@@ -267,16 +349,17 @@ pub fn translate_6_frames(dna: &[u8]) -> [Vec<u8>; 6] {
     for (offset, frame) in frames[3..].iter_mut().enumerate() {
         let mut i = len as i64 - 1 - offset as i64;
         while i >= 2 {
-            frame.push(translate_codon(
+            frame.push(translate_codon_with_table(
                 complement(dna[i as usize]),
                 complement(dna[i as usize - 1]),
                 complement(dna[i as usize - 2]),
+                &table,
             ));
             i -= 3;
         }
     }
 
-    frames
+    Ok(frames)
 }
 
 #[cfg(test)]
@@ -315,8 +398,18 @@ mod tests {
 
     #[test]
     fn test_translate_codon_ambiguous() {
-        // Codons with N should give mask letter
+        // First/second-position ambiguity stays masked.
         assert_eq!(translate_codon(4, 0, 0), 23);
+        // C++ resolves third-position N when all four alternatives agree.
+        assert_eq!(translate_codon(2, 1, 4), 0); // GCN -> A
+        assert_eq!(translate_codon(0, 0, 4), 23); // AAN -> K/N
+    }
+
+    #[test]
+    fn test_translate_non_default_genetic_code() {
+        let table2 = genetic_code_table(2).unwrap();
+        assert_eq!(translate_codon_with_table(3, 2, 0, &table2), 17); // TGA -> W
+        assert!(genetic_code_table(7).is_none());
     }
 
     #[test]
@@ -390,8 +483,21 @@ mod tests {
             1
         );
         assert_eq!(
-            TranslatedPosition::translated_to_absolute(1, Frame::new(Strand::Reverse, 2), 30),
+            TranslatedPosition::translated_to_absolute(1, Frame::new(Strand::Reverse, 2), 30, true),
             24
+        );
+        assert_eq!(
+            TranslatedPosition::translated_to_absolute(
+                5,
+                Frame::new(Strand::Forward, 2),
+                30,
+                false
+            ),
+            5
+        );
+        assert_eq!(
+            TranslatedPosition::translated_to_absolute(5, Frame::new(Strand::Forward, 2), 30, true),
+            17
         );
     }
 }

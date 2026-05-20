@@ -4,6 +4,12 @@ use std::path::Path;
 use super::dmnd::{ReferenceHeader, ReferenceHeader2, CURRENT_DB_VERSION_PROT};
 use super::fasta::{self, FastaRecord};
 use crate::basic::value::SequenceType;
+use crate::masking::tantan::mask_tantan;
+use crate::util::hash::murmurhash3_x64_128;
+
+/// Total size of the two on-disk reference headers (40 + 8 size prefix + 48 data).
+/// Matches `out->tell()` after `*out << header << header2` in diamond/src/data/dmnd/dmnd.cpp.
+const HEADER_TOTAL: u64 = 40 + 8 + 48;
 
 /// Build a DIAMOND database from FASTA input files.
 ///
@@ -45,14 +51,28 @@ fn write_dmnd(
     records: &[FastaRecord],
     seq_type: SequenceType,
 ) -> io::Result<BuildStats> {
+    let total_sequences = records.len() as u64;
+
+    // Apply tantan bit-masking to each amino-acid sequence (matches C++
+    // mask_seqs(block->seqs(), Masking::get(), /*hard_mask=*/false, MaskingAlgo::SEG)
+    // in diamond/src/data/dmnd/dmnd.cpp — with hard_mask=false the worker takes
+    // the mask_bit branch which is tantan in mode 2, setting bit 7 on masked
+    // positions). For nucleotides, no masking is applied.
+    let mut masked: Vec<Vec<u8>> = Vec::with_capacity(records.len());
+    for r in records {
+        let mut seq: Vec<i8> = r.sequence.clone();
+        if seq_type == SequenceType::AminoAcid {
+            mask_tantan(&mut seq);
+        }
+        masked.push(seq.iter().map(|&l| l as u8).collect());
+    }
+
+    let total_letters: u64 = masked.iter().map(|s| s.len() as u64).sum();
+
     let file = std::fs::File::create(output_path)?;
     let mut writer = BufWriter::new(file);
 
-    // Calculate total letters
-    let total_sequences = records.len() as u64;
-    let total_letters: u64 = records.iter().map(|r| r.sequence.len() as u64).sum();
-
-    // Write header1
+    // Write header1 (final pos_array_offset patched in at end).
     let mut header = ReferenceHeader::new();
     header.sequences = total_sequences;
     header.letters = total_letters;
@@ -62,62 +82,67 @@ fn write_dmnd(
     };
     header.write_to(&mut writer)?;
 
-    // Write header2 with size prefix (matching C++ serialization format)
-    let header2 = ReferenceHeader2::new();
+    // Header2 with size prefix; hash is patched in at end.
     let h2_data_size = 48u64; // 16 hash + 4*8 offsets
-    writer.write_all(&h2_data_size.to_le_bytes())?; // size prefix
+    writer.write_all(&h2_data_size.to_le_bytes())?;
+    let header2 = ReferenceHeader2::new();
     header2.write_to(&mut writer)?;
 
-    // Write sequences
-    // Format: [0xFF][sequence_data][0xFF][id\0]
+    // Sequences. C++ stores absolute file offsets in the pos array, starting at
+    // out->tell() after the headers (= HEADER_TOTAL). Chain MurmurHash3_x64_128
+    // over (masked_seq, id) per sequence into header2.hash (dmnd.cpp:328-329).
     let mut pos_array: Vec<(u64, u32)> = Vec::with_capacity(records.len());
-    let mut current_pos = 0u64; // relative position within sequence data
+    let mut current_pos = HEADER_TOTAL;
+    let mut hash = [0u8; 16];
 
-    for record in records {
-        pos_array.push((current_pos, record.sequence.len() as u32));
-
-        writer.write_all(&[0xFF])?; // delimiter
-        current_pos += 1;
-
-        for &letter in &record.sequence {
-            writer.write_all(&[letter as u8])?;
-            current_pos += 1;
+    for (record, seq_bytes) in records.iter().zip(masked.iter()) {
+        // C++ `dmnd.cpp:313-314` throws "File format error: sequence of
+        // length 0" — accepting empty sequences here writes a SeqInfo with
+        // `seq_len == 0`, which the C++ partition logic in `dmnd.cpp:483`
+        // mistakes for the sentinel (`r_next.seq_len == 0` terminates
+        // partitioning), corrupting downstream reads of the same DB.
+        if seq_bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("File format error: sequence '{}' has length 0", record.id),
+            ));
         }
+        pos_array.push((current_pos, seq_bytes.len() as u32));
 
-        writer.write_all(&[0xFF])?; // delimiter
-        current_pos += 1;
-
-        // Write ID as null-terminated string
+        writer.write_all(&[0xFF])?;
+        writer.write_all(seq_bytes)?;
+        writer.write_all(&[0xFF])?;
         writer.write_all(record.id.as_bytes())?;
         writer.write_all(&[0])?;
-        current_pos += record.id.len() as u64 + 1;
+        current_pos += seq_bytes.len() as u64 + record.id.len() as u64 + 3;
+
+        hash = murmurhash3_x64_128(seq_bytes, &hash);
+        hash = murmurhash3_x64_128(record.id.as_bytes(), &hash);
     }
 
-    // Write position array (SeqInfo entries: pos u64 + seq_len u32 + padding u32)
+    let pos_array_offset = current_pos;
+
+    // Position array (u64 pos + u32 seq_len + u32 padding per entry).
     for &(pos, seq_len) in &pos_array {
         writer.write_all(&pos.to_le_bytes())?;
         writer.write_all(&seq_len.to_le_bytes())?;
-        writer.write_all(&0u32.to_le_bytes())?; // padding
+        writer.write_all(&0u32.to_le_bytes())?;
     }
-
-    // Write sentinel entry
+    // Sentinel: (current end-of-seqdata, 0, 0).
     writer.write_all(&current_pos.to_le_bytes())?;
     writer.write_all(&0u32.to_le_bytes())?;
     writer.write_all(&0u32.to_le_bytes())?;
 
     writer.flush()?;
-
-    // Seek back and update header with pos_array_offset
-    // Header1 is 40 bytes, header2 size prefix is 8 bytes, header2 data is 48 bytes
-    let header1_size = 40u64;
-    let header2_total = 8u64 + 48u64; // size prefix + data
-    let pos_array_offset = header1_size + header2_total + current_pos;
     drop(writer);
 
+    // Patch pos_array_offset (u64 at offset 32) and header2.hash (16 bytes at
+    // offset 40 + 8 = 48). Matches C++ which seeks to 0 and rewrites both headers.
     let mut file = std::fs::OpenOptions::new().write(true).open(output_path)?;
-    // pos_array_offset is at offset 32 in header1
     file.seek(SeekFrom::Start(32))?;
     file.write_all(&pos_array_offset.to_le_bytes())?;
+    file.seek(SeekFrom::Start(40 + 8))?;
+    file.write_all(&hash)?;
     file.flush()?;
 
     Ok(BuildStats {

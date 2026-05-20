@@ -21,7 +21,7 @@ pub struct SeedSet {
 }
 
 impl SeedSet {
-    /// Matches C++ `SeedSet::SeedSet`.
+    /// Matches C++ `SeedSet::SeedSet(seqs, max_coverage, skip, seed_cut, soft_masking, shapes, reduction)`.
     pub fn from_block(
         seqs: &mut Block,
         max_coverage: f64,
@@ -69,12 +69,12 @@ impl SeedSet {
         })
     }
 
-    /// Matches C++ `SeedSet::contains`.
+    /// Matches C++ `SeedSet::contains(key, shape)`.
     pub fn contains(&self, key: u64, _shape: u64) -> bool {
         self.data[key as usize]
     }
 
-    /// Matches C++ `SeedSet::coverage`.
+    /// Matches C++ `SeedSet::coverage()`.
     pub fn coverage(&self) -> f64 {
         self.coverage
     }
@@ -86,7 +86,7 @@ pub struct HashedSeedSet {
 }
 
 impl HashedSeedSet {
-    /// Matches C++ `HashedSeedSet::HashedSeedSet(Block&, ...)`.
+    /// Matches C++ `HashedSeedSet::HashedSeedSet(seqs, skip, seed_cut, soft_masking, shapes, reduction)`.
     pub fn from_block(
         seqs: &mut Block,
         skip: Option<&Vec<bool>>,
@@ -139,7 +139,7 @@ impl HashedSeedSet {
         })
     }
 
-    /// Matches C++ `HashedSeedSet::HashedSeedSet(const string&)`.
+    /// Matches C++ `HashedSeedSet::HashedSeedSet(index_file, shapes)`.
     pub fn from_index_file<P: AsRef<std::path::Path>>(
         index_file: P,
         shapes: &ShapeConfig,
@@ -148,7 +148,7 @@ impl HashedSeedSet {
         Self::from_index_bytes(&bytes, shapes)
     }
 
-    /// Matches C++ `HashedSeedSet::HashedSeedSet(const string&)` after mmap.
+    /// Matches C++ `HashedSeedSet::HashedSeedSet(buf, shapes)`.
     pub fn from_index_bytes(buf: &[u8], shapes: &ShapeConfig) -> Result<Self, String> {
         if buf.len() < SEED_INDEX_HEADER_SIZE {
             return Err("Invalid seed index file.".to_string());
@@ -193,17 +193,17 @@ impl HashedSeedSet {
         Ok(Self { data })
     }
 
-    /// Matches C++ `HashedSeedSet::contains`.
+    /// Matches C++ `HashedSeedSet::contains(key, shape)`.
     pub fn contains(&self, key: u64, shape: u64) -> bool {
         self.data[shape as usize].contains(key)
     }
 
-    /// Matches C++ `HashedSeedSet::table`.
+    /// Matches C++ `HashedSeedSet::table(i)`.
     pub fn table(&self, i: usize) -> &Table {
         &self.data[i]
     }
 
-    /// Matches C++ `HashedSeedSet::max_table_size`.
+    /// Matches C++ `HashedSeedSet::max_table_size()`.
     pub fn max_table_size(&self) -> usize {
         self.data.iter().map(Table::size).max().unwrap()
     }

@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use std::fmt;
 use std::sync::Mutex;
 
 use crate::stats::alp_function;
@@ -348,6 +349,12 @@ impl LocalMaxStat {
     }
 }
 
+impl fmt::Display for LocalMaxStat {
+    fn fmt(&self, ostr_: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(ostr_, "{}", self.out())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +365,8 @@ mod tests {
     fn test_local_max_stat_empty_and_full_copy() {
         let mut stat = LocalMaxStat::new(0, None, None);
         assert!(!stat.bool_());
+        assert_eq!(stat.out(), "");
+        assert_eq!(format!("{}", stat), "");
         stat.copy_full(
             2,
             &[-1, 2],

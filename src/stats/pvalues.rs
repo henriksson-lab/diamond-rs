@@ -1,4 +1,6 @@
 use std::f64::consts::PI;
+use std::fmt;
+use std::str::FromStr;
 
 use crate::stats::sls_alp_data::alp_data;
 use crate::stats::sls_alp_regression::alp_reg;
@@ -131,6 +133,364 @@ impl Default for ALP_set_of_parameters {
             vj_y_thr: 0.0,
             c_y_thr: 0.0,
         }
+    }
+}
+
+impl fmt::Display for ALP_set_of_parameters {
+    fn fmt(&self, s_: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            s_,
+            "Lambda\tLambda error\tK\tK error\tC\tC error\ta\ta error\ta_1\ta_1 error\ta_2\ta_2 error\tsigma\tsigma error\talpha\talpha error\talpha_1\talpha_1 error\talpha_2\talpha_2 error\tGapless a\tGapless a error\tGapless alpha\tGapless alpha error\tG\tCalculation time\tArrays for error calculation"
+        )?;
+        write!(
+            s_,
+            "{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{:.17}\t{}\t{:.17}\t",
+            self.lambda,
+            self.lambda_error,
+            self.K,
+            self.K_error,
+            self.C,
+            self.C_error,
+            self.a,
+            self.a_error,
+            self.a_J,
+            self.a_J_error,
+            self.a_I,
+            self.a_I_error,
+            self.sigma,
+            self.sigma_error,
+            self.alpha,
+            self.alpha_error,
+            self.alpha_J,
+            self.alpha_J_error,
+            self.alpha_I,
+            self.alpha_I_error,
+            self.gapless_a,
+            self.gapless_a_error,
+            self.gapless_alpha,
+            self.gapless_alpha_error,
+            self.G,
+            self.m_CalcTime
+        )?;
+
+        write!(s_, "{}\t", self.m_LambdaSbs.len())?;
+        for value in &self.m_LambdaSbs {
+            write!(s_, "{:.17}\t", value)?;
+        }
+        write!(s_, "{}\t", self.m_KSbs.len())?;
+        for value in &self.m_KSbs {
+            write!(s_, "{:.17}\t", value)?;
+        }
+        write!(s_, "{}\t", self.m_CSbs.len())?;
+        for value in &self.m_CSbs {
+            write!(s_, "{:.17}\t", value)?;
+        }
+        write!(s_, "{}\t", self.m_AJSbs.len())?;
+        for value in &self.m_AJSbs {
+            write!(s_, "{:.17}\t", value)?;
+        }
+        write!(s_, "{}\t", self.m_AISbs.len())?;
+        for value in &self.m_AISbs {
+            write!(s_, "{:.17}\t", value)?;
+        }
+        write!(s_, "{}\t", self.m_SigmaSbs.len())?;
+        for value in &self.m_SigmaSbs {
+            write!(s_, "{:.17}\t", value)?;
+        }
+        write!(s_, "{}\t", self.m_AlphaJSbs.len())?;
+        for value in &self.m_AlphaJSbs {
+            write!(s_, "{:.17}\t", value)?;
+        }
+        write!(s_, "{}\t", self.m_AlphaISbs.len())?;
+        for value in &self.m_AlphaISbs {
+            write!(s_, "{:.17}\t", value)?;
+        }
+
+        writeln!(s_)
+    }
+}
+
+impl FromStr for ALP_set_of_parameters {
+    type Err = Error;
+
+    fn from_str(s_: &str) -> Result<Self, Self::Err> {
+        let mut gumbel_params_ = Self::default();
+        gumbel_params_.d_params_flag = false;
+
+        let mut lines = s_.lines();
+        lines.next();
+        let rest = lines.collect::<Vec<_>>().join(" ");
+        let mut iter = rest.split_whitespace();
+
+        gumbel_params_.lambda = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.lambda_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.K = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.K_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.C = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.C_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.a = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.a_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.a_J = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.a_J_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.a_I = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.a_I_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.sigma = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.sigma_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.alpha = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.alpha_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.alpha_J = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.alpha_J_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.alpha_I = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.alpha_I_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.gapless_a = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.gapless_a_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.gapless_alpha = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.gapless_alpha_error = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.G = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        gumbel_params_.m_CalcTime = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+
+        let tmp_size: i64 = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        if tmp_size <= 0 {
+            return Err(Error::new("Error in the input parameters\n".to_string(), 4));
+        }
+        gumbel_params_.m_LambdaSbs.resize(tmp_size as usize, 0.0);
+        for i in 0..tmp_size as usize {
+            gumbel_params_.m_LambdaSbs[i] = iter
+                .next()
+                .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+                .parse()
+                .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        }
+
+        let tmp_size: i64 = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        if tmp_size <= 0 {
+            return Err(Error::new("Error in the input parameters\n".to_string(), 4));
+        }
+        gumbel_params_.m_KSbs.resize(tmp_size as usize, 0.0);
+        for i in 0..tmp_size as usize {
+            gumbel_params_.m_KSbs[i] = iter
+                .next()
+                .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+                .parse()
+                .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        }
+
+        let tmp_size: i64 = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        if tmp_size <= 0 {
+            return Err(Error::new("Error in the input parameters\n".to_string(), 4));
+        }
+        gumbel_params_.m_CSbs.resize(tmp_size as usize, 0.0);
+        for i in 0..tmp_size as usize {
+            gumbel_params_.m_CSbs[i] = iter
+                .next()
+                .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+                .parse()
+                .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        }
+
+        let tmp_size: i64 = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        if tmp_size <= 0 {
+            return Err(Error::new("Error in the input parameters\n".to_string(), 4));
+        }
+        gumbel_params_.m_AJSbs.resize(tmp_size as usize, 0.0);
+        for i in 0..tmp_size as usize {
+            gumbel_params_.m_AJSbs[i] = iter
+                .next()
+                .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+                .parse()
+                .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        }
+
+        let tmp_size: i64 = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        if tmp_size <= 0 {
+            return Err(Error::new("Error in the input parameters\n".to_string(), 4));
+        }
+        gumbel_params_.m_AISbs.resize(tmp_size as usize, 0.0);
+        for i in 0..tmp_size as usize {
+            gumbel_params_.m_AISbs[i] = iter
+                .next()
+                .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+                .parse()
+                .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        }
+
+        let tmp_size: i64 = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        if tmp_size <= 0 {
+            return Err(Error::new("Error in the input parameters\n".to_string(), 4));
+        }
+        gumbel_params_.m_SigmaSbs.resize(tmp_size as usize, 0.0);
+        for i in 0..tmp_size as usize {
+            gumbel_params_.m_SigmaSbs[i] = iter
+                .next()
+                .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+                .parse()
+                .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        }
+
+        let tmp_size: i64 = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        if tmp_size <= 0 {
+            return Err(Error::new("Error in the input parameters\n".to_string(), 4));
+        }
+        gumbel_params_.m_AlphaJSbs.resize(tmp_size as usize, 0.0);
+        for i in 0..tmp_size as usize {
+            gumbel_params_.m_AlphaJSbs[i] = iter
+                .next()
+                .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+                .parse()
+                .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        }
+
+        let tmp_size: i64 = iter
+            .next()
+            .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+            .parse()
+            .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        if tmp_size <= 0 {
+            return Err(Error::new("Error in the input parameters\n".to_string(), 4));
+        }
+        gumbel_params_.m_AlphaISbs.resize(tmp_size as usize, 0.0);
+        for i in 0..tmp_size as usize {
+            gumbel_params_.m_AlphaISbs[i] = iter
+                .next()
+                .ok_or_else(|| Error::new("Error in the input parameters\n".to_string(), 4))?
+                .parse()
+                .map_err(|_| Error::new("Error in the input parameters\n".to_string(), 4))?;
+        }
+
+        gumbel_params_.d_params_flag = true;
+        Ok(gumbel_params_)
     }
 }
 
@@ -879,50 +1239,116 @@ pub struct AreaParams {
     pub beta_j: f64,
     pub sigma: f64,
     pub tau: f64,
+    /// `max(NAT_CUT_OFF_IN_MAX * alpha_i / lambda, 0)` —
+    /// matches sls_pvalues.cpp:353 `compute_tmp_values`.
+    pub vi_y_thr: f64,
+    pub vj_y_thr: f64,
+    pub c_y_thr: f64,
 }
 
 /// Compute the effective search area using the ALP finite-size correction.
 ///
 /// This implements the `get_appr_tail_prob_with_cov_without_errors` function
 /// from the ALP library.
-pub fn compute_area(p: &AreaParams, score: f64, query_len: f64, subject_len: f64) -> f64 {
+/// Numerically stable log(exp(a) + exp(b)) — matches sls_pvalues.cpp:548 `log_sum`.
+fn log_sum(a: f64, b: f64) -> f64 {
+    let (hi, lo) = if a < b { (b, a) } else { (a, b) };
+    hi + (1.0 + (lo - hi).exp()).ln()
+}
+
+/// Numerically stable log(exp(a) - exp(b)), requires a ≥ b — matches `log_diff`.
+fn log_diff(a: f64, b: f64) -> f64 {
+    a + (1.0 - (b - a).exp()).ln()
+}
+
+/// Log-space ALP area computation — direct port of sls_pvalues.cpp `pvalues::log_area`
+/// (lines 560-703). Computes `log(area)` where `area` is the effective search-space
+/// correction. Working in log-space avoids catastrophic cancellation when erfc(F)
+/// is near 0 (large query/subject; e-value far below 1).
+pub fn compute_log_area(p: &AreaParams, score: f64, query_len: f64, subject_len: f64) -> f64 {
     let const_val = 1.0 / (2.0 * PI).sqrt();
-
-    // Query length correction
     let m_li_y = query_len - (p.a_i * score + p.b_i);
-    let vi_y = (p.alpha_i * score + p.beta_i).max(0.0);
+    let vi_y = p.vi_y_thr.max(p.alpha_i * score + p.beta_i);
     let sqrt_vi_y = vi_y.sqrt();
-
     let m_f = if sqrt_vi_y == 0.0 {
         1e100
     } else {
         m_li_y / sqrt_vi_y
     };
 
-    let p_m_f = normal_cdf(m_f);
-    let e_m_f = -const_val * (-0.5 * m_f * m_f).exp();
-    let p1 = m_li_y * p_m_f - sqrt_vi_y * e_m_f;
+    // log_P_m_F = log(0.5) + log(erfc(-sqrt(0.5) * m_F))
+    let log_p_m_f = -std::f64::consts::LN_2
+        + crate::util::log_erfc::log_erfc(-std::f64::consts::FRAC_1_SQRT_2 * m_f);
+    // log(-E_m_F) = log(const_val) - 0.5 * m_F^2  (E_m_F is negative, so log of its negation)
+    let log_minus_e_m_f = const_val.ln() + (-0.5 * m_f * m_f);
+    let log_minus_sqrt_vi_y_e_m_f = sqrt_vi_y.ln() + log_minus_e_m_f;
 
-    // Subject length correction
+    let log_p1 = if m_li_y < 0.0 {
+        let log_minus_m_li_y_p_m_f = (-m_li_y).ln() + log_p_m_f;
+        log_diff(log_minus_sqrt_vi_y_e_m_f, log_minus_m_li_y_p_m_f)
+    } else {
+        let log_m_li_y_p_m_f = m_li_y.ln() + log_p_m_f;
+        log_sum(log_minus_sqrt_vi_y_e_m_f, log_m_li_y_p_m_f)
+    };
+
     let n_lj_y = subject_len - (p.a_j * score + p.b_j);
-    let vj_y = (p.alpha_j * score + p.beta_j).max(0.0);
+    let vj_y = p.vj_y_thr.max(p.alpha_j * score + p.beta_j);
     let sqrt_vj_y = vj_y.sqrt();
-
     let n_f = if sqrt_vj_y == 0.0 {
         1e100
     } else {
         n_lj_y / sqrt_vj_y
     };
 
-    let p_n_f = normal_cdf(n_f);
-    let e_n_f = -const_val * (-0.5 * n_f * n_f).exp();
+    let log_p_n_f = -std::f64::consts::LN_2
+        + crate::util::log_erfc::log_erfc(-std::f64::consts::FRAC_1_SQRT_2 * n_f);
+    let log_minus_e_n_f = const_val.ln() + (-0.5 * n_f * n_f);
+    let log_minus_sqrt_vj_y_e_n_f = sqrt_vj_y.ln() + log_minus_e_n_f;
+
+    let log_p2 = if n_lj_y < 0.0 {
+        let log_minus_n_lj_y_p_n_f = (-n_lj_y).ln() + log_p_n_f;
+        log_diff(log_minus_sqrt_vj_y_e_n_f, log_minus_n_lj_y_p_n_f)
+    } else {
+        let log_n_lj_y_p_n_f = n_lj_y.ln() + log_p_n_f;
+        log_sum(log_minus_sqrt_vj_y_e_n_f, log_n_lj_y_p_n_f)
+    };
+
+    let log_c_y = p.c_y_thr.max(p.sigma * score + p.tau).ln();
+    let log_p_m_f_p_n_f = log_p_m_f + log_p_n_f;
+    let log_c_y_p_m_f_p_n_f = log_c_y + log_p_m_f_p_n_f;
+    let log_p1_p2 = log_p1 + log_p2;
+
+    log_sum(log_p1_p2, log_c_y_p_m_f_p_n_f)
+}
+
+/// Public wrapper kept for tests/callers that want the linear-space area.
+pub fn compute_area(p: &AreaParams, score: f64, query_len: f64, subject_len: f64) -> f64 {
+    let m_li_y = query_len - (p.a_i * score + p.b_i);
+    let vi_y = p.vi_y_thr.max(p.alpha_i * score + p.beta_i);
+    let sqrt_vi_y = vi_y.sqrt();
+    let m_f = if sqrt_vi_y == 0.0 {
+        1e100
+    } else {
+        m_li_y / sqrt_vi_y
+    };
+    let p_m_f = normal_probability(m_f);
+    let e_m_f = -CONST_VAL * (-0.5 * m_f * m_f).exp();
+    let p1 = m_li_y * p_m_f - sqrt_vi_y * e_m_f;
+
+    let n_lj_y = subject_len - (p.a_j * score + p.b_j);
+    let vj_y = p.vj_y_thr.max(p.alpha_j * score + p.beta_j);
+    let sqrt_vj_y = vj_y.sqrt();
+    let n_f = if sqrt_vj_y == 0.0 {
+        1e100
+    } else {
+        n_lj_y / sqrt_vj_y
+    };
+    let p_n_f = normal_probability(n_f);
+    let e_n_f = -CONST_VAL * (-0.5 * n_f * n_f).exp();
     let p2 = n_lj_y * p_n_f - sqrt_vj_y * e_n_f;
 
-    // Covariance correction
-    let c_y = (p.sigma * score + p.tau).max(0.0);
-
-    let area = p1 * p2 + c_y * p_m_f * p_n_f;
-    area.max(0.0)
+    let c_y = p.c_y_thr.max(p.sigma * score + p.tau);
+    p1 * p2 + c_y * p_m_f * p_n_f
 }
 
 /// Compute E-value using the full ALP area computation.
@@ -934,84 +1360,52 @@ pub fn evalue_with_area(
     query_len: f64,
     subject_len: f64,
 ) -> f64 {
-    let area = compute_area(params, score, query_len, subject_len);
-    area * k * (-lambda * score).exp()
-}
-
-/// Standard normal CDF.
-fn normal_cdf(x: f64) -> f64 {
-    0.5 * erfc(-x / std::f64::consts::SQRT_2)
-}
-
-/// Complementary error function (Abramowitz & Stegun approximation).
-fn erfc(x: f64) -> f64 {
-    if x >= 0.0 {
-        erfc_positive(x)
-    } else {
-        2.0 - erfc_positive(-x)
-    }
-}
-
-fn erfc_positive(x: f64) -> f64 {
-    let t = 1.0 / (1.0 + 0.3275911 * x);
-    let poly = t
-        * (0.254829592
-            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-    poly * (-x * x).exp()
+    compute_area(params, score, query_len, subject_len) * k * (-lambda * score).exp()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_normal_cdf() {
-        assert!((normal_cdf(0.0) - 0.5).abs() < 0.001);
-        assert!(normal_cdf(3.0) > 0.99);
-        assert!(normal_cdf(-3.0) < 0.01);
-    }
-
-    #[test]
-    fn test_erfc() {
-        assert!((erfc(0.0) - 1.0).abs() < 0.001);
-        assert!(erfc(3.0) < 0.001);
+    fn area_params_for(alpha_v: f64, sigma: f64, lambda: f64) -> AreaParams {
+        let a = 1.9 / lambda;
+        let nat = NAT_CUT_OFF_IN_MAX;
+        AreaParams {
+            a_i: a,
+            b_i: 0.0,
+            alpha_i: alpha_v,
+            beta_i: 0.0,
+            a_j: a,
+            b_j: 0.0,
+            alpha_j: alpha_v,
+            beta_j: 0.0,
+            sigma,
+            tau: 0.0,
+            vi_y_thr: (nat * alpha_v / lambda).max(0.0),
+            vj_y_thr: (nat * alpha_v / lambda).max(0.0),
+            c_y_thr: (nat * sigma / lambda).max(0.0),
+        }
     }
 
     #[test]
     fn test_compute_area_basic() {
-        let a = 1.9 / 0.267;
-        let params = AreaParams {
-            a_i: a,
-            b_i: 0.0,
-            alpha_i: 1.9,
-            beta_i: 0.0,
-            a_j: a,
-            b_j: 0.0,
-            alpha_j: 1.9,
-            beta_j: 0.0,
-            sigma: 43.0,
-            tau: 0.0,
-        };
+        let params = area_params_for(1.9, 43.0, 0.267);
         let area = compute_area(&params, 20.0, 1000.0, 10000.0);
         assert!(area > 0.0, "Area for low score on large seqs: {}", area);
     }
 
     #[test]
     fn test_evalue_high_score() {
-        let params = AreaParams {
-            a_i: 1.9,
-            b_i: 0.0,
-            alpha_i: 1.9,
-            beta_i: 0.0,
-            a_j: 1.9,
-            b_j: 0.0,
-            alpha_j: 1.9,
-            beta_j: 0.0,
-            sigma: 43.0,
-            tau: 0.0,
-        };
+        let params = area_params_for(1.9, 43.0, 0.267);
         let e = evalue_with_area(0.267, 0.041, &params, 2328.0, 426.0, 426.0);
-        assert!(e < 1e-200, "E-value for extreme score: {}", e);
+        assert_eq!(e, 0.0, "Extreme finite score should underflow to zero");
+    }
+
+    #[test]
+    fn test_evalue_nonfinite_tail_propagates_nan() {
+        let params = area_params_for(1.9, 43.0, 0.267);
+        let e = evalue_with_area(0.267, 0.041, &params, f64::INFINITY, 426.0, 426.0);
+        assert!(e.is_nan(), "Non-finite tail should not be clamped: {}", e);
     }
 
     fn original_params() -> ALP_set_of_parameters {
@@ -1065,6 +1459,36 @@ mod tests {
         assert!((par.m_BJSbs[1] - 17.6).abs() < 1e-12);
         assert_eq!(par.m_TauSbs, vec![-814.0, -858.0]);
         assert!((par.vi_y_thr - 12.734082397003745).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_original_gumbel_parameter_stream_roundtrip() {
+        let mut par = original_params();
+        par.m_CalcTime = 12.5;
+
+        let text = par.to_string();
+        assert!(text.starts_with("Lambda\tLambda error\tK\tK error"));
+        let parsed: ALP_set_of_parameters = text.parse().unwrap();
+
+        assert!(parsed.d_params_flag);
+        assert_eq!(parsed.lambda, par.lambda);
+        assert_eq!(parsed.K, par.K);
+        assert_eq!(parsed.G, par.G);
+        assert_eq!(parsed.m_LambdaSbs, par.m_LambdaSbs);
+        assert_eq!(parsed.m_KSbs, par.m_KSbs);
+        assert_eq!(parsed.m_CSbs, par.m_CSbs);
+        assert_eq!(parsed.m_AJSbs, par.m_AJSbs);
+        assert_eq!(parsed.m_AISbs, par.m_AISbs);
+        assert_eq!(parsed.m_SigmaSbs, par.m_SigmaSbs);
+        assert_eq!(parsed.m_AlphaJSbs, par.m_AlphaJSbs);
+        assert_eq!(parsed.m_AlphaISbs, par.m_AlphaISbs);
+        assert!(parsed.m_BISbs.is_empty());
+        assert!(parsed.m_TauSbs.is_empty());
+
+        let err = "header\n1 2 3"
+            .parse::<ALP_set_of_parameters>()
+            .unwrap_err();
+        assert_eq!(err.st, "Error in the input parameters\n");
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub enum ExtensionMode {
 }
 
 impl ExtensionMode {
-    /// Matches C++ `EnumTraits<Extension::Mode>::from_string`.
+    /// Matches C++ `EnumTraits<Extension::Mode>::from_string(const string&)`.
     pub fn from_string(s: &str) -> Result<Self, String> {
         match s {
             "banded-fast" => Ok(Self::BandedFast),
@@ -38,7 +38,7 @@ impl ExtensionMode {
     }
 }
 
-/// Matches C++ `Extension::default_ext_mode`.
+/// Matches C++ `Extension::default_ext_mode(Sensitivity)`.
 pub fn default_ext_mode(sens: Sensitivity) -> ExtensionMode {
     match sens {
         Sensitivity::Faster
@@ -624,12 +624,12 @@ pub fn get_shape_codes(sens: Sensitivity) -> &'static [&'static str] {
     }
 }
 
-/// Matches C++ `approx_id_to_hamming_id`.
+/// Matches C++ `approx_id_to_hamming_id()`.
 pub fn approx_id_to_hamming_id() -> &'static [(f64, u32)] {
     &[(50.0, 20), (90.0, 30)]
 }
 
-/// Matches C++ `hamming_id_cutoff`.
+/// Matches C++ `hamming_id_cutoff(double)`.
 pub fn hamming_id_cutoff(approx_id: f64) -> u32 {
     let mut cutoff = 0;
     for &(threshold, value) in approx_id_to_hamming_id() {
@@ -641,7 +641,7 @@ pub fn hamming_id_cutoff(approx_id: f64) -> u32 {
     cutoff
 }
 
-/// Matches C++ `iterated_sens`.
+/// Matches C++ `iterated_sens(Sensitivity)`.
 pub fn iterated_sens(sens: Sensitivity) -> &'static [Round] {
     match sens {
         Sensitivity::Faster => ITERATED_FASTER,
@@ -658,7 +658,7 @@ pub fn iterated_sens(sens: Sensitivity) -> &'static [Round] {
     }
 }
 
-/// Matches C++ `Search::soft_masking_algo`.
+/// Matches C++ `Search::soft_masking_algo(...)`.
 pub fn soft_masking_algo(
     traits: &SensitivityTraits,
     motif_masking: &str,
@@ -684,7 +684,7 @@ pub fn soft_masking_algo(
     }
 }
 
-/// Matches C++ `Search::setup_search`.
+/// Matches C++ `Search::setup_search(...)`.
 pub fn setup_search(
     sens: Sensitivity,
     input: &SetupSearchInput,
@@ -821,7 +821,7 @@ pub fn setup_search(
     })
 }
 
-/// Matches C++ `Search::seedp_bits`.
+/// Matches C++ `Search::seedp_bits(int, int, int, const Reduction&)`.
 pub fn seedp_bits(
     shape_weight: i32,
     threads: i32,
@@ -835,7 +835,7 @@ pub fn seedp_bits(
     by_seed_space.max(by_threads).max(10)
 }
 
-/// Matches C++ `Search::use_single_indexed`.
+/// Matches C++ `Search::use_single_indexed(double, size_t, size_t, Sensitivity)`.
 pub fn use_single_indexed(
     coverage: f64,
     query_letters: usize,

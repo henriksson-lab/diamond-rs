@@ -53,6 +53,12 @@ impl PartialEq for PackedUint40 {
         self.high == rhs.high && self.low == rhs.low
     }
 
+    // NOTE: this `ne` is intentionally *not* `!self.eq(rhs)`. It mirrors the
+    // C++ bug in `diamond/src/basic/packed_loc.h:61` which writes
+    // `high != rhs.high && low != rhs.low` — so for `(1, 100)` vs `(2, 100)`
+    // BOTH `==` and `!=` return false. We keep the buggy semantics so any
+    // C++ code path relying on it gives the same answer in Rust.
+    #[allow(clippy::partialeq_ne_impl)]
     fn ne(&self, rhs: &Self) -> bool {
         self.high != rhs.high && self.low != rhs.low
     }

@@ -167,7 +167,7 @@ impl<SeedLoc: SeedLocation> SeedArray<SeedLoc> {
         }
 
         let mut data = vec![SeedArrayEntry::default(); *begin.last().unwrap() as usize];
-        let mut iterators = build_iterators::<SeedLoc>(&begin, hst, range);
+        let mut iterators = build_iterators(&begin, hst, range);
         let partition = enum_cfg
             .partition
             .ok_or_else(|| "EnumCfg::partition is required.".to_string())?;
@@ -348,7 +348,7 @@ impl<SeedLoc: SeedLocation> BufferedWriter<SeedLoc> {
     }
 }
 
-fn build_iterators<SeedLoc: SeedLocation>(
+fn build_iterators(
     begin: &[i64],
     hst: &ShapeHistogram,
     range: &SeedPartitionRange,

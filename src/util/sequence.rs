@@ -3,6 +3,7 @@ use crate::basic::value::{
     letter_mask, Letter, Loc, Score, ValueTraits, AMINO_ACID_COUNT, MASK_LETTER, STOP_LETTER,
     TRUE_AA,
 };
+use crate::util::string::{StringDelimiters, Tokenizer};
 use crate::util::text_buffer::{find_first_of, TextBuffer};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -98,7 +99,18 @@ pub fn get_accession(title: &str, stat: &mut AccessionParsing) -> String {
         if t.starts_with("gi|") {
             let erase_to = t[i + 1..].find('|').map(|j| i + 1 + j + 1).unwrap_or(0);
             t.drain(..erase_to);
-            i = t.find('|').unwrap_or(t.len());
+            // C++ `sequence.cpp:87-91` uses `string::npos` so `t.erase(0,
+            // npos + 1)` becomes a no-op when no further pipe exists.
+            // Mirror that here — drain only when a pipe is actually found,
+            // otherwise we'd `drain(..t.len() + 1)` and panic on inputs
+            // like `gi|123|` where the gi-erase consumed every byte.
+            i = match t.find('|') {
+                Some(idx) => idx,
+                None => {
+                    stat.gi_prefix += 1;
+                    return t;
+                }
+            };
             stat.gi_prefix += 1;
         }
         t.drain(..i + 1);
@@ -121,32 +133,30 @@ pub fn accession_from_title(
     stat: &mut AccessionParsing,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    for token in title.split('\u{0001}') {
-        for part in token.split(" >") {
-            if part.is_empty() {
-                continue;
-            }
-            let id = seqid(part);
-            out.push(if parse_seqids {
-                get_accession(&id, stat)
-            } else {
-                id
-            });
-        }
+    let mut tok = Tokenizer::new(title, StringDelimiters::new(&FASTA_HEADER_SEP));
+    while tok.good() {
+        let s = tok.read_string().map_err(|e| e.to_string()).unwrap();
+        let id = seqid(&s);
+        out.push(if parse_seqids {
+            get_accession(&id, stat)
+        } else {
+            id
+        });
     }
     out
 }
 
 pub fn all_seqids(s: &str) -> String {
-    let mut out = Vec::new();
-    for token in s.split('\u{0001}') {
-        for part in token.split(" >") {
-            if !part.is_empty() {
-                out.push(seqid(part));
-            }
+    let mut out = String::new();
+    let mut tok = Tokenizer::new(s, StringDelimiters::new(&FASTA_HEADER_SEP));
+    while tok.good() {
+        if tok.ptr() != Some(0) {
+            out.push('\u{0001}');
         }
+        let t = tok.read_string().map_err(|e| e.to_string()).unwrap();
+        out.push_str(&seqid(&t));
     }
-    out.join("\u{0001}")
+    out
 }
 
 pub fn fix_title(s: &mut String) -> Option<&'static str> {
@@ -318,6 +328,7 @@ mod tests {
             all_seqids("a desc\u{0001}b more >c tail"),
             "a\u{0001}b\u{0001}c"
         );
+        assert_eq!(all_seqids("a >b\u{0001}c"), "a\u{0001}c");
     }
 
     #[test]
@@ -343,6 +354,10 @@ mod tests {
         assert_eq!(
             accession_from_title("sp|Q1|x text", false, &mut s),
             vec!["sp|Q1|x".to_string()]
+        );
+        assert_eq!(
+            accession_from_title("a >b\u{0001}c", false, &mut s),
+            vec!["a".to_string(), "c".to_string()]
         );
     }
 

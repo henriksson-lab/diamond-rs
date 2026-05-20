@@ -44,7 +44,7 @@ pub fn write_paf_record<W: Write>(writer: &mut W, r: &PafRecord<'_>) -> io::Resu
     )
 }
 
-/// Matches C++ PAFFormat::print_match(const HspContext&).
+/// Matches C++ `PAFFormat::print_match(const HspContext&)`.
 pub fn print_match_context<W: Write>(
     writer: &mut W,
     r: &HspContext,
@@ -83,7 +83,7 @@ pub fn print_match_context<W: Write>(
     writeln!(writer)
 }
 
-/// Matches C++ PAFFormat::print_query_intro().
+/// Matches C++ `PAFFormat::print_query_intro()`.
 pub fn print_query_intro<W: Write>(
     writer: &mut W,
     query_title: &str,

@@ -18,7 +18,7 @@ use crate::stats::score_matrix::ScoreMatrix;
 
 /// Banded Smith-Waterman with CBS corrections and traceback.
 ///
-/// Matches C++ banded_swipe.h scalar path:
+/// Matches C++ `banded_swipe(...)`.
 /// - Band around the seed diagonal prevents spurious gaps
 /// - CBS int8 corrections added per query position
 /// - Soft-masked query positions (bit 7 set) score 0 (matching SIMD zeroing)
@@ -68,10 +68,11 @@ pub fn banded_sw_cbs(
             let query_pos = i - 1;
             let subject_pos = j - 1;
 
-            // Match score: zero if query is soft-masked (matches C++ SIMD zeroing)
+            // Match score: C++ `Sequence::operator[]` strips query soft masks
+            // before scoring, while a masked subject/profile lane scores zero.
             let ql = query[query_pos];
             let sl = subject[subject_pos];
-            let match_score = if ql & SEED_MASK != 0 {
+            let match_score = if (sl & SEED_MASK) != 0 {
                 0
             } else {
                 score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
@@ -86,7 +87,11 @@ pub fn banded_sw_cbs(
 
             h[e_idx] = s;
 
-            if s > best_score {
+            // Best-cell tie-breaking: within a column, the LATEST tied row wins
+            // (C++ `VectorRowCounter::inc` overwrites `i_max` on equality);
+            // between columns, the earliest tied column wins (strict `>` on
+            // the column-max). See the matching comment in `swipe.rs`.
+            if s > best_score || (s == best_score && j == best_j) {
                 best_score = s;
                 best_i = i;
                 best_j = j;
@@ -116,46 +121,25 @@ pub fn banded_sw_cbs(
         let score = h[idx(i, j)];
         let ql = query[i - 1];
         let sl = subject[j - 1];
-        let match_score = if ql & SEED_MASK != 0 {
+        // BUGFIX: must mirror the SW loop's masking condition exactly,
+        // otherwise traceback recomputes a different `diag_score` from the
+        // forward pass and the `score == diag_score` branch silently misses.
+        // The fallback `else { break; }` then truncates the alignment to a
+        // tiny prefix while `score` still reflects the full-length SW max —
+        // producing tabular rows like length=62 / score=5438.
+        let match_score = if (sl & SEED_MASK) != 0 {
             0
         } else {
             score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
         };
         let diag_score = h[idx(i - 1, j - 1)] + match_score + query_cbs[i - 1] as i32;
 
-        if score == diag_score {
-            // Diagonal move (match/substitution)
-            if (ql & LETTER_MASK) == (sl & LETTER_MASK) {
-                ops.push((EditOperation::Match, 1));
-                result.identities += 1;
-            } else {
-                ops.push((EditOperation::Substitution, 1));
-                result.mismatches += 1;
-            }
-            result.length += 1;
-            i -= 1;
-            j -= 1;
-        } else if score == e[idx(i, j)] {
-            // Gap in the query; consumes subject letters.
-            let mut gap_len = 0i32;
-            loop {
-                gap_len += 1;
-                let current = e[idx(i, j)];
-                if current == h[idx(i, j - 1)] - gap_open {
-                    j -= 1;
-                    break;
-                }
-                j -= 1;
-                if j == 0 || current != e[idx(i, j)] - gap_extend {
-                    break;
-                }
-            }
-            ops.push((EditOperation::Deletion, gap_len));
-            result.gap_openings += 1;
-            result.gaps += gap_len;
-            result.length += gap_len;
-        } else {
-            // Gap in the subject; consumes query letters.
+        // Match C++ swipe trace_mask priority: vgap > hgap > diag on ties
+        // (cmp_mask uses == so the gap bit is set whenever current_cell equals
+        // either gap value). f[] = vertical gap (insertion in subject);
+        // e[] = horizontal gap (deletion in query).
+        if score == f[idx(i, j)] {
+            // Vertical gap: insertion in query, consumes query letters.
             let mut gap_len = 0i32;
             loop {
                 gap_len += 1;
@@ -173,6 +157,39 @@ pub fn banded_sw_cbs(
             result.gap_openings += 1;
             result.gaps += gap_len;
             result.length += gap_len;
+        } else if score == e[idx(i, j)] {
+            // Horizontal gap: deletion in query, consumes subject letters.
+            let mut gap_len = 0i32;
+            loop {
+                gap_len += 1;
+                let current = e[idx(i, j)];
+                if current == h[idx(i, j - 1)] - gap_open {
+                    j -= 1;
+                    break;
+                }
+                j -= 1;
+                if j == 0 || current != e[idx(i, j)] - gap_extend {
+                    break;
+                }
+            }
+            ops.push((EditOperation::Deletion, gap_len));
+            result.gap_openings += 1;
+            result.gaps += gap_len;
+            result.length += gap_len;
+        } else if score == diag_score {
+            if (ql & LETTER_MASK) == (sl & LETTER_MASK) {
+                ops.push((EditOperation::Match, 1));
+                result.identities += 1;
+            } else {
+                ops.push((EditOperation::Substitution, 1));
+                result.mismatches += 1;
+            }
+            result.length += 1;
+            i -= 1;
+            j -= 1;
+        } else {
+            // No path reconstructable — stop.
+            break;
         }
     }
 

@@ -73,7 +73,7 @@ impl MaskingMode {
     }
 }
 
-/// Matches C++ `MaskingStat`.
+/// Matches C++ `MaskingStat::MaskingStat()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MaskingStat {
     pub masked_letters: [u64; 3],
@@ -86,14 +86,14 @@ impl MaskingStat {
         }
     }
 
-    /// Matches C++ `MaskingStat::add`.
+    /// Matches C++ `MaskingStat::add(MaskingAlgo, uint64_t)`.
     pub fn add(&mut self, algo: MaskingAlgo, n: u64) {
         let value = algo as u32;
         assert!(value != 0);
         self.masked_letters[value.trailing_zeros() as usize] += n;
     }
 
-    /// Matches C++ `MaskingStat::get`.
+    /// Matches C++ `MaskingStat::get(MaskingAlgo)`.
     pub fn get(&self, algo: MaskingAlgo) -> u64 {
         let value = algo as u32;
         assert!(value != 0);
@@ -109,7 +109,7 @@ impl std::ops::AddAssign for MaskingStat {
     }
 }
 
-/// Matches C++ `Mask::Ranges`.
+/// Matches C++ `Mask::Ranges::Ranges()`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Ranges {
     ranges: VecDeque<(i32, i32)>,
@@ -122,7 +122,7 @@ impl Ranges {
         }
     }
 
-    /// Matches C++ `Mask::Ranges::push_back`.
+    /// Matches C++ `Mask::Ranges::push_back(Loc, Loc)`.
     pub fn push_back(&mut self, begin: i32, end: i32) {
         if self.ranges.is_empty() || begin > self.ranges.back().unwrap().1 {
             self.ranges.push_back((begin, end));
@@ -131,7 +131,7 @@ impl Ranges {
         }
     }
 
-    /// Matches C++ `Mask::Ranges::push_front`.
+    /// Matches C++ `Mask::Ranges::push_front(Loc)`.
     pub fn push_front(&mut self, loc: i32) {
         if !self.ranges.is_empty() && self.ranges.front().unwrap().0 == loc + 1 {
             self.ranges.front_mut().unwrap().0 = loc;
@@ -177,7 +177,7 @@ impl MaskingTable {
         }
     }
 
-    /// Matches C++ `MaskingTable::add`.
+    /// Matches C++ `MaskingTable::add(size_t, Loc, Loc, Letter*)`.
     pub fn add(&mut self, block_id: usize, begin: i32, end: i32, seq: &mut [Letter]) {
         self.entry.push(MaskingTableEntry { block_id, begin });
         self.seqs.push(seq[begin as usize..end as usize].to_vec());
@@ -186,7 +186,7 @@ impl MaskingTable {
         seq[begin as usize..end as usize].fill(MASK_LETTER);
     }
 
-    /// Matches C++ `MaskingTable::remove`.
+    /// Matches C++ `MaskingTable::remove(SequenceSet&, Loc, bool)`.
     pub fn remove(&self, seqs: &mut SequenceSet, template_len: i32, add_bit_mask: bool) {
         for i in 0..self.entry.len() {
             let entry = self.entry[i];
@@ -204,7 +204,7 @@ impl MaskingTable {
         }
     }
 
-    /// Matches C++ `MaskingTable::apply`.
+    /// Matches C++ `MaskingTable::apply(SequenceSet&)`.
     pub fn apply(&self, seqs: &mut SequenceSet) {
         for i in 0..self.entry.len() {
             let entry = self.entry[i];
@@ -214,17 +214,17 @@ impl MaskingTable {
         }
     }
 
-    /// Matches C++ `MaskingTable::blank`.
+    /// Matches C++ `MaskingTable::blank()`.
     pub fn blank(&self) -> bool {
         self.seq_count == 0
     }
 
-    /// Matches C++ `MaskingTable::masked_letters`.
+    /// Matches C++ `MaskingTable::masked_letters()`.
     pub fn masked_letters(&self) -> usize {
         self.masked_letters
     }
 
-    /// Matches C++ `MaskingTable::mem_size`.
+    /// Matches C++ `MaskingTable::mem_size()`.
     pub fn mem_size(&self) -> i64 {
         (self.entry.len() * std::mem::size_of::<MaskingTableEntry>()
             + self.seqs.iter().map(Vec::len).sum::<usize>() * std::mem::size_of::<Letter>())

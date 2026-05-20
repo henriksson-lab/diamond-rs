@@ -1,3 +1,4 @@
+use crate::basic::consts::MAX_CONTEXT;
 use crate::basic::packed_transcript::{EditOperation, PackedTranscript};
 use crate::basic::translate::{Frame, Strand, TranslatedPosition};
 use crate::basic::value::{BlockId, Letter, OId, Score, AMINO_ACID_ALPHABET, LETTER_MASK};
@@ -5,6 +6,7 @@ use crate::stats;
 use crate::stats::cbs::TargetMatrix;
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::geo::DiagonalSegmentT;
+use crate::util::hsp::ApproxHsp;
 use crate::util::interval::Interval;
 use std::sync::Arc;
 
@@ -133,7 +135,37 @@ impl Hsp {
         }
     }
 
-    /// Matches C++ Hsp::clear().
+    /// Matches C++ `Hsp::Hsp(const ApproxHsp&, Loc, Loc)`.
+    pub fn from_approx_hsp(
+        h: &ApproxHsp,
+        query_len: i32,
+        target_len: i32,
+        score_matrix: &ScoreMatrix,
+    ) -> Self {
+        Hsp {
+            backtraced: true,
+            score: h.score,
+            frame: h.frame,
+            length: h.query_range.length(),
+            identities: h.query_range.length(),
+            positives: h.query_range.length(),
+            query_source_range: h.query_range,
+            query_range: h.query_range,
+            subject_source_range: h.subject_range,
+            subject_range: h.subject_range,
+            evalue: h.evalue,
+            bit_score: score_matrix.bitscore(h.score as f64),
+            corrected_bit_score: score_matrix.bitscore_corrected(
+                h.score,
+                query_len as u32,
+                target_len as u32,
+            ),
+            approx_id: 100.0,
+            ..Self::default()
+        }
+    }
+
+    /// Matches C++ `Hsp::clear()`.
     pub fn clear(&mut self) {
         self.seed_only = false;
         self.score = 0;
@@ -185,7 +217,7 @@ impl Hsp {
         }
     }
 
-    /// Matches C++ Hsp::diagonal_bounds().
+    /// Matches C++ `Hsp::diagonal_bounds()`.
     pub fn diagonal_bounds(&self) -> (i32, i32) {
         let mut d0 = i32::MAX;
         let mut d1 = i32::MIN;
@@ -371,7 +403,7 @@ impl Hsp {
         )
     }
 
-    /// Matches C++ Hsp::push_match().
+    /// Matches C++ `Hsp::push_match(Letter, Letter, bool)`.
     pub fn push_match(&mut self, q: Letter, s: Letter, positive: bool) {
         if q == s {
             self.transcript.push_with_count(EditOperation::Match, 1_u32);
@@ -388,7 +420,7 @@ impl Hsp {
         self.length += 1;
     }
 
-    /// Matches C++ Hsp::push_gap().
+    /// Matches C++ `Hsp::push_gap(EditOperation, int, const Sequence&)`.
     ///
     /// For deletions, `subject` is the valid subject prefix ending at the C++
     /// pointer position; letters are emitted in the same `subject[-i]` order.
@@ -409,7 +441,7 @@ impl Hsp {
         }
     }
 
-    /// Matches C++ Hsp::push_back(const DiagonalSegmentT&, ...).
+    /// Matches C++ `Hsp::push_back(const DiagonalSegmentT&, ...)`.
     pub fn push_back_segment(
         &mut self,
         d: &DiagonalSegmentT,
@@ -438,7 +470,7 @@ impl Hsp {
         }
     }
 
-    /// Matches C++ Hsp::splice().
+    /// Matches C++ `Hsp::splice(const DiagonalSegmentT&, const DiagonalSegmentT&, ...)`.
     pub fn splice_segment(
         &mut self,
         a: &DiagonalSegmentT,
@@ -485,7 +517,7 @@ impl Hsp {
         }
     }
 
-    /// Matches C++ Hsp::set_begin(int, int, Frame, int).
+    /// Matches C++ `Hsp::set_begin(int, int, Frame, int)`.
     pub fn set_begin(&mut self, i: i32, j: i32, frame: Frame, dna_len: i32) {
         self.subject_range.begin = j;
         self.query_range.begin = i;
@@ -498,7 +530,7 @@ impl Hsp {
         }
     }
 
-    /// Matches C++ Hsp::set_end(int, int, Frame, int).
+    /// Matches C++ `Hsp::set_end(int, int, Frame, int)`.
     pub fn set_end(&mut self, i: i32, j: i32, frame: Frame, dna_len: i32) {
         self.subject_range.end = j;
         self.query_range.end = i;
@@ -510,7 +542,7 @@ impl Hsp {
         }
     }
 
-    /// Matches C++ Hsp::set_begin(const DiagonalSegmentT&, int).
+    /// Matches C++ `Hsp::set_begin(const DiagonalSegmentT&, int)`.
     pub fn set_begin_segment(&mut self, d: &DiagonalSegmentT, dna_len: i32) {
         self.subject_range.begin = d.j;
         self.query_range.begin = d.i.translated;
@@ -523,7 +555,7 @@ impl Hsp {
         }
     }
 
-    /// Matches C++ Hsp::set_end(const DiagonalSegmentT&, int).
+    /// Matches C++ `Hsp::set_end(const DiagonalSegmentT&, int)`.
     pub fn set_end_segment(&mut self, d: &DiagonalSegmentT, dna_len: i32) {
         self.subject_range.end = d.subject_end();
         self.query_range.end = d.query_end().translated;
@@ -552,7 +584,7 @@ impl Hsp {
     }
 }
 
-/// Matches C++ Hsp::Iterator.
+/// Matches C++ `Hsp::Iterator::Iterator(const Hsp&)`.
 pub struct HspIterator<'a> {
     pub query_pos: TranslatedPosition,
     pub subject_pos: i32,
@@ -620,7 +652,7 @@ impl<'a> HspIterator<'a> {
     }
 }
 
-/// Matches C++ HspContext.
+/// Matches C++ `HspContext::HspContext()`.
 #[derive(Debug, Clone)]
 pub struct HspContext {
     pub query: Vec<Vec<Letter>>,
@@ -811,7 +843,7 @@ impl HspContext {
         &self.query[frame as usize]
     }
 
-    /// Matches C++ HspContext::parse().
+    /// Matches C++ `HspContext::parse(bool, bool, bool, const ScoreMatrix&)`.
     pub fn parse(
         &mut self,
         need_transcript: bool,
@@ -938,7 +970,7 @@ impl Ord for HspContext {
     }
 }
 
-/// Matches C++ HspContext::Iterator.
+/// Matches C++ `HspContext::Iterator::Iterator(const HspContext&)`.
 pub struct HspContextIterator<'a> {
     parent: &'a HspContext,
     inner: HspIterator<'a>,
@@ -1027,6 +1059,11 @@ pub struct Match {
     pub target_block_id: u32,
     /// Target sequence original ID.
     pub target_oid: u64,
+    pub seq: Vec<Letter>,
+    pub matrix: Option<Arc<TargetMatrix>>,
+    pub filter_score: Score,
+    pub filter_evalue: f64,
+    pub ungapped_score: Score,
     /// List of HSPs for this query-target pair.
     pub hsps: Vec<Hsp>,
 }
@@ -1036,18 +1073,112 @@ impl Match {
         Match {
             target_block_id,
             target_oid,
+            seq: Vec::new(),
+            matrix: None,
+            filter_score: 0,
+            filter_evalue: f64::MAX,
+            ungapped_score: 0,
             hsps: Vec::new(),
         }
     }
 
+    /// Matches C++ `Extension::Match::Match(BlockId, Sequence, TargetMatrix, Score, Score, double)`.
+    pub fn new_extension(
+        target_block_id: u32,
+        seq: &[Letter],
+        matrix: Option<Arc<TargetMatrix>>,
+        ungapped_score: Score,
+        filter_score: Score,
+        filter_evalue: f64,
+    ) -> Self {
+        Match {
+            target_block_id,
+            target_oid: 0,
+            seq: seq.to_vec(),
+            matrix,
+            filter_score,
+            filter_evalue,
+            ungapped_score,
+            hsps: Vec::new(),
+        }
+    }
+
+    /// Matches C++ `Match::add_hit(list<Hsp>&, iterator)`.
+    pub fn add_hit_from_vec(&mut self, hsps: &mut Vec<Hsp>, index: usize) {
+        let hsp = hsps.remove(index);
+        self.hsps.push(hsp);
+        let last = self.hsps.last().unwrap();
+        if last.score > self.filter_score {
+            self.filter_evalue = last.evalue;
+            self.filter_score = last.score;
+        }
+    }
+
+    /// Matches C++ `Match::Match(BlockId, Sequence, TargetMatrix, array<list<Hsp>>, int)`.
+    pub fn from_target_hsps(
+        target_block_id: u32,
+        seq: &[Letter],
+        matrix: Option<Arc<TargetMatrix>>,
+        hsps: &mut [Vec<Hsp>; MAX_CONTEXT as usize],
+        ungapped_score: Score,
+        query_contexts: usize,
+        max_hsps: u32,
+    ) -> Self {
+        if max_hsps != 1 {
+            panic!("Match::Match max_hsps != 1.");
+        }
+        let mut m = Match::new_extension(target_block_id, seq, matrix, ungapped_score, 0, f64::MAX);
+        for frame_hsps in hsps.iter_mut().take(query_contexts) {
+            m.hsps.append(frame_hsps);
+        }
+        if m.hsps.is_empty() {
+            panic!("Match::Match hsp.empty()");
+        }
+        m.hsps.sort_by(|a, b| {
+            if a.less_than_score_position(b) {
+                std::cmp::Ordering::Less
+            } else if b.less_than_score_position(a) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        m.hsps.truncate(1);
+        m.filter_evalue = m.hsps[0].evalue;
+        m.filter_score = m.hsps[0].score;
+        m
+    }
+
+    /// Matches C++ `Match::self_match`.
+    pub fn self_match(query_id: BlockId, query_seq: &[Letter]) -> Self {
+        let mut m = Match::new_extension(query_id, query_seq, None, 0, Score::MAX, 0.0);
+        let mut hsp = Hsp::new();
+        hsp.evalue = 0.0;
+        hsp.score = Score::MAX;
+        hsp.bit_score = f64::MAX;
+        hsp.query_range = Interval::new(0, query_seq.len() as i32);
+        hsp.query_source_range = Interval::new(0, query_seq.len() as i32);
+        hsp.subject_range = Interval::new(0, query_seq.len() as i32);
+        m.hsps.push(hsp);
+        m
+    }
+
     /// Best score among all HSPs.
     pub fn top_score(&self) -> Score {
-        self.hsps.iter().map(|h| h.score).max().unwrap_or(0)
+        if self.hsps.is_empty() {
+            self.filter_score
+        } else {
+            self.hsps.iter().map(|h| h.score).max().unwrap_or(0)
+        }
     }
 
     /// Best e-value among all HSPs.
     pub fn top_evalue(&self) -> f64 {
-        self.hsps.iter().map(|h| h.evalue).fold(f64::MAX, f64::min)
+        if self.hsps.is_empty() {
+            self.filter_evalue
+        } else {
+            self.hsps.iter().map(|h| h.evalue).fold(f64::MAX, f64::min)
+        }
     }
 
     /// Sort HSPs by score descending.

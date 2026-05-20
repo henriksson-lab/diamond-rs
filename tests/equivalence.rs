@@ -226,6 +226,14 @@ fn test_native_blastp_matches_ffi_scores() {
         threads: 1,
         outfmt: vec![],
         sensitivity: Sensitivity::Default,
+        masking: diamond::masking::MaskingMode::Tantan,
+        motif_masking: String::new(),
+        min_query_len: 0,
+        query_cover: 0.0,
+        subject_cover: 0.0,
+        comp_based_stats: diamond::stats::cbs::CbsMode::Hauser,
+        no_self_hits: false,
+        ungapped_xdrop_bits: 12.3,
     };
     run(&config).unwrap();
 
@@ -401,6 +409,14 @@ fn test_native_blastp_repeat_sequence() {
         threads: 1,
         outfmt: vec![],
         sensitivity: diamond::config::Sensitivity::Default,
+        masking: diamond::masking::MaskingMode::Tantan,
+        motif_masking: String::new(),
+        min_query_len: 0,
+        query_cover: 0.0,
+        subject_cover: 0.0,
+        comp_based_stats: diamond::stats::cbs::CbsMode::Hauser,
+        no_self_hits: false,
+        ungapped_xdrop_bits: 12.3,
     };
     diamond::commands::blastp::run(&config).unwrap();
 

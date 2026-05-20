@@ -100,7 +100,7 @@ pub fn find_seed_matches(
 }
 
 /// A seed match between a query and reference position.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SeedMatch {
     pub query_id: u32,
     pub query_pos: u32,

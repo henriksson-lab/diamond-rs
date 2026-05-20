@@ -8,7 +8,7 @@ use crate::dp::swipe::HspValues;
 use crate::util::escape_sequences::XML;
 use crate::util::sequence::{FASTA_HEADER_SEP, ID_DELIMITERS};
 
-/// Format a double value matching DIAMOND's C++ `format_double()`.
+/// Matches C++ `format_double(x)`.
 ///
 /// For values >= 100: floor to integer.
 /// For values < 100: round to 1 decimal place, format as "X.Y".
@@ -30,14 +30,32 @@ pub fn format_double(x: f64) -> String {
     }
 }
 
-/// Format an e-value matching DIAMOND's C++ `print_e()`.
+/// Matches C++ `print_e(x)`.
 ///
-/// Zero → "0.0", otherwise `%.2e` format.
+/// Zero → "0.0". Otherwise scientific with 2 fractional digits, an explicit
+/// `+`/`-` exponent sign, and the exponent padded to at least 2 digits.
+/// Rust's `{:.2e}` omits the sign for positive exponents and the leading zero
+/// for single-digit exponents (`8.35e-9` instead of `8.35e-09`).
 pub fn format_evalue(x: f64) -> String {
     if x == 0.0 {
-        "0.0".to_string()
+        return "0.0".to_string();
+    }
+    let s = format!("{:.2e}", x);
+    let bytes = s.as_bytes();
+    let Some(epos) = bytes.iter().position(|&b| b == b'e') else {
+        return s;
+    };
+    let (mantissa, exp) = s.split_at(epos);
+    let exp = &exp[1..]; // strip 'e'
+    let (sign, digits) = match exp.as_bytes().first() {
+        Some(b'-') => ("-", &exp[1..]),
+        Some(b'+') => ("+", &exp[1..]),
+        _ => ("+", exp),
+    };
+    if digits.len() == 1 {
+        format!("{}e{}0{}", mantissa, sign, digits)
     } else {
-        format!("{:.2e}", x)
+        format!("{}e{}{}", mantissa, sign, digits)
     }
 }
 
@@ -285,7 +303,7 @@ pub struct OutputInit {
     pub dp_fields: HspValues,
 }
 
-/// Matches C++ `get_output_format()`.
+/// Matches C++ `get_output_format(output_format, daa_file, command)`.
 pub fn get_output_format(
     output_format: &[&str],
     daa_file: &str,
@@ -618,7 +636,13 @@ impl FieldId {
             "full_qseq_mate" => Some(Self::FullQSeqMate),
             "qseq_translated" => Some(Self::QSeqTranslated),
             "hspnum" => Some(Self::HspNum),
-            "nident_normalized" => Some(Self::NormalizedNident),
+            // C++ `blast_tab_format.cpp:104-105` registers these as
+            // `normalized_bitscore` and `normalized_nident`. Accept both
+            // the C++ name and the prior Rust-only `nident_normalized` spelling
+            // (so existing scripts keep working) and add `normalized_bitscore`
+            // which was missing from `from_name` entirely.
+            "normalized_nident" | "nident_normalized" => Some(Self::NormalizedNident),
+            "normalized_bitscore" => Some(Self::NormalizedBitscore),
             "approx_pident" => Some(Self::ApproxPIdent),
             "corrected_bitscore" => Some(Self::CorrectedBitScore),
             "slineages" => Some(Self::SLineages),
@@ -1357,7 +1381,7 @@ pub fn output_header(fields: &[FieldId], cluster: bool) -> Result<String, String
     Ok(out)
 }
 
-/// Matches C++ `TabularFormat::print_header()` with the resolved header mode.
+/// Matches C++ `TabularFormat::print_header()`.
 pub fn print_tabular_header(
     fields: &[FieldId],
     header: Header,
@@ -1404,7 +1428,7 @@ pub fn print_tabular_footer(is_json: bool) -> &'static str {
     }
 }
 
-/// Matches C++ `OutputFormat::print_title()` for tabular output without escape callbacks.
+/// Matches C++ `OutputFormat::print_title(id, full_titles, all_titles, separator)`.
 pub fn print_title(
     id: &str,
     full_titles: bool,
@@ -1416,14 +1440,19 @@ pub fn print_title(
     let mut n = 0usize;
     let mut rest = id;
     loop {
+        // C++ `StringDelimiters::scan` (`util/string/tokenizer.h:89-96`) probes
+        // the delimiter array in order and returns the FIRST delimiter that
+        // occurs anywhere — i.e. `\x01` always wins over ` >` if both are
+        // present, regardless of position. Picking the earliest-position
+        // delimiter (the obvious thing) would tokenize a multi-seqid header
+        // like `"sp|A >sp|B\x01sp|C"` into 3 pieces instead of C++'s 2.
         let mut split_at = rest.len();
         let mut sep_len = 0usize;
         for sep in FASTA_HEADER_SEP {
             if let Some(i) = rest.find(sep) {
-                if i < split_at {
-                    split_at = i;
-                    sep_len = sep.len();
-                }
+                split_at = i;
+                sep_len = sep.len();
+                break;
             }
         }
         let s = &rest[..split_at];
@@ -1457,7 +1486,7 @@ pub fn print_title(
     out
 }
 
-/// Matches C++ `OutputFormat::print_title()` with `EscapeSequences::XML`.
+/// Matches C++ `OutputFormat::print_title(id, full_titles, all_titles, separator)`.
 pub fn print_title_xml(
     id: &str,
     full_titles: bool,
@@ -1469,14 +1498,15 @@ pub fn print_title_xml(
     let mut n = 0usize;
     let mut rest = id;
     loop {
+        // See `print_title` above: C++ scans delimiters in array order, not
+        // by earliest position. `\x01` always wins over ` >` when both occur.
         let mut split_at = rest.len();
         let mut sep_len = 0usize;
         for sep in FASTA_HEADER_SEP {
             if let Some(i) = rest.find(sep) {
-                if i < split_at {
-                    split_at = i;
-                    sep_len = sep.len();
-                }
+                split_at = i;
+                sep_len = sep.len();
+                break;
             }
         }
         let s = &rest[..split_at];
@@ -1512,13 +1542,19 @@ pub fn print_title_xml(
     out
 }
 
-pub fn print_staxids(taxids: &[TaxId], json: bool) -> String {
-    let sep = if json { ',' } else { ';' };
+pub fn print_staxids(taxids: &[TaxId], _json: bool) -> String {
+    // C++ `TextBuffer::print(vector<T>, char separator)`
+    // (`diamond/src/util/text_buffer.h:267-276`) takes a separator argument
+    // BUT hard-codes `';'` in the body — so blast_tab_format.cpp:139's
+    // `out.print(taxids, json ? ',' : ';')` always emits `;`. Mirror this
+    // bug for byte-identical output rather than silently emitting "correct"
+    // JSON with commas; downstream tools that parse C++ output have
+    // adapted to the `;` form.
     taxids
         .iter()
         .map(|taxid| taxid.to_string())
         .collect::<Vec<_>>()
-        .join(&sep.to_string())
+        .join(";")
 }
 
 pub fn print_taxon_names<I>(taxids: I, tree: &TaxonomyTree, json: bool) -> String
@@ -1759,7 +1795,7 @@ pub fn write_tabular_context_row<W: Write>(
             FieldId::BitScore => write!(writer, "{}", format_double(r.bit_score()))?,
             FieldId::Score => write!(writer, "{}", r.score())?,
             FieldId::Length => write!(writer, "{}", r.length())?,
-            FieldId::PIdent => write!(writer, "{}", r.id_percent())?,
+            FieldId::PIdent => write!(writer, "{}", format_double(r.id_percent()))?,
             FieldId::NIdent => write!(writer, "{}", r.identities())?,
             FieldId::Mismatch => write!(writer, "{}", r.mismatches())?,
             FieldId::Positive => write!(writer, "{}", r.positives())?,
@@ -1768,7 +1804,7 @@ pub fn write_tabular_context_row<W: Write>(
             FieldId::PPos => write!(
                 writer,
                 "{}",
-                r.positives() as f64 * 100.0 / r.length() as f64
+                format_double(r.positives() as f64 * 100.0 / r.length() as f64)
             )?,
             FieldId::QFrame | FieldId::QFrameField => {
                 write!(writer, "{}", r.blast_query_frame(query_translated))?
@@ -1819,7 +1855,7 @@ pub fn write_tabular_context_row<W: Write>(
                 "{}",
                 print_title(&r.target_title, true, true, "<>", false)
             )?,
-            FieldId::QCovHsp | FieldId::QCovS => write!(writer, "{}", r.qcovhsp())?,
+            FieldId::QCovHsp | FieldId::QCovS => write!(writer, "{}", format_double(r.qcovhsp()))?,
             FieldId::QTitle => write!(writer, "{}", r.query_title)?,
             FieldId::FullSSeq => {
                 for &letter in &r.subject_seq {
@@ -1832,7 +1868,7 @@ pub fn write_tabular_context_row<W: Write>(
             }
             FieldId::QNum => write!(writer, "{}", r.query_oid + qnum_offset)?,
             FieldId::SNum => write!(writer, "{}", r.subject_oid + snum_offset)?,
-            FieldId::SCovHsp => write!(writer, "{}", r.scovhsp())?,
+            FieldId::SCovHsp => write!(writer, "{}", format_double(r.scovhsp()))?,
             FieldId::FullQSeq => {
                 for &letter in r.query_index(r.hsp.frame) {
                     write!(
@@ -1902,17 +1938,25 @@ pub fn write_tabular_context_row<W: Write>(
                     }
                 }
             }
-            FieldId::ApproxPIdent => write!(writer, "{}", r.approx_id())?,
-            FieldId::CorrectedBitScore => write!(writer, "{}", r.corrected_bit_score())?,
+            FieldId::ApproxPIdent => write!(writer, "{}", format_double(r.approx_id()))?,
+            // C++ `info.out << r.corrected_bit_score()` (`blast_tab_format.cpp:599`)
+            // routes the double through `format_double` (1-decimal under 100,
+            // floor at/above 100). Writing the raw f64 diverges for any value ≥ 100.
+            FieldId::CorrectedBitScore => {
+                write!(writer, "{}", format_double(r.corrected_bit_score()))?
+            }
             FieldId::HspNum => write!(writer, "{}", r.hsp_num)?,
+            // C++ `info.out.print_d(...)` (`blast_tab_format.cpp:614,618`) uses
+            // `snprintf("%lf", x)` — 6-decimal fixed. Rust's default `{}`
+            // produces shortest-round-trip and diverges.
             FieldId::NormalizedBitscore => write!(
                 writer,
-                "{}",
+                "{:.6}",
                 r.bit_score() / r.query_self_aln_score.max(r.target_self_aln_score)
             )?,
             FieldId::NormalizedNident => write!(
                 writer,
-                "{}",
+                "{:.6}",
                 r.identities() as f64
                     / (r.query_index(r.hsp.frame).len() as i32).max(r.subject_len) as f64
             )?,
@@ -2374,8 +2418,14 @@ pub fn write_tabular_row<W: Write>(
             write!(writer, "\t")?;
         }
         match field {
-            FieldId::QSeqId | FieldId::QAcc | FieldId::QAccVer => write!(writer, "{}", query_id)?,
-            FieldId::SSeqId | FieldId::SAcc | FieldId::SAccVer => write!(writer, "{}", subject_id)?,
+            FieldId::QSeqId | FieldId::QAcc | FieldId::QAccVer => {
+                write!(writer, "{}", print_title(query_id, false, false, "", false))?
+            }
+            FieldId::SSeqId | FieldId::SAcc | FieldId::SAccVer => write!(
+                writer,
+                "{}",
+                print_title(subject_id, false, false, "", false)
+            )?,
             FieldId::PIdent => write!(writer, "{}", format_double(hsp.pident()))?,
             FieldId::Length => write!(writer, "{}", hsp.length)?,
             FieldId::Mismatch => write!(writer, "{}", hsp.mismatches)?,
@@ -2442,7 +2492,10 @@ mod tests {
     fn test_format_evalue() {
         assert_eq!(format_evalue(0.0), "0.0");
         assert_eq!(format_evalue(2.23e-247), "2.23e-247");
-        assert_eq!(format_evalue(1.5e-5), "1.50e-5");
+        // C printf %.2e pads exponent to >=2 digits, so e-5 -> e-05.
+        assert_eq!(format_evalue(1.5e-5), "1.50e-05");
+        assert_eq!(format_evalue(8.35e-9), "8.35e-09");
+        assert_eq!(format_evalue(1.0), "1.00e+00");
     }
 
     #[test]
@@ -3012,7 +3065,9 @@ mod tests {
     fn test_tabular_taxonomy_print_helpers() {
         let tree = tabular_taxonomy_tree();
         assert_eq!(print_staxids(&[20, 30], false), "20;30");
-        assert_eq!(print_staxids(&[20, 30], true), "20,30");
+        // C++ `TextBuffer::print` hard-codes `;` even for JSON, see comment
+        // on `print_staxids`. Mirror this here.
+        assert_eq!(print_staxids(&[20, 30], true), "20;30");
         assert_eq!(
             print_taxon_names([20, 30], &tree, false),
             "Proteobacteria;Euryarchaeota"
@@ -3116,9 +3171,14 @@ mod tests {
         ];
         let mut buf = Vec::new();
         write_tabular_context_row(&mut buf, &ctx, &fields, false, false, 1000, 2000).unwrap();
+        // Match C++ field formatting:
+        //   NormalizedBitscore  → `print_d` = `snprintf("%lf", x)` = 6-decimal fixed (0.215 → "0.215000")
+        //   NormalizedNident    → `print_d` = "%lf" = 6-decimal fixed (1/3 → "0.333333")
+        //   CorrectedBitScore   → routed through `format_double` (1-decimal under 100,
+        //                          floor at/above 100). 20.25 rounds to 20.3 (half-away-from-zero).
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "query\tsubj\tsubj;subj\t1\t4\t1\t4\tAREE\t1CRD--E1\tACD-E\tAR-EE\t2M1I1D1M\t80\t66.66666666666667\t+\tACDE\t3\t0.215\t0.3333333333333333\t20.25\n"
+            "query\tsubj\tsubj;subj\t1\t4\t1\t4\tAREE\t1CRD--E1\tACD-E\tAR-EE\t2M1I1D1M\t80.0\t66.7\t+\tACDE\t3\t0.215000\t0.333333\t20.3\n"
         );
     }
 
