@@ -6,6 +6,7 @@ DIAMOND is a high-performance sequence aligner for protein and translated DNA se
 
 **This crate is under translation. Do not use it. Do not trust any text below**
 
+* 2026-07-07: New audit; state to be checked
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code!
 
