@@ -60,6 +60,25 @@ impl Target {
         }
     }
 
+    fn from_vec(
+        block_id: BlockId,
+        seq: Vec<Letter>,
+        ungapped_score: i32,
+        matrix: Option<Arc<TargetMatrix>>,
+    ) -> Self {
+        Self {
+            block_id,
+            seq,
+            filter_score: 0,
+            filter_evalue: f64::MAX,
+            best_context: 0,
+            ungapped_score,
+            hsp: std::array::from_fn(|_| Vec::new()),
+            matrix,
+            done: false,
+        }
+    }
+
     /// Matches C++ `Target::add_hit(Hsp&&)`.
     pub fn add_hit(&mut self, hsp: Hsp) {
         if hsp.evalue < self.filter_evalue {
@@ -232,7 +251,9 @@ where
     let mut min_evalue = f64::MAX;
     for hit in &hits {
         max_score = max_score.max(hit.filter_score);
-        min_evalue = min_evalue.min(hit.filter_evalue);
+        if hit.filter_evalue < min_evalue {
+            min_evalue = hit.filter_evalue;
+        }
     }
 
     let range_end = output_range_targets(targets, max_target_seqs, toppercent, &mut bitscore);
@@ -484,7 +505,7 @@ pub fn extend_chunk<F1, F2>(
     query_comp: &[f64; TRUE_AA as usize],
     seed_hits: &FlatArray<SeedHit>,
     target_block_ids: &[BlockId],
-    target_block: &mut Block,
+    target_block: &Block,
     stat: &mut Statistics,
     flags: Flags,
     hsp_values: HspValues,
@@ -506,11 +527,6 @@ where
     const GAPPED_FILTER_MIN_QLEN: i32 = 85;
     let n = seed_hits.data_size() as i64;
     stat.inc(StatValue::TargetHits2, n);
-
-    if cfg.lazy_masking && cfg.global_ranking_targets == 0 {
-        let masked = lazy_masking(target_block_ids, target_block, cfg.target_masking);
-        stat.inc(StatValue::MaskedLazy, masked as i64);
-    }
 
     let gf_seed_hits;
     let gf_target_block_ids;
@@ -578,15 +594,37 @@ where
     )
 }
 
-/// Matches C++ `extend(BlockId, const Search::Config&, Statistics&, DP::Flags, SeedHitList&)`.
-pub fn extend_seed_hit_list<F1, F2>(
+enum TargetBlockAccess<'a> {
+    Shared(&'a Block),
+    Mutable(&'a mut Block),
+}
+
+impl TargetBlockAccess<'_> {
+    fn block(&self) -> &Block {
+        match self {
+            TargetBlockAccess::Shared(block) => block,
+            TargetBlockAccess::Mutable(block) => block,
+        }
+    }
+
+    fn lazy_masking(&mut self, target_block_ids: &[BlockId], algo: MaskingAlgo) -> usize {
+        match self {
+            TargetBlockAccess::Shared(_) => {
+                panic!("lazy target masking requires a mutable target block")
+            }
+            TargetBlockAccess::Mutable(block) => lazy_masking(target_block_ids, block, algo),
+        }
+    }
+}
+
+fn extend_seed_hit_list_with_block<F1, F2>(
     query_id: BlockId,
     query_seq: &[Vec<Letter>],
     query_title: &str,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; TRUE_AA as usize],
-    target_block: &mut Block,
+    mut target_block: TargetBlockAccess<'_>,
     stat: &mut Statistics,
     flags: Flags,
     seed_hit_list: &mut SeedHitList,
@@ -608,8 +646,8 @@ where
 {
     const UNIFIED_TARGET_LEN: u32 = 50;
     let query_len = query_seq.first().map_or(0, Vec::len) as u32;
-    let self_aln_score = if target_block.has_self_aln() {
-        target_block.self_aln_score(query_id as i64)
+    let self_aln_score = if target_block.block().has_self_aln() {
+        target_block.block().self_aln_score(query_id as i64)
     } else {
         0.0
     };
@@ -620,7 +658,7 @@ where
         return seed_only_matches(
             seed_hit_list,
             source_query_len as u32,
-            Some(target_block.seqs()),
+            Some(target_block.block().seqs()),
             None,
             cfg.max_hsps,
             cfg.max_target_seqs,
@@ -637,7 +675,7 @@ where
                 flags,
                 HspValues::NONE,
                 stat,
-                target_block,
+                target_block.block(),
                 cfg,
                 score_matrix,
             );
@@ -679,7 +717,7 @@ where
 
     let chunk_size = ranking_chunk_size(
         target_count as i64,
-        target_block.seqs().letters() as i64,
+        target_block.block().seqs().letters() as i64,
         cfg.max_target_seqs,
         cfg,
     )
@@ -718,7 +756,6 @@ where
     let mut seed_hits_chunk = FlatArray::new();
     let mut target_block_ids_chunk = Vec::new();
     let mut matches = Vec::new();
-
     while i0 < seed_hit_list.target_scores.len() {
         let mut aligned_targets = Vec::new();
         let mut new_hits;
@@ -744,6 +781,17 @@ where
                 }
             }
 
+            let current_target_block_ids = if multi_chunk {
+                &target_block_ids_chunk
+            } else {
+                &seed_hit_list.target_block_ids
+            };
+            if cfg.lazy_masking && cfg.global_ranking_targets == 0 {
+                let masked =
+                    target_block.lazy_masking(current_target_block_ids, cfg.target_masking);
+                stat.inc(StatValue::MaskedLazy, masked as i64);
+            }
+
             let v = extend_chunk(
                 query_seq,
                 Some(query_title),
@@ -755,12 +803,8 @@ where
                 } else {
                     &seed_hit_list.seed_hits
                 },
-                if multi_chunk {
-                    &target_block_ids_chunk
-                } else {
-                    &seed_hit_list.target_block_ids
-                },
-                target_block,
+                current_target_block_ids,
+                target_block.block(),
                 stat,
                 flags,
                 first_round,
@@ -780,6 +824,7 @@ where
             new_hits = !v.is_empty();
             round_new_hits = new_hits;
             if multi_chunk {
+                let aligned_len_before_append = aligned_targets.len();
                 new_hits = append_hits_targets(
                     &mut aligned_targets,
                     v,
@@ -788,10 +833,28 @@ where
                     cfg.toppercent,
                     |score| score_matrix.bitscore(score as f64),
                 );
+                if (cfg.ext_chunk_size == 0 || cfg.ext_chunk_size <= 128)
+                    && cfg.toppercent.is_none()
+                    && cfg.max_target_seqs <= 25
+                    && cfg.sensitivity < Sensitivity::VerySensitive
+                    && new_hits
+                    && aligned_targets.len() == aligned_len_before_append
+                    && i0 > 0
+                    && seed_hit_list.target_scores[i1 - 1].score
+                        < seed_hit_list.target_scores[i0 - 1].score
+                {
+                    culling_targets(
+                        &mut aligned_targets,
+                        false,
+                        cfg.max_target_seqs,
+                        cfg.toppercent,
+                        |score| score_matrix.bitscore(score as f64),
+                    );
+                    new_hits = false;
+                }
             } else {
                 aligned_targets = v;
             }
-
             i0 = i1;
             i1 += chunk_size.min(seed_hit_list.target_scores.len() - i1);
             let previous_tail_score = tail_score;
@@ -820,7 +883,7 @@ where
                 flags,
                 HspValues::NONE,
                 stat,
-                target_block,
+                target_block.block(),
                 cfg,
                 score_matrix,
             );
@@ -873,8 +936,265 @@ where
     matches
 }
 
+/// Matches C++ `extend(BlockId, const Search::Config&, Statistics&, DP::Flags, SeedHitList&)`.
+pub fn extend_seed_hit_list<F1, F2>(
+    query_id: BlockId,
+    query_seq: &[Vec<Letter>],
+    query_title: &str,
+    source_query_len: i32,
+    query_cbs: &[Vec<i8>],
+    query_comp: &[f64; TRUE_AA as usize],
+    target_block: &Block,
+    stat: &mut Statistics,
+    flags: Flags,
+    seed_hit_list: &mut SeedHitList,
+    mode: ExtensionMode,
+    cfg: &GappedScoreConfig,
+    ungapped_cfg: &UngappedStageConfig,
+    score_matrix: &ScoreMatrix,
+    output_hsp_values: HspValues,
+    cutoff_gapped1_new: F1,
+    cutoff_gapped2_new: F2,
+    gap_open: i32,
+    gap_extend: i32,
+    gapped_filter_diag_score: i32,
+    gapped_filter_window: i32,
+) -> Vec<Match>
+where
+    F1: Fn(i32, i32) -> i32 + Copy,
+    F2: Fn(i32, i32) -> i32 + Copy,
+{
+    extend_seed_hit_list_with_block(
+        query_id,
+        query_seq,
+        query_title,
+        source_query_len,
+        query_cbs,
+        query_comp,
+        TargetBlockAccess::Shared(target_block),
+        stat,
+        flags,
+        seed_hit_list,
+        mode,
+        cfg,
+        ungapped_cfg,
+        score_matrix,
+        output_hsp_values,
+        cutoff_gapped1_new,
+        cutoff_gapped2_new,
+        gap_open,
+        gap_extend,
+        gapped_filter_diag_score,
+        gapped_filter_window,
+    )
+}
+
+/// Matches C++ `extend(BlockId, const Search::Config&, Statistics&, DP::Flags, SeedHitList&)`.
+pub fn extend_seed_hit_list_mut<F1, F2>(
+    query_id: BlockId,
+    query_seq: &[Vec<Letter>],
+    query_title: &str,
+    source_query_len: i32,
+    query_cbs: &[Vec<i8>],
+    query_comp: &[f64; TRUE_AA as usize],
+    target_block: &mut Block,
+    stat: &mut Statistics,
+    flags: Flags,
+    seed_hit_list: &mut SeedHitList,
+    mode: ExtensionMode,
+    cfg: &GappedScoreConfig,
+    ungapped_cfg: &UngappedStageConfig,
+    score_matrix: &ScoreMatrix,
+    output_hsp_values: HspValues,
+    cutoff_gapped1_new: F1,
+    cutoff_gapped2_new: F2,
+    gap_open: i32,
+    gap_extend: i32,
+    gapped_filter_diag_score: i32,
+    gapped_filter_window: i32,
+) -> Vec<Match>
+where
+    F1: Fn(i32, i32) -> i32 + Copy,
+    F2: Fn(i32, i32) -> i32 + Copy,
+{
+    extend_seed_hit_list_with_block(
+        query_id,
+        query_seq,
+        query_title,
+        source_query_len,
+        query_cbs,
+        query_comp,
+        TargetBlockAccess::Mutable(target_block),
+        stat,
+        flags,
+        seed_hit_list,
+        mode,
+        cfg,
+        ungapped_cfg,
+        score_matrix,
+        output_hsp_values,
+        cutoff_gapped1_new,
+        cutoff_gapped2_new,
+        gap_open,
+        gap_extend,
+        gapped_filter_diag_score,
+        gapped_filter_window,
+    )
+}
+
+/// Matches C++ `extend(BlockId, Search::Hit*, Search::Hit*, ...)`.
+fn extend_with_block<F1, F2, G>(
+    query_id: BlockId,
+    hits: &mut [Hit],
+    query_seq: &[Vec<Letter>],
+    query_title: &str,
+    source_query_len: i32,
+    query_cbs: &[Vec<i8>],
+    query_comp: &[f64; TRUE_AA as usize],
+    target_block: TargetBlockAccess<'_>,
+    stat: &mut Statistics,
+    flags: Flags,
+    mode: ExtensionMode,
+    cfg: &GappedScoreConfig,
+    ungapped_cfg: &UngappedStageConfig,
+    score_matrix: &ScoreMatrix,
+    output_hsp_values: HspValues,
+    cutoff_gapped1_new: F1,
+    cutoff_gapped2_new: F2,
+    gap_open: i32,
+    gap_extend: i32,
+    gapped_filter_diag_score: i32,
+    gapped_filter_window: i32,
+    global_ranking_cb: Option<G>,
+) -> Vec<Match>
+where
+    F1: Fn(i32, i32) -> i32 + Copy,
+    F2: Fn(i32, i32) -> i32 + Copy,
+    G: FnOnce(BlockId, &SeedHitList) -> Vec<Match>,
+{
+    let mut list = load_hits(hits, target_block.block().seqs(), cfg.query_contexts as u32);
+    stat.inc(StatValue::TargetHits0, list.target_block_ids.len() as i64);
+
+    let target_count = list.target_block_ids.len() as i64;
+    if target_count == 0 && !cfg.swipe_all {
+        if mode == ExtensionMode::None {
+            return Vec::new();
+        }
+        if add_self_aln(cfg) {
+            return vec![Match::self_match(query_id, &query_seq[0])];
+        }
+        return Vec::new();
+    }
+
+    let chunk_size = ranking_chunk_size(
+        target_count,
+        target_block.block().seqs().letters() as i64,
+        cfg.max_target_seqs,
+        cfg,
+    );
+    if chunk_size < target_count || cfg.global_ranking_targets > 0 {
+        list.target_scores.sort();
+        if cfg.global_ranking_targets > 0 {
+            if let Some(global_ranking_cb) = global_ranking_cb {
+                return global_ranking_cb(query_id, &list);
+            }
+            return global_ranking::ranking_list(
+                query_id,
+                &mut list.target_scores,
+                &list.target_block_ids,
+                &list.seed_hits,
+                query_seq.first().map(Vec::as_slice),
+                Some(target_block.block()),
+                cfg.global_ranking_targets,
+                cfg.ungapped_window,
+                score_matrix,
+            );
+        }
+    }
+
+    extend_seed_hit_list_with_block(
+        query_id,
+        query_seq,
+        query_title,
+        source_query_len,
+        query_cbs,
+        query_comp,
+        target_block,
+        stat,
+        flags,
+        &mut list,
+        mode,
+        cfg,
+        ungapped_cfg,
+        score_matrix,
+        output_hsp_values,
+        cutoff_gapped1_new,
+        cutoff_gapped2_new,
+        gap_open,
+        gap_extend,
+        gapped_filter_diag_score,
+        gapped_filter_window,
+    )
+}
+
 /// Matches C++ `extend(BlockId, Search::Hit*, Search::Hit*, ...)`.
 pub fn extend<F1, F2, G>(
+    query_id: BlockId,
+    hits: &mut [Hit],
+    query_seq: &[Vec<Letter>],
+    query_title: &str,
+    source_query_len: i32,
+    query_cbs: &[Vec<i8>],
+    query_comp: &[f64; TRUE_AA as usize],
+    target_block: &Block,
+    stat: &mut Statistics,
+    flags: Flags,
+    mode: ExtensionMode,
+    cfg: &GappedScoreConfig,
+    ungapped_cfg: &UngappedStageConfig,
+    score_matrix: &ScoreMatrix,
+    output_hsp_values: HspValues,
+    cutoff_gapped1_new: F1,
+    cutoff_gapped2_new: F2,
+    gap_open: i32,
+    gap_extend: i32,
+    gapped_filter_diag_score: i32,
+    gapped_filter_window: i32,
+    global_ranking_cb: Option<G>,
+) -> Vec<Match>
+where
+    F1: Fn(i32, i32) -> i32 + Copy,
+    F2: Fn(i32, i32) -> i32 + Copy,
+    G: FnOnce(BlockId, &SeedHitList) -> Vec<Match>,
+{
+    extend_with_block(
+        query_id,
+        hits,
+        query_seq,
+        query_title,
+        source_query_len,
+        query_cbs,
+        query_comp,
+        TargetBlockAccess::Shared(target_block),
+        stat,
+        flags,
+        mode,
+        cfg,
+        ungapped_cfg,
+        score_matrix,
+        output_hsp_values,
+        cutoff_gapped1_new,
+        cutoff_gapped2_new,
+        gap_open,
+        gap_extend,
+        gapped_filter_diag_score,
+        gapped_filter_window,
+        global_ranking_cb,
+    )
+}
+
+/// Matches C++ `extend(BlockId, Search::Hit*, Search::Hit*, ...)`.
+pub fn extend_mut<F1, F2, G>(
     query_id: BlockId,
     hits: &mut [Hit],
     query_seq: &[Vec<Letter>],
@@ -903,57 +1223,17 @@ where
     F2: Fn(i32, i32) -> i32 + Copy,
     G: FnOnce(BlockId, &SeedHitList) -> Vec<Match>,
 {
-    let mut list = load_hits(hits, target_block.seqs(), cfg.query_contexts as u32);
-    stat.inc(StatValue::TargetHits0, list.target_block_ids.len() as i64);
-
-    let target_count = list.target_block_ids.len() as i64;
-    if target_count == 0 && !cfg.swipe_all {
-        if mode == ExtensionMode::None {
-            return Vec::new();
-        }
-        if add_self_aln(cfg) {
-            return vec![Match::self_match(query_id, &query_seq[0])];
-        }
-        return Vec::new();
-    }
-
-    let chunk_size = ranking_chunk_size(
-        target_count,
-        target_block.seqs().letters() as i64,
-        cfg.max_target_seqs,
-        cfg,
-    );
-    if chunk_size < target_count || cfg.global_ranking_targets > 0 {
-        list.target_scores.sort();
-        if cfg.global_ranking_targets > 0 {
-            if let Some(global_ranking_cb) = global_ranking_cb {
-                return global_ranking_cb(query_id, &list);
-            }
-            return global_ranking::ranking_list(
-                query_id,
-                &mut list.target_scores,
-                &list.target_block_ids,
-                &list.seed_hits,
-                query_seq.first().map(Vec::as_slice),
-                Some(target_block),
-                cfg.global_ranking_targets,
-                cfg.ungapped_window,
-                score_matrix,
-            );
-        }
-    }
-
-    extend_seed_hit_list(
+    extend_with_block(
         query_id,
+        hits,
         query_seq,
         query_title,
         source_query_len,
         query_cbs,
         query_comp,
-        target_block,
+        TargetBlockAccess::Mutable(target_block),
         stat,
         flags,
-        &mut list,
         mode,
         cfg,
         ungapped_cfg,
@@ -965,6 +1245,7 @@ where
         gap_extend,
         gapped_filter_diag_score,
         gapped_filter_window,
+        global_ranking_cb,
     )
 }
 
@@ -1267,32 +1548,40 @@ pub fn align_work_targets(
     let mut cbs_targets = 0;
 
     for i in 0..targets.len() {
-        r.push(Target::new(
-            targets[i].block_id,
-            &targets[i].seq,
-            targets[i].ungapped_score[0],
-            targets[i].matrix.clone(),
-        ));
+        let matrix = targets[i].matrix.clone();
         if targets[i].done {
+            let mut target = Target::from_vec(
+                targets[i].block_id,
+                std::mem::take(&mut targets[i].seq),
+                targets[i].ungapped_score[0],
+                matrix,
+            );
             debug_assert_eq!(targets[i].hsp[0].len(), 1);
             debug_assert_eq!(cfg.query_contexts, 1);
             let frame = targets[i].hsp[0][0].frame as usize;
-            r.last_mut().unwrap().add_approx_hit(
+            target.add_approx_hit(
                 &targets[i].hsp[0][0],
                 query_seq[frame].len() as i32,
                 score_matrix,
             );
+            r.push(target);
         } else {
             add_dp_targets(
                 &targets[i],
                 i as BlockId,
-                r.last().unwrap().matrix.clone(),
+                matrix.clone(),
                 query_seq,
                 &mut dp_targets,
                 hsp_values,
                 mode,
                 cfg,
             );
+            r.push(Target::from_vec(
+                targets[i].block_id,
+                std::mem::take(&mut targets[i].seq),
+                targets[i].ungapped_score[0],
+                matrix,
+            ));
         }
         if targets[i].matrix.is_some() {
             cbs_targets += 1;
@@ -1317,7 +1606,7 @@ pub fn align_work_targets(
         } else {
             None
         };
-        let mut hsps = if cfg.anchored_swipe {
+        let hsps = if cfg.anchored_swipe {
             let mut acfg = AnchoredSwipeConfig::new(&query_seq[frame], score_matrix);
             acfg.query_cbs = cbs;
             acfg.recompute_adjusted = cfg.comp_based_stats_matrix_adjust;
@@ -1346,9 +1635,19 @@ pub fn align_work_targets(
             params.cbs_matrix_scale = cfg.cbs_matrix_scale;
             swipe(&dp_targets[frame], &mut params)
         };
-        while !hsps.is_empty() {
-            let idx = hsps[0].swipe_target as usize;
-            r[idx].add_hit_from_vec(&mut hsps, 0);
+        for hsp in hsps {
+            let idx = hsp.swipe_target as usize;
+            let frame = hsp.frame as usize;
+            let score = hsp.score;
+            let evalue = hsp.evalue;
+            let hsp_frame = hsp.frame;
+            let target = &mut r[idx];
+            target.hsp[frame].push(hsp);
+            if score > target.filter_score {
+                target.filter_evalue = evalue;
+                target.filter_score = score;
+                target.best_context = hsp_frame;
+            }
         }
     }
 
@@ -1407,8 +1706,8 @@ pub fn full_db_align(
 
     let mut subject_idx = BTreeMap::new();
     let mut r = Vec::new();
-    while !hsp.is_empty() {
-        let block_id = hsp[0].swipe_target as BlockId;
+    for hsp in hsp {
+        let block_id = hsp.swipe_target as BlockId;
         let idx = if let Some(&idx) = subject_idx.get(&block_id) {
             idx
         } else {
@@ -1422,7 +1721,17 @@ pub fn full_db_align(
             ));
             idx
         };
-        r[idx].add_hit_from_vec(&mut hsp, 0);
+        let frame = hsp.frame as usize;
+        let score = hsp.score;
+        let evalue = hsp.evalue;
+        let hsp_frame = hsp.frame;
+        let target = &mut r[idx];
+        target.hsp[frame].push(hsp);
+        if score > target.filter_score {
+            target.filter_evalue = evalue;
+            target.filter_score = score;
+            target.best_context = hsp_frame;
+        }
     }
 
     r
@@ -1629,10 +1938,17 @@ pub fn align_targets_final(
             params.query_or_target_cover = cfg.query_or_target_cover;
             params.approx_min_id = cfg.approx_min_id;
             params.cbs_matrix_scale = cfg.cbs_matrix_scale;
-            let mut hsps = swipe(&dp_targets[frame], &mut params);
-            while !hsps.is_empty() {
-                let idx = hsps[0].swipe_target as usize;
-                r[idx].add_hit_from_vec(&mut hsps, 0);
+            let hsps = swipe(&dp_targets[frame], &mut params);
+            for hsp in hsps {
+                let idx = hsp.swipe_target as usize;
+                let score = hsp.score;
+                let evalue = hsp.evalue;
+                let m = &mut r[idx];
+                m.hsps.push(hsp);
+                if score > m.filter_score {
+                    m.filter_evalue = evalue;
+                    m.filter_score = score;
+                }
             }
         }
 
@@ -1819,11 +2135,10 @@ fn recompute_alt_hsps_round(
         params.query_or_target_cover = cfg.query_or_target_cover;
         params.approx_min_id = cfg.approx_min_id;
         params.cbs_matrix_scale = cfg.cbs_matrix_scale;
-        let mut hsps = swipe(&dp_targets[context], &mut params);
-        while !hsps.is_empty() {
-            let active_idx = hsps[0].swipe_target as usize;
+        let hsps = swipe(&dp_targets[context], &mut params);
+        for hsp in hsps {
+            let active_idx = hsp.swipe_target as usize;
             let match_idx = targets[active_idx].match_index;
-            let hsp = hsps.remove(0);
             let begin = hsp.subject_range.begin.max(0) as usize;
             let end = hsp
                 .subject_range
@@ -2016,15 +2331,16 @@ pub fn inner_hsp_culling(hsps: &mut Vec<Hsp>, max_hsps: u32, inner_culling_overl
         return;
     }
     let overlap = inner_culling_overlap / 100.0;
-    let mut i = 0;
-    while i < hsps.len() {
-        let enveloped = (0..i).any(|j| hsps[i].is_enveloped_by(&hsps[j], overlap));
-        if enveloped {
-            hsps.remove(i);
-        } else {
-            i += 1;
+    let mut kept = Vec::with_capacity(hsps.len());
+    for hsp in hsps.drain(..) {
+        if !kept
+            .iter()
+            .any(|previous| hsp.is_enveloped_by(previous, overlap))
+        {
+            kept.push(hsp);
         }
     }
+    *hsps = kept;
     if max_hsps > 0 {
         max_hsp_culling(hsps, max_hsps);
     }
@@ -3181,5 +3497,37 @@ mod tests {
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].target_block_id, 0);
         assert_eq!(ranked[0].ungapped_score, 40);
+
+        let mut hits = vec![Hit::with_score(0, subject_pos, 3, 40)];
+        let mut cfg = GappedScoreConfig::default();
+        cfg.lazy_masking = true;
+        cfg.target_masking = MaskingAlgo::Seg;
+        let mut stat = Statistics::new();
+        let lazy = extend_mut(
+            0,
+            &mut hits,
+            std::slice::from_ref(&query),
+            "q",
+            query.len() as i32,
+            &[],
+            &query_comp,
+            &mut block,
+            &mut stat,
+            Flags::NONE,
+            ExtensionMode::BandedFast,
+            &cfg,
+            &UngappedStageConfig::default(),
+            &sm,
+            HspValues::COORDS,
+            |_, _| -1,
+            |_, _| -1,
+            sm.gap_open(),
+            sm.gap_extend(),
+            1,
+            100,
+            Option::<fn(BlockId, &SeedHitList) -> Vec<Match>>::None,
+        );
+        assert_eq!(stat.get(StatValue::MaskedLazy), 1);
+        assert_eq!(lazy.len(), 1);
     }
 }

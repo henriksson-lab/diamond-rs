@@ -1,26 +1,43 @@
-use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
+use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-use crate::align::gapped_filter::SeedHit;
-use crate::align::target::{align_work_targets, GappedScoreConfig};
-use crate::align::ungapped::{ungapped_stage_target, UngappedStageConfig};
+use crate::align::hsp::Match;
+use crate::align::target::{extend as extend_targets, GappedScoreConfig};
+use crate::align::ungapped::UngappedStageConfig;
 use crate::basic::reduction::Reduction;
+use crate::basic::seed::{seed_partition, seedp_count, seedp_mask};
 use crate::basic::shape::Shape;
 use crate::basic::statistics::Statistics;
 use crate::basic::value::{Letter, SequenceType};
 use crate::config::Sensitivity;
 use crate::data::block::Block;
 use crate::data::fasta;
+use crate::data::seed_histogram::SeedPartitionRange;
 use crate::dp::swipe::{Flags, HspValues};
 use crate::masking::{MaskingAlgo, MaskingMode};
 use crate::output::format::{self, FieldId, Hsp as OutputHsp};
-use crate::search::{parallel, seed_match, sensitivity};
+use crate::search::hit::Hit;
+use crate::search::left_most::{left_most_filter_with_range, Context as LeftMostContext};
+use crate::search::{parallel, sensitivity};
 use crate::stats::cbs::CbsMode;
-use crate::stats::score_matrix::ScoreMatrix;
+use crate::stats::score_matrix::{CutoffTable2D, ScoreMatrix};
+use crate::util::algo::PatternMatcher;
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+unsafe extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
+fn trim_freed_heap_pages() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        let _ = malloc_trim(0);
+    }
+}
 
 /// Configuration for a blastp run.
 pub struct BlastpConfig {
@@ -32,6 +49,9 @@ pub struct BlastpConfig {
     pub gap_extend: i32,
     pub max_evalue: f64,
     pub max_target_seqs: i64,
+    pub ext_chunk_size: i64,
+    pub toppercent: Option<f64>,
+    pub global_ranking_targets: i64,
     pub min_id: f64,
     pub threads: i32,
     pub outfmt: Vec<String>,
@@ -81,7 +101,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // as FASTA), but `--db nr.fasta` was resolving to `nr.dmnd` in Rust because
     // `with_extension("dmnd")` REPLACES rather than appends. Fix: only consult
     // a `<db>.dmnd` companion when the given path doesn't exist.
-    let mut db_records = {
+    let (mut db_records, _db_from_dmnd) = {
         let db_path = Path::new(&config.database);
         let dmnd_path = if db_path.extension().is_some_and(|e| e == "dmnd") {
             db_path.to_path_buf()
@@ -108,7 +128,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 "Database: {} sequences, {} letters (DMND)",
                 header.sequences, header.letters
             );
-            records
+            (records, true)
         } else {
             let fasta_path = if db_path.extension().is_none() {
                 db_path.with_extension("faa")
@@ -117,7 +137,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             };
             let records = fasta::read_fasta_file(&fasta_path, SequenceType::AminoAcid)?;
             eprintln!("Database: {} sequences (FASTA)", records.len());
-            records
+            (records, false)
         }
     };
 
@@ -147,15 +167,21 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     match config.masking {
         MaskingMode::None => {}
         MaskingMode::Tantan => {
-            // Apply tantan soft masking for seed filtering (high bit set on masked positions).
-            // The DMND reader returns sequences that already have tantan marks (set during
-            // makedb), so this is a no-op for the canonical workflow — but we keep the
-            // call so the FASTA->blastp path (no precomputed marks) still masks.
+            // C++ constructs the tantan masker from the active ScoreMatrix and
+            // applies it at search time to both targets and queries
+            // (`Masking::Masking(const ScoreMatrix&)`, then `mask_seqs` in
+            // `run/double_indexed.cpp`). This matters for non-default matrices
+            // such as BLOSUM45: reusing makedb's default BLOSUM62 mask leaves
+            // low-complexity regions under-masked and inflates self scores.
+            let tantan_masker =
+                crate::masking::tantan::TantanMasker::from_score_matrix(&score_matrix, 0.9);
             db_records.par_iter_mut().for_each(|r| {
-                crate::masking::mask_sequence(&mut r.sequence, MaskingAlgo::Tantan);
+                crate::masking::remove_bit_mask(&mut r.sequence);
+                tantan_masker.mask(&mut r.sequence);
             });
             query_records.par_iter_mut().for_each(|r| {
-                crate::masking::mask_sequence(&mut r.sequence, MaskingAlgo::Tantan);
+                crate::masking::remove_bit_mask(&mut r.sequence);
+                tantan_masker.mask(&mut r.sequence);
             });
         }
         MaskingMode::BlastSeg => {
@@ -237,6 +263,23 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         .iter()
         .map(|code| Shape::from_code(code, &reduction))
         .collect();
+    let shape_patterns: Vec<u32> = shapes.iter().map(|shape| shape.mask).collect();
+    let left_most_contexts: Vec<LeftMostContext<'_>> = (0..shapes.len())
+        .map(|sid| {
+            let previous = if sid == 0 {
+                &shape_patterns[0..0]
+            } else {
+                &shape_patterns[0..sid]
+            };
+            LeftMostContext {
+                previous_matcher: PatternMatcher::new(previous),
+                current_matcher: PatternMatcher::new(&shape_patterns[0..=sid]),
+                short_query_ungapped_cutoff: score_matrix.rawscore_int(25.0),
+                seedp_mask: seedp_mask(10),
+                reduction: &reduction,
+            }
+        })
+        .collect();
     eprintln!(
         "Sensitivity: {:?}, shapes: {} (weights: {})",
         config.sensitivity,
@@ -257,40 +300,36 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // Per-sensitivity seed filters matching C++ DIAMOND:
     //   - `seed_cut * ln(2) * shape.weight` is the entropy floor for
     //     `seed_is_complex` (search/setup.cpp).
-    //   - `freq_sd` (default 50.0 for blastp) is the multiplier for the
-    //     mean+SD frequent-seed mask (data/frequent_seeds.cpp).
+    //   - Frequent-seed masking is guarded by C++ `config.freq_masking`; the
+    //     native default path leaves it disabled.
     let traits = sensitivity::get_traits(config.sensitivity);
-    // Process shapes in parallel: each shape's seed extraction is independent
-    // (no shared state). C++ also processes shapes concurrently (interleaved
-    // with chunks via the index_chunks loop).
-    let shape_results: Vec<Vec<seed_match::SeedMatch>> = shapes
-        .par_iter()
-        .map(|shape| {
-            let complexity_cut = traits.seed_cut * std::f64::consts::LN_2 * shape.weight as f64;
-            parallel::find_seed_matches_partitioned_filtered_min_query_len(
-                &query_seqs,
-                &db_seqs,
-                shape,
-                &reduction,
-                complexity_cut,
-                traits.freq_sd,
-                config.min_query_len,
-            )
-        })
-        .collect();
+    // Process shapes in order and let each shape's seed-array build/join use
+    // the Rayon pool internally. Running the outer shape loop in parallel
+    // competes with the inner reference seed-array work and scales worse on
+    // small real query blocks; collecting in shape order preserves the previous
+    // output order.
     let mut all_seed_matches = Vec::new();
-    for matches in shape_results {
-        all_seed_matches.extend(matches);
+    for (shape_id, shape) in shapes.iter().enumerate() {
+        let complexity_cut = traits.seed_cut * std::f64::consts::LN_2 * shape.weight as f64;
+        let mut matches = parallel::find_seed_matches_partitioned_filtered_min_query_len(
+            &query_seqs,
+            &db_seqs,
+            shape,
+            &reduction,
+            complexity_cut,
+            0.0,
+            config.min_query_len,
+        );
+        for m in &mut matches {
+            m.shape_id = shape_id as u32;
+        }
+        all_seed_matches.append(&mut matches);
     }
     let raw_seed_matches = all_seed_matches.len();
-
-    // Dedupe (q_id, q_pos, r_id, r_pos) across shapes. C++ doesn't dedupe at
-    // this stage, but the downstream pipeline largely collapses duplicates
-    // anyway. Keeping this dedup avoids a large runtime hit in the native
-    // benchmark path and does not affect the current residual divergent rows.
-    all_seed_matches.sort_by_key(|m| (m.query_id, m.query_pos, m.ref_id, m.ref_pos));
-    all_seed_matches.dedup_by_key(|m| (m.query_id, m.query_pos, m.ref_id, m.ref_pos));
-    let after_dedup = all_seed_matches.len();
+    // C++ stage0/stage2 preserves shape + seed-partition join emission order
+    // inside a query. Only group by query so range building is cheap without
+    // imposing a Rust-only target/position tie-breaker on ranking boundaries.
+    all_seed_matches.sort_by_key(|m| m.query_id);
 
     // Stage-1 hamming filter: drop seed hits whose 48-letter window matches
     // fewer than `min_identities` letters. Ports C++ search/hamming/kernel.h.
@@ -301,9 +340,8 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         traits.min_identities,
     );
     eprintln!(
-        "Seed matches: {} (raw) -> {} (dedup) -> {} (hamming)",
+        "Seed matches: {} (raw) -> {} (hamming)",
         raw_seed_matches,
-        after_dedup,
         all_seed_matches.len(),
     );
 
@@ -317,6 +355,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     }
     drop(db_seqs);
     drop(query_seqs);
+    trim_freed_heap_pages();
     // C++ `enum_seeds.h:223` calls `seqs.remove_soft_masking(template_len, mask_seeds)`
     // with `mask_seeds=true` only on the query side, propagating SEED_MASK over
     // `[motif_begin - template_len + 1, motif_begin + motif_len)`. The DB-side
@@ -371,20 +410,44 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         None => Box::new(BufWriter::new(io::stdout())),
     };
     let mut writer = output;
+    const GAPPED_FILTER_EVALUE1: f64 = 2000.0;
+    const GAPPED_FILTER_DIAG_BITS: f64 = 12.0;
+    const GAPPED_FILTER_WINDOW: i32 = 200;
 
-    // Group all seed matches by query
-    let mut query_matches: HashMap<u32, Vec<&seed_match::SeedMatch>> = HashMap::new();
-    for m in &all_seed_matches {
-        query_matches.entry(m.query_id).or_default().push(m);
+    let gapped_filter_evalue = traits.gapped_filter_evalue as f64;
+    let cutoff_gapped1 = if gapped_filter_evalue != 0.0 {
+        Some(CutoffTable2D::new(&score_matrix, GAPPED_FILTER_EVALUE1))
+    } else {
+        None
+    };
+    let cutoff_gapped2 = if gapped_filter_evalue != 0.0 {
+        Some(CutoffTable2D::new(&score_matrix, gapped_filter_evalue))
+    } else {
+        None
+    };
+    let gapped_filter_diag_score = score_matrix.rawscore_int(GAPPED_FILTER_DIAG_BITS);
+
+    // `all_seed_matches` is sorted by query id before the hamming filter, and
+    // the filter preserves order. Store dense ranges instead of hashing each
+    // query into a small Vec of references.
+    let mut query_match_ranges: Vec<Range<usize>> = vec![0..0; query_records.len()];
+    let mut i = 0usize;
+    while i < all_seed_matches.len() {
+        let query_id = all_seed_matches[i].query_id as usize;
+        let begin = i;
+        while i < all_seed_matches.len() && all_seed_matches[i].query_id as usize == query_id {
+            i += 1;
+        }
+        if query_id < query_match_ranges.len() {
+            query_match_ranges[query_id] = begin..i;
+        }
     }
 
-    // Process each query — parallel over queries (each query is independent).
-    // Each worker formats its output into a per-query buffer; we write the
-    // buffers to the final writer in input order to keep output deterministic.
-    let per_query_output: Vec<Vec<u8>> = query_records
-        .par_iter()
-        .enumerate()
-        .map(|(query_idx, query_rec)| -> io::Result<Vec<u8>> {
+    // Process each query in input order. Native blastp keeps lazy target
+    // masking disabled, so the C++-style extension path can read the shared
+    // target block without serializing all queries.
+    let process_query =
+        |(query_idx, query_rec): (usize, &fasta::FastaRecord)| -> io::Result<Vec<u8>> {
             let query = &query_rec.sequence;
 
             // Compute ungapped score cutoff for this query length.
@@ -434,177 +497,253 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             } else {
                 Vec::new()
             };
+            let query_comp = crate::stats::cbs::compute_composition(query);
+            let ungapped_cfg = UngappedStageConfig {
+                comp_based_stats: config.comp_based_stats,
+                xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
+                ..UngappedStageConfig::default()
+            };
+            let ext_mode = sensitivity::default_ext_mode(config.sensitivity);
+            let gapped_cfg = GappedScoreConfig {
+                comp_based_stats_hauser: config.comp_based_stats.hauser(),
+                comp_based_stats_matrix_adjust: config.comp_based_stats.matrix_adjust(),
+                query_cover: config.query_cover,
+                subject_cover: config.subject_cover,
+                no_self_hits: config.no_self_hits,
+                max_evalue: config.max_evalue,
+                min_id: config.min_id,
+                max_target_seqs: config.max_target_seqs,
+                ext_chunk_size: config.ext_chunk_size,
+                toppercent: config.toppercent,
+                global_ranking_targets: config.global_ranking_targets,
+                gapped_filter_evalue,
+                sensitivity: config.sensitivity,
+                ..GappedScoreConfig::default()
+            };
 
-            // Get seed matches for this query
-            let empty_matches = Vec::new();
-            let query_seed_matches = query_matches
-                .get(&(query_idx as u32))
-                .unwrap_or(&empty_matches);
+            // Get seed matches for this query.
+            let query_seed_matches = &all_seed_matches[query_match_ranges[query_idx].clone()];
 
-            // Group by target
-            let mut target_hits: HashMap<u32, Vec<&&seed_match::SeedMatch>> = HashMap::new();
-            for m in query_seed_matches {
-                target_hits.entry(m.ref_id).or_default().push(m);
-            }
-
-            // Process each target
-            let mut target_results: Vec<(u32, f64, OutputHsp)> = Vec::new();
-
-            for (&target_id, hits) in &target_hits {
-                let target = &db_records[target_id as usize].sequence;
-
-                // Stage-2 filter: 96-letter ungapped window walk (C++
-                // `dp/ungapped_align.cpp:ungapped_window`). This is the score C++
-                // uses for the seed-hit cutoff check — deliberately less sensitive
-                // than x-drop so marginal targets get rejected here rather than
-                // sailing through to full alignment.
-                let mut any_seed_passes_window = false;
-                for hit in hits {
-                    let s = crate::dp::ungapped_window::filter_ungapped_score(
-                        query,
-                        target,
-                        hit.query_pos as usize,
-                        hit.ref_pos as usize,
-                        crate::dp::ungapped_window::UNGAPPED_WINDOW,
-                        &score_matrix,
-                    );
-                    if s > ungapped_cutoff {
-                        any_seed_passes_window = true;
-                        break;
-                    }
-                }
-                if !any_seed_passes_window {
-                    continue;
-                }
-
-                let mut seed_hits = Vec::with_capacity(hits.len());
-                for hit in hits {
-                    let score = crate::dp::ungapped_window::filter_ungapped_score(
-                        query,
-                        target,
-                        hit.query_pos as usize,
-                        hit.ref_pos as usize,
-                        crate::dp::ungapped_window::UNGAPPED_WINDOW,
-                        &score_matrix,
-                    );
-                    seed_hits.push(SeedHit::new(
-                        hit.query_pos as i32,
-                        hit.ref_pos as i32,
-                        score,
-                        0,
-                    ));
-                }
-
-                let query_comp = crate::stats::cbs::compute_composition(query);
-                let mut stat = Statistics::new();
-                // C++ `raw_ungapped_xdrop` is computed at startup as
-                // `score_matrix.rawscore(config.ungapped_xdrop)` where
-                // `ungapped_xdrop` is expressed in bits (`--xdrop`, default
-                // 12.3). Compute it from the active matrix so non-BLOSUM62
-                // runs and user overrides match C++.
-                let ungapped_cfg = UngappedStageConfig {
-                    comp_based_stats: config.comp_based_stats,
-                    xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
-                    ..UngappedStageConfig::default()
-                };
-                // C++ uses `BandedSlow` for `MoreSensitive`/`VerySensitive`/
-                // `UltraSensitive` and `BandedFast` for the others (per
-                // `Extension::default_ext_mode` in `extend.cpp:73-86`).
-                // Hardcoding `BandedFast` here over-truncates the band at high
-                // sensitivities, dropping marginal alignments C++ would find.
-                let ext_mode = sensitivity::default_ext_mode(config.sensitivity);
-                let work_target = ungapped_stage_target(
-                    &mut seed_hits,
-                    std::slice::from_ref(query),
-                    std::slice::from_ref(&query_cbs),
-                    &query_comp,
-                    target_id,
-                    target.len() as i32,
-                    &mut stat,
-                    &db_block,
-                    ext_mode,
-                    &ungapped_cfg,
-                    &score_matrix,
-                );
-                if work_target.hsp[0].is_empty() {
-                    continue;
-                }
-
-                let gapped_cfg = GappedScoreConfig {
-                    comp_based_stats_hauser: config.comp_based_stats.hauser(),
-                    comp_based_stats_matrix_adjust: config.comp_based_stats.matrix_adjust(),
-                    query_cover: config.query_cover,
-                    subject_cover: config.subject_cover,
-                    no_self_hits: config.no_self_hits,
-                    max_evalue: config.max_evalue,
-                    min_id: config.min_id,
-                    max_target_seqs: config.max_target_seqs,
-                    sensitivity: config.sensitivity,
-                    ..GappedScoreConfig::default()
-                };
-                let mut work_targets = vec![work_target];
-                let aligned = align_work_targets(
-                    &mut work_targets,
-                    std::slice::from_ref(query),
-                    Some(&query_rec.id),
-                    std::slice::from_ref(&query_cbs),
-                    query.len() as i32,
-                    Flags::NONE,
-                    HspValues::COORDS
-                        | HspValues::IDENT
-                        | HspValues::LENGTH
-                        | HspValues::MISMATCHES
-                        | HspValues::GAP_OPENINGS,
-                    ext_mode,
-                    &mut stat,
-                    &gapped_cfg,
-                    &score_matrix,
-                );
-                let Some(best_target) = aligned.first() else {
-                    continue;
-                };
-                let Some(best_hsp) = best_target.hsp[0].first() else {
-                    continue;
-                };
-
-                let evalue = best_hsp.evalue;
-                if evalue > config.max_evalue {
-                    continue;
-                }
-
-                let pident = if best_hsp.length > 0 {
-                    100.0 * best_hsp.identities as f64 / best_hsp.length as f64
-                } else {
-                    0.0
-                };
-                if pident < config.min_id {
-                    continue;
-                }
-                let qcov = if query.is_empty() {
-                    0.0
-                } else {
-                    100.0 * (best_hsp.query_range.end - best_hsp.query_range.begin).max(0) as f64
-                        / query.len() as f64
-                };
-                if qcov < config.query_cover {
-                    continue;
-                }
-                let scov = if target.is_empty() {
-                    0.0
-                } else {
-                    100.0
-                        * (best_hsp.subject_range.end - best_hsp.subject_range.begin).max(0) as f64
-                        / target.len() as f64
-                };
-                if scov < config.subject_cover {
-                    continue;
-                }
-                if config.no_self_hits
-                    && query == target
-                    && query_rec.id == db_records[target_id as usize].id
+            // Stage-2 filter: 96-letter ungapped window walk (C++
+            // `dp/ungapped_align.cpp:ungapped_window`). Surviving hits are
+            // passed to the same batched extension/ranking path used by the
+            // lower-level Rust translation of C++ `Extension::extend`.
+            let mut hits = Vec::new();
+            hits.reserve(query_seed_matches.len());
+            let ref_seq_data = db_block.seqs().data();
+            let mut group_begin = 0usize;
+            while group_begin < query_seed_matches.len() {
+                let sid = query_seed_matches[group_begin].shape_id as usize;
+                let q_pos = query_seed_matches[group_begin].query_pos as usize;
+                let mut group_end = group_begin + 1;
+                while group_end < query_seed_matches.len()
+                    && query_seed_matches[group_end].shape_id as usize == sid
+                    && query_seed_matches[group_end].query_pos as usize == q_pos
                 {
+                    group_end += 1;
+                }
+
+                let q_start = q_pos.saturating_sub(crate::dp::ungapped_window::UNGAPPED_WINDOW);
+                let window_left = q_pos - q_start;
+                let q_end =
+                    (q_start + crate::dp::ungapped_window::UNGAPPED_WINDOW * 2).min(query.len());
+                let window_clipped = q_end - q_start;
+                let shape = &shapes[sid];
+                let interval_mod = (q_pos % 32) as i32;
+                let interval_overhang = (window_left as i32 - interval_mod).max(0) as usize;
+                let left_q_start = q_start + interval_overhang;
+                let left_seed_offset = window_left.saturating_sub(interval_overhang);
+                if left_q_start >= q_end {
+                    group_begin = group_end;
                     continue;
                 }
+                let left_len = q_end - left_q_start;
+                let query_window = &query[q_start..q_end];
+
+                let mut chunk_begin = group_begin;
+                while chunk_begin < group_end {
+                    let chunk_end = (chunk_begin + 32).min(group_end);
+                    let chunk = &query_seed_matches[chunk_begin..chunk_end];
+                    let subjects = chunk
+                        .iter()
+                        .map(|hit| {
+                            db_block
+                                .seqs()
+                                .position(hit.ref_id as usize, hit.ref_pos as usize)
+                                as isize
+                                - window_left as isize
+                        })
+                        .collect::<Vec<_>>();
+
+                    let subject_storage;
+                    let subject_windows = if subjects.iter().all(|&start| start >= 0) {
+                        subjects
+                            .iter()
+                            .map(|&start| &ref_seq_data[start as usize..])
+                            .collect::<Vec<_>>()
+                    } else {
+                        subject_storage = subjects
+                            .iter()
+                            .map(|&start| {
+                                (0..window_clipped)
+                                    .map(|n| {
+                                        let si = start + n as isize;
+                                        if si < 0 {
+                                            crate::basic::value::DELIMITER_LETTER
+                                        } else {
+                                            ref_seq_data
+                                                .get(si as usize)
+                                                .copied()
+                                                .unwrap_or(crate::basic::value::DELIMITER_LETTER)
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>();
+                        subject_storage
+                            .iter()
+                            .map(Vec::as_slice)
+                            .collect::<Vec<_>>()
+                    };
+                    let scores = if ungapped_cutoff == 0 {
+                        vec![i32::MAX; chunk.len()]
+                    } else {
+                        crate::dp::simd_ungapped::window_ungapped_best(
+                            query_window,
+                            &subject_windows,
+                            window_clipped,
+                            &score_matrix,
+                        )
+                    };
+
+                    for (chunk_idx, hit) in chunk.iter().enumerate() {
+                        let score = scores[chunk_idx];
+                        if score <= ungapped_cutoff {
+                            continue;
+                        }
+                        let subject = db_block
+                            .seqs()
+                            .position(hit.ref_id as usize, hit.ref_pos as usize);
+                        let left_subject_start = subjects[chunk_idx] + interval_overhang as isize;
+                        let subject_storage;
+                        let subject_window = if left_subject_start >= 0
+                            && (left_subject_start as usize + left_len) <= ref_seq_data.len()
+                        {
+                            &ref_seq_data[left_subject_start as usize
+                                ..left_subject_start as usize + left_len]
+                        } else {
+                            subject_storage = (0..left_len)
+                                .map(|n| {
+                                    let si = left_subject_start + n as isize;
+                                    if si < 0 {
+                                        crate::basic::value::DELIMITER_LETTER
+                                    } else {
+                                        ref_seq_data
+                                            .get(si as usize)
+                                            .copied()
+                                            .unwrap_or(crate::basic::value::DELIMITER_LETTER)
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            &subject_storage
+                        };
+                        let chunked = traits.index_chunks > 1;
+                        let use_left_most_range = chunked
+                            && (config.ext_chunk_size == 0 || config.ext_chunk_size <= 128)
+                            && config.max_target_seqs <= 25;
+                        let current_range = if use_left_most_range {
+                            let partitions = seedp_count(10) as usize;
+                            let chunk_size = partitions.div_ceil(traits.index_chunks as usize);
+                            let partition = seed_partition(hit.seed, seedp_mask(10)) as usize;
+                            let begin = (partition / chunk_size) * chunk_size;
+                            let end = (begin + chunk_size).min(partitions);
+                            Some(SeedPartitionRange::with_bounds(begin as u32, end as u32))
+                        } else {
+                            None
+                        };
+                        let skip_left_most = config.sensitivity >= Sensitivity::VerySensitive;
+                        if !skip_left_most
+                            && !left_most_filter_with_range(
+                                &query[left_q_start..q_end],
+                                subject_window,
+                                left_seed_offset as i32,
+                                shape.length,
+                                &left_most_contexts[sid],
+                                sid == 0,
+                                shape,
+                                ungapped_cutoff,
+                                chunked,
+                                traits.min_identities,
+                                current_range,
+                            )
+                        {
+                            continue;
+                        }
+                        hits.push(Hit::with_score(
+                            0,
+                            subject as u64,
+                            hit.query_pos as u32,
+                            if score == i32::MAX {
+                                u16::MAX
+                            } else {
+                                score.min(u16::MAX as i32) as u16
+                            },
+                        ));
+                    }
+                    chunk_begin = chunk_end;
+                }
+                group_begin = group_end;
+            }
+            let mut stat = Statistics::new();
+            let output_hsp_values = HspValues::COORDS
+                | HspValues::IDENT
+                | HspValues::LENGTH
+                | HspValues::MISMATCHES
+                | HspValues::GAP_OPENINGS;
+            let query_cbs_arg: &[Vec<i8>] = if query_cbs.is_empty() {
+                &[]
+            } else {
+                std::slice::from_ref(&query_cbs)
+            };
+            let matches = extend_targets(
+                query_idx as u32,
+                &mut hits,
+                std::slice::from_ref(query),
+                &query_rec.id,
+                query.len() as i32,
+                query_cbs_arg,
+                &query_comp,
+                &db_block,
+                &mut stat,
+                Flags::NONE,
+                ext_mode,
+                &gapped_cfg,
+                &ungapped_cfg,
+                &score_matrix,
+                output_hsp_values,
+                |query_len, target_len| {
+                    cutoff_gapped1
+                        .as_ref()
+                        .map_or(-1, |table| table.call(query_len, target_len))
+                },
+                |query_len, target_len| {
+                    cutoff_gapped2
+                        .as_ref()
+                        .map_or(-1, |table| table.call(query_len, target_len))
+                },
+                score_matrix.gap_open(),
+                score_matrix.gap_extend(),
+                gapped_filter_diag_score,
+                GAPPED_FILTER_WINDOW,
+                Option::<fn(u32, &crate::align::gapped_filter::SeedHitList) -> Vec<Match>>::None,
+            );
+            let mut target_results: Vec<(u32, f64, OutputHsp)> = Vec::new();
+            for m in matches {
+                let Some(best_hsp) = m.hsps.first() else {
+                    continue;
+                };
+                let target_id = m.target_block_id;
+                let evalue = best_hsp.evalue;
 
                 let hsp = OutputHsp {
                     score: best_hsp.score,
@@ -629,26 +768,6 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 target_results.push((target_id, evalue, hsp));
             }
 
-            // Final top-N sort. C++ `Match::cmp_evalue` (`diamond/src/align/extend.h:58-63`)
-            // orders by `(evalue ASC, score DESC, target_block_id ASC)`. The score
-            // tie-break is critical at the `-k 25` boundary: when two targets share
-            // the same evalue, C++ keeps the higher-scoring one. Without it Rust
-            // falls straight to block_id and can swap a higher-score target out
-            // for a lower-score one — produces the residual cpp-only / rust-only
-            // flips around the cutoff.
-            target_results.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.2.score.cmp(&a.2.score))
-                    .then(a.0.cmp(&b.0))
-            });
-
-            // Apply max target seqs
-            let max_targets = config.max_target_seqs as usize;
-            if target_results.len() > max_targets {
-                target_results.truncate(max_targets);
-            }
-
             // Output results into a per-query buffer.
             let mut buf: Vec<u8> = Vec::new();
             for (target_id, _, hsp) in &target_results {
@@ -663,8 +782,20 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 )?;
             }
             Ok(buf)
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+        };
+    let per_query_output: Vec<Vec<u8>> = if rayon::current_num_threads() == 1 {
+        query_records
+            .iter()
+            .enumerate()
+            .map(process_query)
+            .collect::<io::Result<Vec<_>>>()?
+    } else {
+        query_records
+            .par_iter()
+            .enumerate()
+            .map(process_query)
+            .collect::<io::Result<Vec<_>>>()?
+    };
 
     let mut total_alignments = 0u64;
     for buf in &per_query_output {
@@ -704,6 +835,9 @@ mod tests {
             gap_extend: 1,
             max_evalue: 0.001,
             max_target_seqs: 25,
+            ext_chunk_size: 0,
+            toppercent: None,
+            global_ranking_targets: 0,
             min_id: 0.0,
             threads: 1,
             outfmt: vec![],
@@ -744,6 +878,9 @@ mod tests {
             gap_extend: 1,
             max_evalue: 0.001,
             max_target_seqs: 25,
+            ext_chunk_size: 0,
+            toppercent: None,
+            global_ranking_targets: 0,
             min_id: 0.0,
             threads: 1,
             outfmt: vec![],

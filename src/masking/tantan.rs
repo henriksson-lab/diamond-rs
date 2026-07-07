@@ -8,6 +8,7 @@
 //! per-position posterior probability of being in a repeat state.
 
 use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK, SEED_MASK, TRUE_AA};
+use crate::stats::score_matrix::ScoreMatrix;
 
 /// Default tantan parameters matching C++ DIAMOND.
 const P_REPEAT: f32 = 0.005;
@@ -155,6 +156,34 @@ impl TantanMasker {
         }
     }
 
+    /// Create a masker from the active scoring matrix.
+    ///
+    /// Matches C++ `Masking::Masking(const ScoreMatrix&)`, which constructs
+    /// tantan likelihood ratios from the current matrix rather than always
+    /// using BLOSUM62.
+    pub fn from_score_matrix(score_matrix: &ScoreMatrix, min_mask_prob: f32) -> Self {
+        let n = TRUE_AA as usize;
+        let aa_count = AMINO_ACID_COUNT;
+        let mut scores = vec![0i8; aa_count * aa_count];
+        for i in 0..aa_count {
+            for j in 0..aa_count {
+                scores[i * aa_count + j] = score_matrix.score(i as Letter, j as Letter) as i8;
+            }
+        }
+        let lambda = compute_lambda_flat(&scores, aa_count, n);
+        let mut lr_matrix = vec![vec![0.0f32; aa_count]; aa_count];
+        for i in 0..aa_count {
+            for j in 0..aa_count {
+                let score = score_matrix.score(i as Letter, j as Letter);
+                lr_matrix[i][j] = (lambda * score as f64).exp() as f32;
+            }
+        }
+        TantanMasker {
+            lr_matrix,
+            min_mask_prob,
+        }
+    }
+
     /// Mask a sequence using the pre-computed likelihood ratio matrix.
     pub fn mask(&self, seq: &mut [Letter]) {
         mask_tantan_inner(seq, &self.lr_matrix, self.min_mask_prob);
@@ -172,6 +201,11 @@ fn default_masker() -> &'static TantanMasker {
 /// Apply tantan masking to a sequence using default BLOSUM62 parameters.
 pub fn mask_tantan(seq: &mut [Letter]) {
     default_masker().mask(seq);
+}
+
+/// Apply tantan masking using the active score matrix.
+pub fn mask_tantan_with_score_matrix(seq: &mut [Letter], score_matrix: &ScoreMatrix) {
+    TantanMasker::from_score_matrix(score_matrix, DEFAULT_MIN_MASK_PROB).mask(seq);
 }
 
 /// Scalar forward step (generic fallback).

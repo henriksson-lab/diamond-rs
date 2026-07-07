@@ -2,22 +2,47 @@ use super::reduction::Reduction;
 use super::seed::{PackedSeed, MAX_SEED_WEIGHT};
 
 /// `ln(n!)` for small n. The Hauser/SEG-style entropy formula uses this in a
-/// tight loop. Memoized once via `OnceLock` because `f64::ln` is not `const`.
+/// tight loop. Keep this as a literal table instead of a lazily initialized
+/// `OnceLock`: seed enumeration calls it for every candidate seed, so even the
+/// fast initialized path shows up in real blastp profiles.
 #[inline]
 fn ln_factorial(n: u32) -> f64 {
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<[f64; 32]> = OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut t = [0.0f64; 32];
-        let mut acc = 0.0;
-        for i in 2..32 {
-            acc += (i as f64).ln();
-            t[i] = acc;
-        }
-        t
-    });
-    if (n as usize) < table.len() {
-        table[n as usize]
+    const TABLE: [f64; 32] = [
+        0.0,
+        0.0,
+        0.6931471805599453,
+        1.791759469228055,
+        3.1780538303479453,
+        4.787491742782046,
+        6.579251212010101,
+        8.525161361065415,
+        10.60460290274525,
+        12.80182748008147,
+        15.104412573075518,
+        17.502307845873887,
+        19.98721449566189,
+        22.552163853123425,
+        25.191221182738683,
+        27.89927138384089,
+        30.671860106080675,
+        33.50507345013689,
+        36.39544520803305,
+        39.339884187199495,
+        42.335616460753485,
+        45.38013889847691,
+        48.47118135183523,
+        51.60667556776438,
+        54.784729398112326,
+        58.00360522298052,
+        61.261701761002,
+        64.55753862700634,
+        67.88974313718154,
+        71.257038967168,
+        74.65823634883017,
+        78.0922235533153,
+    ];
+    if let Some(&x) = TABLE.get(n as usize) {
+        x
     } else {
         (2..=n).map(|i| (i as f64).ln()).sum()
     }

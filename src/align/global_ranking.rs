@@ -446,7 +446,7 @@ where
         l.seed_hits
             .push_item(SeedHit::new(0, 0, target.score as i32, 0));
     }
-    target::extend_seed_hit_list(
+    target::extend_seed_hit_list_mut(
         query_list.query_block_id,
         query_seq,
         query_title,

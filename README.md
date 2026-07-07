@@ -133,13 +133,14 @@ println!("E-value: {:.2e}, Bit score: {:.1}", evalue, bitscore);
 
 ## Benchmarks
 
-Measured with `RUSTFLAGS="-C target-cpu=native"` on test data (single-threaded, 389 queries vs 1 reference, 3 runs each):
+The previous 389-query benchmark input was not reproducible from files in this checkout. The table below uses bundled test data, measured with `RUSTFLAGS="-C target-cpu=native"`, `-p1`, and `/usr/bin/time` (median of 3 runs):
 
-| Operation | C++ Original | Rust (Native) | Speedup |
-|-----------|-------------|---------------|---------|
-| `blastp` (389 queries) | 0.14s | 0.06s | **2.3x** |
-| `makedb` | 0.02s | <0.01s | **>2x** |
-| `test` (20 regressions) | 28.7s | 28.8s (FFI) | 1.0x |
+| Operation | Input | C++ Original | Rust (Native) | Speedup | Peak RSS Ratio (Rust/C++) |
+|-----------|-------|--------------|---------------|---------|---------------------------|
+| `blastp` | `5.faa` (389 queries) vs `data.dmnd` | 0.14s, 12.5 MiB | 0.08s, 9.0 MiB | **1.8x** | **0.72x** |
+| `makedb` | `data.faa` (389 sequences) | 0.03s, 12.2 MiB | 0.03s, 8.4 MiB | 1.0x | **0.69x** |
+
+Speedup is C++ wall time divided by Rust wall time. Peak RSS ratio is Rust peak resident memory divided by C++ peak resident memory; lower is better.
 
 The native Rust pipeline produces matching scores, coordinates, and bit scores. The `--legacy` flag falls back to C++ FFI for full bit-exact compatibility.
 

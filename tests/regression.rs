@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 fn test_data_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -9,7 +10,15 @@ fn test_data_dir() -> PathBuf {
 }
 
 fn run_diamond(args: &[&str]) -> i32 {
-    diamond::ffi::run(args)
+    let guard = ffi_lock().lock().unwrap();
+    let code = diamond::ffi::run(args);
+    drop(guard);
+    code
+}
+
+fn ffi_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 /// Run the built-in regression test suite (20 test cases with hash comparison).

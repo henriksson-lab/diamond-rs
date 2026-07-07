@@ -503,14 +503,8 @@ pub fn dispatch_swipe(
     p: &Params<'_>,
 ) -> Vec<Hsp> {
     let mut out = Vec::new();
-    let empty_bias;
-    let bias = match p.composition_bias {
-        Some(bias) => bias,
-        None => {
-            empty_bias = vec![0i8; p.query.len()];
-            &empty_bias
-        }
-    };
+    let bias = p.composition_bias.unwrap_or(&[]);
+    let mut score_scratch = ScoreScratch::default();
 
     for target in subject_begin {
         if target.blank() || target.seq.is_empty() {
@@ -518,7 +512,7 @@ pub fn dispatch_swipe(
         }
         let mut reversed_seq;
         let target_seq = if p.reverse_targets {
-            reversed_seq = target.seq.clone();
+            reversed_seq = target.seq.to_vec();
             reversed_seq.reverse();
             &reversed_seq
         } else {
@@ -529,6 +523,49 @@ pub fn dispatch_swipe(
         } else {
             (target.d_begin, target.d_end)
         };
+        if p.v == HspValues::NONE {
+            let sw_score = banded_sw_cbs_score(
+                p.query,
+                target_seq,
+                d_begin,
+                d_end,
+                p.score_matrix,
+                bias,
+                target.matrix.as_deref(),
+                target.matrix_scale(),
+                &mut score_scratch,
+            );
+            if sw_score <= 0 {
+                continue;
+            }
+            let score = if target.adjusted_matrix() {
+                sw_score
+            } else {
+                sw_score * p.cbs_matrix_scale
+            };
+            let evalue =
+                p.score_matrix
+                    .evalue(score, p.query.len() as u32, target.true_target_len as u32);
+            if evalue > p.max_evalue {
+                continue;
+            }
+            let mut hsp = Hsp::new();
+            hsp.score = score;
+            hsp.bit_score = p.score_matrix.bitscore(score as f64);
+            hsp.corrected_bit_score = p.score_matrix.bitscore_corrected(
+                score,
+                p.query.len() as u32,
+                target.true_target_len as u32,
+            );
+            hsp.evalue = evalue;
+            hsp.frame = p.frame;
+            hsp.d_begin = d_begin;
+            hsp.d_end = d_end;
+            hsp.swipe_target = target.target_idx as i32;
+            hsp.swipe_bin = p.swipe_bin;
+            out.push(hsp);
+            continue;
+        }
         let sw = banded_sw_cbs_range(
             p.query,
             target_seq,
@@ -913,28 +950,67 @@ fn banded_sw_cbs_range(
     let gap_open = (score_matrix.gap_open() + score_matrix.gap_extend()) * matrix_scale;
     let gap_extend = score_matrix.gap_extend() * matrix_scale;
     let neg_inf = i32::MIN / 4;
+    let use_cbs = target_matrix.is_none() && !query_cbs.is_empty();
     let rows = qlen + 1;
-    let idx = |i: usize, j: usize| -> usize { j * rows + i };
-
-    let mut h = vec![0i32; rows * (slen + 1)];
-    let mut e = vec![neg_inf; rows * (slen + 1)];
-    let mut f = vec![neg_inf; rows * (slen + 1)];
-    let mut gap_v = vec![false; rows * (slen + 1)];
-    let mut gap_h = vec![false; rows * (slen + 1)];
-    let mut open_v = vec![false; rows * (slen + 1)];
-    let mut open_h = vec![false; rows * (slen + 1)];
+    let band_rows = ((d_end - d_begin + 2).max(1) as usize).min(rows);
+    let col_lower = |j: usize| -> usize {
+        if j == 0 {
+            1
+        } else {
+            let target_pos = j as i32 - 1;
+            (d_begin + target_pos).max(0) as usize + 1
+        }
+    };
+    let band_offset = |i: usize, j: usize| -> Option<usize> {
+        if j > slen {
+            return None;
+        }
+        let lower = col_lower(j);
+        if i < lower {
+            return None;
+        }
+        let k = i - lower;
+        if k < band_rows {
+            Some(k)
+        } else {
+            None
+        }
+    };
+    let band_idx =
+        |i: usize, j: usize| -> Option<usize> { band_offset(i, j).map(|k| j * band_rows + k) };
+    let get_i32 = |v: &[i32], i: usize, j: usize, default: i32| -> i32 {
+        band_idx(i, j).map_or(default, |idx| v[idx])
+    };
+    let get_bool =
+        |v: &[bool], i: usize, j: usize| -> bool { band_idx(i, j).is_some_and(|idx| v[idx]) };
+    let cells = band_rows * (slen + 1);
+    let mut h = vec![0i32; cells];
+    let mut gap_v = vec![false; cells];
+    let mut gap_h = vec![false; cells];
+    let mut open_v = vec![false; cells];
+    let mut open_h = vec![false; cells];
+    let mut prev_e = vec![neg_inf; band_rows];
+    let mut curr_e = vec![neg_inf; band_rows];
+    let mut f_col = vec![neg_inf; band_rows];
     let mut best_score = 0i32;
     let mut best_i = 0usize;
     let mut best_j = 0usize;
 
     for j in 1..=slen {
+        curr_e.fill(neg_inf);
+        f_col.fill(neg_inf);
         let target_pos = j as i32 - 1;
         let lower = (d_begin + target_pos).max(0);
         let upper = (d_end + target_pos - 1).min(qlen as i32 - 1);
         if lower > upper {
+            std::mem::swap(&mut prev_e, &mut curr_e);
             continue;
         }
-        for i in (lower as usize + 1)..=(upper as usize + 1) {
+        let lower_i = lower as usize + 1;
+        let upper_i = upper as usize + 1;
+        let prev_lower = col_lower(j - 1);
+        let curr_col_offset = j * band_rows;
+        for i in lower_i..=upper_i {
             let qpos = i - 1;
             let spos = j - 1;
             let ql = query[qpos];
@@ -947,29 +1023,52 @@ fn banded_sw_cbs_range(
             } else if let Some(matrix) = target_matrix {
                 matrix.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize] as i32
             } else {
-                score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
+                score_matrix.score(ql, sl)
             };
-            let current = idx(i, j);
-            let cbs = if target_matrix.is_some() {
-                0
+            let current_offset = i - lower_i;
+            let current = j * band_rows + current_offset;
+            let cbs = if use_cbs { query_cbs[qpos] as i32 } else { 0 };
+            let diag_score = if i > prev_lower {
+                let diag_offset = i - 1 - prev_lower;
+                if diag_offset < band_rows {
+                    h[(j - 1) * band_rows + diag_offset]
+                } else {
+                    0
+                }
             } else {
-                query_cbs[qpos] as i32
+                0
+            } + match_score
+                + cbs;
+            let e_in = if i >= prev_lower {
+                let prev_offset = i - prev_lower;
+                if prev_offset < band_rows {
+                    prev_e[prev_offset]
+                } else {
+                    neg_inf
+                }
+            } else {
+                neg_inf
             };
-            let diag_score = h[idx(i - 1, j - 1)] + match_score + cbs;
-            let e_in = e[idx(i, j - 1)];
-            let f_in = f[idx(i - 1, j)];
+            let f_in = if i > lower_i {
+                f_col[current_offset - 1]
+            } else {
+                neg_inf
+            };
             let score = diag_score.max(e_in).max(f_in).max(0);
             h[current] = score;
-            gap_v[current] = score == f_in;
-            gap_h[current] = score == e_in;
 
             let e_extend = e_in - gap_extend;
             let f_extend = f_in - gap_extend;
             let open = score - gap_open;
-            e[current] = e_extend.max(open);
-            f[current] = f_extend.max(open);
-            open_h[current] = e[current] == open;
-            open_v[current] = f[current] == open;
+            let e_val = e_extend.max(open);
+            let f_val = f_extend.max(open);
+            curr_e[current_offset] = e_val;
+            f_col[current_offset] = f_val;
+            let trace_idx = curr_col_offset + current_offset;
+            gap_v[trace_idx] = score == f_in;
+            gap_h[trace_idx] = score == e_in;
+            open_v[trace_idx] = f_val == open;
+            open_h[trace_idx] = e_val == open;
             // Best-cell tie-breaking: within a column, the LATEST tied row wins
             // (matches C++ `VectorRowCounter::inc` in `cell_update.h:45-47`:
             //  `i_max = blend(i_max, i, best == current_cell)` overwrites on
@@ -983,6 +1082,7 @@ fn banded_sw_cbs_range(
                 best_j = j;
             }
         }
+        std::mem::swap(&mut prev_e, &mut curr_e);
     }
 
     if best_score == 0 {
@@ -999,8 +1099,8 @@ fn banded_sw_cbs_range(
     };
     let mut ops = Vec::new();
 
-    while i > 0 && j > 0 && h[idx(i, j)] > 0 {
-        let score = h[idx(i, j)];
+    while i > 0 && j > 0 && get_i32(&h, i, j, 0) > 0 {
+        let score = get_i32(&h, i, j, 0);
         let ql = query[i - 1];
         let sl = subject[j - 1];
         // Match the forward-pass mask check above.
@@ -1009,18 +1109,14 @@ fn banded_sw_cbs_range(
         } else if let Some(matrix) = target_matrix {
             matrix.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize] as i32
         } else {
-            score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
+            score_matrix.score(ql, sl)
         };
-        let cbs = if target_matrix.is_some() {
-            0
-        } else {
-            query_cbs[i - 1] as i32
-        };
-        let diag_score = h[idx(i - 1, j - 1)] + match_score + cbs;
+        let cbs = if use_cbs { query_cbs[i - 1] as i32 } else { 0 };
+        let diag_score = get_i32(&h, i - 1, j - 1, 0) + match_score + cbs;
 
         // Match C++ TracebackVectorMatrix::walk_gap(): prefer vertical gap
         // masks, then horizontal masks, then diagonal.
-        if gap_v[idx(i, j)] {
+        if get_bool(&gap_v, i, j) {
             let mut gap_len = 0i32;
             loop {
                 gap_len += 1;
@@ -1028,7 +1124,7 @@ fn banded_sw_cbs_range(
                     break;
                 }
                 i -= 1;
-                if open_v[idx(i, j)] || i == 0 {
+                if get_bool(&open_v, i, j) || i == 0 {
                     break;
                 }
             }
@@ -1036,7 +1132,7 @@ fn banded_sw_cbs_range(
             result.gap_openings += 1;
             result.gaps += gap_len;
             result.length += gap_len;
-        } else if gap_h[idx(i, j)] {
+        } else if get_bool(&gap_h, i, j) {
             let mut gap_len = 0i32;
             loop {
                 gap_len += 1;
@@ -1044,7 +1140,7 @@ fn banded_sw_cbs_range(
                     break;
                 }
                 j -= 1;
-                if open_h[idx(i, j)] || j == 0 {
+                if get_bool(&open_h, i, j) || j == 0 {
                     break;
                 }
             }
@@ -1073,6 +1169,123 @@ fn banded_sw_cbs_range(
     ops.reverse();
     result.operations = ops;
     result
+}
+
+fn banded_sw_cbs_score(
+    query: &[Letter],
+    subject: &[Letter],
+    d_begin: i32,
+    d_end: i32,
+    score_matrix: &ScoreMatrix,
+    query_cbs: &[i8],
+    target_matrix: Option<&TargetMatrix>,
+    matrix_scale: i32,
+    scratch: &mut ScoreScratch,
+) -> i32 {
+    let qlen = query.len();
+    let slen = subject.len();
+    let gap_open = (score_matrix.gap_open() + score_matrix.gap_extend()) * matrix_scale;
+    let gap_extend = score_matrix.gap_extend() * matrix_scale;
+    let neg_inf = i32::MIN / 4;
+    let use_cbs = target_matrix.is_none() && !query_cbs.is_empty();
+    let rows = qlen + 1;
+    let band_rows = ((d_end - d_begin + 2).max(1) as usize).min(rows);
+    scratch.prepare(band_rows, neg_inf);
+    let mut best_score = 0i32;
+    let mut prev_begin = usize::MAX;
+    let mut prev_end = 0usize;
+
+    for j in 1..=slen {
+        let target_pos = j as i32 - 1;
+        let lower = (d_begin + target_pos).max(0);
+        let upper = (d_end + target_pos - 1).min(qlen as i32 - 1);
+        if lower > upper {
+            prev_begin = usize::MAX;
+            prev_end = 0;
+            continue;
+        }
+        let lower_i = lower as usize + 1;
+        let upper_i = upper as usize + 1;
+        for i in lower_i..=upper_i {
+            let qpos = i - 1;
+            let spos = j - 1;
+            let ql = query[qpos];
+            let sl = subject[spos];
+            let match_score = if sl & SEED_MASK != 0 {
+                0
+            } else if let Some(matrix) = target_matrix {
+                matrix.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize] as i32
+            } else {
+                score_matrix.score(ql, sl)
+            };
+            let current_offset = i - lower_i;
+            let cbs = if use_cbs { query_cbs[qpos] as i32 } else { 0 };
+            let diag_score = if i > prev_begin {
+                let diag_offset = i - 1 - prev_begin;
+                if i - 1 < prev_end {
+                    scratch.prev_h[diag_offset]
+                } else {
+                    0
+                }
+            } else {
+                0
+            } + match_score
+                + cbs;
+            let e_in = if i >= prev_begin {
+                let prev_offset = i - prev_begin;
+                if i < prev_end {
+                    scratch.prev_e[prev_offset]
+                } else {
+                    neg_inf
+                }
+            } else {
+                neg_inf
+            };
+            let f_in = if i > lower_i {
+                scratch.f[current_offset - 1]
+            } else {
+                neg_inf
+            };
+            let score = diag_score.max(e_in).max(f_in).max(0);
+            scratch.curr_h[current_offset] = score;
+            let e_extend = e_in - gap_extend;
+            let f_extend = f_in - gap_extend;
+            let open = score - gap_open;
+            scratch.curr_e[current_offset] = e_extend.max(open);
+            scratch.f[current_offset] = f_extend.max(open);
+            best_score = best_score.max(score);
+        }
+        std::mem::swap(&mut scratch.prev_h, &mut scratch.curr_h);
+        std::mem::swap(&mut scratch.prev_e, &mut scratch.curr_e);
+        prev_begin = lower_i;
+        prev_end = upper_i + 1;
+    }
+
+    best_score
+}
+
+#[derive(Default)]
+struct ScoreScratch {
+    prev_h: Vec<i32>,
+    curr_h: Vec<i32>,
+    prev_e: Vec<i32>,
+    curr_e: Vec<i32>,
+    f: Vec<i32>,
+}
+
+impl ScoreScratch {
+    fn prepare(&mut self, rows: usize, neg_inf: i32) {
+        self.prev_h.resize(rows, 0);
+        self.curr_h.resize(rows, 0);
+        self.prev_e.resize(rows, neg_inf);
+        self.curr_e.resize(rows, neg_inf);
+        self.f.resize(rows, neg_inf);
+        self.prev_h.fill(0);
+        self.curr_h.fill(0);
+        self.prev_e.fill(neg_inf);
+        self.curr_e.fill(neg_inf);
+        self.f.fill(neg_inf);
+    }
 }
 
 #[cfg(test)]

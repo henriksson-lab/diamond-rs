@@ -90,6 +90,7 @@ pub fn find_seed_matches(
                         ref_id: ref_loc.seq_id,
                         ref_pos: ref_loc.pos,
                         seed,
+                        shape_id: 0,
                     });
                 }
             }
@@ -107,6 +108,7 @@ pub struct SeedMatch {
     pub ref_id: u32,
     pub ref_pos: u32,
     pub seed: PackedSeed,
+    pub shape_id: u32,
 }
 
 impl SeedMatch {
@@ -175,6 +177,7 @@ mod tests {
             ref_id: 0,
             ref_pos: 5,
             seed: 0,
+            shape_id: 0,
         };
         assert_eq!(m.diagonal(), 5);
     }

@@ -67,6 +67,9 @@ fn main() {
                 gap_extend: parse_arg_or(&args, &["--gapextend"], -1),
                 max_evalue: parse_arg_or(&args, &["-e", "--evalue"], 0.001),
                 max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
+                ext_chunk_size: parse_arg_or(&args, &["--ext-chunk-size"], 0),
+                toppercent: get_arg(&args, &["--top"]).and_then(|s| s.parse().ok()),
+                global_ranking_targets: parse_arg_or(&args, &["--global-ranking"], 0),
                 min_id: parse_arg_or(&args, &["--id"], 0.0),
                 // C++ defaults `--threads` to `std::thread::hardware_concurrency()`
                 // (`config.cpp:783`). Match that — `0` here is interpreted by
@@ -104,6 +107,9 @@ fn main() {
                 gap_extend: parse_arg_or(&args, &["--gapextend"], -1),
                 max_evalue: parse_arg_or(&args, &["-e", "--evalue"], 0.001),
                 max_target_seqs: parse_arg_or(&args, &["-k", "--max-target-seqs"], 25),
+                ext_chunk_size: parse_arg_or(&args, &["--ext-chunk-size"], 0),
+                toppercent: get_arg(&args, &["--top"]).and_then(|s| s.parse().ok()),
+                global_ranking_targets: parse_arg_or(&args, &["--global-ranking"], 0),
                 min_id: parse_arg_or(&args, &["--id"], 0.0),
                 // C++ defaults `--threads` to `std::thread::hardware_concurrency()`.
                 threads: parse_arg_or(&args, &["-p", "--threads"], 0),
@@ -455,10 +461,28 @@ fn run_or_exit(result: std::io::Result<()>) {
 }
 
 fn get_arg(args: &[String], flags: &[&str]) -> Option<String> {
-    args.iter()
-        .position(|a| flags.contains(&a.as_str()))
-        .and_then(|i| args.get(i + 1))
-        .cloned()
+    for (i, arg) in args.iter().enumerate() {
+        if flags.contains(&arg.as_str()) {
+            return args.get(i + 1).cloned();
+        }
+        for flag in flags {
+            if flag.starts_with("--") {
+                let Some(value) = arg.strip_prefix(&format!("{flag}=")) else {
+                    continue;
+                };
+                return Some(value.to_string());
+            }
+            if flag.starts_with('-') && flag.len() == 2 {
+                let Some(value) = arg.strip_prefix(flag) else {
+                    continue;
+                };
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn get_all_args(args: &[String], flags: &[&str]) -> Vec<String> {
@@ -489,6 +513,7 @@ fn route_blastp_to_legacy(args: &[String]) -> bool {
         || get_arg(args, &["--masking"]).is_some_and(|m| m.eq_ignore_ascii_case("seg"))
         || get_arg(args, &["--max-hsps"]).is_some_and(|m| m != "1")
         || get_arg(args, &["--comp-based-stats"]).is_some_and(|m| m != "0" && m != "1")
+        || get_arg(args, &["--global-ranking"]).is_some_and(|m| m != "0")
 }
 
 fn route_blastx_to_legacy(args: &[String]) -> bool {

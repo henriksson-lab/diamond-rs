@@ -17,8 +17,12 @@ pub fn reduce_seq(seq: &[Letter], map: &[Letter]) -> [Letter; 16] {
 
 /// Matches C++ `match_block_reduced(const Letter*, const Letter*, const Reduction&)`.
 pub fn match_block_reduced(x: &[Letter], y: &[Letter], reduction: &Reduction) -> u32 {
+    match_block_reduced_partial(x, y, 16, reduction)
+}
+
+fn match_block_reduced_partial(x: &[Letter], y: &[Letter], n: usize, reduction: &Reduction) -> u32 {
     let mut r = 0u32;
-    for i in (0..16).rev() {
+    for i in (0..n).rev() {
         r <<= 1;
         let lx = letter_mask(x[i]);
         let ly = letter_mask(y[i]);
@@ -34,8 +38,13 @@ pub fn match_block_reduced(x: &[Letter], y: &[Letter], reduction: &Reduction) ->
 
 /// Matches C++ `reduced_match32(const Letter*, const Letter*, unsigned, const Reduction&)`.
 pub fn reduced_match32(q: &[Letter], s: &[Letter], len: u32, reduction: &Reduction) -> u64 {
-    let mut x = ((match_block_reduced(&q[16..], &s[16..], reduction) as u64) << 16)
-        | match_block_reduced(q, s, reduction) as u64;
+    let len = len as usize;
+    let mut x = match_block_reduced_partial(q, s, len.min(16), reduction) as u64;
+    if len > 16 {
+        x |= (match_block_reduced_partial(&q[16..], &s[16..], (len - 16).min(16), reduction)
+            as u64)
+            << 16;
+    }
     if len < 32 {
         x &= (1u64 << len) - 1;
     }
@@ -45,21 +54,26 @@ pub fn reduced_match32(q: &[Letter], s: &[Letter], len: u32, reduction: &Reducti
 /// Matches C++ `reduced_match(const Letter*, const Letter*, int, const Reduction&)`.
 pub fn reduced_match(q: &[Letter], s: &[Letter], len: i32, reduction: &Reduction) -> u64 {
     assert!(len <= 64);
+    let len = len as usize;
     if len < 64 {
         let mask = (1u64 << len) - 1;
-        let mut m = match_block_reduced(q, s, reduction) as u64;
+        let mut m = match_block_reduced_partial(q, s, len.min(16), reduction) as u64;
         if len <= 16 {
             return m & mask;
         }
-        m |= (match_block_reduced(&q[16..], &s[16..], reduction) as u64) << 16;
+        m |= (match_block_reduced_partial(&q[16..], &s[16..], (len - 16).min(16), reduction)
+            as u64)
+            << 16;
         if len <= 32 {
             return m & mask;
         }
-        m |= (match_block_reduced(&q[32..], &s[32..], reduction) as u64) << 32;
+        m |= (match_block_reduced_partial(&q[32..], &s[32..], (len - 32).min(16), reduction)
+            as u64)
+            << 32;
         if len <= 48 {
             return m & mask;
         }
-        m |= (match_block_reduced(&q[48..], &s[48..], reduction) as u64) << 48;
+        m |= (match_block_reduced_partial(&q[48..], &s[48..], len - 48, reduction) as u64) << 48;
         m & mask
     } else {
         match_block_reduced(q, s, reduction) as u64

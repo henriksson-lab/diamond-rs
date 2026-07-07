@@ -2,12 +2,16 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
-use super::seed_array::{emit_join_filtered, match_blocks, sort_merge_join, SeedArray};
+use super::seed_array::{
+    emit_seed_matches_filtered, match_blocks, sort_merge_join, sort_merge_seed_matches,
+    sort_merge_seed_matches_with_complexity, SeedArray,
+};
 use super::seed_match::{self, SeedLoc, SeedMatch};
 use crate::basic::reduction::Reduction;
 use crate::basic::seed::PackedSeed;
 use crate::basic::shape::Shape;
 use crate::basic::value::Letter;
+use crate::search::seed_complexity;
 
 /// Default number of seed partition bits.
 /// 10 bits = 1024 partitions (memory `project_seed_array_partitioning`:
@@ -183,24 +187,109 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
     min_query_len: usize,
 ) -> Vec<SeedMatch> {
     let seedp_bits = DEFAULT_SEEDP_BITS;
+    let single_thread = rayon::current_num_threads() == 1;
 
-    // Build partitioned seed arrays (low-complexity seeds filtered on both sides
-    // when complexity_cut > 0).
+    // C++ default stage0 builds both seed arrays without low-complexity
+    // filtering, computes the hash join, then calls `Search::mask_seeds` on
+    // matched query seed groups. Doing complexity checks here for every DB seed
+    // is both slower and less faithful.
+    if single_thread && freq_sd <= 0.0 {
+        const INDEX_CHUNKS: usize = 4;
+        let num_partitions = crate::basic::seed::seedp_count(seedp_bits) as usize;
+        let chunk_size = num_partitions.div_ceil(INDEX_CHUNKS);
+        let mut matches = Vec::new();
+        let query_counts = SeedArray::count_partitions(
+            query_seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            0.0,
+            min_query_len,
+        );
+        let ref_counts =
+            SeedArray::count_partitions(ref_seqs, shape, reduction, seedp_bits, 0.0, 0);
+        let mut query_data = Vec::new();
+        let mut ref_data = Vec::new();
+        for chunk in 0..INDEX_CHUNKS {
+            let partition_begin = chunk * chunk_size;
+            let partition_end = ((chunk + 1) * chunk_size).min(num_partitions);
+            if partition_begin >= partition_end {
+                continue;
+            }
+            let mut query_sa = SeedArray::build_partition_range_from_counts_reuse(
+                query_seqs,
+                shape,
+                reduction,
+                seedp_bits,
+                min_query_len,
+                partition_begin,
+                partition_end,
+                &query_counts,
+                query_data,
+            );
+            let mut ref_sa = SeedArray::build_partition_range_from_counts_reuse(
+                ref_seqs,
+                shape,
+                reduction,
+                seedp_bits,
+                0,
+                partition_begin,
+                partition_end,
+                &ref_counts,
+                ref_data,
+            );
+            let query_offsets = query_sa.seq_offsets().to_vec();
+            let ref_offsets = ref_sa.seq_offsets().to_vec();
+            for p in partition_begin..partition_end {
+                let q_part = query_sa.partition_mut(p as u32);
+                let r_part = ref_sa.partition_mut(p as u32);
+                let mut part = if complexity_cut > 0.0 {
+                    sort_merge_seed_matches_with_complexity(
+                        q_part,
+                        r_part,
+                        &query_offsets,
+                        &ref_offsets,
+                        p as u32,
+                        seedp_bits,
+                        |_, (query_id, query_pos), _| {
+                            let query = query_seqs[query_id as usize];
+                            let pos = query_pos as usize;
+                            pos < query.len()
+                                && seed_complexity::seed_is_complex(
+                                    &query[pos..],
+                                    shape,
+                                    complexity_cut,
+                                    reduction,
+                                )
+                        },
+                    )
+                } else {
+                    sort_merge_seed_matches(
+                        q_part,
+                        r_part,
+                        &query_offsets,
+                        &ref_offsets,
+                        p as u32,
+                        seedp_bits,
+                    )
+                };
+                matches.append(&mut part);
+            }
+            query_data = query_sa.into_data();
+            ref_data = ref_sa.into_data();
+        }
+        return matches;
+    }
+
     let query_sa = SeedArray::build_with_complexity_cut_and_min_query_len(
         query_seqs,
         shape,
         reduction,
         seedp_bits,
-        complexity_cut,
+        0.0,
         min_query_len,
     );
-    let ref_sa = SeedArray::build_with_complexity_cut(
-        ref_seqs,
-        shape,
-        reduction,
-        seedp_bits,
-        complexity_cut,
-    );
+    let ref_sa = SeedArray::build_with_complexity_cut(ref_seqs, shape, reduction, seedp_bits, 0.0);
 
     let num_partitions = query_sa.num_partitions();
 
@@ -229,79 +318,212 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
     }
     let mut query_sa = query_sa;
     let mut ref_sa = ref_sa;
+    let query_offsets = query_sa.seq_offsets().to_vec();
+    let ref_offsets = ref_sa.seq_offsets().to_vec();
     let mut query_parts = split_into_partitions(&mut query_sa, num_partitions);
     let mut ref_parts = split_into_partitions(&mut ref_sa, num_partitions);
 
     // Phase 1: sort partitions, find match blocks, accumulate q/r count stats.
-    let blocks_per_part: Vec<super::seed_array::PartitionBlocks> = query_parts
-        .par_iter_mut()
-        .zip(ref_parts.par_iter_mut())
-        .map(|(q_part, r_part)| match_blocks(q_part, r_part))
-        .collect();
+    if freq_sd <= 0.0 {
+        let emit_part = |p: usize,
+                         q_part: &mut [super::seed_array::SeedEntry],
+                         r_part: &mut [super::seed_array::SeedEntry]| {
+            if complexity_cut > 0.0 {
+                sort_merge_seed_matches_with_complexity(
+                    q_part,
+                    r_part,
+                    &query_offsets,
+                    &ref_offsets,
+                    p as u32,
+                    seedp_bits,
+                    |_, (query_id, query_pos), _| {
+                        let query = query_seqs[query_id as usize];
+                        let pos = query_pos as usize;
+                        pos < query.len()
+                            && seed_complexity::seed_is_complex(
+                                &query[pos..],
+                                shape,
+                                complexity_cut,
+                                reduction,
+                            )
+                    },
+                )
+            } else {
+                sort_merge_seed_matches(
+                    q_part,
+                    r_part,
+                    &query_offsets,
+                    &ref_offsets,
+                    p as u32,
+                    seedp_bits,
+                )
+            }
+        };
+        return if single_thread {
+            let mut matches = Vec::new();
+            for (p, (q_part, r_part)) in
+                query_parts.iter_mut().zip(ref_parts.iter_mut()).enumerate()
+            {
+                let mut part = emit_part(p, q_part, r_part);
+                matches.append(&mut part);
+            }
+            matches
+        } else {
+            let partition_results: Vec<Vec<SeedMatch>> = query_parts
+                .par_iter_mut()
+                .zip(ref_parts.par_iter_mut())
+                .enumerate()
+                .map(|(p, (q_part, r_part))| emit_part(p, q_part, r_part))
+                .collect();
+            let total: usize = partition_results.iter().map(Vec::len).sum();
+            let mut matches = Vec::with_capacity(total);
+            for mut part in partition_results {
+                matches.append(&mut part);
+            }
+            matches
+        };
+    }
+    let blocks_per_part: Vec<super::seed_array::PartitionBlocks> = if single_thread {
+        query_parts
+            .iter_mut()
+            .zip(ref_parts.iter_mut())
+            .map(|(q_part, r_part)| match_blocks(q_part, r_part))
+            .collect()
+    } else {
+        query_parts
+            .par_iter_mut()
+            .zip(ref_parts.par_iter_mut())
+            .map(|(q_part, r_part)| match_blocks(q_part, r_part))
+            .collect()
+    };
 
-    // Compute global q_max, r_max thresholds via parallel SD reduction.
-    // C++ `FrequentSeeds::build` (frequent_seeds.cpp:107-116) computes one
+    // Compute global q_max, r_max thresholds via SD reduction. C++
+    // `FrequentSeeds::build` (frequent_seeds.cpp:107-116) computes one
     // per-partition `Sd` per worker thread and then constructs a global `Sd`
     // from the vector via `Sd::Sd(vector<Sd>&)`. The group-merge weights each
     // partition by its `k` (= n+1), which is part of the bit-identical
     // threshold computation — pairwise Welford merging would drift.
-    let per_part_sds: Vec<(Sd, Sd)> = blocks_per_part
-        .par_iter()
-        .map(|pb| {
-            let mut qs = Sd::new();
-            let mut rs = Sd::new();
-            for b in &pb.blocks {
-                qs.add(b.q_count as f64);
-                rs.add(b.r_count as f64);
-            }
-            (qs, rs)
-        })
-        .collect();
-    let (q_groups, r_groups): (Vec<Sd>, Vec<Sd>) = per_part_sds.into_iter().unzip();
-    let q_sd = Sd::merge_groups(&q_groups);
-    let r_sd = Sd::merge_groups(&r_groups);
-    // Match C++ `(unsigned)(mean + freq_sd*sd)` which is C-style truncation
-    // toward zero — equivalent to `as u32` for non-negative values.
-    let q_max = if freq_sd > 0.0 {
-        (q_sd.mean + freq_sd * q_sd.sd()).max(0.0) as u32
+    let (q_max, r_max) = if freq_sd > 0.0 {
+        let per_part_sds: Vec<(Sd, Sd)> = if single_thread {
+            blocks_per_part
+                .iter()
+                .map(|pb| {
+                    let mut qs = Sd::new();
+                    let mut rs = Sd::new();
+                    for b in &pb.blocks {
+                        qs.add(b.q_count as f64);
+                        rs.add(b.r_count as f64);
+                    }
+                    (qs, rs)
+                })
+                .collect()
+        } else {
+            blocks_per_part
+                .par_iter()
+                .map(|pb| {
+                    let mut qs = Sd::new();
+                    let mut rs = Sd::new();
+                    for b in &pb.blocks {
+                        qs.add(b.q_count as f64);
+                        rs.add(b.r_count as f64);
+                    }
+                    (qs, rs)
+                })
+                .collect()
+        };
+        let (q_groups, r_groups): (Vec<Sd>, Vec<Sd>) = per_part_sds.into_iter().unzip();
+        let q_sd = Sd::merge_groups(&q_groups);
+        let r_sd = Sd::merge_groups(&r_groups);
+        // Match C++ `(unsigned)(mean + freq_sd*sd)` which is C-style truncation
+        // toward zero — equivalent to `as u32` for non-negative values.
+        (
+            (q_sd.mean + freq_sd * q_sd.sd()).max(0.0) as u32,
+            (r_sd.mean + freq_sd * r_sd.sd()).max(0.0) as u32,
+        )
     } else {
-        u32::MAX
-    };
-    let r_max = if freq_sd > 0.0 {
-        (r_sd.mean + freq_sd * r_sd.sd()).max(0.0) as u32
-    } else {
-        u32::MAX
+        (u32::MAX, u32::MAX)
     };
 
     // Phase 2: emit (q_loc, r_loc) cross product per block, filtering blocks
     // whose counts exceed the frequent-seed threshold.
-    let partition_results: Vec<Vec<SeedMatch>> = blocks_per_part
-        .par_iter()
-        .zip(query_parts.par_iter())
-        .zip(ref_parts.par_iter())
-        .map(|((blocks, q_part), r_part)| {
-            // q_part / r_part are &&mut [SeedEntry] from the zip; the inner
-            // ref is what `emit_join_filtered` wants.
-            let q_part: &[super::seed_array::SeedEntry] = q_part;
-            let r_part: &[super::seed_array::SeedEntry] = r_part;
-            let join = emit_join_filtered(q_part, r_part, blocks, q_max, r_max);
-            let _ = sort_merge_join; // keep the old function exported
-            join.query_locs
-                .iter()
-                .zip(join.ref_locs.iter())
-                .map(|(&(q_seq, q_pos), &(r_seq, r_pos))| SeedMatch {
-                    query_id: q_seq,
-                    query_pos: q_pos,
-                    ref_id: r_seq,
-                    ref_pos: r_pos,
-                    seed: 0, // seed value not needed downstream
-                })
-                .collect()
-        })
-        .collect();
+    let emit_part = |blocks: &super::seed_array::PartitionBlocks,
+                     q_part: &&mut [super::seed_array::SeedEntry],
+                     r_part: &&mut [super::seed_array::SeedEntry]| {
+        // q_part / r_part are &&mut [SeedEntry] from the zip; the inner
+        // ref is what `emit_seed_matches_filtered` wants.
+        let q_part: &[super::seed_array::SeedEntry] = q_part;
+        let r_part: &[super::seed_array::SeedEntry] = r_part;
+        let _ = sort_merge_join; // keep the old function exported
+        if complexity_cut > 0.0 {
+            let blocks = super::seed_array::PartitionBlocks {
+                blocks: blocks
+                    .blocks
+                    .iter()
+                    .copied()
+                    .filter(|b| {
+                        let (_, (query_id, query_pos)) = {
+                            let q_entry = q_part[b.q_start as usize];
+                            (
+                                q_entry,
+                                super::seed_array::decode_seq_pos(&query_offsets, q_entry),
+                            )
+                        };
+                        let query = query_seqs[query_id as usize];
+                        let pos = query_pos as usize;
+                        pos < query.len()
+                            && seed_complexity::seed_is_complex(
+                                &query[pos..],
+                                shape,
+                                complexity_cut,
+                                reduction,
+                            )
+                    })
+                    .collect(),
+            };
+            emit_seed_matches_filtered(
+                q_part,
+                r_part,
+                &query_offsets,
+                &ref_offsets,
+                &blocks,
+                q_max,
+                r_max,
+            )
+        } else {
+            emit_seed_matches_filtered(
+                q_part,
+                r_part,
+                &query_offsets,
+                &ref_offsets,
+                blocks,
+                q_max,
+                r_max,
+            )
+        }
+    };
+    let matches = if single_thread {
+        let mut matches = Vec::new();
+        for ((blocks, q_part), r_part) in blocks_per_part.iter().zip(&query_parts).zip(&ref_parts) {
+            let mut part = emit_part(blocks, q_part, r_part);
+            matches.append(&mut part);
+        }
+        matches
+    } else {
+        let partition_results: Vec<Vec<SeedMatch>> = blocks_per_part
+            .par_iter()
+            .zip(query_parts.par_iter())
+            .zip(ref_parts.par_iter())
+            .map(|((blocks, q_part), r_part)| emit_part(blocks, q_part, r_part))
+            .collect();
 
-    // Flatten
-    partition_results.into_iter().flatten().collect()
+        let total: usize = partition_results.iter().map(Vec::len).sum();
+        let mut matches = Vec::with_capacity(total);
+        for mut part in partition_results {
+            matches.append(&mut part);
+        }
+        matches
+    };
+    matches
 }
 
 /// Find seed matches in parallel across multiple queries (legacy HashMap path).
@@ -326,6 +548,7 @@ pub fn find_seed_matches_parallel(
                             ref_id: ref_loc.seq_id,
                             ref_pos: ref_loc.pos,
                             seed,
+                            shape_id: 0,
                         });
                     }
                 }

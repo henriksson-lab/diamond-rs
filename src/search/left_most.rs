@@ -2,7 +2,7 @@ use crate::basic::reduction::Reduction;
 use crate::basic::seed::{seed_partition, PackedSeed};
 use crate::basic::shape::Shape;
 use crate::basic::value::Letter;
-use crate::data::seed_histogram::CURRENT_RANGE;
+use crate::data::seed_histogram::{SeedPartitionRange, CURRENT_RANGE};
 use crate::search::hamming::FingerPrint;
 use crate::search::sse_dist::{reduced_match, seed_mask};
 use crate::util::algo::PatternMatcher;
@@ -31,30 +31,69 @@ pub fn verify_hit(
     seedp_mask: PackedSeed,
     reduction: &Reduction,
 ) -> bool {
+    verify_hit_with_range(
+        q,
+        s,
+        center,
+        _score_cutoff,
+        left,
+        match_mask,
+        shape,
+        chunked,
+        hamming_filter_id,
+        seedp_mask,
+        reduction,
+        None,
+    )
+}
+
+pub fn verify_hit_with_range(
+    q: &[Letter],
+    s: &[Letter],
+    center: usize,
+    _score_cutoff: i32,
+    left: bool,
+    match_mask: u32,
+    shape: &Shape,
+    chunked: bool,
+    hamming_filter_id: u32,
+    seedp_mask: PackedSeed,
+    reduction: &Reduction,
+    current_range: Option<SeedPartitionRange>,
+) -> bool {
     if chunked && (shape.mask & match_mask) == shape.mask {
+        if center + shape.length as usize > s.len() {
+            return false;
+        }
         let Some(seed) = shape.set_seed(&s[center..], reduction) else {
             return false;
         };
         let p = seed_partition(seed, seedp_mask);
-        let current_range = CURRENT_RANGE.lock().unwrap();
-        if left && !current_range.lower_or_equal(p) {
-            return false;
-        }
-        if !left && !current_range.lower(p) {
-            return false;
+        if let Some(current_range) = current_range {
+            if left && !current_range.lower_or_equal(p) {
+                return false;
+            }
+            if !left && !current_range.lower(p) {
+                return false;
+            }
+        } else {
+            let current_range = CURRENT_RANGE.lock().unwrap();
+            if left && !current_range.lower_or_equal(p) {
+                return false;
+            }
+            if !left && !current_range.lower(p) {
+                return false;
+            }
         }
     }
-    if center < 16 || center + 32 > q.len() || center + 32 > s.len() {
-        return false;
-    }
-    let fq = FingerPrint::from_seq_center(q, center);
-    let fs = FingerPrint::from_seq_center(s, center);
+    let fq = FingerPrint::from_seq_center(q, center + 16);
+    let fs = FingerPrint::from_seq_center(s, center + 16);
     fq.match_count(&fs) >= hamming_filter_id
 }
 
 /// Matches C++ `verify_hits(...)`.
 pub fn verify_hits(
-    mut mask: u32,
+    mask: u32,
     q: &[Letter],
     s: &[Letter],
     offset: usize,
@@ -67,11 +106,43 @@ pub fn verify_hits(
     seedp_mask: PackedSeed,
     reduction: &Reduction,
 ) -> bool {
+    verify_hits_with_range(
+        mask,
+        q,
+        s,
+        offset,
+        score_cutoff,
+        left,
+        match_mask,
+        shape,
+        chunked,
+        hamming_filter_id,
+        seedp_mask,
+        reduction,
+        None,
+    )
+}
+
+pub fn verify_hits_with_range(
+    mut mask: u32,
+    q: &[Letter],
+    s: &[Letter],
+    offset: usize,
+    score_cutoff: i32,
+    left: bool,
+    match_mask: u32,
+    shape: &Shape,
+    chunked: bool,
+    hamming_filter_id: u32,
+    seedp_mask: PackedSeed,
+    reduction: &Reduction,
+    current_range: Option<SeedPartitionRange>,
+) -> bool {
     let mut shift = 0usize;
     while mask != 0 {
         let i = mask.trailing_zeros() as usize;
         let center = offset + i + shift;
-        if verify_hit(
+        if verify_hit_with_range(
             q,
             s,
             center,
@@ -83,6 +154,7 @@ pub fn verify_hits(
             hamming_filter_id,
             seedp_mask,
             reduction,
+            current_range,
         ) {
             return true;
         }
@@ -104,6 +176,34 @@ pub fn left_most_filter(
     score_cutoff: i32,
     chunked: bool,
     hamming_filter_id: u32,
+) -> bool {
+    left_most_filter_with_range(
+        query,
+        subject,
+        seed_offset,
+        seed_len,
+        context,
+        first_shape,
+        shape,
+        score_cutoff,
+        chunked,
+        hamming_filter_id,
+        None,
+    )
+}
+
+pub fn left_most_filter_with_range(
+    query: &[Letter],
+    subject: &[Letter],
+    seed_offset: i32,
+    seed_len: i32,
+    context: &Context,
+    first_shape: bool,
+    shape: &Shape,
+    score_cutoff: i32,
+    chunked: bool,
+    hamming_filter_id: u32,
+    current_range: Option<SeedPartitionRange>,
 ) -> bool {
     const WINDOW_LEFT: i32 = 16;
     const WINDOW_RIGHT: i32 = 32;
@@ -136,7 +236,7 @@ pub fn left_most_filter(
 
     if first_shape && !chunked {
         return left_hit == 0
-            || !verify_hits(
+            || !verify_hits_with_range(
                 left_hit,
                 q,
                 s,
@@ -149,6 +249,7 @@ pub fn left_most_filter(
                 hamming_filter_id,
                 context.seedp_mask,
                 context.reduction,
+                current_range,
             );
     }
 
@@ -162,9 +263,8 @@ pub fn left_most_filter(
         &context.previous_matcher
     };
     let right_hit = right_matcher.hit(match_mask_right, len_right) & query_mask_right;
-
     (left_hit == 0
-        || !verify_hits(
+        || !verify_hits_with_range(
             left_hit,
             q,
             s,
@@ -177,9 +277,10 @@ pub fn left_most_filter(
             hamming_filter_id,
             context.seedp_mask,
             context.reduction,
+            current_range,
         ))
         && (right_hit == 0
-            || !verify_hits(
+            || !verify_hits_with_range(
                 right_hit,
                 q,
                 s,
@@ -192,6 +293,7 @@ pub fn left_most_filter(
                 hamming_filter_id,
                 context.seedp_mask,
                 context.reduction,
+                current_range,
             ))
 }
 
@@ -231,7 +333,7 @@ mod tests {
             seedp_mask(8),
             &reduction,
         ));
-        s[10] = 9;
+        s[30] = 9;
         assert!(!verify_hit(
             &q,
             &s,
@@ -334,7 +436,10 @@ mod tests {
         let shape = Shape::from_code("111", &reduction);
         let context = context(&shape, &reduction);
         let q: Vec<Letter> = (0..96).map(|i| (i % 20) as Letter).collect();
-        let s = q.clone();
+        let mut s = q.clone();
+        for x in &mut s[16..32] {
+            *x = 21;
+        }
         assert!(left_most_filter(
             &q,
             &s,
