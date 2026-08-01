@@ -339,15 +339,9 @@ pub fn containing_directory(file_name: &str) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn page_size() -> usize {
-    #[cfg(target_os = "linux")]
-    {
-        unsafe { sysconf(_SC_PAGESIZE) as usize }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        4096
-    }
+    unsafe { sysconf(_SC_PAGESIZE) as usize }
 }
 
 fn is_sep_char(c: char) -> bool {
@@ -485,24 +479,6 @@ fn parent_dir_posix(abs_path: &str) -> String {
         Some(0) => "/".to_string(),
         Some(pos) => abs_path[..pos].to_string(),
         None => ".".to_string(),
-    }
-}
-
-#[cfg(windows)]
-fn widen_utf8(s: &str) -> Vec<u16> {
-    if s.is_empty() {
-        Vec::new()
-    } else {
-        s.encode_utf16().collect()
-    }
-}
-
-#[cfg(windows)]
-fn narrow_utf8(w: &[u16]) -> String {
-    if w.is_empty() {
-        String::new()
-    } else {
-        String::from_utf16_lossy(w)
     }
 }
 

@@ -49,7 +49,10 @@ impl TempFileData {
         #[cfg(unix)]
         let fd = file.into_raw_fd();
         #[cfg(not(unix))]
-        let fd = -1;
+        let fd = {
+            let _ = &file;
+            -1
+        };
         let unlinked = if unlink {
             std::fs::remove_file(&path).is_ok()
         } else {

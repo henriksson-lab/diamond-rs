@@ -18,6 +18,9 @@ pub const NEON: i32 = 32;
 pub fn cpuid(info: &mut [i32; 4], info_type: i32) {
     #[cfg(target_arch = "x86")]
     {
+        #[cfg(target_env = "msvc")]
+        let r = std::arch::x86::__cpuid_count(info_type as u32, 0);
+        #[cfg(not(target_env = "msvc"))]
         let r = unsafe { std::arch::x86::__cpuid_count(info_type as u32, 0) };
         info[0] = r.eax as i32;
         info[1] = r.ebx as i32;
@@ -26,6 +29,9 @@ pub fn cpuid(info: &mut [i32; 4], info_type: i32) {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        #[cfg(target_env = "msvc")]
+        let r = std::arch::x86_64::__cpuid_count(info_type as u32, 0);
+        #[cfg(not(target_env = "msvc"))]
         let r = unsafe { std::arch::x86_64::__cpuid_count(info_type as u32, 0) };
         info[0] = r.eax as i32;
         info[1] = r.ebx as i32;

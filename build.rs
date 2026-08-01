@@ -2,13 +2,8 @@ fn main() {
     build();
 }
 
-#[cfg(feature = "ffi")]
+#[cfg(all(feature = "ffi", not(windows)))]
 fn build() {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        println!("cargo:rerun-if-changed=build.rs");
-        return;
-    }
-
     use cmake::Config;
 
     let dst = Config::new("diamond")
@@ -36,7 +31,7 @@ fn build() {
     println!("cargo:rerun-if-changed=diamond/CMakeLists.txt");
 }
 
-#[cfg(not(feature = "ffi"))]
+#[cfg(any(not(feature = "ffi"), windows))]
 fn build() {
     println!("cargo:rerun-if-changed=build.rs");
 }

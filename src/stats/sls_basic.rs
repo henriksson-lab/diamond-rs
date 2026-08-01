@@ -1,17 +1,13 @@
 #![allow(non_snake_case)]
 
-use std::os::raw::c_double;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::util::log_erfc::erfc;
 
 pub const PI: f64 = 3.1415926535897932384626433832795;
 pub const INVSQRTTWO: f64 = std::f64::consts::FRAC_1_SQRT_2;
 pub const CONST_VAL: f64 = 0.39894228040143267793994605993438;
 pub const QUICK_TESTS_TRIALS_NUMBER: i64 = 100;
-
-#[link(name = "m")]
-unsafe extern "C" {
-    fn erfc(x: c_double) -> c_double;
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
@@ -145,7 +141,7 @@ pub fn one_minus_exp_function(y_: f64) -> f64 {
 }
 
 pub fn normal_probability(x_: f64) -> f64 {
-    0.5 * unsafe { erfc(-INVSQRTTWO * x_) }
+    0.5 * erfc(-INVSQRTTWO * x_)
 }
 
 pub fn normal_probability_eps(x_: f64, mut eps_: f64) -> f64 {
