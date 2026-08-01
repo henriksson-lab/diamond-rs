@@ -1,6 +1,16 @@
-use cmake::Config;
-
 fn main() {
+    build();
+}
+
+#[cfg(feature = "ffi")]
+fn build() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rerun-if-changed=build.rs");
+        return;
+    }
+
+    use cmake::Config;
+
     let dst = Config::new("diamond")
         .build_target("diamond_core")
         .define("CMAKE_BUILD_TYPE", "Release")
@@ -24,4 +34,9 @@ fn main() {
     // Rerun if C++ sources change
     println!("cargo:rerun-if-changed=diamond/src/");
     println!("cargo:rerun-if-changed=diamond/CMakeLists.txt");
+}
+
+#[cfg(not(feature = "ffi"))]
+fn build() {
+    println!("cargo:rerun-if-changed=build.rs");
 }

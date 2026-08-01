@@ -19,5 +19,9 @@ flate2 = "1"
 rayon = "1"
 zstd = "0.13"
 
+[features]
+default = []
+ffi = ["dep:cmake"]
+
 [build-dependencies]
-cmake = "0.1"
+cmake = { version = "0.1", optional = true }

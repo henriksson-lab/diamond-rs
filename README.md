@@ -6,6 +6,7 @@ DIAMOND is a high-performance sequence aligner for protein and translated DNA se
 
 **This crate is under translation. Do not use it. Do not trust any text below**
 
+* 2026-08-01: CI added. Full translation is blocked until BLAST is translated
 * 2026-07-07: New audit; state to be checked
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code!
@@ -35,23 +36,23 @@ But:
 
 This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 
-- **CLI**: `blastp` and `blastx` run natively in Rust by default; `--legacy` for C++ FFI
+- **CLI**: `blastp` and `blastx` run natively in Rust by default; C++ FFI fallback is only built for non-Windows conformance testing with `--features ffi`
 - **Native Rust commands**: `blastp`, `blastx`, `makedb`, `dbinfo`, `getseq`, `version`, `help`
 - **Parallel**: Seed search uses rayon for multi-threaded processing
 - **SIMD**: SSE4.1/AVX2 vectorized ungapped scoring
 - **Library API**: Core types, scoring matrices, DP kernels, FASTA parsing, and seed search
 - **Tests**: 206 tests including all 20 C++ regression tests + native-vs-FFI equivalence
+- **Not yet translated**: SQLite-backed taxonomy lookup for NCBI BLAST databases (`taxonomy4blast.sqlite3`), used by taxonomy-aware output fields such as `slineages`, `sskingdoms`, `skingdoms`, and `sphylums`
 
 ## Building
 
 ### Prerequisites
 
 - Rust 1.70+
-- CMake 2.6+
-- C++ compiler (GCC or Clang)
-- zlib, SQLite3, pthreads
+- Default native Rust build: no CMake or C++ toolchain required
+- Optional non-Windows FFI test build: CMake 2.6+, a C++ compiler, zlib, SQLite3, and pthreads. SQLite3 is currently required by the vendored C++ build, but SQLite-backed BLAST taxonomy lookup has not yet been translated into native Rust.
 
-On Ubuntu/Debian:
+For the optional FFI build on Ubuntu/Debian:
 ```bash
 sudo apt-get install g++ cmake zlib1g-dev libsqlite3-dev
 ```
@@ -63,6 +64,9 @@ cargo build --release
 
 # With native CPU optimizations (recommended for benchmarks)
 RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+# Build the non-Windows C++ FFI backend for conformance testing
+cargo build --features ffi
 ```
 
 ### Test
@@ -71,8 +75,11 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 # Run all tests (single-threaded for FFI safety)
 cargo test --release -- --test-threads=1
 
+# Run tests that compare against the vendored C++ FFI backend
+cargo test --release --features ffi -- --test-threads=1
+
 # Run just the 20 regression tests
-cargo run --release -- test
+cargo run --release --features ffi -- test
 ```
 
 ## CLI Usage
@@ -134,6 +141,8 @@ println!("E-value: {:.2e}, Bit score: {:.1}", evalue, bitscore);
 
 ## Benchmarks
 
+Original benchmark baseline: vendored upstream DIAMOND from `https://github.com/bbuchfink/diamond.git`, commit `1d162b4fefb5` (`v2.1.24-2-g1d162b4f-dirty`).
+
 The previous 389-query benchmark input was not reproducible from files in this checkout. The table below uses bundled test data, measured with `RUSTFLAGS="-C target-cpu=native"`, `-p1`, and `/usr/bin/time` (median of 3 runs):
 
 | Operation | Input | C++ Original | Rust (Native) | Speedup | Peak RSS Ratio (Rust/C++) |
@@ -143,7 +152,7 @@ The previous 389-query benchmark input was not reproducible from files in this c
 
 Speedup is C++ wall time divided by Rust wall time. Peak RSS ratio is Rust peak resident memory divided by C++ peak resident memory; lower is better.
 
-The native Rust pipeline produces matching scores, coordinates, and bit scores. The `--legacy` flag falls back to C++ FFI for full bit-exact compatibility.
+The native Rust pipeline produces matching scores, coordinates, and bit scores. When built on a non-Windows target with `--features ffi`, the `--legacy` flag falls back to C++ FFI for conformance testing.
 
 ## Architecture
 

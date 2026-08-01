@@ -1,9 +1,11 @@
 use std::io;
+#[cfg(all(feature = "ffi", not(windows)))]
 use std::time::Instant;
 
 /// Run the built-in regression test suite.
 ///
 /// Runs blastp on test data via FFI and verifies against reference output files.
+#[cfg(all(feature = "ffi", not(windows)))]
 pub fn run() -> io::Result<()> {
     let start = Instant::now();
     let td = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test");
@@ -85,4 +87,11 @@ pub fn run() -> io::Result<()> {
             total - passed
         )))
     }
+}
+
+#[cfg(not(all(feature = "ffi", not(windows))))]
+pub fn run() -> io::Result<()> {
+    Err(io::Error::other(
+        "built-in regression tests require the non-Windows C++ FFI backend; rebuild with --features ffi",
+    ))
 }

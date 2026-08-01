@@ -202,6 +202,7 @@ fn test_output_formatting_matches_cpp() {
 
 /// Test native blastp finds the same alignment as FFI.
 #[test]
+#[cfg(all(feature = "ffi", not(windows)))]
 fn test_native_blastp_matches_ffi_scores() {
     use diamond::commands::blastp::{run, BlastpConfig};
     use diamond::config::Sensitivity;

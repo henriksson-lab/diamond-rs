@@ -39,6 +39,7 @@ pub mod config;
 pub mod data;
 pub mod dna;
 pub mod dp;
+#[cfg(all(feature = "ffi", not(windows)))]
 pub mod ffi;
 pub mod masking;
 pub mod output;
@@ -58,16 +59,24 @@ pub mod prelude {
     pub use crate::stats::score_matrix::ScoreMatrix;
 }
 
-/// Run DIAMOND with command-line arguments (FFI to C++ implementation).
+/// Run DIAMOND with command-line arguments through the C++ FFI implementation.
 ///
-/// This is the primary entry point that delegates to the C++ DIAMOND
-/// implementation for full feature support and bit-exact output.
+/// The FFI backend is intended for non-Windows conformance testing and is only
+/// available when the crate is built with `--features ffi`.
 ///
 /// # Example
-/// ```rust,no_run
+/// ```rust,no_run,ignore
 /// let code = diamond::run(&["diamond", "version"]);
 /// assert_eq!(code, 0);
 /// ```
+#[cfg(all(feature = "ffi", not(windows)))]
 pub fn run(args: &[&str]) -> i32 {
-    ffi::run(args)
+    crate::ffi::run(args)
+}
+
+/// Fallback when the C++ FFI backend is not compiled.
+#[cfg(not(all(feature = "ffi", not(windows))))]
+pub fn run(_args: &[&str]) -> i32 {
+    eprintln!("C++ FFI backend is not available in this build.");
+    1
 }

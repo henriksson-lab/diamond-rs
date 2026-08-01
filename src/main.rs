@@ -421,7 +421,7 @@ fn main() {
                 .map(|s| s.as_str())
                 .filter(|s| *s != "--legacy")
                 .collect();
-            let code = diamond::ffi::run(&filtered);
+            let code = run_legacy(&filtered);
             std::process::exit(code);
         }
     }
@@ -450,7 +450,22 @@ fn print_usage() {
     println!("  test       Run regression tests");
     println!();
     println!("Use 'diamond COMMAND --help' for command-specific options.");
+    #[cfg(all(feature = "ffi", not(windows)))]
     println!("Add --legacy to blastp/blastx to use C++ FFI backend.");
+    #[cfg(not(all(feature = "ffi", not(windows))))]
+    println!("C++ FFI fallback is not available in this build.");
+}
+
+#[cfg(all(feature = "ffi", not(windows)))]
+fn run_legacy(args: &[&str]) -> i32 {
+    diamond::ffi::run(args)
+}
+
+#[cfg(not(all(feature = "ffi", not(windows))))]
+fn run_legacy(_args: &[&str]) -> i32 {
+    eprintln!("Error: C++ FFI fallback is not available in this build.");
+    eprintln!("Rebuild on a non-Windows target with `--features ffi` to enable it for testing.");
+    1
 }
 
 fn run_or_exit(result: std::io::Result<()>) {
