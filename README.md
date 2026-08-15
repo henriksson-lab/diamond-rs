@@ -186,6 +186,13 @@ When using DIAMOND in published research, please cite:
 > scale using DIAMOND", *Nature Methods* **18**, 366-368 (2021).
 > [doi:10.1038/s41592-021-01101-x](https://doi.org/10.1038/s41592-021-01101-x)
 
+If you use our translation, we recommend that you also cite the precise version you use. If you link to [crates.io](http://crates.io), you can cite the version number;
+but if you link to our Git repository, for reproducibility, it is better that you provide the URL to the repository and the git hash (Github lists it high up on the page as 7 letters, under the Code button, e.g. '21751cd')
+
+In addition, we appreciate if you cite the paper below describing the translation approach. If for some reason you struggle with journal citation limits, please prioritizing citing the original software over our translation paper.
+
+> Johan Henriksson. Static analysis-guided agentic AI translation enables Rust as a full stack bioinformatics language. arXiv:2608.13029, 2026. https://doi.org/10.48550/arXiv.2608.13029
+
 ## License
 
 Apache-2.0
