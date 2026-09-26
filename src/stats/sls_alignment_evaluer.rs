@@ -161,7 +161,10 @@ impl AlignmentEvaluer {
             (self.d_params.alpha_I_error + self.d_params.alpha_J_error) * 0.5;
 
         self.d_params.d_params_flag = true;
-        pvalues::compute_intercepts(&mut self.d_params)?;
+        if let Err(error) = pvalues::compute_intercepts(&mut self.d_params) {
+            self.d_params.d_params_flag = false;
+            return Err(error);
+        }
 
         if !pvalues::assert_Gumbel_parameters(&self.d_params) || !self.isGood() {
             self.d_params.d_params_flag = false;
@@ -428,7 +431,10 @@ impl AlignmentEvaluer {
             (self.d_params.alpha_I_error + self.d_params.alpha_J_error) * 0.5;
 
         self.d_params.d_params_flag = true;
-        pvalues::compute_intercepts(&mut self.d_params)?;
+        if let Err(error) = pvalues::compute_intercepts(&mut self.d_params) {
+            self.d_params.d_params_flag = false;
+            return Err(error);
+        }
 
         let mut CurrentTime2 = 0.0;
         get_current_time(&mut CurrentTime2);
@@ -449,6 +455,8 @@ impl AlignmentEvaluer {
         &mut self,
         parameters_: &AlignmentEvaluerParameters,
     ) -> Result<(), Error> {
+        let mut current_time_1 = 0.0;
+        get_current_time(&mut current_time_1);
         self.d_params.d_params_flag = false;
         let calculation_error = 1e-6;
 
@@ -521,8 +529,13 @@ impl AlignmentEvaluer {
         self.d_params.m_TauSbs = vec![self.d_params.tau, self.d_params.tau + calculation_error];
 
         self.d_params.d_params_flag = true;
-        pvalues::compute_tmp_values(&mut self.d_params)?;
-        self.d_params.m_CalcTime = 0.0;
+        if let Err(error) = pvalues::compute_tmp_values(&mut self.d_params) {
+            self.d_params.d_params_flag = false;
+            return Err(error);
+        }
+        let mut current_time_2 = 0.0;
+        get_current_time(&mut current_time_2);
+        self.d_params.m_CalcTime = current_time_2 - current_time_1;
 
         if !pvalues::assert_Gumbel_parameters(&self.d_params) || !self.isGood() {
             self.d_params.d_params_flag = false;
@@ -538,6 +551,8 @@ impl AlignmentEvaluer {
         &mut self,
         parameters_: &AlignmentEvaluerParametersWithErrors,
     ) -> Result<(), Error> {
+        let mut current_time_1 = 0.0;
+        get_current_time(&mut current_time_1);
         self.d_params.d_params_flag = false;
         let array_dim = 20usize;
         unsafe {
@@ -651,7 +666,13 @@ impl AlignmentEvaluer {
         }
 
         self.d_params.d_params_flag = true;
-        pvalues::compute_tmp_values(&mut self.d_params)?;
+        if let Err(error) = pvalues::compute_tmp_values(&mut self.d_params) {
+            self.d_params.d_params_flag = false;
+            return Err(error);
+        }
+        let mut current_time_2 = 0.0;
+        get_current_time(&mut current_time_2);
+        self.d_params.m_CalcTime = current_time_2 - current_time_1;
         if !pvalues::assert_Gumbel_parameters(&self.d_params) || !self.isGood() {
             self.d_params.d_params_flag = false;
             return Err(Error::new(
@@ -812,12 +833,93 @@ impl AlignmentEvaluer {
         self.d_params.K * (-self.d_params.lambda * score_).exp()
     }
 
+    pub fn evalue_per_area(&self, score: f64) -> f64 {
+        self.evaluePerArea(score)
+    }
+
     pub fn bitScore(&self, score_: f64) -> f64 {
         (self.d_params.lambda * score_ - self.d_params.K.ln()) / 2.0f64.ln()
     }
 
+    pub fn bit_score(&self, score: f64) -> f64 {
+        self.bitScore(score)
+    }
+
     pub fn isGood(&self) -> bool {
         self.d_params.d_params_flag
+    }
+
+    pub fn is_good(&self) -> bool {
+        self.isGood()
+    }
+
+    pub fn init_gapless(
+        &mut self,
+        alphabet_size: i64,
+        substitution_score_matrix: &[Vec<i64>],
+        letter_freqs_1: &[f64],
+        letter_freqs_2: &[f64],
+        max_time: f64,
+    ) -> Result<(), Error> {
+        self.initGapless(
+            alphabet_size,
+            substitution_score_matrix,
+            letter_freqs_1,
+            letter_freqs_2,
+            max_time,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn init_gapped(
+        &mut self,
+        alphabet_size: i64,
+        substitution_score_matrix: &[Vec<i64>],
+        letter_freqs_1: &[f64],
+        letter_freqs_2: &[f64],
+        gap_open_1: i64,
+        gap_extension_1: i64,
+        gap_open_2: i64,
+        gap_extension_2: i64,
+        insertions_after_deletions: bool,
+        eps_lambda: f64,
+        eps_k: f64,
+        max_time: f64,
+        max_memory: f64,
+        random_seed: i64,
+        temperature: f64,
+    ) -> Result<(), Error> {
+        self.initGapped(
+            alphabet_size,
+            substitution_score_matrix,
+            letter_freqs_1,
+            letter_freqs_2,
+            gap_open_1,
+            gap_extension_1,
+            gap_open_2,
+            gap_extension_2,
+            insertions_after_deletions,
+            eps_lambda,
+            eps_k,
+            max_time,
+            max_memory,
+            random_seed,
+            temperature,
+        )
+    }
+
+    pub fn init_parameters(
+        &mut self,
+        parameters: &AlignmentEvaluerParameters,
+    ) -> Result<(), Error> {
+        self.initParameters(parameters)
+    }
+
+    pub fn init_parameters_with_errors(
+        &mut self,
+        parameters: &AlignmentEvaluerParametersWithErrors,
+    ) -> Result<(), Error> {
+        self.initParametersWithErrors(parameters)
     }
 
     pub fn parameters(&self) -> &ALP_set_of_parameters {
@@ -938,6 +1040,7 @@ impl AlignmentEvaluer {
             sum1 += freq;
         }
         if sum1 <= 0.0 {
+            self.d_params.d_params_flag = false;
             return Err(Error::new(
                 format!(
                     "Error - sum of the frequencies \"letterFreqs1_\" is non-positive in the function \"{}\"\n",
@@ -966,6 +1069,7 @@ impl AlignmentEvaluer {
             sum2 += freq;
         }
         if sum2 <= 0.0 {
+            self.d_params.d_params_flag = false;
             return Err(Error::new(
                 format!(
                     "Error - sum of the frequencies \"letterFreqs2_\" is non-positive in the function \"{}\"\n",
@@ -980,6 +1084,21 @@ impl AlignmentEvaluer {
             .collect::<Vec<_>>();
 
         Ok((letterFreqs1_normalized, letterFreqs2_normalized))
+    }
+
+    pub fn assert_gapless_input_parameters(
+        &mut self,
+        alphabet_size: i64,
+        letter_freqs_1: &[f64],
+        letter_freqs_2: &[f64],
+        function_name: &str,
+    ) -> Result<(Vec<f64>, Vec<f64>), Error> {
+        self.assert_Gapless_input_parameters(
+            alphabet_size,
+            letter_freqs_1,
+            letter_freqs_2,
+            function_name,
+        )
     }
 }
 

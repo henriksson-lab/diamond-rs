@@ -5,6 +5,9 @@ use crate::basic::value::{
     CharRepresentation, Letter, SequenceType, AMINO_ACID_ALPHABET, MASK_LETTER, NUCLEOTIDE_ALPHABET,
 };
 
+pub mod fasta_file;
+pub use fasta_file::{FastaEntry, FastaFile, FastaFileConfig};
+
 /// A parsed FASTA/FASTQ record.
 #[derive(Debug, Clone)]
 pub struct FastaRecord {

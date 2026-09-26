@@ -1,3 +1,9 @@
+//! Fundamental DIAMOND value types and alphabet conversion tables.
+//!
+//! This mirrors `diamond/src/basic/value.cpp` and the inline value semantics
+//! in `diamond/src/basic/value.h`. Mutable C++ trait globals remain explicit
+//! `ValueTraits` arguments in Rust.
+
 /// Letter is the fundamental sequence element type, matching the C++ `signed char` (`Letter`).
 pub type Letter = i8;
 
@@ -114,6 +120,7 @@ pub const NCBI_TO_STD: [Letter; 28] = [
 ];
 
 /// Converts characters to Letter values for a given alphabet.
+#[derive(Clone)]
 pub struct CharRepresentation {
     data: [Letter; 256],
 }
@@ -124,6 +131,8 @@ impl CharRepresentation {
     pub fn new(alphabet: &[u8], mask: Letter, mask_chars: &[u8]) -> Self {
         let mut data = [INVALID_LETTER; 256];
         for (i, &ch) in alphabet.iter().enumerate() {
+            // Mirrors `assert(chars[i] != CharRepresentation::invalid)`.
+            debug_assert_ne!(ch, u8::MAX, "alphabet contains the invalid sentinel");
             data[ch as usize] = i as Letter;
             data[(ch as char).to_ascii_lowercase() as usize] = i as Letter;
         }
@@ -149,6 +158,7 @@ impl CharRepresentation {
 }
 
 /// Traits for a particular value/sequence type (amino acid or nucleotide).
+#[derive(Clone)]
 pub struct ValueTraits {
     pub alphabet: &'static [u8],
     pub alphabet_size: usize,
@@ -288,6 +298,38 @@ mod tests {
     }
 
     #[test]
+    fn char_representation_matches_case_mask_precedence_and_errors() {
+        // Mask characters are installed after alphabet characters in C++, so
+        // an overlap deliberately overrides the alphabet encoding.
+        let cr = CharRepresentation::new(b"AB", MASK_LETTER, b"B-");
+        assert_eq!(cr.convert(b'A'), Ok(0));
+        assert_eq!(cr.convert(b'a'), Ok(0));
+        assert_eq!(cr.convert(b'B'), Ok(MASK_LETTER));
+        assert_eq!(cr.convert(b'b'), Ok(MASK_LETTER));
+        assert_eq!(cr.convert(b'-'), Ok(MASK_LETTER));
+        assert_eq!(
+            cr.convert(b'!'),
+            Err("Invalid character in sequence: '!'".to_string())
+        );
+        assert_eq!(
+            cr.convert(b'\n'),
+            Err("Invalid character in sequence: ASCII 10".to_string())
+        );
+
+        // C++ value objects are copy-constructible; cloning must retain the
+        // complete 256-entry conversion table.
+        let copy = cr.clone();
+        assert_eq!(copy.convert(b'b'), Ok(MASK_LETTER));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "alphabet contains the invalid sentinel")]
+    fn char_representation_rejects_the_invalid_sentinel_in_alphabet() {
+        let _ = CharRepresentation::new(&[u8::MAX], MASK_LETTER, b"");
+    }
+
+    #[test]
     fn test_is_amino_acid() {
         assert!(is_amino_acid(0)); // A
         assert!(is_amino_acid(1)); // R
@@ -304,10 +346,93 @@ mod tests {
 
     #[test]
     fn test_iupacaa_to_std() {
-        // Position 1 => A (0)
-        assert_eq!(IUPACAA_TO_STD[1], 0);
-        // Position 2 => B (20)
-        assert_eq!(IUPACAA_TO_STD[2], 20);
+        assert_eq!(
+            IUPACAA_TO_STD,
+            [
+                -1,
+                0,
+                20,
+                4,
+                3,
+                6,
+                13,
+                7,
+                8,
+                9,
+                21,
+                11,
+                10,
+                12,
+                2,
+                MASK_LETTER,
+                14,
+                5,
+                1,
+                15,
+                16,
+                MASK_LETTER,
+                19,
+                17,
+                23,
+                18,
+                22,
+                -1,
+                -1,
+                -1,
+                -1,
+                24,
+            ]
+        );
+        assert_eq!(
+            NCBI_TO_STD,
+            [
+                MASK_LETTER,
+                0,
+                20,
+                4,
+                3,
+                6,
+                13,
+                7,
+                8,
+                9,
+                11,
+                10,
+                12,
+                2,
+                14,
+                5,
+                1,
+                15,
+                16,
+                19,
+                17,
+                23,
+                18,
+                22,
+                MASK_LETTER,
+                24,
+                MASK_LETTER,
+                21,
+            ]
+        );
+    }
+
+    #[test]
+    fn value_traits_clone_preserves_all_cpp_fields() {
+        let traits = ValueTraits::new(
+            AMINO_ACID_ALPHABET,
+            MASK_LETTER,
+            b"UO-",
+            SequenceType::AminoAcid,
+        );
+        let copy = traits.clone();
+        assert_eq!(copy.alphabet, AMINO_ACID_ALPHABET);
+        assert_eq!(copy.alphabet_size, AMINO_ACID_COUNT);
+        assert_eq!(copy.mask_char, MASK_LETTER);
+        assert_eq!(copy.seq_type, SequenceType::AminoAcid);
+        assert_eq!(copy.from_char.convert(b'o'), Ok(MASK_LETTER));
+        assert_eq!(copy.to_char(24), '*');
     }
 
     #[test]

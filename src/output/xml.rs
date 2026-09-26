@@ -307,6 +307,28 @@ pub fn print_match_context<W: Write>(
     xml_blord_format: bool,
     no_parse_seqids: bool,
 ) -> io::Result<()> {
+    print_match_context_with_accession_stats(
+        writer,
+        r,
+        score_matrix,
+        query_translated,
+        xml_blord_format,
+        no_parse_seqids,
+        &mut AccessionParsing::default(),
+    )
+}
+
+/// Full C++ `XMLFormat::print_match` mapping, including mutation of the
+/// accession parsing statistics stored in `Output::Info`.
+pub fn print_match_context_with_accession_stats<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    score_matrix: &ScoreMatrix,
+    query_translated: bool,
+    xml_blord_format: bool,
+    no_parse_seqids: bool,
+    accession_stats: &mut AccessionParsing,
+) -> io::Result<()> {
     if r.hsp_num == 0 {
         if r.hit_num > 0 {
             writeln!(writer, "  </Hit_hsps>")?;
@@ -334,7 +356,7 @@ pub fn print_match_context<W: Write>(
         let accession = if no_parse_seqids {
             id
         } else {
-            get_accession(&id, &mut AccessionParsing::default())
+            get_accession(&id, accession_stats)
         };
         writeln!(
             writer,
@@ -560,15 +582,34 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("<BlastOutput_program>blastp</BlastOutput_program>"));
-        assert!(output.contains("<BlastOutput_version>diamond 2.1.24</BlastOutput_version>"));
-        assert!(output.contains("<BlastOutput_db>db<&>.dmnd</BlastOutput_db>"));
-        assert!(
-            output.contains("<BlastOutput_query-def>query &lt;o</BlastOutput_query-def>"),
-            "{output}"
+        assert_eq!(
+            output,
+            format!(
+                concat!(
+                    "<?xml version=\"1.0\"?>\n",
+                    "<!DOCTYPE BlastOutput PUBLIC \"-//NCBI//NCBI BlastOutput/EN\" \"http://www.ncbi.nlm.nih.gov/dtd/NCBI_BlastOutput.dtd\">\n",
+                    "<BlastOutput>\n",
+                    "  <BlastOutput_program>blastp</BlastOutput_program>\n",
+                    "  <BlastOutput_version>diamond {}</BlastOutput_version>\n",
+                    "  <BlastOutput_reference>Benjamin Buchfink, Xie Chao, and Daniel Huson (2015), &quot;Fast and sensitive protein alignment using DIAMOND&quot;, Nature Methods 12:59-60.</BlastOutput_reference>\n",
+                    "  <BlastOutput_db>db<&>.dmnd</BlastOutput_db>\n",
+                    "  <BlastOutput_query-ID>Query_1</BlastOutput_query-ID>\n",
+                    "  <BlastOutput_query-def>query &lt;o</BlastOutput_query-def>\n",
+                    "  <BlastOutput_query-len>42</BlastOutput_query-len>\n",
+                    "  <BlastOutput_param>\n",
+                    "    <Parameters>\n",
+                    "      <Parameters_matrix>BLOSUM62</Parameters_matrix>\n",
+                    "      <Parameters_expect>0.001</Parameters_expect>\n",
+                    "      <Parameters_gap-open>11</Parameters_gap-open>\n",
+                    "      <Parameters_gap-extend>1</Parameters_gap-extend>\n",
+                    "      <Parameters_filter>F</Parameters_filter>\n",
+                    "    </Parameters>\n",
+                    "  </BlastOutput_param>\n",
+                    "<BlastOutput_iterations>\n",
+                ),
+                VERSION_STRING
+            )
         );
-        assert!(output.contains("<Parameters_gap-open>11</Parameters_gap-open>"));
-        assert!(output.ends_with("<BlastOutput_iterations>\n"));
     }
 
     #[test]
@@ -652,16 +693,51 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        print_match_context(&mut buf, &ctx, &score_matrix, false, false, false).unwrap();
+        let mut accession_stats = AccessionParsing::default();
+        print_match_context_with_accession_stats(
+            &mut buf,
+            &ctx,
+            &score_matrix,
+            false,
+            false,
+            false,
+            &mut accession_stats,
+        )
+        .unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("<Hit_num>1</Hit_num>"));
-        assert!(output.contains("<Hit_id>sp|P0|target</Hit_id>"));
-        assert!(output.contains("<Hit_def>definition &gt;sp|P1|other other</Hit_def>"));
-        assert!(output.contains("<Hit_accession>P0</Hit_accession>"));
-        assert!(output.contains("<Hsp_score>50</Hsp_score>"));
-        assert!(output.contains("<Hsp_qseq>AR-</Hsp_qseq>"));
-        assert!(output.contains("<Hsp_hseq>ARD</Hsp_hseq>"));
-        assert!(output.contains("<Hsp_midline>A+ </Hsp_midline>"));
+        assert_eq!(
+            output,
+            concat!(
+                "<Hit>\n",
+                "  <Hit_num>1</Hit_num>\n",
+                "  <Hit_id>sp|P0|target</Hit_id>\n",
+                "  <Hit_def>definition &gt;sp|P1|other other</Hit_def>\n",
+                "  <Hit_accession>P0</Hit_accession>\n",
+                "  <Hit_len>100</Hit_len>\n",
+                "  <Hit_hsps>\n",
+                "    <Hsp>\n",
+                "      <Hsp_num>1</Hsp_num>\n",
+                "      <Hsp_bit-score>25.0</Hsp_bit-score>\n",
+                "      <Hsp_score>50</Hsp_score>\n",
+                "      <Hsp_evalue>1.00e-08</Hsp_evalue>\n",
+                "      <Hsp_query-from>1</Hsp_query-from>\n",
+                "      <Hsp_query-to>3</Hsp_query-to>\n",
+                "      <Hsp_hit-from>6</Hsp_hit-from>\n",
+                "      <Hsp_hit-to>8</Hsp_hit-to>\n",
+                "      <Hsp_query-frame>0</Hsp_query-frame>\n",
+                "      <Hsp_hit-frame>0</Hsp_hit-frame>\n",
+                "      <Hsp_identity>1</Hsp_identity>\n",
+                "      <Hsp_positive>2</Hsp_positive>\n",
+                "      <Hsp_gaps>1</Hsp_gaps>\n",
+                "      <Hsp_align-len>3</Hsp_align-len>\n",
+                "         <Hsp_qseq>AR-</Hsp_qseq>\n",
+                "         <Hsp_hseq>ARD</Hsp_hseq>\n",
+                "      <Hsp_midline>A+ </Hsp_midline>\n",
+                "    </Hsp>\n",
+            )
+        );
+        assert_eq!(accession_stats.prefix_before_pipe, 1);
+        assert_eq!(accession_stats.suffix_after_pipe, 1);
     }
 
     #[test]
@@ -669,17 +745,41 @@ mod tests {
         let mut buf = Vec::new();
         print_query_intro(&mut buf, 2, "query <one> >second", 33).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("<Iteration_iter-num>3</Iteration_iter-num>"));
-        assert!(output.contains("<Iteration_query-ID>Query_3</Iteration_query-ID>"));
-        assert!(output.contains("<Iteration_query-def>query &lt;one&gt;</Iteration_query-def>"));
-        assert!(output.contains("<Iteration_query-len>33</Iteration_query-len>"));
+        assert_eq!(
+            output,
+            concat!(
+                "<Iteration>\n",
+                "  <Iteration_iter-num>3</Iteration_iter-num>\n",
+                "  <Iteration_query-ID>Query_3</Iteration_query-ID>\n",
+                "  <Iteration_query-def>query &lt;one&gt;</Iteration_query-def>\n",
+                "  <Iteration_query-len>33</Iteration_query-len>\n",
+                "<Iteration_hits>\n",
+            )
+        );
 
         let mut buf = Vec::new();
         print_query_epilog(&mut buf, false, 7, 99, 0.1, 0.2).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.starts_with("  </Hit_hsps>\n</Hit>\n</Iteration_hits>"));
-        assert!(output.contains("<Statistics_db-num>7</Statistics_db-num>"));
-        assert!(output.contains("<Statistics_lambda>0.200000</Statistics_lambda>"));
+        assert_eq!(
+            output,
+            concat!(
+                "  </Hit_hsps>\n",
+                "</Hit>\n",
+                "</Iteration_hits>\n",
+                "  <Iteration_stat>\n",
+                "    <Statistics>\n",
+                "      <Statistics_db-num>7</Statistics_db-num>\n",
+                "      <Statistics_db-len>99</Statistics_db-len>\n",
+                "      <Statistics_hsp-len>0</Statistics_hsp-len>\n",
+                "      <Statistics_eff-space>0</Statistics_eff-space>\n",
+                "      <Statistics_kappa>0.100000</Statistics_kappa>\n",
+                "      <Statistics_lambda>0.200000</Statistics_lambda>\n",
+                "      <Statistics_entropy>0</Statistics_entropy>\n",
+                "    </Statistics>\n",
+                "  </Iteration_stat>\n",
+                "</Iteration>\n",
+            )
+        );
 
         let mut buf = Vec::new();
         print_footer(&mut buf).unwrap();

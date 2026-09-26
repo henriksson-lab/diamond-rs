@@ -5,7 +5,7 @@ use crate::basic::packed_transcript::EditOperation;
 use crate::basic::value::{TaxId, AMINO_ACID_ALPHABET, LETTER_MASK};
 use crate::data::taxonomy::TaxonomyTree;
 use crate::dp::swipe::HspValues;
-use crate::util::escape_sequences::XML;
+use crate::util::escape_sequences::{EscapeSequences, XML};
 use crate::util::sequence::{FASTA_HEADER_SEP, ID_DELIMITERS};
 
 /// Matches C++ `format_double(x)`.
@@ -450,7 +450,9 @@ pub fn init_output(cfg: &OutputInitConfig<'_>) -> Result<OutputInit, String> {
     let max_target_seqs;
     let message;
     if let Some(top) = toppercent {
-        if !(0.0..=100.0).contains(&top) {
+        // Preserve C++ comparison semantics: NaN is neither below zero nor
+        // above 100 and therefore is not rejected by this validation.
+        if top < 0.0 || top > 100.0 {
             return Err("Allowed value range for --top is between 0.0 and 100.0".to_string());
         }
         if top == 100.0 {
@@ -458,7 +460,9 @@ pub fn init_output(cfg: &OutputInitConfig<'_>) -> Result<OutputInit, String> {
             max_target_seqs = i64::MAX;
             message = "#Target sequences to report alignments for: unlimited\n".to_string();
         } else {
-            max_target_seqs = cfg.max_target_seqs.unwrap_or(DEFAULT_MAX_TARGET_SEQS);
+            // Search::Config initializes this output parameter to zero. C++
+            // leaves it untouched while top-percent culling is active.
+            max_target_seqs = 0;
             message = format!("Percentage range of top alignment score to report hits: {top}\n");
         }
     } else {
@@ -575,6 +579,7 @@ pub enum FieldId {
     Reserved1 = 74,
     Reserved2 = 75,
     SLineages = 76,
+    Count = 77,
 }
 
 impl FieldId {
@@ -1436,6 +1441,19 @@ pub fn print_title(
     separator: &str,
     json_array: bool,
 ) -> String {
+    print_title_escaped(id, full_titles, all_titles, separator, None, json_array)
+}
+
+/// Full Rust mapping of C++ `OutputFormat::print_title`, including its optional
+/// caller-provided escape table.
+pub fn print_title_escaped(
+    id: &str,
+    full_titles: bool,
+    all_titles: bool,
+    separator: &str,
+    escape_sequences: Option<&EscapeSequences>,
+    json_array: bool,
+) -> String {
     let mut out = String::new();
     let mut n = 0usize;
     let mut rest = id;
@@ -1462,14 +1480,17 @@ pub fn print_title(
         if json_array {
             out.push('"');
         }
-        if full_titles {
-            out.push_str(s);
+        let value = if full_titles {
+            s
         } else {
-            out.push_str(
-                s.split(|c: char| ID_DELIMITERS.contains(c))
-                    .next()
-                    .unwrap_or(""),
-            );
+            s.split(|c: char| ID_DELIMITERS.contains(c))
+                .next()
+                .unwrap_or("")
+        };
+        if let Some(esc) = escape_sequences {
+            out.push_str(&esc.escape_string(value));
+        } else {
+            out.push_str(value);
         }
         if json_array {
             out.push('"');
@@ -1482,6 +1503,12 @@ pub fn print_title(
             break;
         }
         rest = &rest[split_at + sep_len..];
+        // C++ Tokenizer::good() is false when a delimiter points directly at
+        // the terminating NUL, so a trailing separator does not add an empty
+        // title. Consecutive non-trailing separators still produce empties.
+        if rest.is_empty() {
+            break;
+        }
     }
     out
 }
@@ -1494,52 +1521,14 @@ pub fn print_title_xml(
     separator: &str,
     json_array: bool,
 ) -> String {
-    let mut out = String::new();
-    let mut n = 0usize;
-    let mut rest = id;
-    loop {
-        // See `print_title` above: C++ scans delimiters in array order, not
-        // by earliest position. `\x01` always wins over ` >` when both occur.
-        let mut split_at = rest.len();
-        let mut sep_len = 0usize;
-        for sep in FASTA_HEADER_SEP {
-            if let Some(i) = rest.find(sep) {
-                split_at = i;
-                sep_len = sep.len();
-                break;
-            }
-        }
-        let s = &rest[..split_at];
-        if n > 0 {
-            out.push_str(separator);
-        }
-        if json_array {
-            out.push('"');
-        }
-        if full_titles {
-            out.push_str(&XML.escape_string(s));
-        } else {
-            out.push_str(
-                &XML.escape_string(
-                    s.split(|c: char| ID_DELIMITERS.contains(c))
-                        .next()
-                        .unwrap_or(""),
-                ),
-            );
-        }
-        if json_array {
-            out.push('"');
-        }
-        n += 1;
-        if !all_titles {
-            break;
-        }
-        if split_at == rest.len() {
-            break;
-        }
-        rest = &rest[split_at + sep_len..];
-    }
-    out
+    print_title_escaped(
+        id,
+        full_titles,
+        all_titles,
+        separator,
+        Some(&XML),
+        json_array,
+    )
 }
 
 pub fn print_staxids(taxids: &[TaxId], _json: bool) -> String {
@@ -1582,7 +1571,6 @@ where
 }
 
 pub fn lineage(taxid: TaxId, tree: &TaxonomyTree) -> Vec<TaxId> {
-    const MAX_LINEAGE: usize = 64;
     let mut out = Vec::new();
     let mut i = taxid;
     loop {
@@ -1594,7 +1582,7 @@ pub fn lineage(taxid: TaxId, tree: &TaxonomyTree) -> Vec<TaxId> {
         }
         out.push(i);
         i = tree.parent(i);
-        if out.len() >= MAX_LINEAGE {
+        if out.len() >= crate::data::sequence_file::MAX_LINEAGE {
             panic!("Lineage too long for taxid {}", taxid);
         }
     }
@@ -1974,7 +1962,8 @@ pub fn write_tabular_context_row<W: Write>(
             | FieldId::FullQSeqMate
             | FieldId::NegEValue
             | FieldId::Reserved1
-            | FieldId::Reserved2 => write!(writer, "N/A")?,
+            | FieldId::Reserved2
+            | FieldId::Count => write!(writer, "N/A")?,
         }
     }
     writeln!(writer)?;
@@ -2516,6 +2505,8 @@ mod tests {
         assert_eq!(FieldId::from_name("evalue"), Some(FieldId::EValue));
         assert_eq!(FieldId::from_name("bitscore"), Some(FieldId::BitScore));
         assert_eq!(FieldId::from_name("unknown"), None);
+        assert_eq!(FieldId::Count as u32, 77);
+        assert_eq!(FieldId::Count.output_field(), None);
     }
 
     #[test]
@@ -2672,6 +2663,7 @@ mod tests {
         cfg.toppercent = Some(10.0);
         let init = init_output(&cfg).unwrap();
         assert_eq!(init.toppercent, Some(10.0));
+        assert_eq!(init.max_target_seqs, 0);
         assert_eq!(
             init.message,
             "Percentage range of top alignment score to report hits: 10\n"
@@ -2687,6 +2679,12 @@ mod tests {
             init_output(&cfg).unwrap_err(),
             "Allowed value range for --top is between 0.0 and 100.0"
         );
+
+        // C++ checks `top < 0 || top > 100`; both comparisons are false for
+        // NaN, so preserve its acceptance even though it is unusual CLI input.
+        cfg.toppercent = Some(f64::NAN);
+        let init = init_output(&cfg).unwrap();
+        assert!(init.toppercent.unwrap().is_nan());
     }
 
     #[test]
@@ -3017,6 +3015,19 @@ mod tests {
         assert_eq!(
             print_title_xml("sp|A <desc> >tr|B & other", true, true, " &gt;", false),
             "sp|A &lt;desc&gt; &gt;tr|B &amp; other"
+        );
+        assert_eq!(print_title("sp|A\x01", false, true, ";", false), "sp|A");
+        assert_eq!(print_title("sp|A\x01", false, true, ",", true), "\"sp|A\"");
+        assert_eq!(
+            print_title_escaped(
+                "sp|A <desc>\x01tr|B & other",
+                true,
+                true,
+                " | ",
+                Some(&XML),
+                false,
+            ),
+            "sp|A &lt;desc&gt; | tr|B &amp; other"
         );
     }
 

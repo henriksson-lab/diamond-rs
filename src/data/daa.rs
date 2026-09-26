@@ -7,7 +7,7 @@ use crate::align::hsp::{Hsp, HspContext};
 use crate::basic::packed_sequence::PackedSequence;
 use crate::basic::packed_transcript::{PackedOperation, PackedTranscript};
 use crate::basic::translate::translate_6_frames;
-use crate::basic::value::{Letter, SequenceType};
+use crate::basic::value::{AlignMode, Letter, SequenceType};
 use crate::output::format::{
     write_tabular_context_row, write_tabular_context_row_json, write_tabular_query_intro,
     TabularFormat,
@@ -474,6 +474,13 @@ pub const DAA_HEADER1_SIZE: usize = 16;
 pub const DAA_HEADER2_SIZE: usize = 2432;
 pub const DAA_ID_DELIMITERS: &str = " \x07\x08\x0c\n\r\t\x0b\x01";
 
+/// Matches the inline C++ `translate_query(query, context)` helper from
+/// `daa_record.h`.
+pub fn translate_query(query: &[Letter]) -> [Vec<Letter>; 6] {
+    let dna: Vec<u8> = query.iter().map(|&letter| letter as u8).collect();
+    translate_6_frames(&dna).map(|frame| frame.into_iter().map(|letter| letter as Letter).collect())
+}
+
 /// Query record decoded from a DAA alignment block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaaQueryRecord {
@@ -495,7 +502,7 @@ impl DaaQueryRecord {
         let mut source_seq = Vec::new();
         let mut context: [Vec<Letter>; 6] = Default::default();
 
-        if file.mode() == 2 {
+        if file.mode() == AlignMode::BLASTP as u32 {
             let byte_count = (query_len * 5).div_ceil(8);
             let packed = PackedSequence::from_raw(it.read_bytes(byte_count)?.to_vec(), false);
             context[0] = packed.unpack(5, query_len);
@@ -505,13 +512,7 @@ impl DaaQueryRecord {
             let byte_count = (query_len * bits as usize).div_ceil(8);
             let packed = PackedSequence::from_raw(it.read_bytes(byte_count)?.to_vec(), have_n);
             source_seq = packed.unpack(bits, query_len);
-            let dna: Vec<u8> = source_seq.iter().map(|&x| x as u8).collect();
-            context = translate_6_frames(&dna).map(|frame| {
-                frame
-                    .into_iter()
-                    .map(|letter| letter as Letter)
-                    .collect::<Vec<_>>()
-            });
+            context = translate_query(&source_seq);
         }
 
         Ok(Self {
@@ -545,7 +546,7 @@ impl DaaQueryRecord {
 
     /// Matches C++ `DAA_query_record::query_len()`.
     pub fn query_len(&self) -> usize {
-        if self.mode == 3 {
+        if self.mode == AlignMode::BLASTX as u32 {
             self.source_seq.len()
         } else {
             self.context[0].len()
@@ -553,7 +554,7 @@ impl DaaQueryRecord {
     }
 
     pub fn query_source(&self) -> &[Letter] {
-        if self.mode == 3 {
+        if self.mode == AlignMode::BLASTX as u32 {
             &self.source_seq
         } else {
             &self.context[0]
@@ -561,7 +562,7 @@ impl DaaQueryRecord {
     }
 
     pub fn input_sequence_type(&self) -> SequenceType {
-        if self.mode == 2 {
+        if self.mode == AlignMode::BLASTP as u32 {
             SequenceType::AminoAcid
         } else {
             SequenceType::Nucleotide
@@ -586,7 +587,9 @@ impl DaaMatch {
         HspContext::new(
             self.hsp.clone(),
             parent.query_num as u32,
-            parent.query_num as u64,
+            // C++ `DAA_query_record::Match::context()` passes a literal 0 as
+            // the query OID; `query_num` is only the block/query ID.
+            0,
             parent.context.to_vec(),
             parent.query_len() as i32,
             &parent.query_name,
@@ -662,17 +665,23 @@ impl<'a> Iterator for DaaMatchIterator<'a> {
         hsp.subject_range = Interval::new(raw.subject_begin as i32, raw.subject_begin as i32);
         hsp.transcript = PackedTranscript::from_bytes(&raw.transcript);
 
-        if self.file.mode() == 3 {
+        if self.file.mode() == AlignMode::BLASTX as u32 {
             hsp.frame = if (raw.flag & (1 << 6)) == 0 {
                 (raw.query_begin % 3) as i32
             } else {
-                3 + ((self.parent.source_seq.len() as u32 - 1 - raw.query_begin) % 3) as i32
+                let Some(last_source_position) = self.parent.source_seq.len().checked_sub(1) else {
+                    return Some(Err("Translated query sequence is empty.".to_string()));
+                };
+                if raw.query_begin as usize > last_source_position {
+                    return Some(Err("Query begin out of bounds.".to_string()));
+                }
+                3 + ((last_source_position as u32 - raw.query_begin) % 3) as i32
             };
             hsp.set_translated_query_begin(
                 raw.query_begin as i32,
                 self.parent.source_seq.len() as i32,
             );
-        } else if self.file.mode() == 2 {
+        } else if self.file.mode() == AlignMode::BLASTP as u32 {
             hsp.frame = 0;
             hsp.query_range.begin = raw.query_begin as i32;
         }
@@ -688,7 +697,12 @@ impl<'a> Iterator for DaaMatchIterator<'a> {
             subject_name,
         };
         let mut context = parsed.context(self.parent);
-        if let Err(e) = context.parse(true, true, self.file.mode() == 3, self.score_matrix) {
+        if let Err(e) = context.parse(
+            true,
+            true,
+            self.file.mode() == AlignMode::BLASTX as u32,
+            self.score_matrix,
+        ) {
             return Some(Err(e));
         }
         parsed.hsp = context.hsp();
@@ -1092,18 +1106,7 @@ pub fn build_mapping(
     seq_lens: &mut Vec<u32>,
     f: &DaaFile,
 ) -> HashMap<u32, u32> {
-    let mut r = HashMap::new();
-    for i in 0..f.db_seqs_used() as usize {
-        let name = f.ref_name(i).to_string();
-        let next = acc2oid.len() as u32;
-        let oid = *acc2oid.entry(name.clone()).or_insert(next);
-        r.insert(i as u32, oid);
-        if oid == next {
-            seq_ids.push(name);
-            seq_lens.push(f.ref_len_at(i));
-        }
-    }
-    r
+    crate::output::daa::merge::build_mapping(acc2oid, seq_ids, seq_lens, f)
 }
 
 /// Matches C++ `write_file(f, out, subject_map)`.
@@ -1112,64 +1115,16 @@ pub fn write_file<W: Write>(
     out: &mut W,
     subject_map: &HashMap<u32, u32>,
 ) -> io::Result<i64> {
-    let mut out_buf = Vec::new();
-    let mut last_query_num = None;
-    while let Some((buf, query_num)) = f.read_query_buffer()? {
-        let r = DaaQueryRecord::from_buffer(f, &buf, query_num)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let seek_pos = write_daa_query_record(
-            &mut out_buf,
-            &r.query_name,
-            r.query_source(),
-            r.input_sequence_type(),
-        );
-        let mut it = r.raw_begin();
-        while it.good() {
-            copy_match_record_raw(&mut it, &mut out_buf, subject_map)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        }
-        finish_daa_query_record(&mut out_buf, seek_pos);
-        out.write_all(&out_buf)?;
-        out_buf.clear();
-        last_query_num = Some(query_num);
-    }
-    Ok(last_query_num.map_or(0, |query_num| query_num as i64 + 1))
+    crate::output::daa::merge::write_file(f, out, subject_map)
 }
 
 /// Matches C++ `merge_daa(input_files, output_file)`.
 pub fn merge_daa_files<P: AsRef<Path>>(input_files: &[P], output_file: P) -> io::Result<i64> {
-    if input_files.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Missing parameter: input files (--in)",
-        ));
-    }
-
-    let mut files = Vec::with_capacity(input_files.len());
-    let mut acc2oid = HashMap::new();
-    let mut oid_maps = Vec::with_capacity(input_files.len());
-    let mut seq_ids = Vec::new();
-    let mut seq_lens = Vec::new();
-
-    for file in input_files {
-        let daa = DaaFile::open(file)?;
-        oid_maps.push(build_mapping(
-            &mut acc2oid,
-            &mut seq_ids,
-            &mut seq_lens,
-            &daa,
-        ));
-        files.push(daa);
-    }
-
-    let mut out = File::create(output_file)?;
-    init_daa(&mut out)?;
-    let mut query_count = 0;
-    for (file, subject_map) in files.iter_mut().zip(oid_maps.iter()) {
-        query_count += write_file(file, &mut out, subject_map)?;
-    }
-    finish_daa_from_refs(&mut out, &files[0], &seq_ids, &seq_lens, query_count)?;
-    Ok(query_count)
+    let config = crate::output::daa::merge::DaaMergeConfig::new(
+        input_files.iter().map(|path| path.as_ref().to_path_buf()),
+        output_file.as_ref().to_path_buf(),
+    );
+    crate::output::daa::merge::merge_daa(&config)
 }
 
 /// Matches C++ `write_daa_query_record(buf, query_name, query, input_sequence_type)`.
@@ -1797,8 +1752,46 @@ mod tests {
         assert_eq!(matches[0].hsp.identities, 3);
         assert!(matches[0].hsp.evalue.is_finite());
         assert!(matches[0].hsp.bit_score > 0.0);
+        let context = matches[0].context(&record);
+        assert_eq!(context.query_id, 7);
+        assert_eq!(context.query_oid, 0);
         assert_eq!(matches[1].hit_num, 0);
         assert_eq!(matches[1].hsp_num, 1);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_daa_match_iterator_rejects_out_of_bounds_reverse_query_begin() {
+        let (mut daa, path) = daa_file_for_mode(3);
+        daa.h2.db_letters = 1000;
+        daa.ref_name = vec!["subject0".to_string()];
+        daa.ref_len = vec![100];
+
+        let query = vec![0, 1, 2, 0, 1, 2];
+        let packed = PackedSequence::new(&query, SequenceType::Nucleotide);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(query.len() as u32).to_ne_bytes());
+        buf.extend_from_slice(b"dna0\0");
+        buf.push(if packed.has_n() { 1 } else { 0 });
+        buf.extend_from_slice(packed.data());
+
+        let flag = compute_flag(30, 99, 5, true);
+        buf.extend_from_slice(&0u32.to_ne_bytes());
+        buf.push(flag);
+        write_packed_width(&mut buf, 30, flag & 3);
+        write_packed_width(&mut buf, 99, (flag >> 2) & 3);
+        write_packed_width(&mut buf, 5, (flag >> 4) & 3);
+        buf.push(PackedOperation::terminator().code);
+
+        let record = DaaQueryRecord::from_buffer(&daa, &buf, 0).unwrap();
+        let score_matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, daa.db_letters()).unwrap();
+        let error = record
+            .begin(&daa, &score_matrix)
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error, "Query begin out of bounds.");
 
         std::fs::remove_file(path).unwrap();
     }

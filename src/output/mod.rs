@@ -1,14 +1,22 @@
+pub mod blast_pairwise_format;
+pub mod blast_tab_format;
+pub mod daa;
 pub mod edge;
 pub mod format;
 pub mod intermediate;
 pub mod join_blocks;
+pub mod output_format;
 pub mod output_sink;
 pub mod paf;
+pub mod paf_format;
 pub mod pairwise;
 pub mod sam;
+pub mod sam_format;
 pub mod target_culling;
 pub mod taxon;
+pub mod taxon_format;
 pub mod xml;
+pub mod xml_format;
 
 use crate::align::hsp::{Hsp, HspContext};
 

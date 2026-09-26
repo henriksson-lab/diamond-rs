@@ -462,7 +462,10 @@ mod tests {
 
         assert_eq!(stats, SeedStats::default());
         assert!(cb.finished);
-        assert_eq!(cb.rows, vec![(2, 1, 0, 0), (12, 2, 0, 0), (32, 6, 1, 0)]);
+        assert_eq!(
+            cb.rows,
+            vec![(2, 256, 0, 0), (12, 257, 0, 0), (32, 261, 1, 0)]
+        );
     }
 
     #[test]
@@ -668,6 +671,6 @@ mod tests {
         let mut c = cfg(None, SeedEncoding::SpacedFactor, 1);
         c.skip = Some(&skip);
         enum_seeds(&mut seqs, &mut cb, 0, 2, &KeyFilter(1), &c, &ctx);
-        assert_eq!(cb.rows, vec![(1, 4, 1, 0)]);
+        assert_eq!(cb.rows, vec![(1, 259, 1, 0)]);
     }
 }

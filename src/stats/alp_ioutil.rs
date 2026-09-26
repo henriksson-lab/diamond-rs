@@ -44,11 +44,12 @@ pub fn clearTerminator() -> char {
 }
 
 pub fn abort() -> ! {
-    panic!("IoUtil::abort")
+    std::process::exit(1)
 }
 
 pub fn abort_msg(s_: &str) -> ! {
-    panic!("{}", s_)
+    eprintln!("{s_}");
+    abort()
 }
 
 pub fn getLine_lines<I>(in_: &mut I, str_: &mut String, t_: char) -> bool
@@ -61,7 +62,7 @@ where
     for mut line in in_ {
         let first_non_ws = line
             .char_indices()
-            .find(|&(_, c)| !c.is_whitespace())
+            .find(|&(_, c)| !c.is_ascii_whitespace())
             .map(|(_, c)| c);
         if first_non_ws.is_none() || first_non_ws == Some(t_) {
             continue;
@@ -99,7 +100,7 @@ pub fn getLine(input: &str, offset: &mut usize, str_: &mut String, t_: char) -> 
 
         let first_non_ws = line
             .char_indices()
-            .find(|&(_, c)| !c.is_whitespace())
+            .find(|&(_, c)| !c.is_ascii_whitespace())
             .map(|(_, c)| c);
         if first_non_ws.is_none() || first_non_ws == Some(t_) {
             continue;
@@ -133,13 +134,13 @@ where
     let Some(str_) = line_.split_whitespace().next() else {
         return false;
     };
-    match str_.parse::<T>() {
-        Ok(value) => {
-            *value_ = value;
-            true
-        }
-        Err(_) => false,
+    if let Ok(value) = str_.parse::<T>() {
+        *value_ = value;
     }
+    // The template parses through a separate stringstream and returns the
+    // state of the original input stream, so conversion failure is not
+    // propagated to the caller.
+    true
 }
 
 pub fn getLine_stream(input: &str, offset: &mut usize, t_: char) -> Option<String> {
@@ -157,12 +158,18 @@ pub fn in_double(token: &str, x_: &mut f64) -> bool {
         *x_ = f64::INFINITY;
         true
     } else {
-        match s.parse::<f64>() {
-            Ok(x) => {
+        let parsed = s
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(s.len()))
+            .rev()
+            .find_map(|end| s[..end].parse::<f64>().ok());
+        match parsed {
+            Some(x) => {
                 *x_ = x;
                 true
             }
-            Err(_) => false,
+            None => false,
         }
     }
 }
@@ -223,5 +230,23 @@ mod tests {
         assert!(in_double("3.5", &mut x));
         assert_eq!(x, 3.5);
         assert!(!in_double("abc", &mut x));
+        assert!(in_double("3.5trailing", &mut x));
+        assert_eq!(x, 3.5);
+    }
+
+    #[test]
+    fn get_string_does_not_propagate_secondary_conversion_failure() {
+        let mut offset = 0;
+        let mut line = String::new();
+        let mut value = 41_i32;
+        assert!(getString(
+            "not-an-int rest\n",
+            &mut offset,
+            &mut value,
+            &mut line,
+            '!'
+        ));
+        assert_eq!(value, 41);
+        assert_eq!(line, "not-an-int rest");
     }
 }

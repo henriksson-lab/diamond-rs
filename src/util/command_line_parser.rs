@@ -16,22 +16,81 @@ pub trait ReadOption: Clone + 'static {
     fn set_option_default(dst: &mut Self, value: &Self) {
         *dst = value.clone();
     }
+    fn set_base_ptr(&mut self, _base: &OptionBase) {}
 }
 
-macro_rules! impl_read_option_from_str {
-    ($($t:ty),* $(,)?) => {
-        $(
-            impl ReadOption for $t {
-                fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
-                    *dst = v[0].parse::<$t>().unwrap_or_default();
-                    Ok(())
-                }
-            }
-        )*
+fn c_atoll(value: &str) -> i64 {
+    let bytes = value.trim_start().as_bytes();
+    let (negative, mut i) = match bytes.first() {
+        Some(b'-') => (true, 1),
+        Some(b'+') => (false, 1),
+        _ => (false, 0),
     };
+    let mut found = false;
+    let mut magnitude = 0u64;
+    let limit = if negative {
+        i64::MAX as u64 + 1
+    } else {
+        i64::MAX as u64
+    };
+    while let Some(&byte) = bytes.get(i) {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        found = true;
+        magnitude = magnitude
+            .saturating_mul(10)
+            .saturating_add((byte - b'0') as u64)
+            .min(limit);
+        i += 1;
+    }
+    if !found {
+        0
+    } else if negative && magnitude == i64::MAX as u64 + 1 {
+        i64::MIN
+    } else if negative {
+        -(magnitude as i64)
+    } else {
+        magnitude as i64
+    }
 }
 
-impl_read_option_from_str!(i32, u32, i64, u64, usize, isize, f64);
+fn c_atof(value: &str) -> f64 {
+    let value = value.trim_start();
+    for end in value
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(value.len()))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        if let Ok(parsed) = value[..end].parse::<f64>() {
+            return parsed;
+        }
+    }
+    0.0
+}
+
+macro_rules! impl_read_option_signed {
+    ($($t:ty),* $(,)?) => {$ (
+        impl ReadOption for $t {
+            fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
+                *dst = c_atoll(&v[0]) as $t;
+                Ok(())
+            }
+        }
+    )* };
+}
+
+impl_read_option_signed!(i32, u32, i64, u64, usize, isize);
+
+impl ReadOption for f64 {
+    fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
+        *dst = c_atof(&v[0]);
+        Ok(())
+    }
+}
 
 impl ReadOption for bool {
     fn read_option(dst: &mut Self, _v: &[String]) -> Result<(), String> {
@@ -66,29 +125,92 @@ impl ReadOption for Vec<String> {
     }
 }
 
-macro_rules! impl_read_option_value_from_str {
-    ($($t:ty),* $(,)?) => {
-        $(
-            impl ReadOption for OptionValue<$t> {
-                fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
-                    let value = v[0]
-                        .parse::<$t>()
-                        .map_err(|_| "Invalid option value.".to_string())?;
-                    dst.set(value);
-                    Ok(())
-                }
-
-                fn check_present(&self) -> bool {
-                    self.present()
-                }
-
-                fn set_option_default(_dst: &mut Self, _value: &Self) {}
+macro_rules! impl_read_option_value_signed {
+    ($($t:ty),* $(,)?) => {$ (
+        impl ReadOption for OptionValue<$t> {
+            fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
+                dst.set(c_atoll(&v[0]) as $t);
+                Ok(())
             }
-        )*
-    };
+
+            fn check_present(&self) -> bool {
+                self.present()
+            }
+
+            fn set_option_default(_dst: &mut Self, _value: &Self) {}
+
+            fn set_base_ptr(&mut self, base: &OptionBase) {
+                let value = self.get_present().ok();
+                *self = OptionValue::with_base(crate::util::options::OptionBase::new(
+                    &base.id,
+                    base.short_id,
+                    &base.desc,
+                    base.disabled,
+                    Some(&base.group_title),
+                ));
+                if let Some(value) = value {
+                    self.set(value);
+                }
+            }
+        }
+    )* };
 }
 
-impl_read_option_value_from_str!(i32, u32, i64, u64, usize, isize, f64, String);
+impl_read_option_value_signed!(i32, u32, i64, u64, usize, isize);
+
+impl ReadOption for OptionValue<f64> {
+    fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
+        dst.set(c_atof(&v[0]));
+        Ok(())
+    }
+
+    fn check_present(&self) -> bool {
+        self.present()
+    }
+
+    fn set_option_default(_dst: &mut Self, _value: &Self) {}
+
+    fn set_base_ptr(&mut self, base: &OptionBase) {
+        let value = self.get_present().ok();
+        *self = OptionValue::with_base(crate::util::options::OptionBase::new(
+            &base.id,
+            base.short_id,
+            &base.desc,
+            base.disabled,
+            Some(&base.group_title),
+        ));
+        if let Some(value) = value {
+            self.set(value);
+        }
+    }
+}
+
+impl ReadOption for OptionValue<String> {
+    fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
+        dst.set(v[0].clone());
+        Ok(())
+    }
+
+    fn check_present(&self) -> bool {
+        self.present()
+    }
+
+    fn set_option_default(_dst: &mut Self, _value: &Self) {}
+
+    fn set_base_ptr(&mut self, base: &OptionBase) {
+        let value = self.get_present().ok();
+        *self = OptionValue::with_base(crate::util::options::OptionBase::new(
+            &base.id,
+            base.short_id,
+            &base.desc,
+            base.disabled,
+            Some(&base.group_title),
+        ));
+        if let Some(value) = value {
+            self.set(value);
+        }
+    }
+}
 
 impl ReadOption for OptionValue<Vec<String>> {
     fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
@@ -105,6 +227,20 @@ impl ReadOption for OptionValue<Vec<String>> {
     }
 
     fn set_option_default(_dst: &mut Self, _value: &Self) {}
+
+    fn set_base_ptr(&mut self, base: &OptionBase) {
+        let value = self.get_present().ok();
+        *self = OptionValue::with_base(crate::util::options::OptionBase::new(
+            &base.id,
+            base.short_id,
+            &base.desc,
+            base.disabled,
+            Some(&base.group_title),
+        ));
+        if let Some(value) = value {
+            self.set(value);
+        }
+    }
 }
 
 pub fn read_option<T: ReadOption>(dst: &mut T, v: &[String]) -> Result<(), String> {
@@ -121,6 +257,10 @@ pub fn check_present<T: ReadOption>(v: &T) -> bool {
 
 pub fn set_option_default<T: ReadOption>(option: &mut T, value: &T) {
     T::set_option_default(option, value);
+}
+
+pub fn set_base_ptr<T: ReadOption>(option: &mut T, base: &OptionBase) {
+    option.set_base_ptr(base);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,15 +299,17 @@ impl<T: ReadOption> OptionDesc<T> {
         group_title: &str,
         commands: &[u32],
     ) -> Self {
+        let base = OptionBase {
+            id: id.to_string(),
+            short_id,
+            desc: desc.to_string(),
+            disabled,
+            commands: commands.to_vec(),
+            group_title: group_title.to_string(),
+        };
+        store.borrow_mut().set_base_ptr(&base);
         Self {
-            base: OptionBase {
-                id: id.to_string(),
-                short_id,
-                desc: desc.to_string(),
-                disabled,
-                commands: commands.to_vec(),
-                group_title: group_title.to_string(),
-            },
+            base,
             default,
             min_count,
             store,
@@ -361,19 +503,23 @@ impl CommandLineParser {
         const COL1_WIDTH: usize = 25;
         let mut out = String::from("Options:\n");
         for group in &self.groups {
-            if !group.commands.contains(&command) {
-                continue;
-            }
-            for option in &group.options {
-                if option.base().desc.is_empty() {
+            // The C++ implementation intentionally iterates the command list,
+            // so a duplicated command entry prints the group more than once.
+            for &group_command in &group.commands {
+                if group_command != command {
                     continue;
                 }
-                let mut col1 = format!("--{}", option.base().id);
-                let pad = COL1_WIDTH.max(col1.len()) - col1.len();
-                col1.extend(std::iter::repeat(' ').take(pad));
-                out.push_str(&col1);
-                out.push_str(&option.base().desc);
-                out.push('\n');
+                for option in &group.options {
+                    if option.base().desc.is_empty() {
+                        continue;
+                    }
+                    let mut col1 = format!("--{}", option.base().id);
+                    let pad = COL1_WIDTH.max(col1.len()) - col1.len();
+                    col1.extend(std::iter::repeat_n(' ', pad));
+                    out.push_str(&col1);
+                    out.push_str(&option.base().desc);
+                    out.push('\n');
+                }
             }
         }
         out.push('\n');
@@ -448,6 +594,19 @@ mod tests {
             &["a".to_string(), "b".to_string()],
             2
         ));
+
+        let mut signed = 0i32;
+        read_option(&mut signed, &["  -12trailing".to_string()]).unwrap();
+        assert_eq!(signed, -12);
+        let mut unsigned = 0u32;
+        read_option(&mut unsigned, &["-1".to_string()]).unwrap();
+        assert_eq!(unsigned, u32::MAX);
+        let mut floating = 0.0f64;
+        read_option(&mut floating, &["2.5e1suffix".to_string()]).unwrap();
+        assert_eq!(floating, 25.0);
+        let mut optional = OptionValue::<i64>::new();
+        read_option(&mut optional, &["not-a-number".to_string()]).unwrap();
+        assert_eq!(optional.get_present(), Ok(0));
     }
 
     #[test]
@@ -488,5 +647,124 @@ mod tests {
             err.unwrap_err(),
             "Option is not permitted for this workflow: db"
         );
+    }
+
+    #[test]
+    fn test_command_line_parser_exact_help_and_documentation() {
+        let value = Rc::new(RefCell::new(String::new()));
+        let mut parser = CommandLineParser::new();
+        parser
+            .add_command("blastp", "protein search", 1)
+            .add_command("hidden", "", 2);
+        let group = parser.add_group("General", vec![1, 1], false);
+        parser.add_option(
+            group,
+            "database",
+            'd',
+            "database path",
+            value,
+            String::new(),
+            1,
+        );
+
+        assert_eq!(
+            parser.print_help(),
+            "Syntax: diamond COMMAND [OPTIONS]\n\nCommands:\nblastp                   protein search\n\nPossible [OPTIONS] for COMMAND can be seen with syntax: diamond COMMAND\n\nOnline documentation at http://www.diamondsearch.org\n"
+        );
+        assert_eq!(
+            parser.print_documentation(1),
+            "Options:\n--database               database path\n--database               database path\n\n"
+        );
+    }
+
+    #[test]
+    fn test_command_line_parser_exact_error_paths_and_default_reset() {
+        let name = Rc::new(RefCell::new(String::new()));
+        let disabled = Rc::new(RefCell::new(false));
+        let optional = Rc::new(RefCell::new(OptionValue::<String>::new()));
+        let mut parser = CommandLineParser::new();
+        parser.add_command("run", "run", 7);
+        let enabled_group = parser.add_group("Enabled", vec![7], false);
+        parser.add_option(
+            enabled_group,
+            "name",
+            'n',
+            "name",
+            name.clone(),
+            "default".to_string(),
+            1,
+        );
+        parser.add_option(
+            enabled_group,
+            "optional",
+            'o',
+            "optional",
+            optional.clone(),
+            OptionValue::new(),
+            1,
+        );
+        let disabled_group = parser.add_group("Disabled", vec![7], true);
+        parser.add_option(
+            disabled_group,
+            "disabled",
+            'x',
+            "disabled",
+            disabled,
+            false,
+            1,
+        );
+
+        let mut command = 0;
+        assert_eq!(
+            parser.store(&["diamond"], &mut command).unwrap_err(),
+            "Syntax: diamond COMMAND [OPTIONS]. To print help message: diamond help"
+        );
+        assert_eq!(
+            parser.store(&["diamond", "bad"], &mut command).unwrap_err(),
+            "Invalid command: bad. To print help message: diamond help"
+        );
+        assert_eq!(
+            parser
+                .store(&["diamond", "run", "value"], &mut command)
+                .unwrap_err(),
+            "Command line options must begin with - or --."
+        );
+        assert_eq!(
+            parser
+                .store(&["diamond", "run", "-"], &mut command)
+                .unwrap_err(),
+            "Invalid option syntax."
+        );
+        assert_eq!(
+            parser
+                .store(&["diamond", "run", "--missing"], &mut command)
+                .unwrap_err(),
+            "Invalid option: missing"
+        );
+        assert_eq!(
+            parser
+                .store(&["diamond", "run", "--disabled"], &mut command)
+                .unwrap_err(),
+            "Invalid option: disabled"
+        );
+        assert_eq!(
+            parser
+                .store(&["diamond", "run", "--name"], &mut command)
+                .unwrap_err(),
+            "Invalid parameter count for option '-n/--name'"
+        );
+        assert_eq!(parser.require("unknown").unwrap_err(), "Unknown option.");
+        assert_eq!(
+            optional.borrow().require().unwrap_err(),
+            "Missing parameter: --optional/-o"
+        );
+
+        parser
+            .store(&["diamond", "--run", "-ncustom"], &mut command)
+            .unwrap();
+        assert_eq!(command, 7);
+        assert_eq!(name.borrow().as_str(), "custom");
+        parser.store(&["diamond", "run"], &mut command).unwrap();
+        assert_eq!(name.borrow().as_str(), "default");
     }
 }

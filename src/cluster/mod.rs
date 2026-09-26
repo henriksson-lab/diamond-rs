@@ -1,5 +1,17 @@
 use crate::basic::value::OId;
 
+pub mod cascaded;
+pub mod cluster_registry;
+pub mod external;
+pub mod helpers;
+pub mod multinode;
+pub mod output;
+pub mod realign;
+pub mod reassign;
+
+pub use cluster_registry::{ClusterRegistry, ClusterRegistryStatic, ClusteringAlgorithm};
+pub use reassign::{reassign, ReassignBackend, ReassignConfig, ReassignSummary};
+
 /// A protein sequence cluster — a centroid with its member sequences.
 #[derive(Debug, Clone)]
 pub struct Cluster {

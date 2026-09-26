@@ -55,6 +55,22 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "makeidx" => {
+            if let Some(database) = get_arg(&args, &["-d", "--db"]) {
+                print_banner();
+                let mut config =
+                    diamond::data::index::MakeIndexConfig::new(database, parse_sensitivity(&args));
+                config.shape_mask = get_all_args(&args, &["--shape-mask"]);
+                config.shapes = parse_arg_or(&args, &["--shapes"], 0);
+                match diamond::data::index::make_index(&config) {
+                    Ok(path) => eprintln!("Wrote seed index: {}", path.display()),
+                    Err(e) => run_or_exit(Err(e)),
+                }
+            } else {
+                eprintln!("Error: -d/--db argument required");
+                std::process::exit(1);
+            }
+        }
         "blastp" if !has_flag(&args, "--legacy") && !route_blastp_to_legacy(&args) => {
             // Native Rust blastp pipeline
             print_banner();
@@ -444,6 +460,7 @@ fn print_usage() {
     println!("  view       View DAA file");
     println!("  dbinfo     Print database info");
     println!("  getseq     Retrieve sequences from database");
+    println!("  makeidx    Build persistent seed index");
     println!("  cluster    Cluster sequences");
     println!("  merge-daa  Merge DAA files");
     println!("  version    Show version");

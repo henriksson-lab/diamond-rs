@@ -1,3 +1,5 @@
+use super::value::{Letter, MASK_LETTER};
+
 /// DNA strand direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
@@ -275,6 +277,69 @@ fn genetic_code_table(id: u32) -> Option<[u8; 64]> {
     Some(table)
 }
 
+/// Explicit, immutable replacement for C++ `Translator`'s mutable lookup globals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Translator {
+    lookup: [[[Letter; 5]; 5]; 5],
+    lookup_reverse: [[[Letter; 5]; 5]; 5],
+}
+
+impl Translator {
+    pub const REVERSE_LETTER: [Letter; 5] = [3, 2, 1, 0, 4];
+
+    /// Build the forward and reverse lookup tables for an NCBI genetic code.
+    pub fn init(id: u32) -> Result<Self, String> {
+        let code = genetic_code_table(id).ok_or_else(|| "Invalid genetic code id.".to_string())?;
+        let mut translator = Self {
+            lookup: [[[MASK_LETTER; 5]; 5]; 5],
+            lookup_reverse: [[[MASK_LETTER; 5]; 5]; 5],
+        };
+
+        for i in 0..4 {
+            for j in 0..4 {
+                for k in 0..4 {
+                    translator.lookup[i][j][k] = code[i * 16 + j * 4 + k] as Letter;
+                    translator.lookup_reverse[i][j][k] =
+                        code[(3 - i) * 16 + (3 - j) * 4 + (3 - k)] as Letter;
+                }
+                if translator.lookup[i][j][1..4]
+                    .iter()
+                    .all(|&value| value == translator.lookup[i][j][0])
+                {
+                    translator.lookup[i][j][4] = translator.lookup[i][j][0];
+                }
+                if translator.lookup_reverse[i][j][1..4]
+                    .iter()
+                    .all(|&value| value == translator.lookup_reverse[i][j][0])
+                {
+                    translator.lookup_reverse[i][j][4] = translator.lookup_reverse[i][j][0];
+                }
+            }
+        }
+        Ok(translator)
+    }
+
+    pub fn get_reverse_complement(letter: Letter) -> Letter {
+        Self::REVERSE_LETTER[letter as usize]
+    }
+
+    pub fn get_amino_acid(&self, dna: &[Letter], pos: usize) -> Letter {
+        self.lookup[dna[pos] as usize][dna[pos + 1] as usize][dna[pos + 2] as usize]
+    }
+
+    pub fn get_amino_acid_reverse(&self, dna: &[Letter], pos: usize) -> Letter {
+        self.lookup_reverse[dna[pos + 2] as usize][dna[pos + 1] as usize][dna[pos] as usize]
+    }
+
+    pub fn reverse(&self, sequence: &[Letter]) -> Vec<Letter> {
+        sequence
+            .iter()
+            .rev()
+            .map(|&letter| Self::get_reverse_complement(letter))
+            .collect()
+    }
+}
+
 /// Translate a DNA codon (3 nucleotide letters) to an amino acid letter.
 ///
 /// Nucleotide encoding: A=0, C=1, G=2, T=3, N=4
@@ -308,8 +373,8 @@ pub fn translate_6_frames_with_genetic_code(
     dna: &[u8],
     genetic_code: u32,
 ) -> Result<[Vec<u8>; 6], String> {
-    let table = genetic_code_table(genetic_code)
-        .ok_or_else(|| format!("Invalid genetic code id: {}", genetic_code))?;
+    let table =
+        genetic_code_table(genetic_code).ok_or_else(|| "Invalid genetic code id.".to_string())?;
     let len = dna.len();
     let mut frames = [
         Vec::new(),
@@ -410,6 +475,32 @@ mod tests {
         let table2 = genetic_code_table(2).unwrap();
         assert_eq!(translate_codon_with_table(3, 2, 0, &table2), 17); // TGA -> W
         assert!(genetic_code_table(7).is_none());
+    }
+
+    #[test]
+    fn test_translator_init_forward_reverse_and_ambiguity_tables() {
+        let translator = Translator::init(1).unwrap();
+        for a in 0..5i8 {
+            for b in 0..5i8 {
+                for c in 0..5i8 {
+                    let dna = [a, b, c];
+                    assert_eq!(
+                        translator.get_amino_acid(&dna, 0),
+                        translate_codon(a as u8, b as u8, c as u8) as Letter
+                    );
+                    assert_eq!(
+                        translator.get_amino_acid_reverse(&dna, 0),
+                        translate_codon(
+                            Translator::get_reverse_complement(c) as u8,
+                            Translator::get_reverse_complement(b) as u8,
+                            Translator::get_reverse_complement(a) as u8,
+                        ) as Letter
+                    );
+                }
+            }
+        }
+        assert_eq!(translator.reverse(&[0, 1, 4, 3]), vec![0, 4, 2, 3]);
+        assert_eq!(Translator::init(7).unwrap_err(), "Invalid genetic code id.");
     }
 
     #[test]

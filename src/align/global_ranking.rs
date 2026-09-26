@@ -1,3 +1,5 @@
+//! Compatibility facade for the mirrored global-ranking source files.
+
 use crate::align::gapped_filter::{load_hits, SeedHit, TargetScore};
 use crate::align::hsp::Match;
 use crate::align::target::{self, GappedScoreConfig};
@@ -6,231 +8,25 @@ use crate::basic::statistics::Statistics;
 use crate::basic::value::{BlockId, Letter};
 use crate::data::block::Block;
 use crate::dp::swipe::{Flags, HspValues};
-use crate::dp::ungapped::{ungapped_window, xdrop_ungapped};
-use crate::output::intermediate::IntermediateRecord;
+use crate::dp::ungapped::xdrop_ungapped;
 use crate::search::hit::Hit as SearchHit;
 use crate::search::sensitivity::ExtensionMode;
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::data_structures::BitVector;
-use crate::util::text_buffer::TextBuffer;
 use std::collections::HashMap;
-use std::io::{self, Read};
+
+pub mod extend;
+pub mod global_ranking;
+pub mod table;
+
+pub use extend::{
+    extend, extend_merged_query_list, ExtendConfig, GlobalRankingBackend, QueryOutput,
+    RankedTarget, SequenceLoadConfig,
+};
+pub use global_ranking::*;
+pub use table::{update_table, UpdateTableConfig};
 
 pub type TargetMap = HashMap<u64, BlockId>;
-
-/// Matches C++ `GlobalRanking::QueryList::Target`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QueryListTarget {
-    pub database_id: u32,
-    pub score: u16,
-}
-
-/// Matches C++ `GlobalRanking::QueryList`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct QueryList {
-    pub query_block_id: u32,
-    pub last_query_block_id: u32,
-    pub targets: Vec<QueryListTarget>,
-}
-
-/// Matches C++ `GlobalRanking::Hit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Hit {
-    pub oid: u32,
-    pub score: u16,
-    pub context: u8,
-}
-
-impl Hit {
-    pub fn new(oid: u32, score: u16, context: u32) -> Self {
-        Self {
-            oid,
-            score,
-            context: context as u8,
-        }
-    }
-
-    pub fn from_target_id(target_id: isize) -> Self {
-        Self {
-            oid: target_id as u32,
-            score: 0,
-            context: 0,
-        }
-    }
-
-    pub fn less_than(&self, x: &Hit) -> bool {
-        self.score > x.score || (self.score == x.score && self.oid < x.oid)
-    }
-
-    pub fn target(&self) -> u32 {
-        self.oid
-    }
-
-    pub fn cmp_oid_score(x: &Hit, y: &Hit) -> std::cmp::Ordering {
-        x.oid.cmp(&y.oid).then_with(|| y.score.cmp(&x.score))
-    }
-
-    pub fn cmp_oid(x: &Hit, y: &Hit) -> bool {
-        x.oid == y.oid
-    }
-}
-
-impl PartialOrd for Hit {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Hit {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        if self.less_than(other) {
-            std::cmp::Ordering::Less
-        } else if other.less_than(self) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    }
-}
-
-/// Matches C++ `GlobalRanking::recompute_overflow_scores`.
-pub fn recompute_overflow_scores(
-    hits: &[SeedHit],
-    query_seq: &[Letter],
-    target_seq: &[Letter],
-    ungapped_window_size: usize,
-    score_matrix: &ScoreMatrix,
-) -> u16 {
-    let mut score = 0;
-    for hit in hits {
-        if hit.score != u8::MAX as i32 {
-            continue;
-        }
-        let center = hit.i.max(0) as usize;
-        let query_begin = center.saturating_sub(ungapped_window_size);
-        let query_end = (query_begin + ungapped_window_size * 2).min(query_seq.len());
-        let window_left = center.saturating_sub(query_begin);
-        let subject_center = hit.j.max(0) as usize;
-        let subject_begin = subject_center.saturating_sub(window_left);
-        if subject_begin >= target_seq.len() {
-            continue;
-        }
-        let s = ungapped_window(
-            &query_seq[query_begin..query_end],
-            &target_seq[subject_begin..],
-            query_end - query_begin,
-            score_matrix,
-        );
-        score = score.max(s);
-    }
-    score.min(u16::MAX as i32) as u16
-}
-
-/// Matches C++ `GlobalRanking::ranking_list`.
-pub fn ranking_list(
-    _query_id: BlockId,
-    target_scores: &mut [TargetScore],
-    target_block_ids: &[BlockId],
-    seed_hits: &crate::util::data_structures::FlatArray<SeedHit>,
-    query_seq: Option<&[Letter]>,
-    target_block: Option<&Block>,
-    global_ranking_targets: i64,
-    ungapped_window_size: usize,
-    score_matrix: &ScoreMatrix,
-) -> Vec<Match> {
-    let mut overflows = 0usize;
-    for target_score in target_scores.iter_mut() {
-        if target_score.score < u8::MAX as u16 {
-            break;
-        }
-        if target_score.score == u8::MAX as u16 {
-            if let (Some(query_seq), Some(target_block)) = (query_seq, target_block) {
-                let target_id = target_block_ids[target_score.target as usize];
-                target_score.score = recompute_overflow_scores(
-                    seed_hits.range(target_score.target as u64),
-                    query_seq,
-                    target_block.seqs().get(target_id as usize),
-                    ungapped_window_size,
-                    score_matrix,
-                );
-            }
-            overflows += 1;
-        }
-    }
-    if overflows > 0 {
-        target_scores.sort();
-    }
-
-    let n = (global_ranking_targets.max(0) as usize).min(target_scores.len());
-    let mut out = Vec::with_capacity(n);
-    for target_score in target_scores.iter().take(n) {
-        out.push(Match::new_extension(
-            target_block_ids[target_score.target as usize],
-            &[],
-            None,
-            target_score.score as i32,
-            0,
-            f64::MAX,
-        ));
-    }
-    out
-}
-
-/// Matches C++ `GlobalRanking::write_merged_query_list_intro`.
-pub fn write_merged_query_list_intro(query_id: u32, buf: &mut TextBuffer) -> usize {
-    let seek_pos = buf.size();
-    buf.write(query_id).write(0u32);
-    seek_pos
-}
-
-/// Matches C++ `GlobalRanking::write_merged_query_list`.
-pub fn write_merged_query_list(
-    _record: &IntermediateRecord,
-    _out: &mut TextBuffer,
-    _ranking_db_filter: &mut BitVector,
-    _stat: &mut Statistics,
-) {
-}
-
-/// Matches C++ `GlobalRanking::finish_merged_query_list`.
-pub fn finish_merged_query_list(buf: &mut TextBuffer, seek_pos: usize) {
-    let n = (buf.size() - seek_pos - std::mem::size_of::<u32>() * 2) as u32;
-    let begin = seek_pos + std::mem::size_of::<u32>();
-    buf.data_mut()[begin..begin + std::mem::size_of::<u32>()].copy_from_slice(&n.to_ne_bytes());
-}
-
-/// Matches C++ `GlobalRanking::fetch_query_targets`.
-pub fn fetch_query_targets<R: Read>(
-    query_list: &mut R,
-    next_query: &mut u32,
-) -> io::Result<QueryList> {
-    let mut out = QueryList {
-        last_query_block_id: *next_query,
-        ..QueryList::default()
-    };
-    let mut b4 = [0u8; 4];
-    match query_list.read_exact(&mut b4) {
-        Ok(()) => out.query_block_id = u32::from_ne_bytes(b4),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(out),
-        Err(e) => return Err(e),
-    }
-    *next_query = out.query_block_id + 1;
-    query_list.read_exact(&mut b4)?;
-    let size = u32::from_ne_bytes(b4);
-    let n = size as usize / 6;
-    out.targets.reserve(n);
-    for _ in 0..n {
-        let mut target = [0u8; 4];
-        let mut score = [0u8; 2];
-        query_list.read_exact(&mut target)?;
-        query_list.read_exact(&mut score)?;
-        out.targets.push(QueryListTarget {
-            database_id: u32::from_ne_bytes(target),
-            score: u16::from_ne_bytes(score),
-        });
-    }
-    Ok(out)
-}
 
 /// Matches C++ `GlobalRanking::db_filter`.
 pub fn db_filter(table: &[Hit], db_size: usize) -> BitVector {
@@ -546,6 +342,7 @@ where
 mod tests {
     use super::*;
     use crate::align::gapped_filter::SeedHitList;
+    use crate::util::text_buffer::TextBuffer;
 
     fn sm() -> ScoreMatrix {
         ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap()

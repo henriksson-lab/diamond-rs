@@ -9,6 +9,7 @@
 
 use crate::align::hsp::Hsp;
 use crate::basic::packed_transcript::EditOperation;
+use crate::basic::statistics::{StatValue, Statistics};
 use crate::basic::translate::{Frame, TranslatedPosition};
 use crate::basic::value::{Letter, LETTER_MASK, SEED_MASK};
 use crate::data::sequence_set::SequenceSet;
@@ -18,7 +19,21 @@ use crate::stats::cbs::TargetMatrix;
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::geo;
 use crate::util::interval::Interval;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+#[path = "swipe/banded_3frame_swipe.rs"]
+pub mod banded_3frame_swipe;
+use std::time::Instant;
+
+#[path = "swipe/anchored_wrapper.rs"]
+pub mod anchored_wrapper;
+
+#[path = "swipe/swipe_wrapper.rs"]
+pub mod swipe_wrapper;
+
+pub use swipe_wrapper::{
+    DispatchCell, DispatchConfig, IdMaskKind, RowCounterKind, SwipeRuntimeConfig,
+};
 
 pub const BINS: usize = 6;
 pub const SCORE_BINS: usize = 3;
@@ -362,6 +377,9 @@ pub struct Params<'a> {
     pub query_or_target_cover: f64,
     pub approx_min_id: f64,
     pub cbs_matrix_scale: i32,
+    /// Shared sink mirroring C++ `DP::Params::stat`. `Arc<Mutex<_>>` keeps
+    /// cloned reverse-pass parameters on the same accumulator.
+    pub statistics: Option<Arc<Mutex<Statistics>>>,
 }
 
 impl<'a> Params<'a> {
@@ -389,6 +407,13 @@ impl<'a> Params<'a> {
             query_or_target_cover: 0.0,
             approx_min_id: 0.0,
             cbs_matrix_scale: 1,
+            statistics: None,
+        }
+    }
+
+    pub fn inc_stat(&self, value: StatValue, count: i64) {
+        if let Some(statistics) = &self.statistics {
+            statistics.lock().unwrap().inc(value, count);
         }
     }
 }
@@ -716,11 +741,40 @@ pub fn swipe_bin(
     if begin.is_empty() {
         return (Vec::new(), TargetVec::default());
     }
+    let timer = Instant::now();
+    p.inc_stat(StatValue::SwipeTasksTotal, 1);
+    let extension_stat = match bin % SCORE_BINS {
+        0 => StatValue::Ext8,
+        1 => StatValue::Ext16,
+        _ => StatValue::Ext32,
+    };
+    p.inc_stat(extension_stat, begin.len() as i64);
+    let cells = begin
+        .iter()
+        .map(|target| {
+            if p.flags.any(Flags::FULL_MATRIX) {
+                p.query.len() as i64 * target.seq.len() as i64
+            } else {
+                p.query.len() as i64 * (target.d_end - target.d_begin).max(0) as i64
+            }
+        })
+        .sum::<i64>();
+    p.inc_stat(StatValue::GrossDpCells, cells);
+    p.inc_stat(StatValue::NetDpCells, cells);
     let mut overflow = TargetVec::default();
     if !p.flags.any(Flags::FULL_MATRIX) {
         sort(begin, p.band_bin, p.col_bin);
     }
     let out = swipe_threads(begin, &mut overflow, round, bin, p);
+    let time_stat = if p.v.any(HspValues::TRANSCRIPT) {
+        StatValue::TimeTracebackSw
+    } else {
+        StatValue::TimeSw
+    };
+    p.inc_stat(
+        time_stat,
+        timer.elapsed().as_micros().min(i64::MAX as u128) as i64,
+    );
     (out, overflow)
 }
 
@@ -1347,11 +1401,17 @@ mod tests {
         ));
         let mut params = Params::new(&query, &sm);
         params.v = HspValues::TRANSCRIPT | HspValues::COORDS;
+        let statistics = Arc::new(Mutex::new(Statistics::new()));
+        params.statistics = Some(statistics.clone());
         let out = swipe(&ts, &mut params);
         assert_eq!(out.len(), 1);
         assert!(out[0].score > 0);
         assert_eq!(out[0].query_range, Interval::new(0, query.len() as i32));
         assert_eq!(out[0].subject_range, Interval::new(0, query.len() as i32));
+        let statistics = statistics.lock().unwrap();
+        assert_eq!(statistics.get(StatValue::SwipeTasksTotal), 1);
+        assert!(statistics.get(StatValue::GrossDpCells) > 0);
+        assert!(statistics.get(StatValue::TimeTracebackSw) >= 0);
     }
 
     #[test]

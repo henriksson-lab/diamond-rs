@@ -216,7 +216,9 @@ pub fn print_match_context<W: Write>(
         write!(
             writer,
             "Query  {:>width$}  ",
-            qi.query_pos().absolute(dna_len, query_translated, false) + 1,
+            qi.query_pos()
+                .absolute(dna_len, query_translated, blastn_command)
+                + 1,
             width = digits
         )?;
         for _ in 0..WIDTH {
@@ -273,12 +275,17 @@ pub fn print_match_context<W: Write>(
     Ok(())
 }
 
-/// Write the BLAST pairwise header.
-pub fn write_header<W: Write>(writer: &mut W) -> io::Result<()> {
+/// C++ `PairwiseFormat::print_header`.
+pub fn print_header<W: Write>(writer: &mut W) -> io::Result<()> {
     writeln!(writer, "BLASTP 2.3.0+")?;
     writeln!(writer)?;
     writeln!(writer)?;
     Ok(())
+}
+
+/// Backward-compatible alias retained for existing Rust callers.
+pub fn write_header<W: Write>(writer: &mut W) -> io::Result<()> {
+    print_header(writer)
 }
 
 /// Write the query header.

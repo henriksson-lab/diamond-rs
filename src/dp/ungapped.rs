@@ -1,3 +1,6 @@
+//! Ungapped alignment translated from `dp/ungapped_align.cpp` and
+//! `dp/ungapped.h`.
+
 use crate::align::hsp::Hsp;
 use crate::basic::value::{Letter, Score, DELIMITER_LETTER, LETTER_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
@@ -396,6 +399,73 @@ pub fn xdrop_ungapped_with_cbs(
     )
 }
 
+/// Matches the C++ overload taking a floating-point `HauserCorrection`.
+pub fn xdrop_ungapped_with_float_cbs(
+    query: &[Letter],
+    query_cbs: &[f32],
+    subject: &[Letter],
+    qa: usize,
+    sa: usize,
+    xdrop: f32,
+    score_matrix: &ScoreMatrix,
+) -> DiagonalSegment {
+    assert!(query_cbs.len() >= query.len());
+    let mut score = 0.0f32;
+    let mut running = 0.0f32;
+    let mut delta = 0i32;
+    let mut len = 0i32;
+    let mut n = 1i32;
+
+    let mut q = qa as i32 - 1;
+    let mut s = sa as i32 - 1;
+    while q >= 0
+        && s >= 0
+        && score - running < xdrop
+        && query[q as usize] != DELIMITER_LETTER
+        && subject[s as usize] != DELIMITER_LETTER
+    {
+        running += score_matrix.score(
+            query[q as usize] & LETTER_MASK,
+            subject[s as usize] & LETTER_MASK,
+        ) as f32
+            + query_cbs[q as usize];
+        if running > score {
+            score = running;
+            delta = n;
+        }
+        q -= 1;
+        s -= 1;
+        n += 1;
+    }
+
+    let mut q = qa;
+    let mut s = sa;
+    running = score;
+    n = 1;
+    while q < query.len()
+        && s < subject.len()
+        && score - running < xdrop
+        && query[q] != DELIMITER_LETTER
+        && subject[s] != DELIMITER_LETTER
+    {
+        running += score_matrix.score(query[q] & LETTER_MASK, subject[s] & LETTER_MASK) as f32
+            + query_cbs[q];
+        if running > score {
+            score = running;
+            len = n;
+        }
+        q += 1;
+        s += 1;
+        n += 1;
+    }
+    DiagonalSegment::new(
+        qa as i32 - delta,
+        sa as i32 - delta,
+        len + delta,
+        score as i32,
+    )
+}
+
 /// Compute score over a fixed range of a diagonal.
 pub fn score_range(
     query: &[Letter],
@@ -442,15 +512,37 @@ pub fn score_range_s(
 
 /// Compute the self-alignment score of a sequence (best local score of seq vs itself).
 pub fn self_score(seq: &[Letter], score_matrix: &ScoreMatrix) -> Score {
-    let mut s: Score = 0;
-    let mut sl: Score = 0;
-    for &l in seq {
-        let l = l & LETTER_MASK;
-        sl += score_matrix.score(l, l);
-        sl = sl.max(0);
-        s = s.max(sl);
+    let mut best: Score = 0;
+    let mut running: Score = 0;
+    for &letter in seq {
+        let letter = letter & LETTER_MASK;
+        running += score_matrix.score(letter, letter);
+        running = running.max(0);
+        best = best.max(running);
     }
-    s
+    best
+}
+
+/// C++ `self_score` with the former global CBS mode represented by an
+/// explicitly supplied correction vector.
+pub fn self_score_with_cbs(
+    seq: &[Letter],
+    query_cbs: Option<&[i8]>,
+    score_matrix: &ScoreMatrix,
+) -> Score {
+    let Some(cbs) = query_cbs else {
+        return self_score(seq, score_matrix);
+    };
+    assert!(cbs.len() >= seq.len());
+    let mut best: Score = 0;
+    let mut running: Score = 0;
+    for (i, &letter) in seq.iter().enumerate() {
+        let letter = letter & LETTER_MASK;
+        running += score_matrix.score(letter, letter) + cbs[i] as Score;
+        running = running.max(0);
+        best = best.max(running);
+    }
+    best
 }
 
 /// X-drop ungapped extension to the right only.
@@ -492,9 +584,10 @@ pub fn ungapped_window(
     window: usize,
     score_matrix: &ScoreMatrix,
 ) -> i32 {
+    assert!(query.len() >= window && subject.len() >= window);
     let mut score: i32 = 0;
     let mut st: i32 = 0;
-    for n in 0..window.min(query.len()).min(subject.len()) {
+    for n in 0..window {
         st += score_matrix.score(query[n] & LETTER_MASK, subject[n] & LETTER_MASK);
         st = st.max(0);
         score = score.max(st);
@@ -649,10 +742,12 @@ pub fn make_clipped_anchor(
         .unwrap_or(1 - anchor_window)
         .max(0);
     let mut d1 = d1;
-    while (d0 as usize) < q.len() && q[d0 as usize] != t[d0 as usize] {
+    while (d0 as usize) < q.len()
+        && (q[d0 as usize] & LETTER_MASK) != (t[d0 as usize] & LETTER_MASK)
+    {
         d0 += 1;
     }
-    while d1 > 0 && q[(d1 - 1) as usize] != t[(d1 - 1) as usize] {
+    while d1 > 0 && (q[(d1 - 1) as usize] & LETTER_MASK) != (t[(d1 - 1) as usize] & LETTER_MASK) {
         d1 -= 1;
     }
     if d1 <= d0 {
@@ -715,7 +810,7 @@ pub fn trivial_at(
     let mut score: Score = 0;
     let mut mask = 0u64;
     for i in 0..l {
-        let eq = (query[i + dq] == target[i + dt]) as u64;
+        let eq = ((query[i + dq] & LETTER_MASK) == (target[i + dt] & LETTER_MASK)) as u64;
         mask = ((mask << 1) | eq) & bits;
         n += 1;
         if n >= WINDOW && mask.count_ones() < ID {
@@ -809,6 +904,26 @@ mod tests {
     }
 
     #[test]
+    fn float_hauser_overload_matches_integral_correction_values() {
+        let sm = make_test_matrix();
+        let query = vec![DELIMITER_LETTER, 0, 1, 2, DELIMITER_LETTER];
+        let subject = query.clone();
+        let cbs_i8 = vec![0, 1, -2, 3, 0];
+        let cbs_f32 = vec![0.0, 1.0, -2.0, 3.0, 0.0];
+        let integral =
+            xdrop_ungapped_with_cbs(&query, Some(&cbs_i8), &subject, 1, 1, 20, false, &sm);
+        let floating = xdrop_ungapped_with_float_cbs(&query, &cbs_f32, &subject, 1, 1, 20.0, &sm);
+        assert_eq!(floating, integral);
+
+        let mut masked_query = query.clone();
+        masked_query[1] |= crate::basic::value::SEED_MASK;
+        masked_query[3] |= crate::basic::value::SEED_MASK;
+        let masked =
+            xdrop_ungapped_with_float_cbs(&masked_query, &cbs_f32, &subject, 1, 1, 20.0, &sm);
+        assert_eq!(masked, floating);
+    }
+
+    #[test]
     fn test_xdrop_ungapped_different() {
         let sm = make_test_matrix();
         // Completely different sequences
@@ -826,6 +941,9 @@ mod tests {
         let s = self_score(&seq, &sm);
         // Self-score should be positive (4+5+6+6 = 21 for BLOSUM62 diagonal)
         assert!(s > 0);
+
+        let cbs = vec![1, 1, 1, 1];
+        assert_eq!(self_score_with_cbs(&seq, Some(&cbs), &sm), s + 4);
     }
 
     #[test]
@@ -863,6 +981,13 @@ mod tests {
         let subject = vec![0, 1, 2, 3];
         let s = ungapped_window(&query, &subject, 4, &sm);
         assert!(s > 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn ungapped_window_requires_cpp_pointer_precondition() {
+        let sm = make_test_matrix();
+        let _ = ungapped_window(&[0, 1], &[0, 1], 3, &sm);
     }
 
     #[test]
@@ -936,6 +1061,12 @@ mod tests {
 
         let filtered = trivial(&query, &target, None, 0.0, &sm);
         assert_eq!(filtered.score, 0);
+
+        let masked_query = vec![0 | crate::basic::value::SEED_MASK; 40];
+        let plain_target = vec![0; 40];
+        let masked = trivial(&masked_query, &plain_target, None, f64::MAX, &sm);
+        assert!(masked.score > 0);
+        assert_eq!(masked.query_range, Interval::new(0, 40));
     }
 
     #[test]

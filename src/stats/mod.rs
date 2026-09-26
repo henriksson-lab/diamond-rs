@@ -16,9 +16,14 @@ pub mod alp_random;
 pub mod alp_root;
 pub mod alp_uniform;
 pub mod alp_vector;
+pub mod blast;
 pub mod cbs;
+pub mod comp_based_stats;
+pub mod hauser_correction;
 pub mod linear_algebra;
 pub mod matrices;
+pub mod matrix_adjust;
+pub mod matrix_data;
 pub mod pvalues;
 pub mod score_matrix;
 pub mod sls_alignment_evaluer;
@@ -29,6 +34,8 @@ pub mod sls_alp_sim;
 pub mod sls_basic;
 pub mod standard_matrix;
 pub mod target_freq;
+
+pub use hauser_correction::HauserCorrection;
 
 pub fn approx_id(raw_score: i32, range1: i32, range2: i32) -> f64 {
     let m = range1.max(range2);

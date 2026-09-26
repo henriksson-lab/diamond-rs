@@ -1,8 +1,15 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
-use crate::util::data_structures::{DoubleArray, FlatArray, FlatIndex};
+use crate::util::data_structures::{DoubleArray, FlatIndex};
 use crate::util::hash::murmur_hash_u64;
+
+pub mod greedy_vertex_cover;
+
+pub use greedy_vertex_cover::{
+    greedy_vertex_cover, make_cluster_cc, make_cluster_gvc, neighbor_count, neighbor_count2,
+    neighbor_count_with_member_counts, Entry,
+};
 
 pub const MAX_SHAPE_LEN: usize = 19;
 pub const JOIN_SPLIT_SIZE: usize = 100_000;
@@ -15,18 +22,6 @@ pub struct Edge<Int> {
     pub node1: Int,
     pub node2: Int,
     pub weight: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Entry<Int> {
-    pub node: Int,
-    pub depth: Int,
-}
-
-impl<Int> Entry<Int> {
-    pub fn new(node: Int, depth: Int) -> Self {
-        Self { node, depth }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,232 +69,6 @@ impl AlgoInt for u64 {
 
 impl AlgoInt for usize {
     const NIL: Self = usize::MAX;
-}
-
-fn int_to_usize<Int: AlgoInt>(x: Int) -> usize
-where
-    <Int as TryInto<usize>>::Error: std::fmt::Debug,
-    <Int as TryFrom<usize>>::Error: std::fmt::Debug,
-{
-    x.try_into().unwrap()
-}
-
-fn usize_to_int<Int: AlgoInt>(x: usize) -> Int
-where
-    <Int as TryFrom<usize>>::Error: std::fmt::Debug,
-    <Int as TryInto<usize>>::Error: std::fmt::Debug,
-{
-    Int::try_from(x).unwrap()
-}
-
-pub fn neighbor_count2<Int>(edges: &[Edge<Int>], centroids: &[Int]) -> Int
-where
-    Int: AlgoInt,
-    <Int as TryInto<usize>>::Error: std::fmt::Debug,
-    <Int as TryFrom<usize>>::Error: std::fmt::Debug,
-{
-    let mut n = 0usize;
-    let mut last = Int::NIL;
-    for edge in edges {
-        if centroids[int_to_usize(edge.node2)] == Int::NIL && edge.node2 != last {
-            n += 1;
-            last = edge.node2;
-        }
-    }
-    usize_to_int(n)
-}
-
-fn neighbor_count<Int>(edges: &mut [Edge<Int>], centroids: &[Int]) -> Int
-where
-    Int: AlgoInt,
-    <Int as TryInto<usize>>::Error: std::fmt::Debug,
-    <Int as TryFrom<usize>>::Error: std::fmt::Debug,
-{
-    let mut n = 0usize;
-    let mut last = Int::NIL;
-    let mut w = 0usize;
-    let mut i = 0usize;
-    while i < edges.len() {
-        if edges[i].node1 == Int::NIL {
-            break;
-        }
-        if centroids[int_to_usize(edges[i].node2)] == Int::NIL && edges[i].node2 != last {
-            n += 1;
-            last = edges[i].node2;
-            if w < i {
-                edges.swap(w, i);
-            }
-            w += 1;
-        }
-        i += 1;
-    }
-    if w < edges.len() {
-        edges[w].node1 = Int::NIL;
-    }
-    usize_to_int(n)
-}
-
-fn neighbor_count_with_member_counts<Int>(
-    node: Int,
-    edges: &[Edge<Int>],
-    centroids: &[Int],
-    member_counts: &[Int],
-) -> Int
-where
-    Int: AlgoInt,
-    <Int as TryInto<usize>>::Error: std::fmt::Debug,
-    <Int as TryFrom<usize>>::Error: std::fmt::Debug,
-{
-    let mut n = int_to_usize(member_counts[int_to_usize(node)]);
-    for edge in edges {
-        if centroids[int_to_usize(edge.node2)] == Int::NIL {
-            n += int_to_usize(member_counts[int_to_usize(edge.node2)]);
-        }
-    }
-    usize_to_int(n)
-}
-
-fn fix_assignment<Int>(centroids: &mut [Int])
-where
-    Int: AlgoInt,
-    <Int as TryInto<usize>>::Error: std::fmt::Debug,
-    <Int as TryFrom<usize>>::Error: std::fmt::Debug,
-{
-    let mut i = 0usize;
-    while i < centroids.len() {
-        let ci = int_to_usize(centroids[i]);
-        if centroids[ci] != centroids[i] {
-            centroids[i] = centroids[ci];
-        } else {
-            i += 1;
-        }
-    }
-}
-
-pub fn make_cluster_gvc<Int>(
-    rep: Int,
-    neighbors: &FlatArray<Edge<Int>, Int>,
-    centroids: &mut [Int],
-    merge_recursive: bool,
-) where
-    Int: AlgoInt,
-    <Int as TryInto<usize>>::Error: std::fmt::Debug,
-    <Int as TryFrom<usize>>::Error: std::fmt::Debug,
-{
-    centroids[int_to_usize(rep)] = rep;
-    for edge in neighbors.range(rep) {
-        let node2 = int_to_usize(edge.node2);
-        if centroids[node2] == Int::NIL || (merge_recursive && centroids[node2] == edge.node2) {
-            centroids[node2] = rep;
-        }
-    }
-}
-
-pub fn make_cluster_cc<Int>(
-    rep: Int,
-    neighbors: &FlatArray<Edge<Int>, Int>,
-    centroids: &mut [Int],
-    depth: Int,
-) where
-    Int: AlgoInt,
-    <Int as TryInto<usize>>::Error: std::fmt::Debug,
-    <Int as TryFrom<usize>>::Error: std::fmt::Debug,
-{
-    centroids[int_to_usize(rep)] = rep;
-    let mut q = VecDeque::new();
-    for edge in neighbors.range(rep) {
-        if centroids[int_to_usize(edge.node2)] == Int::NIL {
-            q.push_back(Entry::new(edge.node2, Int::from(1)));
-        }
-    }
-    while let Some(node) = q.pop_front() {
-        let node_usize = int_to_usize(node.node);
-        if centroids[node_usize] != Int::NIL || node.depth > depth {
-            continue;
-        }
-        for edge in neighbors.range(node.node) {
-            if centroids[int_to_usize(edge.node2)] == Int::NIL {
-                q.push_back(Entry::new(edge.node2, node.depth + Int::from(1)));
-            }
-        }
-        centroids[node_usize] = rep;
-    }
-}
-
-pub fn greedy_vertex_cover<Int>(
-    neighbors: &mut FlatArray<Edge<Int>, Int>,
-    member_counts: Option<&[Int]>,
-    merge_recursive: bool,
-    reassign: bool,
-    connected_component_depth: Int,
-) -> Vec<Int>
-where
-    Int: AlgoInt,
-    <Int as TryInto<usize>>::Error: std::fmt::Debug,
-    <Int as TryFrom<usize>>::Error: std::fmt::Debug,
-{
-    let size = int_to_usize(neighbors.size());
-    let mut q = std::collections::BinaryHeap::<(Int, Int)>::new();
-    let mut centroids = vec![Int::NIL; size];
-    for i in 0..size {
-        let node = usize_to_int::<Int>(i);
-        let count = if let Some(member_counts) = member_counts {
-            neighbor_count_with_member_counts(
-                node,
-                neighbors.range(node),
-                &centroids,
-                member_counts,
-            )
-        } else {
-            neighbors.count(node)
-        };
-        q.push((count, node));
-    }
-
-    while let Some((_, node)) = q.pop() {
-        let node_usize = int_to_usize(node);
-        if centroids[node_usize] != Int::NIL {
-            continue;
-        }
-        let count = if let Some(member_counts) = member_counts {
-            neighbor_count_with_member_counts(
-                node,
-                neighbors.range(node),
-                &centroids,
-                member_counts,
-            )
-        } else {
-            neighbor_count(neighbors.range_mut(node), &centroids)
-        };
-        if q.peek().is_some_and(|top| count < top.0) {
-            q.push((count, node));
-        } else if connected_component_depth > Int::from(0) {
-            make_cluster_cc(node, neighbors, &mut centroids, connected_component_depth);
-        } else {
-            make_cluster_gvc(node, neighbors, &mut centroids, merge_recursive);
-        }
-    }
-
-    if reassign {
-        let mut weights = vec![f64::NEG_INFINITY; size];
-        for node in 0..size {
-            let node_int = usize_to_int::<Int>(node);
-            if centroids[node] == node_int {
-                for edge in neighbors.range(node_int) {
-                    let node2 = int_to_usize(edge.node2);
-                    if centroids[node2] != edge.node2 && edge.weight > weights[node2] {
-                        weights[node2] = edge.weight;
-                        centroids[node2] = node_int;
-                    }
-                }
-            }
-        }
-    }
-
-    if merge_recursive {
-        fix_assignment(&mut centroids);
-    }
-    centroids
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1739,6 +1508,7 @@ impl Dsu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::data_structures::FlatArray;
 
     #[test]
     fn test_edge_ordering() {

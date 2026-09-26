@@ -2,6 +2,8 @@ use crate::basic::consts::MAX_CONTEXT;
 use crate::basic::packed_transcript::{EditOperation, PackedTranscript};
 use crate::basic::translate::{Frame, Strand, TranslatedPosition};
 use crate::basic::value::{BlockId, Letter, OId, Score, AMINO_ACID_ALPHABET, LETTER_MASK};
+use crate::dp::swipe::HspValues;
+use crate::output::intermediate::IntermediateRecord;
 use crate::stats;
 use crate::stats::cbs::TargetMatrix;
 use crate::stats::score_matrix::ScoreMatrix;
@@ -163,6 +165,76 @@ impl Hsp {
             approx_id: 100.0,
             ..Self::default()
         }
+    }
+
+    /// Matches C++ `Hsp::Hsp(const IntermediateRecord&, ...)`.
+    ///
+    /// The original constructor reads the active alignment mode and score
+    /// matrix from process globals. Rust makes both dependencies explicit.
+    pub fn from_intermediate_record(
+        record: &IntermediateRecord,
+        query_source_len: u32,
+        query_len: i32,
+        target_len: i32,
+        hsp_values: HspValues,
+        align_mode: i32,
+        score_matrix: &ScoreMatrix,
+    ) -> Self {
+        let seed_only = record.seed_only();
+        let mut hsp = Hsp {
+            backtraced: !seed_only
+                && !IntermediateRecord::stats_mode(hsp_values)
+                && hsp_values != HspValues::NONE,
+            seed_only,
+            score: record.score as Score,
+            evalue: record.evalue,
+            bit_score: score_matrix.bitscore(record.score as f64),
+            corrected_bit_score: score_matrix.bitscore_corrected(
+                record.score as Score,
+                query_len as u32,
+                target_len as u32,
+            ),
+            transcript: record.transcript.clone(),
+            ..Self::default()
+        };
+
+        hsp.subject_range.begin = record.subject_begin as i32;
+        if seed_only {
+            hsp.subject_range.end = record.subject_end as i32;
+            if align_mode == crate::basic::value::AlignMode::BLASTX {
+                hsp.frame = record.frame(query_source_len as i32, align_mode) as i32;
+                hsp.set_translated_query_begin(record.query_begin as i32, query_source_len as i32);
+                hsp.set_translated_query_end(record.query_end as i32, query_source_len as i32);
+            } else {
+                hsp.query_range.begin = record.query_begin as i32;
+                hsp.query_range.end = record.query_end.wrapping_add(1) as i32;
+            }
+            hsp.subject_source_range = hsp.subject_range;
+            return hsp;
+        }
+
+        if align_mode == crate::basic::value::AlignMode::BLASTX {
+            hsp.frame = record.frame(query_source_len as i32, align_mode) as i32;
+            hsp.set_translated_query_begin(record.query_begin as i32, query_source_len as i32);
+        } else {
+            hsp.query_range.begin = record.query_begin as i32;
+        }
+
+        if IntermediateRecord::stats_mode(hsp_values) {
+            hsp.identities = record.identities as i32;
+            hsp.gaps = record.gaps as i32;
+            hsp.gap_openings = record.gap_openings as i32;
+            hsp.mismatches = record.mismatches as i32;
+            hsp.positives = record.positives as i32;
+            hsp.length = record.length as i32;
+            if align_mode == crate::basic::value::AlignMode::BLASTX {
+                hsp.set_translated_query_end(record.query_end as i32, query_source_len as i32);
+            } else {
+                hsp.query_range.end = record.query_end.wrapping_add(1) as i32;
+            }
+            hsp.subject_range.end = record.subject_end as i32;
+        }
+        hsp
     }
 
     /// Matches C++ `Hsp::clear()`.
@@ -1746,6 +1818,71 @@ mod tests {
         assert_eq!(ops[3].letter, 12);
         assert_eq!(ops[4].op, EditOperation::Deletion);
         assert_eq!(ops[4].letter, 11);
+    }
+
+    #[test]
+    fn test_hsp_from_intermediate_record_stats() {
+        let score_matrix = ScoreMatrix::new("blosum62", 11, 1, -1, 1, 1_000).unwrap();
+        let record = IntermediateRecord {
+            score: 42,
+            evalue: 1e-8,
+            query_begin: 3,
+            query_end: 10,
+            subject_begin: 7,
+            subject_end: 15,
+            identities: 6,
+            mismatches: 2,
+            positives: 7,
+            length: 9,
+            gap_openings: 1,
+            gaps: 1,
+            ..IntermediateRecord::default()
+        };
+
+        let hsp = Hsp::from_intermediate_record(
+            &record,
+            20,
+            20,
+            30,
+            HspValues::COORDS,
+            crate::basic::value::AlignMode::BLASTP,
+            &score_matrix,
+        );
+        assert!(!hsp.backtraced);
+        assert_eq!(hsp.score, 42);
+        assert_eq!(hsp.query_range, Interval::new(3, 11));
+        assert_eq!(hsp.subject_range, Interval::new(7, 15));
+        assert_eq!((hsp.identities, hsp.mismatches, hsp.positives), (6, 2, 7));
+        assert_eq!((hsp.length, hsp.gap_openings, hsp.gaps), (9, 1, 1));
+    }
+
+    #[test]
+    fn test_hsp_from_intermediate_record_seed_only() {
+        let score_matrix = ScoreMatrix::new("blosum62", 11, 1, -1, 1, 1_000).unwrap();
+        let record = IntermediateRecord {
+            score: 21,
+            query_begin: 2,
+            query_end: 5,
+            subject_begin: 9,
+            subject_end: 13,
+            flag: IntermediateRecord::SEED_ONLY,
+            ..IntermediateRecord::default()
+        };
+
+        let hsp = Hsp::from_intermediate_record(
+            &record,
+            20,
+            20,
+            30,
+            HspValues::COORDS,
+            crate::basic::value::AlignMode::BLASTP,
+            &score_matrix,
+        );
+        assert!(hsp.seed_only);
+        assert!(!hsp.backtraced);
+        assert_eq!(hsp.query_range, Interval::new(2, 6));
+        assert_eq!(hsp.subject_range, Interval::new(9, 13));
+        assert_eq!(hsp.subject_source_range, hsp.subject_range);
     }
 
     #[test]

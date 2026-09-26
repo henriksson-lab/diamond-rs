@@ -1,6 +1,14 @@
+pub mod align;
+pub mod alt_hsp;
+pub mod culling;
+pub mod extend;
+pub mod full_db;
 pub mod gapped_filter;
+pub mod gapped_final;
+pub mod gapped_score;
 pub mod global_ranking;
 pub mod hsp;
+pub mod legacy;
 pub mod output;
 pub mod target;
 pub mod ungapped;

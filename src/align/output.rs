@@ -48,6 +48,7 @@ pub fn generate_output<T, F>(
     query_block_id: BlockId,
     stat: &mut Statistics,
     iterated: bool,
+    format_report_unaligned: bool,
     report_unaligned: bool,
     current_ref_block: usize,
     output_format: &OutputFormat,
@@ -66,7 +67,7 @@ where
     F: GenerateOutputFormat,
 {
     let aligned = !targets.is_empty();
-    if !aligned && !report_unaligned {
+    if !aligned && !format_report_unaligned {
         return Ok(None);
     }
 
@@ -398,6 +399,7 @@ mod tests {
             &mut stat,
             false,
             false,
+            false,
             2,
             &fmt,
             &mut target,
@@ -416,6 +418,35 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_output_distinguishes_format_and_global_unaligned_flags() {
+        let fmt = OutputFormat::new(FormatCode::Tabular, HspValues::COORDS);
+        let mut stat = Statistics::new();
+        let mut target = test_target();
+        let out = generate_output::<_, TestFormat>(
+            &[],
+            5,
+            &mut stat,
+            false,
+            true,
+            false,
+            2,
+            &fmt,
+            &mut target,
+            None,
+            vec![vec![0, 1, 2]],
+            &[0, 1, 2],
+            "query1",
+            11,
+            0.0,
+            SequenceType::AminoAcid,
+            false,
+        )
+        .unwrap();
+        assert_eq!(out, Some(Vec::new()));
+        assert_eq!(stat.get(StatValue::Aligned), 0);
+    }
+
+    #[test]
     fn test_generate_output_text_prints_context_and_stats() {
         let fmt = OutputFormat::new(FormatCode::Tabular, HspValues::COORDS);
         let mut stat = Statistics::new();
@@ -425,6 +456,7 @@ mod tests {
             &[one_hsp_match()],
             5,
             &mut stat,
+            false,
             false,
             false,
             2,
@@ -467,6 +499,7 @@ mod tests {
             &mut stat,
             true,
             false,
+            false,
             2,
             &fmt,
             &mut target,
@@ -500,6 +533,7 @@ mod tests {
             &[one_hsp_match()],
             5,
             &mut stat,
+            false,
             false,
             false,
             2,

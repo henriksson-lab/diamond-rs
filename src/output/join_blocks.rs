@@ -8,6 +8,80 @@ pub trait JoinBlocksDb {
     fn oid(&self, target_dict_id: DictId, ref_block: i64) -> OId;
 }
 
+/// Explicit replacement for the process-global settings used by the C++
+/// `join_blocks`, `join_worker`, and `join_query` functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinBlocksConfig {
+    /// Select score ordering (`!config.toppercent.blank()`) instead of e-value
+    /// ordering.
+    pub use_score_order: bool,
+    /// Byte written between non-empty per-query output buffers.
+    pub query_separator: Option<u8>,
+    /// Whether gaps between aligned query ids and the trailing query range are
+    /// reported through `JoinBlocksCallbacks::write_unaligned`.
+    pub report_unaligned: bool,
+    /// Total number of queries, used for the trailing unaligned range.
+    pub query_count: u32,
+}
+
+impl Default for JoinBlocksConfig {
+    fn default() -> Self {
+        Self {
+            use_score_order: false,
+            query_separator: None,
+            report_unaligned: false,
+            query_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinTargetAction {
+    Include,
+    Next,
+    Finished,
+}
+
+/// Per-target hooks for the parts of C++ `join_query` owned by the configured
+/// output format and target-culling implementation.
+pub trait JoinQueryCallbacks {
+    fn cull(
+        &mut self,
+        records: &[IntermediateRecord],
+        block_idx: i64,
+        target_oid: OId,
+    ) -> JoinTargetAction;
+
+    fn write_match(
+        &mut self,
+        out: &mut Vec<u8>,
+        record: &IntermediateRecord,
+        block_idx: i64,
+        target_oid: OId,
+        target_num: usize,
+        hsp_num: usize,
+    ) -> io::Result<()>;
+
+    fn add(&mut self, records: &[IntermediateRecord], block_idx: i64, target_oid: OId);
+}
+
+/// Observable counters updated by C++ `join_query`/`join_worker`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct JoinStatistics {
+    pub aligned: u64,
+    pub pairwise: u64,
+    pub matches: u64,
+}
+
+/// Query-level formatting hooks used by the translated worker. This keeps the
+/// merge algorithm independent of concrete query/database storage while still
+/// retaining the C++ call order exactly.
+pub trait JoinBlocksCallbacks: JoinQueryCallbacks {
+    fn write_query_intro(&mut self, out: &mut Vec<u8>, query_id: u32) -> io::Result<()>;
+    fn write_query_epilog(&mut self, out: &mut Vec<u8>, query_id: u32) -> io::Result<()>;
+    fn write_unaligned(&mut self, out: &mut Vec<u8>, query_id: u32) -> io::Result<()>;
+}
+
 /// Rust translation of C++ `JoinWriter`.
 #[derive(Debug)]
 pub struct JoinWriter<W> {
@@ -112,6 +186,12 @@ pub struct JoinFetcher {
 impl JoinFetcher {
     /// Matches C++ `JoinFetcher::init(files)`.
     pub fn init(files: Vec<Vec<u8>>) -> io::Result<Self> {
+        if files.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "join_blocks requires at least one input block",
+            ));
+        }
         let mut cursors = Vec::with_capacity(files.len());
         let mut query_ids = Vec::with_capacity(files.len());
         for file in files {
@@ -171,6 +251,131 @@ impl JoinFetcher {
         }
         Ok(self.next() != FINISHED)
     }
+}
+
+/// Translation of C++ `join_query`, with format/culling/database-global work
+/// represented by explicit callback and configuration arguments.
+pub fn join_query<D: JoinBlocksDb, C: JoinQueryCallbacks>(
+    buf: &[Vec<u8>],
+    out: &mut Vec<u8>,
+    statistics: &mut JoinStatistics,
+    db: &D,
+    output_format: &OutputFormat,
+    config: &JoinBlocksConfig,
+    callbacks: &mut C,
+) -> io::Result<()> {
+    let mut joiner = BlockJoiner::new(buf, db, output_format, config.use_score_order)?;
+    let mut target_hsp = Vec::new();
+    let mut block_idx = 0;
+    let mut target_oid = 0;
+    let mut target_num = 0usize;
+
+    while joiner.get(
+        &mut target_hsp,
+        &mut block_idx,
+        &mut target_oid,
+        db,
+        output_format,
+    )? {
+        match callbacks.cull(&target_hsp, block_idx, target_oid) {
+            JoinTargetAction::Finished => break,
+            JoinTargetAction::Next => continue,
+            JoinTargetAction::Include => {}
+        }
+        for (hsp_num, record) in target_hsp.iter().enumerate() {
+            callbacks.write_match(out, record, block_idx, target_oid, target_num, hsp_num)?;
+        }
+        callbacks.add(&target_hsp, block_idx, target_oid);
+        target_num += 1;
+        statistics.pairwise += 1;
+        statistics.matches += target_hsp.len() as u64;
+    }
+    Ok(())
+}
+
+/// Translation of C++ `join_worker`. The C++ task queue parallelizes this
+/// loop, then reorders buffers by task number; emitting the same buffers in
+/// this sequential implementation has identical externally visible ordering.
+pub fn join_worker<D: JoinBlocksDb, C: JoinBlocksCallbacks>(
+    fetcher: &mut JoinFetcher,
+    db: &D,
+    output_format: &OutputFormat,
+    config: &JoinBlocksConfig,
+    callbacks: &mut C,
+    statistics: &mut JoinStatistics,
+) -> io::Result<Vec<Vec<u8>>> {
+    let mut outputs = Vec::new();
+    let report_unaligned = config.report_unaligned && output_format.code != FormatCode::Daa;
+    loop {
+        let has_more = fetcher.fetch_next()?;
+        if fetcher.query_id == FINISHED {
+            break;
+        }
+        statistics.aligned += 1;
+        let mut out = Vec::new();
+        if report_unaligned {
+            for query_id in fetcher.unaligned_from..fetcher.query_id {
+                callbacks.write_unaligned(&mut out, query_id)?;
+            }
+        }
+        callbacks.write_query_intro(&mut out, fetcher.query_id)?;
+        join_query(
+            &fetcher.buf,
+            &mut out,
+            statistics,
+            db,
+            output_format,
+            config,
+            callbacks,
+        )?;
+        callbacks.write_query_epilog(&mut out, fetcher.query_id)?;
+        outputs.push(out);
+        if !has_more {
+            break;
+        }
+    }
+    Ok(outputs)
+}
+
+/// Translation of C++ `join_blocks`, accepting already-read temporary block
+/// bytes and returning the exact merged byte stream.
+pub fn join_blocks<D: JoinBlocksDb, C: JoinBlocksCallbacks>(
+    files: Vec<Vec<u8>>,
+    db: &D,
+    output_format: &OutputFormat,
+    config: &JoinBlocksConfig,
+    callbacks: &mut C,
+) -> io::Result<(Vec<u8>, JoinStatistics)> {
+    let mut fetcher = JoinFetcher::init(files)?;
+    let mut statistics = JoinStatistics::default();
+    let outputs = join_worker(
+        &mut fetcher,
+        db,
+        output_format,
+        config,
+        callbacks,
+        &mut statistics,
+    )?;
+    let last_query = fetcher.query_last;
+    fetcher.finish();
+
+    let mut merged = Vec::new();
+    for (n, output) in outputs.iter().enumerate() {
+        if n != 0 {
+            if let Some(separator) = config.query_separator {
+                merged.push(separator);
+            }
+        }
+        merged.extend_from_slice(output);
+    }
+    if config.report_unaligned && output_format.code != FormatCode::Daa {
+        let mut trailing = Vec::new();
+        for query_id in last_query.wrapping_add(1)..config.query_count {
+            callbacks.write_unaligned(&mut trailing, query_id)?;
+        }
+        merged.extend_from_slice(&trailing);
+    }
+    Ok((merged, statistics))
 }
 
 /// Rust translation of C++ `BlockJoiner`.
@@ -489,5 +694,121 @@ mod tests {
         assert!(!fetcher.fetch_next().unwrap());
         assert_eq!(fetcher.query_id, FINISHED);
         assert!(fetcher.buf[0].is_empty());
+    }
+
+    #[derive(Default)]
+    struct BinaryCallbacks {
+        seen_targets: Vec<(i64, OId, usize)>,
+    }
+
+    impl JoinQueryCallbacks for BinaryCallbacks {
+        fn cull(
+            &mut self,
+            _records: &[IntermediateRecord],
+            _block_idx: i64,
+            _target_oid: OId,
+        ) -> JoinTargetAction {
+            JoinTargetAction::Include
+        }
+
+        fn write_match(
+            &mut self,
+            out: &mut Vec<u8>,
+            record: &IntermediateRecord,
+            block_idx: i64,
+            target_oid: OId,
+            _target_num: usize,
+            _hsp_num: usize,
+        ) -> io::Result<()> {
+            out.push(b'M');
+            out.extend_from_slice(&record.score.to_le_bytes());
+            self.seen_targets
+                .push((block_idx, target_oid, record.score as usize));
+            Ok(())
+        }
+
+        fn add(&mut self, _records: &[IntermediateRecord], _block_idx: i64, _target_oid: OId) {}
+    }
+
+    impl JoinBlocksCallbacks for BinaryCallbacks {
+        fn write_query_intro(&mut self, out: &mut Vec<u8>, query_id: u32) -> io::Result<()> {
+            out.push(b'Q');
+            out.extend_from_slice(&query_id.to_le_bytes());
+            Ok(())
+        }
+
+        fn write_query_epilog(&mut self, out: &mut Vec<u8>, _query_id: u32) -> io::Result<()> {
+            out.push(b'E');
+            Ok(())
+        }
+
+        fn write_unaligned(&mut self, out: &mut Vec<u8>, query_id: u32) -> io::Result<()> {
+            out.push(b'U');
+            out.extend_from_slice(&query_id.to_le_bytes());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_join_blocks_exact_binary_and_query_order() {
+        let format = OutputFormat::new(FormatCode::Tabular, HspValues::COORDS);
+        let block0 = join_file(vec![
+            (1, record_bytes(&format, 7, &hsp(80, 1.0e-20, 1, 2))),
+            (4, record_bytes(&format, 8, &hsp(60, 1.0e-10, 3, 4))),
+        ]);
+        let block1 = join_file(vec![(1, record_bytes(&format, 9, &hsp(90, 1.0e-30, 5, 6)))]);
+        let config = JoinBlocksConfig {
+            use_score_order: false,
+            query_separator: Some(b'|'),
+            report_unaligned: true,
+            query_count: 6,
+        };
+        let mut callbacks = BinaryCallbacks::default();
+        let (actual, statistics) = join_blocks(
+            vec![block0, block1],
+            &TestDb,
+            &format,
+            &config,
+            &mut callbacks,
+        )
+        .unwrap();
+
+        let mut expected = Vec::new();
+        expected.push(b'U');
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        expected.push(b'Q');
+        expected.extend_from_slice(&1u32.to_le_bytes());
+        expected.push(b'M');
+        expected.extend_from_slice(&90u32.to_le_bytes());
+        expected.push(b'M');
+        expected.extend_from_slice(&80u32.to_le_bytes());
+        expected.push(b'E');
+        expected.push(b'|');
+        for query_id in [2u32, 3] {
+            expected.push(b'U');
+            expected.extend_from_slice(&query_id.to_le_bytes());
+        }
+        expected.push(b'Q');
+        expected.extend_from_slice(&4u32.to_le_bytes());
+        expected.push(b'M');
+        expected.extend_from_slice(&60u32.to_le_bytes());
+        expected.push(b'E');
+        expected.push(b'U');
+        expected.extend_from_slice(&5u32.to_le_bytes());
+
+        assert_eq!(actual, expected);
+        assert_eq!(statistics.aligned, 2);
+        assert_eq!(statistics.pairwise, 3);
+        assert_eq!(statistics.matches, 3);
+        assert_eq!(
+            callbacks.seen_targets,
+            vec![(1, 1009, 90), (0, 7, 80), (0, 8, 60)]
+        );
+    }
+
+    #[test]
+    fn test_join_blocks_rejects_no_input_blocks() {
+        let err = JoinFetcher::init(Vec::new()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

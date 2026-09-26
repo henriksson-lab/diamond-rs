@@ -1,44 +1,15 @@
-use crate::basic::value::{Letter, Loc, TaxId, NCBI_TO_STD};
-use crate::data::blastdb::asn1::{decode, Node};
-use crate::data::blastdb::ber::{decode_integer, read_be32, read_le64, read_pascal_string};
+use crate::basic::value::{Letter, Loc, TaxId};
 use crate::data::sequence_set::{SequenceSet, StringSet};
 use crate::util::io::File as DiamondFile;
-use crate::util::string::ends_with;
-use crate::util::system::{absolute_path, exists, is_absolute_path, PATH_SEPARATOR};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Read;
+#[cfg(test)]
+use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SeqId {
-    pub type_: String,
-    pub value: String,
-    pub version: Option<i64>,
-    pub chain: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct BlastDefLine {
-    pub title: String,
-    pub seqids: Vec<SeqId>,
-    pub taxid: Option<TaxId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PinIndex {
-    pub version: u32,
-    pub is_protein: bool,
-    pub volume_number: u32,
-    pub title: String,
-    pub lmdb_file: String,
-    pub date: String,
-    pub num_oids: u32,
-    pub total_length: u64,
-    pub max_length: u32,
-    pub header_index: Vec<u32>,
-    pub sequence_index: Vec<u32>,
-    pub ambiguity_offsets_offset: usize,
-    pub pin_length: usize,
-}
+pub use super::pal::Pal;
+pub use super::phr::{
+    build_title, decode_deflines, format_seqid, id_len, tag_name_from_number, BlastDefLine, SeqId,
+};
+pub use super::pin::PinIndex;
+pub use super::psq::{decode_protein_sequence, length};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SequenceFileFlags(pub i32);
@@ -163,78 +134,6 @@ impl RawChunk {
     pub fn empty(&self) -> bool {
         self.end <= self.begin
     }
-
-    pub fn decode(
-        &self,
-        flags: SequenceFileFlags,
-        filter: Option<&DbFilter>,
-        mut accs: Option<&mut HashMap<String, bool>>,
-    ) -> Result<DecodedPackage, String> {
-        assert!(filter.is_none() || accs.is_none());
-        let mut pkg = DecodedPackage {
-            no: self.no,
-            ..Default::default()
-        };
-        let n = (self.end - self.begin) as usize;
-        let mut seq_ptr = 0usize;
-        let mut phr_ptr = 0usize;
-        let titles = flags.contains(SequenceFileFlags::TITLES);
-        let seqs = flags.contains(SequenceFileFlags::SEQS);
-        let taxids = flags.contains(SequenceFileFlags::TAXON_MAPPING);
-        let full_titles = flags.contains(SequenceFileFlags::FULL_TITLES);
-        let all_seqids = flags.contains(SequenceFileFlags::ALL_SEQIDS);
-        pkg.oids.reserve(n);
-
-        for i in 0..n {
-            let oid = self.begin + i as u64;
-            let mut f = filter.map(|filter| filter.get(oid)).unwrap_or(true);
-
-            if titles || taxids || accs.is_some() {
-                let lhdr = (self.phr_index[i + 1] - self.phr_index[i]) as usize;
-                if f || accs.is_some() {
-                    let deflines = decode_deflines(
-                        &self.phr_data[phr_ptr..phr_ptr + lhdr],
-                        all_seqids,
-                        full_titles,
-                        taxids,
-                    )?;
-                    if let Some(accs) = accs.as_deref_mut() {
-                        f = acc_filter(&deflines, accs);
-                    }
-                    if f && titles {
-                        let title = build_title(&deflines, "\x01", true);
-                        pkg.ids.push_back(title.as_bytes());
-                    }
-                    if f && taxids {
-                        let mut s = BTreeSet::new();
-                        for j in &deflines {
-                            if let Some(taxid) = j.taxid {
-                                s.insert(taxid);
-                            }
-                        }
-                        for t in s {
-                            pkg.taxids.push((oid, t));
-                        }
-                    }
-                }
-                phr_ptr += lhdr;
-            }
-
-            if seqs {
-                let lseq = (self.seq_index[i + 1] - self.seq_index[i]) as usize;
-                if f {
-                    let seq = decode_protein_sequence(&self.seq_data[seq_ptr..seq_ptr + lseq])?;
-                    pkg.seqs.push(&seq);
-                }
-                seq_ptr += lseq;
-            }
-
-            if f {
-                pkg.oids.push(oid);
-            }
-        }
-        Ok(pkg)
-    }
 }
 
 #[derive(Debug)]
@@ -242,40 +141,14 @@ pub struct BlastVolume {
     pub idx: i32,
     pub begin: u64,
     pub end: u64,
-    index: PinIndex,
-    phr_mapping: DiamondFile,
-    psq_mapping: DiamondFile,
-    seq_ptr: u32,
-    hdr_ptr: u32,
+    pub(super) index: PinIndex,
+    pub(super) phr_mapping: DiamondFile,
+    pub(super) psq_mapping: DiamondFile,
+    pub(super) seq_ptr: u32,
+    pub(super) hdr_ptr: u32,
 }
 
 impl BlastVolume {
-    pub fn new(
-        path: &str,
-        idx: i32,
-        begin: u64,
-        end: u64,
-        load_index: bool,
-    ) -> Result<Self, String> {
-        let phr_mapping =
-            DiamondFile::open(&format!("{path}.phr"), "rb").map_err(|e| e.to_string())?;
-        let psq_mapping =
-            DiamondFile::open(&format!("{path}.psq"), "rb").map_err(|e| e.to_string())?;
-        let mut pin = DiamondFile::open(&format!("{path}.pin"), "rb").map_err(|e| e.to_string())?;
-        let index = Self::parse_pin_file(&mut pin, load_index)?;
-        pin.close().map_err(|e| e.to_string())?;
-        Ok(Self {
-            idx,
-            begin,
-            end,
-            index,
-            phr_mapping,
-            psq_mapping,
-            seq_ptr: 0,
-            hdr_ptr: 0,
-        })
-    }
-
     pub fn from_parts(
         index: PinIndex,
         phr_mapping: DiamondFile,
@@ -302,85 +175,6 @@ impl BlastVolume {
 
     pub fn seq_ptr(&self) -> u32 {
         self.seq_ptr
-    }
-
-    pub fn parse_pin_file(mapping: &mut DiamondFile, load_index: bool) -> Result<PinIndex, String> {
-        let mut index = PinIndex {
-            version: read_be32(mapping).map_err(|e| e.to_string())?,
-            ..Default::default()
-        };
-        if index.version != 4 && index.version != 5 {
-            return Err(format!(
-                "Unsupported database format version: {}",
-                index.version
-            ));
-        }
-
-        let seq_type_flag = read_be32(mapping).map_err(|e| e.to_string())?;
-        index.is_protein = seq_type_flag == 1;
-
-        if index.version == 5 {
-            index.volume_number = read_be32(mapping).map_err(|e| e.to_string())?;
-        }
-        index.title = read_pascal_string(mapping).map_err(|e| e.to_string())?;
-
-        if index.version == 5 {
-            index.lmdb_file = read_pascal_string(mapping).map_err(|e| e.to_string())?;
-        }
-
-        index.date = read_pascal_string(mapping).map_err(|e| e.to_string())?;
-        index.num_oids = read_be32(mapping).map_err(|e| e.to_string())?;
-        index.total_length = read_le64(mapping).map_err(|e| e.to_string())?;
-        index.max_length = read_be32(mapping).map_err(|e| e.to_string())?;
-        if !load_index {
-            return Ok(index);
-        }
-
-        let count = index.num_oids as usize + 1;
-        index.header_index.reserve(count);
-        index.sequence_index.reserve(count);
-        for _ in 0..count {
-            index
-                .header_index
-                .push(read_be32(mapping).map_err(|e| e.to_string())?);
-        }
-
-        for _ in 0..count {
-            index
-                .sequence_index
-                .push(read_be32(mapping).map_err(|e| e.to_string())?);
-        }
-
-        Ok(index)
-    }
-
-    pub fn deflines(
-        &mut self,
-        oid: u32,
-        all: bool,
-        full_titles: bool,
-        taxids: bool,
-    ) -> Result<Vec<BlastDefLine>, String> {
-        if oid >= self.index.num_oids {
-            return Err("OID exceeds number of sequences in volume".to_string());
-        }
-        let header_offset = self.index.header_index[oid as usize] as usize;
-        let next_header_offset = self.index.header_index[oid as usize + 1] as usize;
-        if next_header_offset < header_offset {
-            return Err("Header offsets exceed PHR file size".to_string());
-        }
-        let header_length = next_header_offset - header_offset;
-        if oid != self.hdr_ptr {
-            self.phr_mapping
-                .seek(header_offset as i64, std::io::SeekFrom::Start(0))
-                .map_err(|e| e.to_string())?;
-        }
-        self.hdr_ptr = oid + 1;
-        let data = self
-            .phr_mapping
-            .read(header_length)
-            .map_err(|e| e.to_string())?;
-        decode_deflines(data, all, full_titles, taxids)
     }
 
     pub fn sequence(&mut self, oid: u32) -> Result<Vec<Letter>, String> {
@@ -418,502 +212,9 @@ impl BlastVolume {
         Ok(v)
     }
 
-    pub fn raw_deflines(&mut self, count: u32) -> Result<Vec<u8>, String> {
-        let n = (self.index.header_index[(self.hdr_ptr + count) as usize]
-            - self.index.header_index[self.hdr_ptr as usize]) as usize;
-        let mut v = vec![0u8; n];
-        self.phr_mapping
-            .read_exact(&mut v)
-            .map_err(|e| e.to_string())?;
-        self.hdr_ptr += count;
-        Ok(v)
-    }
-
     pub fn length(&self, oid: u32) -> Loc {
         length(&self.index.sequence_index, oid as usize)
     }
-
-    pub fn id_len(&self, oid: u32) -> usize {
-        id_len(&self.index.header_index, oid as usize)
-    }
-
-    pub fn raw_chunk(
-        &mut self,
-        letters: usize,
-        flags: SequenceFileFlags,
-    ) -> Result<RawChunk, String> {
-        let mut begin = self.hdr_ptr;
-        if !flags.contains(SequenceFileFlags::SEQS) {
-            if self.seq_ptr != 0 {
-                return Err("Volume::raw_chunk".to_string());
-            }
-        } else if !flags.contains(SequenceFileFlags::TITLES)
-            && !flags.contains(SequenceFileFlags::TAXON_MAPPING)
-        {
-            if self.hdr_ptr != 0 {
-                return Err("Volume::raw_chunk".to_string());
-            }
-            begin = self.seq_ptr;
-        } else if self.hdr_ptr != self.seq_ptr {
-            return Err(
-                "Cannot read raw chunk: last accessed header and sequence OIDs do not match"
-                    .to_string(),
-            );
-        }
-
-        let mut end = begin;
-        let mut l = 0usize;
-        while end < self.index.num_oids && l < letters {
-            l += self.length(end) as usize;
-            end += 1;
-        }
-        let mut chunk = RawChunk {
-            letters: l,
-            begin: begin as u64 + self.begin,
-            end: end as u64 + self.begin,
-            ..Default::default()
-        };
-        let n = end - begin;
-        if n == 0 {
-            return Ok(chunk);
-        }
-        if flags.contains(SequenceFileFlags::TITLES)
-            || flags.contains(SequenceFileFlags::TAXON_MAPPING)
-        {
-            chunk.phr_index = self.index.header_index
-                [self.hdr_ptr as usize..self.hdr_ptr as usize + n as usize + 1]
-                .to_vec();
-            chunk.phr_data = self.raw_deflines(n)?;
-        }
-        if flags.contains(SequenceFileFlags::SEQS) {
-            chunk.seq_index = self.index.sequence_index
-                [self.seq_ptr as usize..self.seq_ptr as usize + n as usize + 1]
-                .to_vec();
-            chunk.seq_data = self.raw_sequence(n)?;
-        }
-        Ok(chunk)
-    }
-
-    pub fn rewind(&mut self) -> Result<(), String> {
-        self.hdr_ptr = 0;
-        self.seq_ptr = 0;
-        self.phr_mapping
-            .seek(0, std::io::SeekFrom::Start(0))
-            .map_err(|e| e.to_string())?;
-        self.psq_mapping
-            .seek(0, std::io::SeekFrom::Start(0))
-            .map_err(|e| e.to_string())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Pal {
-    pub volumes: Vec<String>,
-    pub metadata: BTreeMap<String, String>,
-    pub oid_index: Vec<u64>,
-    pub sequence_count: u64,
-    pub letters: u64,
-    pub version: i32,
-}
-
-impl Pal {
-    pub fn new(path: &str) -> Result<Self, String> {
-        let supported_keys: BTreeSet<&str> = [
-            "TITLE",
-            "MEMB_BIT",
-            "SEQIDLIST",
-            "NSEQ",
-            "LENGTH",
-            "TAXIDLIST",
-        ]
-        .into_iter()
-        .collect();
-        let (db_dir, file) = absolute_path(path);
-        let mut pal = Pal::default();
-        if !exists(&format!("{path}.pal")) && !ends_with(path, ".pal") {
-            pal.volumes.push(format!("{db_dir}{PATH_SEPARATOR}{file}"));
-        } else {
-            let pal_path = if ends_with(path, ".pal") {
-                path.to_string()
-            } else {
-                format!("{path}.pal")
-            };
-            let mut text = String::new();
-            std::fs::File::open(&pal_path)
-                .map_err(|_| format!("Unable to open PAL file: {pal_path}"))?
-                .read_to_string(&mut text)
-                .map_err(|e| e.to_string())?;
-            for (line_number0, mut line) in text.lines().map(str::to_string).enumerate() {
-                let line_number = line_number0 + 1;
-                if let Some(comment) = line.find('#') {
-                    line.truncate(comment);
-                }
-                line = trim(&line);
-                if line.is_empty() {
-                    continue;
-                }
-
-                let key_end = line.find([' ', '\t']).ok_or_else(|| {
-                    format!("Error parsing PAL file: line {line_number} is missing a value: {line}")
-                })?;
-                let key = line[..key_end].to_string();
-                let value = trim(&line[key_end + 1..]);
-                if value.is_empty() {
-                    return Err(format!(
-                        "Error parsing PAL file: line {line_number} has an empty value: {line}"
-                    ));
-                }
-
-                if key == "DBLIST" {
-                    let vls = split_whitespace(&value);
-                    if vls.is_empty() {
-                        return Err(format!(
-                            "Error parsing PAL file: DBLIST on line {line_number} does not list any volumes"
-                        ));
-                    }
-                    pal.volumes.extend(vls);
-                    for s in &mut pal.volumes {
-                        if !is_absolute_path(s) && !s.is_empty() && !s.starts_with('"') {
-                            *s = format!("{db_dir}{PATH_SEPARATOR}{s}");
-                        }
-                    }
-                    continue;
-                }
-
-                if !supported_keys.contains(key.as_str()) {
-                    return Err(format!(
-                        "Error parsing PAL file: Unsupported PAL key '{key}' on line {line_number}"
-                    ));
-                }
-
-                if pal.metadata.contains_key(&key) {
-                    return Err(format!(
-                        "Error parsing PAL file: Duplicate key '{key}' on line {line_number}"
-                    ));
-                }
-
-                pal.metadata.insert(key, value);
-            }
-        }
-        pal.sequence_count = 0;
-        pal.letters = 0;
-        pal.oid_index.push(0);
-
-        let mut it = 0usize;
-        while it < pal.volumes.len() {
-            let volume = pal.volumes[it].clone();
-            if volume.len() >= 2 && volume.starts_with('"') && volume.ends_with('"') {
-                let nested = volume[1..volume.len() - 1].to_string();
-                pal.volumes.remove(it);
-                let nested_path = if is_absolute_path(&nested) {
-                    nested
-                } else {
-                    format!("{db_dir}{PATH_SEPARATOR}{nested}")
-                };
-                let inserted = pal.recurse(&nested_path, it)?;
-                it += inserted;
-            } else {
-                let vol = BlastVolume::new(&volume, 0, 0, 0, false)?;
-                pal.sequence_count += u64::from(vol.index().num_oids);
-                pal.oid_index
-                    .push(u64::from(vol.index().num_oids) + *pal.oid_index.last().unwrap());
-                pal.letters += vol.index().total_length;
-                pal.version = vol.index().version as i32;
-                it += 1;
-            }
-        }
-        if let Some(seqidlist) = pal.metadata.get_mut("SEQIDLIST") {
-            if ends_with(seqidlist, ".bsl") {
-                return Err(format!(
-                    "Binary SEQIDLIST files(.bsl) are not supported, use text file instead : {seqidlist}"
-                ));
-            }
-            if !is_absolute_path(seqidlist) {
-                *seqidlist = format!("{db_dir}{PATH_SEPARATOR}{seqidlist}");
-            }
-        }
-        if let Some(taxidlist) = pal.metadata.get_mut("TAXIDLIST") {
-            if !is_absolute_path(taxidlist) {
-                *taxidlist = format!("{db_dir}{PATH_SEPARATOR}{taxidlist}");
-            }
-        }
-        assert!(pal.sequence_count > 0);
-        Ok(pal)
-    }
-
-    pub fn recurse(&mut self, path: &str, volume_it: usize) -> Result<usize, String> {
-        let pal = Pal::new(path)?;
-        let inserted = pal.volumes.len();
-        self.volumes.splice(volume_it..volume_it, pal.volumes);
-
-        for (key, value) in pal.metadata {
-            if self.metadata.contains_key(&key) {
-                if key == "TITLE" || key == "NSEQ" || key == "LENGTH" {
-                    continue;
-                }
-                return Err(format!("Duplicate key '{key}' in nested PAL file: {path}"));
-            } else {
-                self.metadata.insert(key, value);
-            }
-        }
-        let base = *self.oid_index.last().unwrap();
-        for oid in pal.oid_index.iter().skip(1) {
-            self.oid_index.push(*oid + base);
-        }
-        self.sequence_count += pal.sequence_count;
-        self.letters += pal.letters;
-        self.version = pal.version;
-        Ok(inserted)
-    }
-
-    pub fn volume(&self, oid: u64) -> i32 {
-        assert!(oid < self.sequence_count);
-        let it = self.oid_index.partition_point(|&x| x <= oid);
-        it as i32 - 1
-    }
-}
-
-pub fn tag_name_from_number(num: u32) -> String {
-    match num {
-        0 => "local",
-        1 => "gibbsq",
-        2 => "gibbmt",
-        3 => "giim",
-        4 => "genbank",
-        5 => "embl",
-        6 => "pir",
-        7 => "swissprot",
-        8 => "patent",
-        9 => "other",
-        10 => "general",
-        11 => "gi",
-        12 => "ddbj",
-        13 => "prf",
-        14 => "pdb",
-        15 => "tpg",
-        16 => "tpe",
-        17 => "tpd",
-        18 => "gpipe",
-        19 => "named-annot-track",
-        _ => return format!("unknown-{num}"),
-    }
-    .to_string()
-}
-
-fn trim(text: &str) -> String {
-    text.trim_matches([' ', '\t', '\r', '\n']).to_string()
-}
-
-fn split_whitespace(text: &str) -> Vec<String> {
-    text.split_whitespace().map(str::to_string).collect()
-}
-
-fn acc_filter(deflines: &[BlastDefLine], accs: &mut HashMap<String, bool>) -> bool {
-    for d in deflines {
-        for s in &d.seqids {
-            if accs.contains_key(&s.value) {
-                accs.insert(s.value.clone(), true);
-                return true;
-            }
-            if (s.version.is_some() || s.chain.is_some()) && accs.contains_key(&format_seqid(s)) {
-                accs.insert(format_seqid(s), true);
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn decode_seqid_into(node: &Node, seqid: &mut SeqId) {
-    for n4 in &node.children {
-        match n4.tag.tag_number {
-            1 => {
-                for n5 in &n4.children {
-                    if n5.tag.tag_number == 26 {
-                        seqid.value = String::from_utf8_lossy(&n5.value).into_owned();
-                    }
-                }
-            }
-            3 => {
-                for n5 in &n4.children {
-                    if n5.tag.tag_number == 2 {
-                        seqid.version = Some(decode_integer(&n5.value));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn decode_seqid(node: &Node) -> SeqId {
-    let mut seqid = SeqId::default();
-    for n1 in &node.children {
-        if n1.tag.tag_number == 16 {
-            for n2 in &n1.children {
-                match n2.tag.tag_number {
-                    0 | 1 | 4 | 5 | 7 | 9 | 12 | 15 | 16 => {
-                        seqid.type_ = tag_name_from_number(n2.tag.tag_number);
-                        decode_seqid_into(n2, &mut seqid);
-                        for n3 in &n2.children {
-                            if n3.tag.tag_number == 16 {
-                                decode_seqid_into(n3, &mut seqid);
-                            }
-                        }
-                    }
-                    14 => {
-                        seqid.type_ = tag_name_from_number(n2.tag.tag_number);
-                        for n3 in &n2.children {
-                            if n3.tag.tag_number == 16 {
-                                for n4 in &n3.children {
-                                    match n4.tag.tag_number {
-                                        0 => {
-                                            for n5 in &n4.children {
-                                                if n5.tag.tag_number == 26 {
-                                                    seqid.value =
-                                                        String::from_utf8_lossy(&n5.value)
-                                                            .into_owned();
-                                                }
-                                            }
-                                        }
-                                        3 => {
-                                            for n5 in &n4.children {
-                                                if n5.tag.tag_number == 26 {
-                                                    seqid.chain = Some(
-                                                        String::from_utf8_lossy(&n5.value)
-                                                            .into_owned(),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    seqid
-}
-
-fn decode_defline(node: &Node, full_titles: bool, taxids: bool) -> BlastDefLine {
-    let mut defline = BlastDefLine::default();
-    for n1 in &node.children {
-        match n1.tag.tag_number {
-            0 => {
-                if full_titles {
-                    for n2 in &n1.children {
-                        if n2.tag.tag_number == 26 {
-                            defline.title = String::from_utf8_lossy(&n2.value).into_owned();
-                        }
-                    }
-                }
-            }
-            1 => defline.seqids.push(decode_seqid(n1)),
-            2 => {
-                if taxids {
-                    for n2 in &n1.children {
-                        if n2.tag.tag_number == 2 {
-                            defline.taxid = Some(decode_integer(&n2.value) as TaxId);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    defline
-}
-
-pub fn decode_deflines(
-    header_data: &[u8],
-    all: bool,
-    full_titles: bool,
-    taxids: bool,
-) -> Result<Vec<BlastDefLine>, String> {
-    let mut out = Vec::new();
-    let nodes = decode(header_data).map_err(|e| e.to_string())?;
-    if nodes.is_empty() {
-        return Ok(out);
-    }
-    for i in &nodes[0].children {
-        out.push(decode_defline(i, full_titles, taxids));
-        if !all && !taxids {
-            break;
-        }
-    }
-    Ok(out)
-}
-
-pub fn format_seqid(id: &SeqId) -> String {
-    if id.value.is_empty() {
-        return "N/A".to_string();
-    }
-    let mut os = id.value.clone();
-    if let Some(version) = id.version {
-        os.push('.');
-        os.push_str(&version.to_string());
-    }
-    if let Some(chain) = &id.chain {
-        if !chain.is_empty() {
-            os.push('_');
-            os.push_str(chain);
-        }
-    }
-    os
-}
-
-pub fn build_title(deflines: &[BlastDefLine], delimiter: &str, all: bool) -> String {
-    let mut h = String::new();
-    for (i, defline) in deflines.iter().enumerate() {
-        if i != 0 {
-            if !all {
-                break;
-            }
-            h.push_str(delimiter);
-        }
-        h.push_str(&format_seqid(
-            defline.seqids.first().unwrap_or(&SeqId::default()),
-        ));
-        h.push(' ');
-        h.push_str(&defline.title);
-    }
-    if h.is_empty() {
-        h = "N/A".to_string();
-    }
-    h
-}
-
-pub fn decode_protein_sequence(data: &[u8]) -> Result<Vec<Letter>, String> {
-    let mut decoded = Vec::with_capacity(data.len());
-    for (i, &aa) in data.iter().enumerate() {
-        if aa == b'\0' {
-            if i == 0 {
-                continue;
-            } else if i == data.len() - 1 {
-                break;
-            } else {
-                return Err("Unexpected null terminator in sequence data".to_string());
-            }
-        }
-        if usize::from(aa) >= NCBI_TO_STD.len() {
-            return Err("Invalid amino acid code in sequence data".to_string());
-        }
-        decoded.push(NCBI_TO_STD[aa as usize]);
-    }
-    Ok(decoded)
-}
-
-pub fn length(sequence_index: &[u32], oid: usize) -> Loc {
-    (sequence_index[oid + 1] - sequence_index[oid] - 1) as Loc
-}
-
-pub fn id_len(header_index: &[u32], oid: usize) -> usize {
-    (header_index[oid + 1] - header_index[oid]) as usize
 }
 
 #[cfg(test)]
@@ -1119,6 +420,24 @@ mod tests {
         std::fs::remove_file(prefix5.with_extension("pin")).unwrap();
         std::fs::remove_file(prefix5.with_extension("phr")).unwrap();
         std::fs::remove_file(prefix5.with_extension("psq")).unwrap();
+    }
+
+    #[test]
+    fn test_deflines_reject_oid_and_descending_offsets() {
+        let prefix = temp_prefix("phr-errors");
+        write_volume_files(&prefix, 4, 1, &[3, 2], &[0, 1], b"abc", &[0]);
+        let mut volume = BlastVolume::new(prefix.to_str().unwrap(), 0, 0, 1, true).unwrap();
+        assert_eq!(
+            volume.deflines(1, true, true, true).unwrap_err(),
+            "OID exceeds number of sequences in volume"
+        );
+        assert_eq!(
+            volume.deflines(0, true, true, true).unwrap_err(),
+            "Header offsets exceed PHR file size"
+        );
+        std::fs::remove_file(prefix.with_extension("pin")).unwrap();
+        std::fs::remove_file(prefix.with_extension("phr")).unwrap();
+        std::fs::remove_file(prefix.with_extension("psq")).unwrap();
     }
 
     #[test]

@@ -40,24 +40,29 @@ impl DynProgProbLim {
         self.d_probLost = probLost_;
     }
 
-    pub fn setLimits(&mut self, valueBegin_: i64, valueEnd_: i64) {
-        assert!(valueBegin_ < valueEnd_);
+    pub fn set_limits(&mut self, value_begin: i64, value_end: i64) {
+        assert!(value_begin < value_end);
 
-        for value in self.getValueLower()..valueBegin_ {
+        for value in self.getValueLower()..value_begin {
             self.d_probLost += self.getProb(value);
         }
-        for value in valueEnd_..self.getValueUpper() {
+        for value in value_end..self.getValueUpper() {
             self.d_probLost += self.getProb(value);
         }
 
-        let arrayCapacity = (valueEnd_ - valueBegin_) as usize;
+        let arrayCapacity = (value_end - value_begin) as usize;
         if self.getArrayCapacity() <= arrayCapacity {
             self.reserve(arrayCapacity);
-            self.setValueBegin(valueBegin_);
+            self.set_value_begin(value_begin);
         } else {
-            self.setValueBegin(valueBegin_);
+            self.set_value_begin(value_begin);
             self.reserve(arrayCapacity);
         }
+    }
+
+    #[allow(non_snake_case)]
+    pub fn setLimits(&mut self, value_begin: i64, value_end: i64) {
+        self.set_limits(value_begin, value_end);
     }
 
     pub fn update(&mut self) {
@@ -163,8 +168,13 @@ impl DynProgProbLim {
         self.base.getInputProb()
     }
 
-    pub fn getProbLost(&self) -> f64 {
+    pub fn get_prob_lost(&self) -> f64 {
         self.d_probLost
+    }
+
+    #[allow(non_snake_case)]
+    pub fn getProbLost(&self) -> f64 {
+        self.get_prob_lost()
     }
 
     fn reserve(&mut self, arrayCapacity_: usize) {
@@ -181,12 +191,12 @@ impl DynProgProbLim {
         *self.base.lgetArrayCapacity() = arrayCapacity_;
     }
 
-    fn setValueBegin(&mut self, valueBegin_: i64) {
-        if valueBegin_ <= self.getValueBegin() {
-            self.base.setValueBegin(valueBegin_);
+    fn set_value_begin(&mut self, value_begin: i64) {
+        if value_begin <= self.getValueBegin() {
+            self.base.setValueBegin(value_begin);
             return;
         }
-        let offSet = (valueBegin_ - self.getValueBegin()) as usize;
+        let offSet = (value_begin - self.getValueBegin()) as usize;
         for i in 0..2 {
             let old = self.base.lgetArray()[i].clone();
             self.base.lgetArray()[i].fill(0.0);
@@ -195,7 +205,7 @@ impl DynProgProbLim {
                 self.base.lgetArray()[i][..len].copy_from_slice(&old[offSet..offSet + len]);
             }
         }
-        *self.base.lgetValueBegin() = valueBegin_;
+        *self.base.lgetValueBegin() = value_begin;
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::basic::translate::translate_6_frames;
+use crate::basic::translate::{translate_6_frames, translate_6_frames_with_genetic_code};
 use crate::basic::value::{
     letter_mask, Letter, Loc, Score, ValueTraits, AMINO_ACID_COUNT, MASK_LETTER, STOP_LETTER,
     TRUE_AA,
@@ -14,6 +14,20 @@ pub struct AccessionParsing {
     pub suffix_after_pipe: i64,
     pub suffix_after_dot: i64,
     pub pdb_suffix: i64,
+}
+
+impl std::fmt::Display for AccessionParsing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut table = crate::util::table::Table::new();
+        table
+            .add_i64("UniRef prefix", self.uniref_prefix, "")
+            .add_i64("gi|xxx| prefix", self.gi_prefix, "")
+            .add_i64("xxx| prefix", self.prefix_before_pipe, "")
+            .add_i64("|xxx suffix", self.suffix_after_pipe, "")
+            .add_i64(".xxx suffix", self.suffix_after_dot, "")
+            .add_i64(":PDB= suffix", self.pdb_suffix, "");
+        write!(f, "{table}")
+    }
 }
 
 pub const ID_DELIMITERS: &str = " \u{0007}\u{0008}\u{000c}\n\r\t\u{000b}\u{0001}";
@@ -99,21 +113,14 @@ pub fn get_accession(title: &str, stat: &mut AccessionParsing) -> String {
         if t.starts_with("gi|") {
             let erase_to = t[i + 1..].find('|').map(|j| i + 1 + j + 1).unwrap_or(0);
             t.drain(..erase_to);
-            // C++ `sequence.cpp:87-91` uses `string::npos` so `t.erase(0,
-            // npos + 1)` becomes a no-op when no further pipe exists.
-            // Mirror that here — drain only when a pipe is actually found,
-            // otherwise we'd `drain(..t.len() + 1)` and panic on inputs
-            // like `gi|123|` where the gi-erase consumed every byte.
-            i = match t.find('|') {
-                Some(idx) => idx,
-                None => {
-                    stat.gi_prefix += 1;
-                    return t;
-                }
-            };
+            i = t.find('|').unwrap_or(usize::MAX);
             stat.gi_prefix += 1;
         }
-        t.drain(..i + 1);
+        // C++ size_t arithmetic makes `npos + 1 == 0`, hence no erase.
+        let erase_to = i.wrapping_add(1);
+        if erase_to != 0 {
+            t.drain(..erase_to);
+        }
         stat.prefix_before_pipe += 1;
         if let Some(j) = t.find('|') {
             t.truncate(j);
@@ -214,6 +221,20 @@ pub fn translate(seq: &[Letter]) -> [Vec<Letter>; 6] {
     }
     let dna: Vec<u8> = seq.iter().map(|&x| x as u8).collect();
     translate_6_frames(&dna).map(|frame| frame.into_iter().map(|x| x as Letter).collect())
+}
+
+/// Translate with the formerly global genetic-code selection supplied
+/// explicitly. `translate` remains the standard-code compatibility wrapper.
+pub fn translate_with_genetic_code(
+    seq: &[Letter],
+    genetic_code: u32,
+) -> Result<[Vec<Letter>; 6], String> {
+    if seq.len() < 3 {
+        return Ok(Default::default());
+    }
+    let dna: Vec<u8> = seq.iter().map(|&x| x as u8).collect();
+    translate_6_frames_with_genetic_code(&dna, genetic_code)
+        .map(|frames| frames.map(|frame| frame.into_iter().map(|x| x as Letter).collect()))
 }
 
 pub fn find_orfs(seq: &mut [Letter], min_len: Loc) -> Loc {
@@ -342,6 +363,15 @@ mod tests {
         assert_eq!(s.prefix_before_pipe, 1);
         assert_eq!(s.suffix_after_pipe, 1);
         assert_eq!(get_accession("sp|Q9ABC1|NAME", &mut s), "Q9ABC1");
+
+        let before = s.prefix_before_pipe;
+        assert_eq!(get_accession("gi|123|", &mut s), "");
+        assert_eq!(s.gi_prefix, 2);
+        assert_eq!(s.prefix_before_pipe, before + 1);
+        let rendered = s.to_string();
+        assert!(rendered.contains("UniRef prefix"));
+        assert!(rendered.contains("gi|xxx| prefix"));
+        assert!(rendered.contains(":PDB= suffix"));
     }
 
     #[test]
@@ -417,9 +447,16 @@ mod tests {
         let mut blank = "\r\n".to_string();
         assert_eq!(fix_title(&mut blank), Some(BLANK_ERR));
         assert_eq!(blank, "N/A");
+        let mut spaces = " \u{0007}name".to_string();
+        assert_eq!(fix_title(&mut spaces), Some(SPACES_ERR));
+        assert_eq!(spaces, "name");
         assert_eq!(
             get_title_def("abc def ghi"),
             ("abc".to_string(), "def ghi".to_string())
+        );
+        assert_eq!(
+            get_title_def("abc\u{0001}def"),
+            ("abc".to_string(), "def".to_string())
         );
         assert!(is_fully_masked(&[MASK_LETTER, STOP_LETTER]));
         assert!(!is_fully_masked(&[0, MASK_LETTER]));
@@ -449,10 +486,35 @@ mod tests {
         let frames = translate(&dna);
         assert_eq!(frames.len(), 6);
 
+        let six = from_string("ATGAAA", &nuc, 1).unwrap();
+        assert_eq!(
+            translate(&six),
+            [
+                vec![12, 11],
+                vec![24],
+                vec![6],
+                vec![13, 8],
+                vec![13],
+                vec![15]
+            ]
+        );
+        let tga = from_string("TGA", &nuc, 1).unwrap();
+        assert_eq!(translate_with_genetic_code(&tga, 1).unwrap()[0], vec![24]);
+        assert_eq!(translate_with_genetic_code(&tga, 2).unwrap()[0], vec![17]);
+        assert!(translate_with_genetic_code(&tga, 0).is_err());
+
         let mut out = Vec::new();
         from_string_into("AC\nGT\rN", &mut out, &nuc, 2).unwrap();
         assert_eq!(out, dna);
         assert_eq!(remove_newlines("a\nb\rc"), "abc");
+        assert!(from_string("AC\nGT", &nuc, 1).is_err());
+
+        let mut edge_orfs = vec![STOP_LETTER, 0, 1, STOP_LETTER, STOP_LETTER, 2, 3];
+        assert_eq!(find_orfs(&mut edge_orfs, 2), 4);
+        assert_eq!(
+            edge_orfs,
+            vec![STOP_LETTER, 0, 1, STOP_LETTER, STOP_LETTER, 2, 3]
+        );
     }
 
     #[test]

@@ -839,6 +839,31 @@ impl alp_data {
         Ok(Some(first_line.contains("0.5*")))
     }
 
+    /// Instance form of the C++ `check_out_file`, including its compatibility
+    /// check against this object's active symmetric/non-symmetric mode.
+    pub fn validate_out_file(&self, out_file_name: &str) -> Result<(), Error> {
+        let Some(symmetric_case) = Self::check_out_file(out_file_name)? else {
+            return Ok(());
+        };
+        if symmetric_case && !self.d_smatr_symmetric_flag {
+            return Err(Error::new(
+                format!(
+                    "The output file {out_file_name} exists and corresponds to symmetric case; \nthe current calculation uses non-symmetric parameters;\nplease define another output file name\n"
+                ),
+                3,
+            ));
+        }
+        if !symmetric_case && self.d_smatr_symmetric_flag {
+            return Err(Error::new(
+                format!(
+                    "The output file {out_file_name} exists and corresponds to non-symmetric case; \nthe current calculation uses symmetric parameters;\nplease define another output file name\n"
+                ),
+                3,
+            ));
+        }
+        Ok(())
+    }
+
     pub fn read_smatr(smatr_file_name_: &str) -> Result<(Vec<Vec<i64>>, i64), Error> {
         let text = fs::read_to_string(smatr_file_name_).map_err(|_| {
             Error::new(
@@ -876,6 +901,12 @@ impl alp_data {
         Ok((RR_, RR_sum_, RR_sum_elements_, number_of_AA_RR_))
     }
 
+    pub fn read_rr_with_sum(
+        rr_file_name: &str,
+    ) -> Result<(Vec<f64>, Vec<f64>, Vec<i64>, i64), Error> {
+        Self::read_RR_with_sum(rr_file_name)
+    }
+
     pub fn read_RR(RR_file_name_: &str) -> Result<(Vec<f64>, i64), Error> {
         let text = fs::read_to_string(RR_file_name_)
             .map_err(|_| Error::new(format!("Error - file {} is not found\n", RR_file_name_), 3))?;
@@ -908,6 +939,10 @@ impl alp_data {
         }
         Self::check_RR_sum(sum_tmp, number_of_AA_RR_, RR_file_name_)?;
         Ok((RR_, number_of_AA_RR_))
+    }
+
+    pub fn read_rr(rr_file_name: &str) -> Result<(Vec<f64>, i64), Error> {
+        Self::read_RR(rr_file_name)
     }
 
     pub fn calculate_RR_sum(
@@ -949,6 +984,13 @@ impl alp_data {
         Ok((RR_sum_, RR_sum_elements_))
     }
 
+    pub fn calculate_rr_sum(
+        probabilities: &mut [f64],
+        alphabet_size: i64,
+    ) -> Result<(Vec<f64>, Vec<i64>), Error> {
+        Self::calculate_RR_sum(probabilities, alphabet_size)
+    }
+
     pub fn check_RR_sum(
         sum_tmp_: f64,
         number_of_AA_RR_: i64,
@@ -982,6 +1024,10 @@ impl alp_data {
             }
         }
         Ok(())
+    }
+
+    pub fn check_rr_sum(sum: f64, alphabet_size: i64, probability_file: &str) -> Result<(), Error> {
+        Self::check_RR_sum(sum, alphabet_size, probability_file)
     }
 
     pub fn long_to_string(number_: i64) -> String {

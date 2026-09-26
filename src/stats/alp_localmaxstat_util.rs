@@ -1,6 +1,6 @@
 #![allow(non_snake_case)]
 
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 use crate::stats::alp_approx;
 use crate::stats::alp_dynprogproblim::DynProgProbLim;
@@ -19,43 +19,45 @@ struct LocalParams {
     entry: i64,
 }
 
-static LOCAL_PARAMS: Mutex<LocalParams> = Mutex::new(LocalParams {
-    dimension: 0,
-    score: Vec::new(),
-    prob: Vec::new(),
-    morgue: 0,
-    entry: 0,
-});
+thread_local! {
+    static LOCAL_PARAMS: RefCell<LocalParams> = RefCell::new(LocalParams::default());
+}
 
 fn n_setParameters(dimension_: usize, score_: &[i64], prob_: &[f64], entry_: i64) {
-    let mut params = LOCAL_PARAMS.lock().unwrap();
-    params.dimension = dimension_;
-    params.score.clear();
-    params.score.extend_from_slice(&score_[..dimension_]);
-    params.prob.clear();
-    params.prob.extend_from_slice(&prob_[..dimension_]);
-    params.morgue = score_[0] - 1;
-    params.entry = entry_;
+    LOCAL_PARAMS.with(|params| {
+        let mut params = params.borrow_mut();
+        params.dimension = dimension_;
+        params.score.clear();
+        params.score.extend_from_slice(&score_[..dimension_]);
+        params.prob.clear();
+        params.prob.extend_from_slice(&prob_[..dimension_]);
+        params.morgue = score_[0] - 1;
+        params.entry = entry_;
+    });
 }
 
 fn n_totalProbAssoc(x_: f64) -> f64 {
-    let params = LOCAL_PARAMS.lock().unwrap();
-    let mut sum = 0.0;
-    for i in 0..params.dimension {
-        sum += params.prob[i] * (x_ * params.score[i] as f64).exp();
-    }
-    sum
+    LOCAL_PARAMS.with(|params| {
+        let params = params.borrow();
+        let mut sum = 0.0;
+        for i in 0..params.dimension {
+            sum += params.prob[i] * (x_ * params.score[i] as f64).exp();
+        }
+        sum
+    })
 }
 
 fn n_meanPowerAssoc(x_: f64, power_: i64) -> f64 {
-    let params = LOCAL_PARAMS.lock().unwrap();
-    let mut sum = 0.0;
-    for i in 0..params.dimension {
-        sum += alp_integer::integerPower(params.score[i] as f64, power_)
-            * params.prob[i]
-            * (x_ * params.score[i] as f64).exp();
-    }
-    sum
+    LOCAL_PARAMS.with(|params| {
+        let params = params.borrow();
+        let mut sum = 0.0;
+        for i in 0..params.dimension {
+            sum += alp_integer::integerPower(params.score[i] as f64, power_)
+                * params.prob[i]
+                * (x_ * params.score[i] as f64).exp();
+        }
+        sum
+    })
 }
 
 fn n_meanAssoc(x_: f64) -> f64 {
@@ -64,9 +66,10 @@ fn n_meanAssoc(x_: f64) -> f64 {
 
 fn n_bracket() -> (f64, f64) {
     const FACTOR: f64 = 0.5;
-    let params = LOCAL_PARAMS.lock().unwrap();
-    let mut p = -params.prob[params.dimension - 1].ln() / params.score[params.dimension - 1] as f64;
-    drop(params);
+    let mut p = LOCAL_PARAMS.with(|params| {
+        let params = params.borrow();
+        -params.prob[params.dimension - 1].ln() / params.score[params.dimension - 1] as f64
+    });
     while 1.0 <= n_totalProbAssoc(p) {
         p *= FACTOR;
     }
@@ -75,23 +78,27 @@ fn n_bracket() -> (f64, f64) {
 }
 
 pub fn n_step(oldValue_: i64, state_: usize) -> i64 {
-    let params = LOCAL_PARAMS.lock().unwrap();
-    assert!(state_ < params.dimension);
-    if params.morgue < oldValue_ {
-        oldValue_ + params.score[state_]
-    } else {
-        oldValue_
-    }
+    LOCAL_PARAMS.with(|params| {
+        let params = params.borrow();
+        assert!(state_ < params.dimension);
+        if params.morgue < oldValue_ {
+            oldValue_ + params.score[state_]
+        } else {
+            oldValue_
+        }
+    })
 }
 
 pub fn n_bury(oldValue_: i64, state_: usize) -> i64 {
-    let params = LOCAL_PARAMS.lock().unwrap();
-    assert!(state_ < params.dimension);
-    if params.entry < oldValue_ {
-        oldValue_
-    } else {
-        params.morgue
-    }
+    LOCAL_PARAMS.with(|params| {
+        let params = params.borrow();
+        assert!(state_ < params.dimension);
+        if params.entry < oldValue_ {
+            oldValue_
+        } else {
+            params.morgue
+        }
+    })
 }
 
 pub fn flatten(
@@ -483,6 +490,7 @@ pub fn isLogarithmic(dimension_: usize, score_: &[i64], prob_: &[f64]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 

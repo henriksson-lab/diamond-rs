@@ -50,6 +50,17 @@ pub fn print_match_context<W: Write>(
     r: &HspContext,
     score_matrix: &ScoreMatrix,
 ) -> io::Result<()> {
+    print_match_context_with_command(writer, r, score_matrix, false)
+}
+
+/// Full mapping of C++ `PAFFormat::print_match`, including the `WITH_DNA`
+/// `config.command == blastn` output branch.
+pub fn print_match_context_with_command<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    score_matrix: &ScoreMatrix,
+    blastn_command: bool,
+) -> io::Result<()> {
     let query_id = r
         .query_title
         .split(|c: char| ID_DELIMITERS.contains(c))
@@ -64,7 +75,7 @@ pub fn print_match_context<W: Write>(
 
     write!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t255\tAS:i:{}\tZR:i:{}\tZE:f:",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
         query_id,
         r.query_len,
         r.query_source_range().begin,
@@ -76,6 +87,19 @@ pub fn print_match_context<W: Write>(
         r.subject_range().end - 1,
         r.identities(),
         r.length(),
+    )?;
+    if blastn_command {
+        write!(
+            writer,
+            "{}\tcm:i:{}\t",
+            r.hsp.mapping_quality, r.hsp.n_anchors
+        )?;
+    } else {
+        write!(writer, "255\t")?;
+    }
+    write!(
+        writer,
+        "AS:i:{}\tZR:i:{}\tZE:f:",
         score_matrix.bitscore(r.score() as f64) as u32,
         r.score(),
     )?;
@@ -160,8 +184,57 @@ mod tests {
         let mut buf = Vec::new();
         print_match_context(&mut buf, &ctx, &score_matrix).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.starts_with("query\t100\t5\t14\t+\ttarget\t200\t20\t29\t9\t10\t255"));
-        assert!(output.contains("\tZR:i:80\tZE:f:"));
+        assert_eq!(
+            output,
+            format!(
+                "query\t100\t5\t14\t+\ttarget\t200\t20\t29\t9\t10\t255\tAS:i:{}\tZR:i:80\tZE:f:1.00e-12\n",
+                score_matrix.bitscore(80.0) as u32
+            )
+        );
+    }
+
+    #[test]
+    fn test_print_match_context_blastn_mapping_fields() {
+        use crate::align::hsp::{Hsp, HspContext};
+        use crate::util::interval::Interval;
+
+        let score_matrix = ScoreMatrix::new("blosum62", 11, 1, -1, 1, 1000).unwrap();
+        let mut hsp = Hsp::new();
+        hsp.score = 42;
+        hsp.evalue = 0.25;
+        hsp.frame = 3;
+        hsp.identities = 7;
+        hsp.length = 8;
+        hsp.mapping_quality = 37;
+        hsp.n_anchors = 6;
+        hsp.query_source_range = Interval::new(3, 11);
+        hsp.subject_range = Interval::new(13, 21);
+        let ctx = HspContext::new(
+            hsp,
+            0,
+            0,
+            Vec::new(),
+            50,
+            "reverse query",
+            0,
+            75,
+            "subject description",
+            0,
+            0,
+            Vec::new(),
+            0.0,
+            0.0,
+        );
+
+        let mut buf = Vec::new();
+        print_match_context_with_command(&mut buf, &ctx, &score_matrix, true).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            format!(
+                "reverse\t50\t3\t10\t-\tsubject\t75\t13\t20\t7\t8\t37\tcm:i:6\tAS:i:{}\tZR:i:42\tZE:f:2.50e-01\n",
+                score_matrix.bitscore(42.0) as u32
+            )
+        );
     }
 
     #[test]

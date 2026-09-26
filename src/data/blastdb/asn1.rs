@@ -1,3 +1,8 @@
+//! Minimal BER/ASN.1 tree decoder used by BLAST database headers.
+//!
+//! Mirrors `diamond/src/data/blastdb/asn1.cpp` and `asn1.h`, including its
+//! permissive handling of an unterminated indefinite constructed value.
+
 use crate::data::blastdb::ber::decode_integer;
 
 const K_CLASS_MASK: u8 = 0xc0;
@@ -217,9 +222,16 @@ fn decode_impl(
         let mut indefinite = false;
         let content_length = parse_length(data, length, offset, &mut indefinite)?;
 
-        if !indefinite && *offset + content_length > length {
-            return Err(DecodeError::new("content length exceeds available data"));
-        }
+        let definite_end = if indefinite {
+            None
+        } else {
+            Some(
+                offset
+                    .checked_add(content_length)
+                    .filter(|&end| end <= length)
+                    .ok_or_else(|| DecodeError::new("content length exceeds available data"))?,
+            )
+        };
 
         let mut node = Node {
             tag,
@@ -228,11 +240,7 @@ fn decode_impl(
         };
 
         if tag.constructed {
-            let end = if indefinite {
-                length
-            } else {
-                *offset + content_length
-            };
+            let end = definite_end.unwrap_or(length);
             node.children = decode_impl(data, end, offset, indefinite)?;
 
             if !indefinite && *offset != end {
@@ -241,16 +249,12 @@ fn decode_impl(
                 ));
             }
         } else {
-            let end = if indefinite {
-                length
-            } else {
-                *offset + content_length
-            };
             if indefinite {
                 return Err(DecodeError::new(
                     "indefinite length used for primitive value",
                 ));
             }
+            let end = definite_end.expect("primitive indefinite length was rejected");
             node.value.extend_from_slice(&data[*offset..end]);
             *offset = end;
         }
@@ -507,5 +511,90 @@ mod tests {
                 .to_string(),
             "tag number is excessively large"
         );
+    }
+
+    #[test]
+    fn test_tag_and_length_boundary_errors() {
+        assert_eq!(
+            decode(&[0x1f]).unwrap_err().to_string(),
+            "unexpected end of buffer while reading long tag"
+        );
+        assert_eq!(
+            decode(&[0x02]).unwrap_err().to_string(),
+            "unexpected end of buffer while reading length"
+        );
+        assert_eq!(
+            decode(&[0x04, 0x82, 0x01]).unwrap_err().to_string(),
+            "unexpected end of buffer while reading long length"
+        );
+
+        let unsupported_count = 0x80 | (std::mem::size_of::<usize>() as u8 + 1);
+        assert_eq!(
+            decode(&[0x04, unsupported_count]).unwrap_err().to_string(),
+            "length uses more bytes than supported"
+        );
+
+        let mut overflowing = vec![0x04, 0x80 | std::mem::size_of::<usize>() as u8];
+        overflowing.extend(std::iter::repeat_n(0xff, std::mem::size_of::<usize>()));
+        assert_eq!(
+            decode(&overflowing).unwrap_err().to_string(),
+            "content length exceeds available data"
+        );
+    }
+
+    #[test]
+    fn test_classes_siblings_and_nested_tree_are_exact() {
+        let nodes = decode(&[
+            0x61, 0x06, // application, constructed, tag 1
+            0x82, 0x01, b'x', // context-specific primitive tag 2
+            0xc3, 0x01, b'y', // private primitive tag 3
+            0x05, 0x00, // top-level universal NULL sibling
+        ])
+        .unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].tag.tag_class, Class::Application);
+        assert!(nodes[0].tag.constructed);
+        assert_eq!(nodes[0].children.len(), 2);
+        assert_eq!(nodes[0].children[0].tag.tag_class, Class::ContextSpecific);
+        assert_eq!(nodes[0].children[0].value, b"x");
+        assert_eq!(nodes[0].children[1].tag.tag_class, Class::Private);
+        assert_eq!(nodes[0].children[1].value, b"y");
+        assert_eq!(nodes[1].tag.tag_number, UniversalTag::Null as u32);
+    }
+
+    #[test]
+    fn test_indefinite_tree_matches_cpp_eoc_semantics() {
+        let terminated = decode(&[0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00]).unwrap();
+        let unterminated = decode(&[0x30, 0x80, 0x02, 0x01, 0x01]).unwrap();
+        assert_eq!(terminated, unterminated);
+
+        // At top level EOC is an ordinary zero-length node because stop_at_eoc is false.
+        let top_level_eoc = decode(&[0x00, 0x00]).unwrap();
+        assert_eq!(top_level_eoc.len(), 1);
+        assert_eq!(top_level_eoc[0].tag.tag_number, 0);
+        assert!(top_level_eoc[0].value.is_empty());
+    }
+
+    #[test]
+    fn test_value_descriptions_and_printing_match_cpp() {
+        assert_eq!(decode_oid(&[42, 0x86, 0x48]), "1.2.840");
+        assert_eq!(decode_oid(&[42, 0x86]), "");
+        assert_eq!(hex_dump(&[0, 10, 255]), "00 0a ff");
+        assert!(is_printable_ascii(b"line one\nline two"));
+        assert!(!is_printable_ascii(&[0x1f]));
+
+        let nodes = decode(&[
+            0x01, 0x01, 0xff, // BOOLEAN TRUE
+            0x06, 0x03, 42, 0x86, 0x48, // OID 1.2.840
+            0x04, 0x02, b'O', b'K', // printable OCTET STRING
+        ])
+        .unwrap();
+        let mut output = String::new();
+        for node in &nodes {
+            print_node(node, &mut output, 0);
+        }
+        assert!(output.contains("Tag: 1 (BOOLEAN)\n  Decoded: TRUE\n"));
+        assert!(output.contains("Tag: 6 (OBJECT IDENTIFIER)\n  Decoded: 1.2.840\n"));
+        assert!(output.contains("Tag: 4 (OCTET STRING)\n  Decoded: \"OK\"\n"));
     }
 }

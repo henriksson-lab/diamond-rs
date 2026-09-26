@@ -7,7 +7,8 @@
 //! Uses a 50-position window HMM with forward-backward algorithm to compute
 //! per-position posterior probability of being in a repeat state.
 
-use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK, SEED_MASK, TRUE_AA};
+use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK, MASK_LETTER, SEED_MASK, TRUE_AA};
+use crate::masking::Ranges;
 use crate::stats::score_matrix::ScoreMatrix;
 
 /// Default tantan parameters matching C++ DIAMOND.
@@ -186,7 +187,46 @@ impl TantanMasker {
 
     /// Mask a sequence using the pre-computed likelihood ratio matrix.
     pub fn mask(&self, seq: &mut [Letter]) {
-        mask_tantan_inner(seq, &self.lr_matrix, self.min_mask_prob);
+        self.mask_bit(seq);
+    }
+
+    /// C++ `Masking::operator()` path without a masking table.
+    pub fn mask_hard(&self, seq: &mut [Letter]) -> Ranges {
+        mask(
+            seq,
+            &self.lr_matrix,
+            P_REPEAT,
+            P_REPEAT_END,
+            REPEAT_GROWTH,
+            self.min_mask_prob,
+            1,
+        )
+    }
+
+    /// C++ `Masking::operator()` path with a masking table.
+    pub fn mask_ranges(&self, seq: &mut [Letter]) -> Ranges {
+        mask(
+            seq,
+            &self.lr_matrix,
+            P_REPEAT,
+            P_REPEAT_END,
+            REPEAT_GROWTH,
+            self.min_mask_prob,
+            0,
+        )
+    }
+
+    /// C++ `Masking::mask_bit` path.
+    pub fn mask_bit(&self, seq: &mut [Letter]) {
+        mask(
+            seq,
+            &self.lr_matrix,
+            P_REPEAT,
+            P_REPEAT_END,
+            REPEAT_GROWTH,
+            self.min_mask_prob,
+            2,
+        );
     }
 }
 
@@ -218,8 +258,7 @@ fn forward_step_scalar(
     p_repeat_end: f32,
     b2b: f32,
     f_sum_prev: f32,
-    f_sum_out: &mut f32,
-) {
+) -> f32 {
     let b_old = *b;
     let mut f_sum_new = 0.0f32;
     for off in 0..50 {
@@ -228,7 +267,7 @@ fn forward_step_scalar(
         f_sum_new += vf;
     }
     *b = b_old * b2b + f_sum_prev * p_repeat_end;
-    *f_sum_out = f_sum_new;
+    f_sum_new
 }
 
 /// Scalar backward step (generic fallback).
@@ -240,7 +279,7 @@ fn backward_step_scalar(
     f2f: f32,
     p_repeat_end: f32,
     b2b: f32,
-) {
+) -> f32 {
     let mut tsum = 0.0f32;
     let c = p_repeat_end * *b;
     for off in 0..50 {
@@ -249,13 +288,88 @@ fn backward_step_scalar(
         f[off] = vf * f2f + c;
     }
     *b = b2b * *b + tsum;
+    tsum
 }
 
-/// Core tantan implementation using a pre-computed likelihood ratio matrix.
-fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: f32) {
+/// Advance the forward probabilities by one residue.
+///
+/// This is the snake-case Rust mapping of C++ `forward_step`. Runtime dispatch
+/// replaces C++'s compile-time `DISPATCH_ARCH` instantiations.
+fn forward_step(
+    f: &mut [f32; WINDOW],
+    d: &[f32; WINDOW],
+    e_seg: &[f32],
+    b: &mut f32,
+    f2f: f32,
+    p_repeat_end: f32,
+    b2b: f32,
+    f_sum_prev: f32,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if super::tantan_simd::has_avx2_fma() {
+        // SAFETY: runtime feature detection above established AVX2 support.
+        return unsafe {
+            super::tantan_simd::forward_step_avx2(
+                f,
+                d,
+                e_seg,
+                b,
+                f2f,
+                p_repeat_end,
+                b2b,
+                f_sum_prev,
+            )
+        };
+    }
+
+    forward_step_scalar(f, d, e_seg, b, f2f, p_repeat_end, b2b, f_sum_prev)
+}
+
+/// Advance the backward probabilities by one residue and return `tsum`.
+///
+/// This restores the direct Rust symbol mapping for C++ `backward_step`; the
+/// return value is retained even though `mask` only needs its update of `b`.
+fn backward_step(
+    f: &mut [f32; WINDOW],
+    d: &[f32; WINDOW],
+    e_seg: &[f32],
+    b: &mut f32,
+    f2f: f32,
+    p_repeat_end: f32,
+    b2b: f32,
+) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if super::tantan_simd::has_avx2_fma() {
+        // The architecture helper performs the same update but does not expose
+        // C++'s otherwise-unused `tsum`. Recover it from the defining equation.
+        let b_old = *b;
+        unsafe {
+            super::tantan_simd::backward_step_avx2(f, d, e_seg, b, f2f, p_repeat_end, b2b);
+        }
+        return *b - b2b * b_old;
+    }
+
+    backward_step_scalar(f, d, e_seg, b, f2f, p_repeat_end, b2b)
+}
+
+/// Run the tantan forward-backward masker.
+///
+/// This is the direct translation of C++ `Util::tantan::mask`. `mask_mode` has
+/// the same values as the original: 0 records ranges without changing the
+/// sequence, 1 replaces residues with `MASK_LETTER`, and 2 sets `SEED_MASK`.
+pub fn mask(
+    seq: &mut [Letter],
+    likelihood_ratio_matrix: &[Vec<f32>],
+    p_repeat: f32,
+    p_repeat_end: f32,
+    repeat_growth: f32,
+    p_mask: f32,
+    mask_mode: i32,
+) -> Ranges {
     let len = seq.len();
+    let mut ranges = Ranges::new();
     if len == 0 {
-        return;
+        return ranges;
     }
 
     let alphabet_size = AMINO_ACID_COUNT;
@@ -266,15 +380,16 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
     let emission_rows = (LETTER_MASK as usize) + 1;
 
     // Tantan HMM parameters
-    let b2b = 1.0f32 - P_REPEAT;
-    let f2f = 1.0f32 - P_REPEAT_END;
-    let b2f0 = P_REPEAT * (1.0 - REPEAT_GROWTH) / (1.0 - REPEAT_GROWTH.powi(WINDOW as i32));
+    let b2b = 1.0f32 - p_repeat;
+    let f2f = 1.0f32 - p_repeat_end;
+    // C++ calls the floating-point overload `std::pow(float, float)` here.
+    let b2f0 = p_repeat * (1.0 - repeat_growth) / (1.0 - repeat_growth.powf(WINDOW as f32));
 
     // Repeat-state entry distribution (geometric decay over window positions)
     let mut d = [0.0f32; WINDOW];
     d[WINDOW - 1] = b2f0;
     for i in (0..WINDOW - 1).rev() {
-        d[i] = d[i + 1] * REPEAT_GROWTH;
+        d[i] = d[i + 1] * repeat_growth;
     }
 
     // Pre-compute emission vectors matching C++ tantan.cpp:152-164. C++ fills an
@@ -290,16 +405,12 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
             for j in 0..len {
                 let idx = (seq[j] & LETTER_MASK) as usize;
                 if idx < alphabet_size {
-                    ev[len - 1 - j] = lr_matrix[aa][idx];
+                    ev[len - 1 - j] = likelihood_ratio_matrix[aa][idx];
                 }
             }
         }
         e.push(ev);
     }
-
-    // Forward-backward HMM with runtime SIMD dispatch. The AVX2 path avoids FMA
-    // to match DIAMOND's AVX2 build and keep rounding parity with C++.
-    let use_simd = super::tantan_simd::has_avx2_fma();
 
     let mut f = [0.0f32; WINDOW];
     let mut d_arr = [0.0f32; WINDOW];
@@ -314,46 +425,7 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         let ltr = (seq[i] & LETTER_MASK) as usize;
         let e_seg = &e[ltr][len - i..];
 
-        #[cfg(target_arch = "x86_64")]
-        if use_simd {
-            // SAFETY: has_avx2_fma() confirmed AVX2+FMA support
-            f_sum = unsafe {
-                super::tantan_simd::forward_step_avx2(
-                    &mut f,
-                    &d_arr,
-                    e_seg,
-                    &mut b,
-                    f2f,
-                    P_REPEAT_END,
-                    b2b,
-                    f_sum,
-                )
-            };
-        } else {
-            forward_step_scalar(
-                &mut f,
-                &d_arr,
-                e_seg,
-                &mut b,
-                f2f,
-                P_REPEAT_END,
-                b2b,
-                f_sum,
-                &mut f_sum,
-            );
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        forward_step_scalar(
-            &mut f,
-            &d_arr,
-            e_seg,
-            &mut b,
-            f2f,
-            P_REPEAT_END,
-            b2b,
-            f_sum,
-            &mut f_sum,
-        );
+        f_sum = forward_step(&mut f, &d_arr, e_seg, &mut b, f2f, p_repeat_end, b2b, f_sum);
 
         // Rescale every 16 positions to avoid underflow
         if (i & 15) == 15 {
@@ -361,7 +433,7 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
             scale[i / 16] = s;
             b *= s;
             #[cfg(target_arch = "x86_64")]
-            if use_simd {
+            if super::tantan_simd::has_avx2_fma() {
                 unsafe {
                     super::tantan_simd::scale_avx2(&mut f, s);
                 }
@@ -382,7 +454,7 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
     // Terminal probability
     let f_total = {
         #[cfg(target_arch = "x86_64")]
-        if use_simd {
+        if super::tantan_simd::has_avx2_fma() {
             unsafe { super::tantan_simd::sum_avx2(&f) }
         } else {
             f.iter().sum::<f32>()
@@ -392,12 +464,12 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
             f.iter().sum::<f32>()
         }
     };
-    let z = b * b2b + f_total * P_REPEAT_END;
+    let z = b * b2b + f_total * p_repeat_end;
     let zinv = 1.0 / z;
 
     // Backward pass
     b = b2b;
-    f.fill(P_REPEAT_END);
+    f.fill(p_repeat_end);
 
     for i in (0..len).rev() {
         let pf = 1.0 - (pb[i] * b * zinv);
@@ -407,7 +479,7 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
             let s = scale[i / 16];
             b *= s;
             #[cfg(target_arch = "x86_64")]
-            if use_simd {
+            if super::tantan_simd::has_avx2_fma() {
                 unsafe {
                     super::tantan_simd::scale_avx2(&mut f, s);
                 }
@@ -425,34 +497,142 @@ fn mask_tantan_inner(seq: &mut [Letter], lr_matrix: &[Vec<f32>], min_mask_prob: 
         let ltr = (seq[i] & LETTER_MASK) as usize;
         let e_seg = &e[ltr][len - i..];
 
-        #[cfg(target_arch = "x86_64")]
-        if use_simd {
-            unsafe {
-                super::tantan_simd::backward_step_avx2(
-                    &mut f,
-                    &d_arr,
-                    e_seg,
-                    &mut b,
-                    f2f,
-                    P_REPEAT_END,
-                    b2b,
-                );
-            }
-        } else {
-            backward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        backward_step_scalar(&mut f, &d_arr, e_seg, &mut b, f2f, P_REPEAT_END, b2b);
+        backward_step(&mut f, &d_arr, e_seg, &mut b, f2f, p_repeat_end, b2b);
 
-        if pf >= min_mask_prob {
-            seq[i] |= SEED_MASK;
+        if pf >= p_mask {
+            if mask_mode == 1 {
+                seq[i] = MASK_LETTER;
+            } else if mask_mode == 2 {
+                seq[i] |= SEED_MASK;
+            }
+            ranges.push_front(i as i32);
         }
     }
+
+    ranges
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flat_ranges(ranges: &Ranges) -> Vec<(i32, i32)> {
+        let (a, b) = ranges.as_slices();
+        a.iter().chain(b).copied().collect()
+    }
+
+    #[test]
+    fn test_forward_step_scalar_matches_definition() {
+        let mut f = std::array::from_fn(|i| (i as f32 + 1.0) / 100.0);
+        let d = std::array::from_fn(|i| (50 - i) as f32 / 1000.0);
+        let e: Vec<f32> = (0..WINDOW).map(|i| 0.75 + i as f32 / 200.0).collect();
+        let original_f = f;
+        let mut b = 0.625;
+        let b_old = b;
+        let f2f = 0.95;
+        let p_repeat_end = 0.05;
+        let b2b = 0.995;
+        let f_sum_prev = 1.25;
+
+        let sum = forward_step_scalar(&mut f, &d, &e, &mut b, f2f, p_repeat_end, b2b, f_sum_prev);
+
+        let mut expected_sum = 0.0f32;
+        for i in 0..WINDOW {
+            let expected = (original_f[i] * f2f + b_old * d[i]) * e[i];
+            assert_eq!(f[i].to_bits(), expected.to_bits(), "f[{i}]");
+            expected_sum += expected;
+        }
+        assert_eq!(sum.to_bits(), expected_sum.to_bits());
+        assert_eq!(
+            b.to_bits(),
+            (b_old * b2b + f_sum_prev * p_repeat_end).to_bits()
+        );
+    }
+
+    #[test]
+    fn test_backward_step_scalar_matches_definition() {
+        let mut f = std::array::from_fn(|i| (i as f32 + 1.0) / 80.0);
+        let d = std::array::from_fn(|i| (50 - i) as f32 / 700.0);
+        let e: Vec<f32> = (0..WINDOW).map(|i| 0.8 + i as f32 / 250.0).collect();
+        let original_f = f;
+        let mut b = 0.625;
+        let b_old = b;
+        let f2f = 0.95;
+        let p_repeat_end = 0.05;
+        let b2b = 0.995;
+
+        let tsum = backward_step_scalar(&mut f, &d, &e, &mut b, f2f, p_repeat_end, b2b);
+
+        let mut expected_sum = 0.0f32;
+        for i in 0..WINDOW {
+            let vf = original_f[i] * e[i];
+            expected_sum += vf * d[i];
+            let expected = vf * f2f + p_repeat_end * b_old;
+            assert_eq!(f[i].to_bits(), expected.to_bits(), "f[{i}]");
+        }
+        assert_eq!(tsum.to_bits(), expected_sum.to_bits());
+        assert_eq!(b.to_bits(), (b2b * b_old + expected_sum).to_bits());
+    }
+
+    #[test]
+    fn test_mask_modes_and_ranges_match_cpp_contract() {
+        let lr = vec![vec![1.0f32; AMINO_ACID_COUNT]; AMINO_ACID_COUNT];
+        let original: Vec<Letter> = (0..64).map(|i| (i % TRUE_AA as usize) as Letter).collect();
+
+        let mut table_only = original.clone();
+        let table_ranges = mask(
+            &mut table_only,
+            &lr,
+            P_REPEAT,
+            P_REPEAT_END,
+            REPEAT_GROWTH,
+            -1.0,
+            0,
+        );
+        assert_eq!(table_only, original);
+        assert_eq!(flat_ranges(&table_ranges), vec![(0, 64)]);
+
+        let mut hard = original.clone();
+        let hard_ranges = mask(
+            &mut hard,
+            &lr,
+            P_REPEAT,
+            P_REPEAT_END,
+            REPEAT_GROWTH,
+            -1.0,
+            1,
+        );
+        assert!(hard.iter().all(|&letter| letter == MASK_LETTER));
+        assert_eq!(hard_ranges, table_ranges);
+
+        let mut soft = original.clone();
+        let soft_ranges = mask(
+            &mut soft,
+            &lr,
+            P_REPEAT,
+            P_REPEAT_END,
+            REPEAT_GROWTH,
+            -1.0,
+            2,
+        );
+        assert!(soft.iter().all(|&letter| letter & SEED_MASK != 0));
+        assert_eq!(soft_ranges, table_ranges);
+    }
+
+    #[test]
+    fn test_mask_empty_returns_no_ranges() {
+        let lr = vec![vec![1.0f32; AMINO_ACID_COUNT]; AMINO_ACID_COUNT];
+        let ranges = mask(
+            &mut [],
+            &lr,
+            P_REPEAT,
+            P_REPEAT_END,
+            REPEAT_GROWTH,
+            DEFAULT_MIN_MASK_PROB,
+            2,
+        );
+        assert!(ranges.is_empty());
+    }
 
     #[test]
     fn test_no_mask_short() {

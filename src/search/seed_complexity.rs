@@ -6,6 +6,13 @@ use crate::data::flags::{PackedLocId, SeedEncoding};
 use crate::data::seed_histogram::SeedPartitionRange;
 use crate::data::sequence_set::SequenceSet;
 use crate::util::data_structures::DoubleArray;
+use std::collections::HashSet;
+use std::sync::{LazyLock, RwLock};
+
+/// Ownership-safe counterpart of the file-scope C++ `soft_mask` set.
+/// The upstream implementation currently defines but does not consume it.
+pub static SOFT_MASK: LazyLock<RwLock<HashSet<u64>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SeedStats {

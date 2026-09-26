@@ -3,7 +3,7 @@ use crate::basic::seed::SeedOffset;
 use crate::basic::shape_config::ShapeConfig;
 use crate::config::Sensitivity;
 use crate::masking::MaskingAlgo;
-use crate::stats::score_matrix::ScoreMatrix;
+use crate::stats::score_matrix::{CutoffTable, ScoreMatrix};
 use crate::util::enum_utils::FlagBits;
 use crate::util::math::{bit_length, power};
 
@@ -31,7 +31,7 @@ impl ExtensionMode {
             "none" => Ok(Self::None),
             "global" => Ok(Self::Global),
             _ => Err(format!(
-                "Invalid value for string field: {}. Permitted values: banded-fast, banded-slow, full, none, global",
+                "Invalid value for string field: {}. Permitted values: banded-fast, banded-slow, full, global, none",
                 s
             )),
         }
@@ -140,6 +140,8 @@ pub struct SetupSearchResult {
     pub gapped_filter_diag_score: i32,
     pub seed_complexity_cut: f64,
     pub soft_masking_bits: u32,
+    pub cutoff_table: CutoffTable,
+    pub cutoff_table_short: CutoffTable,
     pub extension_mode: ExtensionMode,
 }
 
@@ -177,7 +179,6 @@ pub const ITERATED_SHAPES30X10: &[Round] = &[
     Round::new(Sensitivity::Fast, true),
     Round::new(Sensitivity::Shapes30x10, true),
 ];
-pub const ITERATED_SHAPES6X10: &[Round] = &[Round::new(Sensitivity::Shapes6x10, true)];
 pub const ITERATED_MID_SENSITIVE: &[Round] = &[
     Round::new(Sensitivity::Fast, true),
     Round::new(Sensitivity::Linclust40, true),
@@ -650,7 +651,9 @@ pub fn iterated_sens(sens: Sensitivity) -> &'static [Round] {
         Sensitivity::Linclust40 => ITERATED_LINCLUST40,
         Sensitivity::Linclust20 => ITERATED_LINCLUST20,
         Sensitivity::Shapes30x10 => ITERATED_SHAPES30X10,
-        Sensitivity::Shapes6x10 => ITERATED_SHAPES6X10,
+        // Deliberately absent from C++ `iterated_sens`. Its `map::at` lookup
+        // throws when bare `--iterate` is combined with shapes-6x10.
+        Sensitivity::Shapes6x10 => panic!("no iterated-search schedule for shapes-6x10"),
         Sensitivity::MidSensitive => ITERATED_MID_SENSITIVE,
         Sensitivity::Sensitive => ITERATED_SENSITIVE,
         Sensitivity::MoreSensitive => ITERATED_MORE_SENSITIVE,
@@ -691,27 +694,47 @@ pub fn setup_search(
     score_matrix: &ScoreMatrix,
 ) -> Result<SetupSearchResult, String> {
     let traits = get_traits(sens);
-    let freq_sd = input.freq_sd.unwrap_or(traits.freq_sd);
+    // C++ `Config::set_option(option, value, sentinel, fallback)` chooses the
+    // supplied value verbatim when it differs from the sentinel.  In
+    // particular, an explicit identity cutoff is not raised by
+    // `approx_min_id`; that maximum is only the fallback.
+    let freq_sd = input
+        .freq_sd
+        .filter(|&value| value != 0.0)
+        .unwrap_or(traits.freq_sd);
     let hamming_filter_id = input
         .min_identities
-        .unwrap_or(traits.min_identities)
-        .max(hamming_id_cutoff(input.approx_min_id));
+        .filter(|&value| value != 0)
+        .unwrap_or_else(|| {
+            traits
+                .min_identities
+                .max(hamming_id_cutoff(input.approx_min_id))
+        });
     let ungapped_evalue = input
         .ungapped_evalue
+        .filter(|&value| value != -1.0)
         .unwrap_or(traits.ungapped_evalue as f64);
     let ungapped_evalue_short = input
         .ungapped_evalue_short
+        .filter(|&value| value != -1.0)
         .unwrap_or(traits.ungapped_evalue_short as f64);
     let gapped_filter_evalue = input
         .gapped_filter_evalue
+        .filter(|&value| value != -1.0)
         .unwrap_or(traits.gapped_filter_evalue as f64);
     let query_bins = input
         .query_bins
         .unwrap_or(((input.threads as f64 / 8.0).round() as u32).max(traits.query_bins));
-    let minimizer_window = input.minimizer_window.unwrap_or(traits.minimizer_window);
-    let sketch_size = input.sketch_size.unwrap_or(traits.sketch_size);
+    let minimizer_window = input
+        .minimizer_window
+        .filter(|&value| value != 0)
+        .unwrap_or(traits.minimizer_window);
+    let sketch_size = input
+        .sketch_size
+        .filter(|&value| value != 0)
+        .unwrap_or(traits.sketch_size);
 
-    let reduction = if input.contiguous_seed_mode && sens == Sensitivity::Default {
+    let shape_reduction = if input.contiguous_seed_mode && sens == Sensitivity::Default {
         Reduction::new(
             DEFAULT_CONTIGUOUS_REDUCTION,
             crate::basic::value::AMINO_ACID_ALPHABET,
@@ -732,7 +755,13 @@ pub fn setup_search(
     } else {
         input.shape_mask.clone()
     };
-    let shapes = ShapeConfig::from_codes(&shape_codes, input.shapes, &reduction)?;
+    // Upstream constructs contiguous shapes with the temporary 16-class
+    // reduction, then unconditionally restores the sensitivity trait's
+    // Murphy-10 reduction. Both have a four-bit encoding, so the shape's
+    // stored long mask remains valid while subsequent seed encoding uses
+    // Murphy-10.
+    let shapes = ShapeConfig::from_codes(&shape_codes, input.shapes, &shape_reduction)?;
+    let reduction = Reduction::default_reduction();
     if (input.lin_stage1_target || input.lin_stage1_query || input.lin_stage1_combo)
         && shapes[0].weight < 10
     {
@@ -753,13 +782,13 @@ pub fn setup_search(
     )?
     .bits();
     if !input.soft_masking.is_empty() {
-        soft_masking_bits |= match input.soft_masking.to_lowercase().as_str() {
+        soft_masking_bits |= match input.soft_masking.as_str() {
             "0" | "none" => MaskingAlgo::None.bits(),
-            "1" | "tantan" => MaskingAlgo::Tantan.bits(),
+            "tantan" => MaskingAlgo::Tantan.bits(),
             "seg" => MaskingAlgo::Seg.bits(),
             _ => {
                 return Err(format!(
-                    "Invalid value for string field: {}. Permitted values: none, tantan, seg",
+                    "Invalid value for string field: {}. Permitted values: 0, none, seg, tantan",
                     input.soft_masking
                 ))
             }
@@ -802,6 +831,9 @@ pub fn setup_search(
         );
     }
 
+    let cutoff_table = CutoffTable::new(score_matrix, ungapped_evalue);
+    let cutoff_table_short = CutoffTable::new(score_matrix, ungapped_evalue_short);
+
     Ok(SetupSearchResult {
         sensitivity: sens,
         freq_sd,
@@ -817,6 +849,8 @@ pub fn setup_search(
         gapped_filter_diag_score: score_matrix.rawscore_int(input.gapped_filter_diag_bit_score),
         seed_complexity_cut,
         soft_masking_bits,
+        cutoff_table,
+        cutoff_table_short,
         extension_mode,
     })
 }
@@ -846,9 +880,9 @@ pub fn use_single_indexed(
         return false;
     }
     if sensitivity >= Sensitivity::Sensitive {
-        query_letters < 300_000 && query_letters * 20_000 < ref_letters
+        query_letters < 300_000 && query_letters.wrapping_mul(20_000) < ref_letters
     } else {
-        query_letters < 3_000_000 && query_letters * 2_000 < ref_letters
+        query_letters < 3_000_000 && query_letters.wrapping_mul(2_000) < ref_letters
     }
 }
 
@@ -1047,7 +1081,7 @@ mod tests {
         };
         let result = setup_search(Sensitivity::Fast, &input, &score_matrix).unwrap();
         assert_eq!(result.freq_sd, 7.0);
-        assert_eq!(result.hamming_filter_id, 30);
+        assert_eq!(result.hamming_filter_id, 3);
         assert_eq!(result.query_bins, 2);
         assert_eq!(result.shapes.count(), 1);
         assert_ne!(result.soft_masking_bits & MaskingAlgo::Tantan.bits(), 0);
@@ -1073,7 +1107,7 @@ mod tests {
         assert_eq!(format!("{}", result.shapes), "111111");
         assert_eq!(
             format!("{}", result.reduction),
-            "[RK][QE][D][N][C][G][H][F][Y][IV][LM][W][P][S][T][A]"
+            "[A][RK][NDQE][C][G][H][ILMV][FWY][P][ST]"
         );
         assert_eq!(
             setup_search(Sensitivity::Fast, &input, &score_matrix)

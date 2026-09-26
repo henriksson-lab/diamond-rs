@@ -1536,47 +1536,102 @@ impl alp {
     }
 
     pub fn partially_release_memory(&mut self) {
-        self.d_seqi.clear();
-        self.d_seqj.clear();
-        self.d_WS_i_const_pred.clear();
-        self.d_WI_i_const_pred.clear();
-        self.d_WD_i_const_pred.clear();
-        self.d_WS_i_const_next.clear();
-        self.d_WI_i_const_next.clear();
-        self.d_WD_i_const_next.clear();
-        self.d_WS_j_const_pred.clear();
-        self.d_WI_j_const_pred.clear();
-        self.d_WD_j_const_pred.clear();
-        self.d_WS_j_const_next.clear();
-        self.d_WI_j_const_next.clear();
-        self.d_WD_j_const_next.clear();
-        self.d_HS_i_const_pred.clear();
-        self.d_HI_i_const_pred.clear();
-        self.d_HD_i_const_pred.clear();
-        self.d_H_i_const_pred.clear();
-        self.d_HS_i_const_next.clear();
-        self.d_HI_i_const_next.clear();
-        self.d_HD_i_const_next.clear();
-        self.d_H_i_const_next.clear();
-        self.d_HS_j_const_pred.clear();
-        self.d_HI_j_const_pred.clear();
-        self.d_HD_j_const_pred.clear();
-        self.d_H_j_const_pred.clear();
-        self.d_HS_j_const_next.clear();
-        self.d_HI_j_const_next.clear();
-        self.d_HD_j_const_next.clear();
-        self.d_H_j_const_next.clear();
-        self.d_H_edge_max.clear();
+        // Match the C++ release helpers: released allocations stop counting
+        // toward the memory limit, and a repeated release is a no-op.
+        let mut released_bytes = 0usize;
+        released_bytes += (self.d_seqi.len() + self.d_seqj.len()) * std::mem::size_of::<i64>();
+        released_bytes += (self.d_WS_i_const_pred.len()
+            + self.d_WI_i_const_pred.len()
+            + self.d_WD_i_const_pred.len()
+            + self.d_WS_i_const_next.len()
+            + self.d_WI_i_const_next.len()
+            + self.d_WD_i_const_next.len()
+            + self.d_WS_j_const_pred.len()
+            + self.d_WI_j_const_pred.len()
+            + self.d_WD_j_const_pred.len()
+            + self.d_WS_j_const_next.len()
+            + self.d_WI_j_const_next.len()
+            + self.d_WD_j_const_next.len())
+            * std::mem::size_of::<f64>();
+        released_bytes += (self.d_HS_i_const_pred.len()
+            + self.d_HI_i_const_pred.len()
+            + self.d_HD_i_const_pred.len()
+            + self.d_H_i_const_pred.len()
+            + self.d_HS_i_const_next.len()
+            + self.d_HI_i_const_next.len()
+            + self.d_HD_i_const_next.len()
+            + self.d_H_i_const_next.len()
+            + self.d_HS_j_const_pred.len()
+            + self.d_HI_j_const_pred.len()
+            + self.d_HD_j_const_pred.len()
+            + self.d_H_j_const_pred.len()
+            + self.d_HS_j_const_next.len()
+            + self.d_HI_j_const_next.len()
+            + self.d_HD_j_const_next.len()
+            + self.d_H_j_const_next.len()
+            + self.d_H_edge_max.len())
+            * std::mem::size_of::<i64>();
+        for state in self.d_alp_states.iter().flatten() {
+            released_bytes += (state.d_HS_i_const_next.len()
+                + state.d_HI_i_const_next.len()
+                + state.d_HD_i_const_next.len()
+                + state.d_H_i_const_next.len()
+                + state.d_HS_j_const_next.len()
+                + state.d_HI_j_const_next.len()
+                + state.d_HD_j_const_next.len()
+                + state.d_H_j_const_next.len())
+                * std::mem::size_of::<i64>();
+        }
+        self.d_alp_data.d_memory_size_in_MB -= released_bytes as f64 / mb_bytes;
+
+        macro_rules! release_vecs {
+            ($($value:expr),+ $(,)?) => { $( *$value = Vec::new(); )+ };
+        }
+        release_vecs!(
+            &mut self.d_seqi,
+            &mut self.d_seqj,
+            &mut self.d_WS_i_const_pred,
+            &mut self.d_WI_i_const_pred,
+            &mut self.d_WD_i_const_pred,
+            &mut self.d_WS_i_const_next,
+            &mut self.d_WI_i_const_next,
+            &mut self.d_WD_i_const_next,
+            &mut self.d_WS_j_const_pred,
+            &mut self.d_WI_j_const_pred,
+            &mut self.d_WD_j_const_pred,
+            &mut self.d_WS_j_const_next,
+            &mut self.d_WI_j_const_next,
+            &mut self.d_WD_j_const_next,
+            &mut self.d_HS_i_const_pred,
+            &mut self.d_HI_i_const_pred,
+            &mut self.d_HD_i_const_pred,
+            &mut self.d_H_i_const_pred,
+            &mut self.d_HS_i_const_next,
+            &mut self.d_HI_i_const_next,
+            &mut self.d_HD_i_const_next,
+            &mut self.d_H_i_const_next,
+            &mut self.d_HS_j_const_pred,
+            &mut self.d_HI_j_const_pred,
+            &mut self.d_HD_j_const_pred,
+            &mut self.d_H_j_const_pred,
+            &mut self.d_HS_j_const_next,
+            &mut self.d_HI_j_const_next,
+            &mut self.d_HD_j_const_next,
+            &mut self.d_H_j_const_next,
+            &mut self.d_H_edge_max,
+        );
         for state in &mut self.d_alp_states {
             if let Some(state) = state {
-                state.d_HS_i_const_next.clear();
-                state.d_HI_i_const_next.clear();
-                state.d_HD_i_const_next.clear();
-                state.d_H_i_const_next.clear();
-                state.d_HS_j_const_next.clear();
-                state.d_HI_j_const_next.clear();
-                state.d_HD_j_const_next.clear();
-                state.d_H_j_const_next.clear();
+                release_vecs!(
+                    &mut state.d_HS_i_const_next,
+                    &mut state.d_HI_i_const_next,
+                    &mut state.d_HD_i_const_next,
+                    &mut state.d_H_i_const_next,
+                    &mut state.d_HS_j_const_next,
+                    &mut state.d_HI_j_const_next,
+                    &mut state.d_HD_j_const_next,
+                    &mut state.d_H_j_const_next,
+                );
                 state.d_cells_counts = array::new(None);
             }
         }

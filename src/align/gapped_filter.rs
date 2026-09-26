@@ -1,3 +1,10 @@
+//! Two-stage gapped filtering mirrored from `align/gapped_filter.cpp`.
+//!
+//! C++ process globals (alignment mode, score parameters, target block, and
+//! thread count) are explicit inputs here. The compatibility entry point uses
+//! the host parallelism when `Flags::PARALLEL` is set; callers that require a
+//! fixed schedule can use [`gapped_filter_seed_hits_with_config`].
+
 use crate::align::hsp::{Hsp, Match};
 use crate::align::target::culling_matches;
 use crate::basic::statistics::{StatValue, Statistics};
@@ -13,6 +20,19 @@ use crate::search::hit::Hit;
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::data_structures::FlatArray;
 use crate::util::interval::Interval;
+use crate::util::parallel::scheduled_thread_pool_auto;
+use std::sync::Mutex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GappedFilterExecutionConfig {
+    pub thread_count: usize,
+}
+
+impl Default for GappedFilterExecutionConfig {
+    fn default() -> Self {
+        Self { thread_count: 1 }
+    }
+}
 
 /// Matches C++ `Extension::SeedHit`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +345,56 @@ where
     F1: Fn(i32, i32) -> i32 + Copy,
     F2: Fn(i32, i32) -> i32 + Copy,
 {
+    let thread_count = if flags.any(Flags::PARALLEL) {
+        std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    gapped_filter_seed_hits_with_config(
+        query,
+        query_cbs,
+        seed_hits,
+        target_block_ids,
+        target_seqs,
+        stat,
+        flags,
+        cutoff_gapped1_new,
+        cutoff_gapped2_new,
+        gap_open,
+        gap_extend,
+        gapped_filter_diag_score,
+        query_translated,
+        gapped_filter_window,
+        score_matrix,
+        GappedFilterExecutionConfig { thread_count },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gapped_filter_seed_hits_with_config<F1, F2>(
+    query: &[&[Letter]],
+    query_cbs: Option<&[&[i8]]>,
+    seed_hits: &FlatArray<SeedHit>,
+    target_block_ids: &[BlockId],
+    target_seqs: &SequenceSet,
+    stat: &mut Statistics,
+    flags: Flags,
+    cutoff_gapped1_new: F1,
+    cutoff_gapped2_new: F2,
+    gap_open: i32,
+    gap_extend: i32,
+    gapped_filter_diag_score: i32,
+    query_translated: bool,
+    gapped_filter_window: i32,
+    score_matrix: &ScoreMatrix,
+    execution: GappedFilterExecutionConfig,
+) -> (FlatArray<SeedHit>, Vec<BlockId>)
+where
+    F1: Fn(i32, i32) -> i32 + Copy,
+    F2: Fn(i32, i32) -> i32 + Copy,
+{
     let n = seed_hits.size() as usize;
     let mut hits_out = FlatArray::new();
     let mut target_ids_out = Vec::new();
@@ -332,36 +402,126 @@ where
         return (hits_out, target_ids_out);
     }
 
+    if let Some(query_cbs) = query_cbs {
+        assert_eq!(
+            query_cbs.len(),
+            query.len(),
+            "query CBS/profile context count mismatch"
+        );
+    }
+    assert!(
+        execution.thread_count > 0,
+        "gapped-filter thread count must be positive"
+    );
     let mut query_profile = Vec::with_capacity(query.len());
     for i in 0..query.len() {
         let cbs = query_cbs.and_then(|all| all.get(i).copied());
         query_profile.push(make_profile8(query[i], cbs, 0, score_matrix));
     }
 
-    let _ = flags;
-    for i in 0..n {
-        let target_block_id = target_block_ids[i];
-        let target = target_seqs.get(target_block_id as usize);
-        if gapped_filter_target(
-            seed_hits.range(i as u64),
-            &query_profile,
-            target,
-            stat,
-            query_profile[0].length() as i32,
-            cutoff_gapped1_new,
-            cutoff_gapped2_new,
-            gap_open,
-            gap_extend,
-            gapped_filter_diag_score,
-            query_translated,
-            gapped_filter_window,
-        ) {
-            target_ids_out.push(target_block_id);
-            hits_out.push_back(seed_hits.range(i as u64));
+    let qlen = query_profile[0].length() as i32;
+    if flags.any(Flags::PARALLEL) && execution.thread_count > 1 {
+        // Search::Config cutoffs are pure length lookups upstream. Evaluate
+        // them before entering the pool so generic Rust callbacks need not be
+        // shared between threads.
+        let cutoffs: Vec<(i32, i32)> = target_block_ids[..n]
+            .iter()
+            .map(|&target_block_id| {
+                let slen = target_seqs.get(target_block_id as usize).len() as i32;
+                (
+                    cutoff_gapped1_new(qlen, slen),
+                    cutoff_gapped2_new(qlen, slen),
+                )
+            })
+            .collect();
+        let completed = Mutex::new(Vec::with_capacity(n));
+        scheduled_thread_pool_auto(execution.thread_count, n, &|i, _thread_id| {
+            let result = gapped_filter_worker(
+                i,
+                &query_profile,
+                seed_hits,
+                target_block_ids,
+                target_seqs,
+                qlen,
+                cutoffs[i],
+                gap_open,
+                gap_extend,
+                gapped_filter_diag_score,
+                query_translated,
+                gapped_filter_window,
+            );
+            completed.lock().unwrap().push(result);
+        });
+        for (accepted, worker_stat) in completed.into_inner().unwrap() {
+            *stat += &worker_stat;
+            if let Some((target_block_id, hits)) = accepted {
+                target_ids_out.push(target_block_id);
+                hits_out.push_back(&hits);
+            }
+        }
+    } else {
+        for i in 0..n {
+            let target_block_id = target_block_ids[i];
+            let target = target_seqs.get(target_block_id as usize);
+            if gapped_filter_target(
+                seed_hits.range(i as u64),
+                &query_profile,
+                target,
+                stat,
+                qlen,
+                cutoff_gapped1_new,
+                cutoff_gapped2_new,
+                gap_open,
+                gap_extend,
+                gapped_filter_diag_score,
+                query_translated,
+                gapped_filter_window,
+            ) {
+                target_ids_out.push(target_block_id);
+                hits_out.push_back(seed_hits.range(i as u64));
+            }
         }
     }
 
     (hits_out, target_ids_out)
+}
+
+type GappedFilterWorkerResult = (Option<(BlockId, Vec<SeedHit>)>, Statistics);
+
+#[allow(clippy::too_many_arguments)]
+fn gapped_filter_worker(
+    i: usize,
+    query_profile: &[LongScoreProfile<i8>],
+    seed_hits: &FlatArray<SeedHit>,
+    target_block_ids: &[BlockId],
+    target_seqs: &SequenceSet,
+    qlen: i32,
+    cutoffs: (i32, i32),
+    gap_open: i32,
+    gap_extend: i32,
+    gapped_filter_diag_score: i32,
+    query_translated: bool,
+    gapped_filter_window: i32,
+) -> GappedFilterWorkerResult {
+    let mut stat = Statistics::new();
+    let target_block_id = target_block_ids[i];
+    let hits = seed_hits.range(i as u64);
+    let accepted = gapped_filter_target(
+        hits,
+        query_profile,
+        target_seqs.get(target_block_id as usize),
+        &mut stat,
+        qlen,
+        |_, _| cutoffs.0,
+        |_, _| cutoffs.1,
+        gap_open,
+        gap_extend,
+        gapped_filter_diag_score,
+        query_translated,
+        gapped_filter_window,
+    )
+    .then(|| (target_block_id, hits.to_vec()));
+    (accepted, stat)
 }
 
 /// Matches C++ `seed_only_hsp`.
@@ -495,6 +655,38 @@ mod tests {
     }
 
     #[test]
+    fn gapped_filter_hit_clamps_diagonal_and_target_window() {
+        fn encode_scan_bounds(
+            _profile: &LongScoreProfile<i8>,
+            _target: &[Letter],
+            d: i32,
+            j0: i32,
+            j1: i32,
+            scores: &mut [i32],
+        ) {
+            scores.fill(0);
+            scores[0] = (d + 20) + 100 * j0 + 10_000 * j1;
+        }
+
+        let profile = [LongScoreProfile::<i8>::new(128)];
+        let target = [0; 10];
+        // diag=-9; diag-band/2=-41 is clamped to -(slen-1)=-9.
+        // The window around j=9 is clamped from [6, 12) to [6, 10).
+        let score = gapped_filter_hit(
+            &SeedHit::new(0, 9, 0, 0),
+            &profile,
+            &target,
+            64,
+            3,
+            encode_scan_bounds,
+            0,
+            0,
+            1,
+        );
+        assert_eq!(score, 100_611);
+    }
+
+    #[test]
     fn test_gapped_filter_target_two_stage_and_translated_short_query() {
         let sm = make_test_matrix();
         let query = vec![0, 1, 2, 3, 4, 5, 6, 7];
@@ -539,6 +731,42 @@ mod tests {
         assert!(!rejected);
         assert_eq!(stat.get(StatValue::GappedFilterHits1), 1);
         assert_eq!(stat.get(StatValue::GappedFilterHits2), 1);
+    }
+
+    #[test]
+    fn stage_one_cutoff_is_strictly_greater_than() {
+        let sm = make_test_matrix();
+        let query = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let profile = vec![make_profile8(&query, None, 128, &sm)];
+        let hits = [SeedHit::new(3, 3, 0, 0)];
+        let stage_one_score = gapped_filter_hit(
+            &hits[0],
+            &profile,
+            &query,
+            64,
+            100,
+            scan_diags64,
+            sm.gap_open(),
+            sm.gap_extend(),
+            1,
+        );
+        let mut stat = Statistics::new();
+        assert!(!gapped_filter_target(
+            &hits,
+            &profile,
+            &query,
+            &mut stat,
+            query.len() as i32,
+            |_, _| stage_one_score,
+            |_, _| -1,
+            sm.gap_open(),
+            sm.gap_extend(),
+            1,
+            false,
+            100,
+        ));
+        assert_eq!(stat.get(StatValue::GappedFilterHits1), 1);
+        assert_eq!(stat.get(StatValue::GappedFilterHits2), 0);
     }
 
     #[test]
@@ -621,6 +849,93 @@ mod tests {
         assert_eq!(filtered_hits.range(1), seed_hits.range(1));
         assert_eq!(stat.get(StatValue::GappedFilterHits1), 2);
         assert_eq!(stat.get(StatValue::GappedFilterHits2), 2);
+    }
+
+    #[test]
+    fn parallel_worker_matches_sequential_filter_and_merges_statistics() {
+        let sm = make_test_matrix();
+        let query = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let mut target_seqs = SequenceSet::new();
+        target_seqs.push(&query);
+        target_seqs.push(&query[..4]);
+        let mut seed_hits = FlatArray::new();
+        seed_hits.push_back(&[SeedHit::new(3, 3, 0, 0)]);
+        seed_hits.push_back(&[SeedHit::new(2, 2, 0, 0)]);
+        let target_ids = [0, 1];
+        let query_refs: [&[Letter]; 1] = [&query];
+
+        let run = |flags, execution, stat: &mut Statistics| {
+            gapped_filter_seed_hits_with_config(
+                &query_refs,
+                None,
+                &seed_hits,
+                &target_ids,
+                &target_seqs,
+                stat,
+                flags,
+                |_, _| -1,
+                |_, slen| if slen == 8 { -1 } else { i32::MAX },
+                sm.gap_open(),
+                sm.gap_extend(),
+                1,
+                false,
+                100,
+                &sm,
+                execution,
+            )
+        };
+
+        let mut sequential_stat = Statistics::new();
+        let sequential = run(
+            Flags::NONE,
+            GappedFilterExecutionConfig { thread_count: 1 },
+            &mut sequential_stat,
+        );
+        let mut parallel_stat = Statistics::new();
+        let parallel = run(
+            Flags::PARALLEL,
+            GappedFilterExecutionConfig { thread_count: 2 },
+            &mut parallel_stat,
+        );
+
+        assert_eq!(sequential.1, vec![0]);
+        assert_eq!(parallel.1, vec![0]);
+        assert_eq!(parallel.0, sequential.0);
+        assert_eq!(parallel_stat, sequential_stat);
+        assert_eq!(parallel_stat.get(StatValue::GappedFilterHits1), 2);
+        assert_eq!(parallel_stat.get(StatValue::GappedFilterHits2), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "query CBS/profile context count mismatch")]
+    fn profile_construction_rejects_mismatched_cbs_contexts() {
+        let sm = make_test_matrix();
+        let query = [0, 1, 2];
+        let query_refs: [&[Letter]; 1] = [&query];
+        let empty_cbs: [&[i8]; 0] = [];
+        let mut seed_hits = FlatArray::new();
+        seed_hits.push_back(&[SeedHit::new(0, 0, 0, 0)]);
+        let mut targets = SequenceSet::new();
+        targets.push(&query);
+        let mut stat = Statistics::new();
+        let _ = gapped_filter_seed_hits_with_config(
+            &query_refs,
+            Some(&empty_cbs),
+            &seed_hits,
+            &[0],
+            &targets,
+            &mut stat,
+            Flags::NONE,
+            |_, _| 0,
+            |_, _| 0,
+            sm.gap_open(),
+            sm.gap_extend(),
+            1,
+            false,
+            100,
+            &sm,
+            GappedFilterExecutionConfig::default(),
+        );
     }
 
     #[test]

@@ -77,7 +77,9 @@ pub fn write_aligned<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basic::value::{SequenceType, AMINO_ACID_ALPHABET, MASK_LETTER};
+    use crate::basic::value::{
+        SequenceType, AMINO_ACID_ALPHABET, MASK_LETTER, NUCLEOTIDE_ALPHABET,
+    };
 
     fn amino_traits() -> ValueTraits {
         ValueTraits::new(
@@ -86,6 +88,10 @@ mod tests {
             b"UO-",
             SequenceType::AminoAcid,
         )
+    }
+
+    fn nucleotide_traits() -> ValueTraits {
+        ValueTraits::new(NUCLEOTIDE_ALPHABET, 4, b"", SequenceType::Nucleotide)
     }
 
     #[test]
@@ -137,5 +143,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::str::from_utf8(&aligned).unwrap(), ">q2\nDC\n");
+
+        // In translated mode the emitted record is the original nucleotide
+        // query, not any of its six translated protein contexts. Qualities
+        // likewise belong to that source record and must survive verbatim.
+        let mut translated = Block::new();
+        translated
+            .push_back(
+                &[0, 1, 2, 3, 4],
+                Some("dna query"),
+                Some(b"!#$%&"),
+                0,
+                SequenceType::Nucleotide,
+                0b11_1111,
+                true,
+            )
+            .unwrap();
+        *QUERY_ALIGNED.lock().unwrap() = vec![true];
+
+        let mut fastq = Vec::new();
+        write_aligned(
+            &translated,
+            &mut fastq,
+            "fastq",
+            &nucleotide_traits(),
+            AlignModeBlock::blastx(),
+        )
+        .unwrap();
+        assert_eq!(fastq, b"@dna query\nACGTN\n+\n!#$%&\n");
+
+        let mut excluded = Vec::new();
+        write_unaligned(
+            &translated,
+            &mut excluded,
+            "fastq",
+            &nucleotide_traits(),
+            AlignModeBlock::blastx(),
+        )
+        .unwrap();
+        assert!(excluded.is_empty());
+
+        // `Util::Seq::format` is called with its C++ default wrap of 160.
+        let mut long = Block::new();
+        long.push_back(
+            &vec![0; 161],
+            Some("long"),
+            None,
+            0,
+            SequenceType::AminoAcid,
+            0,
+            false,
+        )
+        .unwrap();
+        *QUERY_ALIGNED.lock().unwrap() = vec![false];
+        let mut wrapped = Vec::new();
+        write_unaligned(
+            &long,
+            &mut wrapped,
+            "fasta",
+            &traits,
+            AlignModeBlock::blastp(),
+        )
+        .unwrap();
+        let lines: Vec<&[u8]> = wrapped.split(|&b| b == b'\n').collect();
+        assert_eq!(lines[0], b">long");
+        assert_eq!(lines[1].len(), 160);
+        assert!(lines[1].iter().all(|&b| b == b'A'));
+        assert_eq!(lines[2], b"A");
     }
 }

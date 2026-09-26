@@ -251,8 +251,12 @@ where
             return Err(TokenizerException::new());
         }
         let p = self.p.unwrap();
-        let mut end = p;
+        let mut start = p;
         let bytes = self.s.as_bytes();
+        while start < self.s.len() && bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        let mut end = start;
         if end < self.s.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
             end += 1;
         }
@@ -263,7 +267,7 @@ where
         if end == digits_begin {
             return Err(TokenizerException::new());
         }
-        Ok((&self.s[p..end], end))
+        Ok((&self.s[start..end], end))
     }
 
     fn read_float_prefix(
@@ -275,60 +279,18 @@ where
             return Err(TokenizerException::with_msg(empty_msg));
         }
         let p = self.p.unwrap();
-        let bytes = self.s.as_bytes();
-        let mut end = p;
-        if end < self.s.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-            end += 1;
-        }
-        let mut seen_digit = false;
-        while end < self.s.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-            seen_digit = true;
-        }
-        if end < self.s.len() && bytes[end] == b'.' {
-            end += 1;
-            while end < self.s.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-                seen_digit = true;
-            }
-        }
-        if !seen_digit {
-            return Err(TokenizerException::with_msg(parse_msg));
-        }
-        if end < self.s.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
-            let exp = end;
-            end += 1;
-            if end < self.s.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-                end += 1;
-            }
-            let exp_digits = end;
-            while end < self.s.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            if end == exp_digits {
-                end = exp;
-            }
-        }
-        Ok((&self.s[p..end], end))
+        let (start, end) = scan_decimal_float_prefix(self.s, p)
+            .ok_or_else(|| TokenizerException::with_msg(parse_msg))?;
+        Ok((&self.s[start..end], end))
     }
 }
 
 pub fn ends_with(s: &str, t: &str) -> bool {
-    if s.len() < t.len() {
-        return false;
-    }
-    &s[s.len() - t.len()..] == t
+    s.ends_with(t)
 }
 
 pub fn rstrip(s: &str, t: &str) -> String {
-    if s.len() < t.len() {
-        return s.to_string();
-    }
-    if &s[s.len() - t.len()..] == t {
-        s[..s.len() - t.len()].to_string()
-    } else {
-        s.to_string()
-    }
+    s.strip_suffix(t).unwrap_or(s).to_string()
 }
 
 pub fn max_len(s: &[&str]) -> usize {
@@ -337,6 +299,11 @@ pub fn max_len(s: &[&str]) -> usize {
         l = l.max(item.len());
     }
     l
+}
+
+/// Safe view-based counterpart of C++ `charp_array(begin, end)`.
+pub fn charp_array(values: &[String]) -> Vec<&str> {
+    values.iter().map(String::as_str).collect()
 }
 
 pub fn convert_size(mut size: usize) -> String {
@@ -364,6 +331,22 @@ pub fn join<T: std::fmt::Display>(sep: &str, values: &[T]) -> String {
         out.push_str(&value.to_string());
     }
     out
+}
+
+/// Writer-oriented counterpart of the C++ `join(sep, begin, end, out)`
+/// overload. [`join`] maps the overload that returns a string.
+pub fn write_join<W, T>(writer: &mut W, sep: &str, values: &[T]) -> std::io::Result<()>
+where
+    W: std::io::Write,
+    T: std::fmt::Display,
+{
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            writer.write_all(sep.as_bytes())?;
+        }
+        write!(writer, "{value}")?;
+    }
+    Ok(())
 }
 
 pub fn format_double(x: f64) -> String {
@@ -411,18 +394,13 @@ where
 }
 
 pub fn interpret_number(s: &str) -> Result<i64, String> {
-    let trimmed = s.trim_start();
-    let mut split = trimmed.len();
-    for (i, c) in trimmed.char_indices() {
-        if !(c.is_ascii_digit() || c == '.' || c == '+' || c == '-') {
-            split = i;
-            break;
-        }
-    }
-    let n: f64 = trimmed[..split]
+    let (number_start, number_end) =
+        scan_decimal_float_prefix(s, 0).ok_or_else(|| format!("Invalid number format: {}", s))?;
+    let n: f64 = s[number_start..number_end]
         .parse()
         .map_err(|_| format!("Invalid number format: {}", s))?;
-    let suffix = trimmed[split..].chars().next().ok_or_else(|| {
+    let suffix_text = s[number_end..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let suffix = suffix_text.chars().next().ok_or_else(|| {
         format!(
             "Missing size specifier in number: {}. Permitted values: T, G, M, K",
             s
@@ -440,10 +418,7 @@ pub fn interpret_number(s: &str) -> Result<i64, String> {
             ))
         }
     };
-    if trimmed[split + suffix.len_utf8()..]
-        .chars()
-        .any(|c| !c.is_ascii_whitespace())
-    {
+    if !suffix_text[suffix.len_utf8()..].trim().is_empty() {
         return Err(format!("Invalid number format: {}", s));
     }
     Ok((n * mult) as i64)
@@ -476,10 +451,81 @@ pub fn parse_csv(s: &str) -> BTreeSet<i32> {
     let t = tokenize(s, ",");
     for item in t {
         if !item.is_empty() {
-            r.insert(item.parse::<i32>().unwrap_or(0));
+            r.insert(atoi_compat(&item));
         }
     }
     r
+}
+
+fn atoi_compat(value: &str) -> i32 {
+    let bytes = value.as_bytes();
+    let mut position = 0;
+    while position < bytes.len() && bytes[position].is_ascii_whitespace() {
+        position += 1;
+    }
+    let mut negative = false;
+    if position < bytes.len() && (bytes[position] == b'+' || bytes[position] == b'-') {
+        negative = bytes[position] == b'-';
+        position += 1;
+    }
+    let mut parsed = 0i64;
+    let mut any = false;
+    while position < bytes.len() && bytes[position].is_ascii_digit() {
+        parsed = parsed
+            .saturating_mul(10)
+            .saturating_add((bytes[position] - b'0') as i64);
+        position += 1;
+        any = true;
+    }
+    if !any {
+        return 0;
+    }
+    if negative {
+        parsed = -parsed;
+    }
+    parsed as i32
+}
+
+fn scan_decimal_float_prefix(value: &str, position: usize) -> Option<(usize, usize)> {
+    let bytes = value.as_bytes();
+    let mut start = position;
+    while start < bytes.len() && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let mut end = start;
+    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
+        end += 1;
+    }
+    let mut seen_digit = false;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+        seen_digit = true;
+    }
+    if end < bytes.len() && bytes[end] == b'.' {
+        end += 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+            seen_digit = true;
+        }
+    }
+    if !seen_digit {
+        return None;
+    }
+    if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
+        let exponent = end;
+        end += 1;
+        if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
+            end += 1;
+        }
+        let exponent_digits = end;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == exponent_digits {
+            end = exponent;
+        }
+    }
+    Some((start, end))
 }
 
 pub fn convert_string_i64(s: &str) -> Result<i64, String> {
@@ -1060,7 +1106,11 @@ mod tests {
         assert!(!ends_with("abc", ".dmnd"));
         assert_eq!(rstrip("abc.dmnd", ".dmnd"), "abc");
         assert_eq!(rstrip("abc", ".dmnd"), "abc");
+        assert!(!ends_with("é", "x"));
+        assert_eq!(rstrip("café", "fé"), "ca");
         assert_eq!(max_len(&["a", "abcd", "xy"]), 4);
+        let owned = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(charp_array(&owned), ["alpha", "beta"]);
     }
 
     #[test]
@@ -1068,9 +1118,14 @@ mod tests {
         assert_eq!(convert_size(1), "1.0 B");
         assert_eq!(convert_size(1536), "1.5 KB");
         assert_eq!(join(",", &[1, 2, 3]), "1,2,3");
+        let mut joined = Vec::new();
+        write_join(&mut joined, "::", &[1, 2, 3]).unwrap();
+        assert_eq!(joined, b"1::2::3");
         assert_eq!(format_double(99.94), "99.9");
         assert_eq!(format_double(99.95), "100.0");
         assert_eq!(format_double(100.9), "100");
+        assert_eq!(format_double(-0.5), "0.-5");
+        assert_eq!(format_double(-1.5), "-1.-5");
     }
 
     #[test]
@@ -1082,8 +1137,11 @@ mod tests {
         assert_eq!(interpret_number("1.5K").unwrap(), 1500);
         assert_eq!(interpret_number("2M").unwrap(), 2_000_000);
         assert_eq!(interpret_number(" 2M \t").unwrap(), 2_000_000);
+        assert_eq!(interpret_number("1.5e2 K").unwrap(), 150_000);
+        assert_eq!(interpret_number(".25 M").unwrap(), 250_000);
         assert!(interpret_number("10").is_err());
         assert!(interpret_number("10X").is_err());
+        assert!(interpret_number("1e K").is_err());
     }
 
     #[test]
@@ -1094,6 +1152,10 @@ mod tests {
             parse_csv("1,2,,2").into_iter().collect::<Vec<_>>(),
             vec![1, 2]
         );
+        assert_eq!(
+            parse_csv(" 3x,-2junk,nan").into_iter().collect::<Vec<_>>(),
+            vec![-2, 0, 3]
+        );
         assert_eq!(convert_string_i64("-7").unwrap(), -7);
         assert_eq!(convert_string_i64(" +7").unwrap(), 7);
         assert!(convert_string_i64("7 ").is_err());
@@ -1101,7 +1163,10 @@ mod tests {
         assert!(convert_string_i32("2147483648").is_err());
         assert_eq!(convert_string_u64("7").unwrap(), 7);
         assert_eq!(convert_string_u64(" -2").unwrap(), u64::MAX - 1);
+        assert!(convert_string_u64("-1").is_err());
         assert!(convert_string_u32("-1").is_err());
+        assert!(convert_string_i64(&i64::MAX.to_string()).is_err());
+        assert!(convert_string_i64(&i64::MIN.to_string()).is_err());
         assert_eq!(convert_string::<i64>("-8").unwrap(), -8);
         assert_eq!(convert_string::<u32>("8").unwrap(), 8);
     }
@@ -1173,6 +1238,11 @@ mod tests {
         let mut t = Tokenizer::new("1e,tail", CharDelimiter::new(','));
         assert!(t.read_f64().is_err());
         assert_eq!(t.ptr(), Some(0));
+
+        let mut t = Tokenizer::new("  -12, .5,1.e2", CharDelimiter::new(','));
+        assert_eq!(t.read_i64().unwrap(), -12);
+        assert_eq!(t.read_f64().unwrap(), 0.5);
+        assert_eq!(t.read_f64().unwrap(), 100.0);
 
         let mut t = Tokenizer::new("abc\ndef", CharDelimiter::new(','));
         assert_eq!(t.getline(), "abc");

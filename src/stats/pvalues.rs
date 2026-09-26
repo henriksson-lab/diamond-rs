@@ -14,6 +14,19 @@ unsafe extern "C" {
 
 const RAND_MAX_F64: f64 = 2147483647.0;
 
+fn normal_probability_stable(value: f64) -> f64 {
+    // libm erfc, used by the C++ source, saturates in these tails. The local
+    // polynomial erfc implementation can produce NaN for the 1e100 sentinel
+    // used by pvalues when a variance is zero.
+    if value >= 40.0 {
+        1.0
+    } else if value <= -40.0 {
+        0.0
+    } else {
+        normal_probability(value)
+    }
+}
+
 #[allow(non_snake_case, non_camel_case_types)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ALP_set_of_parameters {
@@ -503,6 +516,9 @@ pub struct pvalues {
     pub b_normal: f64,
     pub N_normal: i64,
     pub h_normal: f64,
+    /// Owned equivalent of the source's pointer to its 1001-entry normal CDF
+    /// lookup table. The table is not used by active `sls_pvalues.cpp` paths.
+    pub p_normal: Vec<f64>,
 }
 
 #[allow(non_snake_case)]
@@ -518,6 +534,13 @@ impl pvalues {
             b_normal,
             N_normal,
             h_normal: (b_normal - a_normal) / N_normal as f64,
+            p_normal: (0..=N_normal)
+                .map(|index| {
+                    normal_probability_stable(
+                        a_normal + (b_normal - a_normal) * index as f64 / N_normal as f64,
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -613,7 +636,7 @@ impl pvalues {
                 alp_data::error_of_the_ratio(m_li_y, m_li_y_error, sqrt_vi_y, sqrt_vi_y_error),
             )
         };
-        let P_m_F = normal_probability(m_F);
+        let P_m_F = normal_probability_stable(m_F);
         let P_m_F_error = CONST_VAL * (-0.5 * m_F * m_F).exp() * m_F_error;
         let E_m_F = -CONST_VAL * (-0.5 * m_F * m_F).exp();
         let E_m_F_error = (-E_m_F * m_F).abs() * m_F_error;
@@ -641,7 +664,7 @@ impl pvalues {
                 alp_data::error_of_the_ratio(n_lj_y, n_lj_y_error, sqrt_vj_y, sqrt_vj_y_error),
             )
         };
-        let P_n_F = normal_probability(n_F);
+        let P_n_F = normal_probability_stable(n_F);
         let P_n_F_error = CONST_VAL * (-0.5 * n_F * n_F).exp() * n_F_error;
         let E_n_F = -CONST_VAL * (-0.5 * n_F * n_F).exp();
         let E_n_F_error = (-E_n_F * n_F).abs() * n_F_error;
@@ -797,7 +820,7 @@ impl pvalues {
         } else {
             m_li_y / sqrt_vi_y
         };
-        let P_m_F = normal_probability(m_F);
+        let P_m_F = normal_probability_stable(m_F);
         let E_m_F = -CONST_VAL * (-0.5 * m_F * m_F).exp();
         let p1 = m_li_y * P_m_F - sqrt_vi_y * E_m_F;
 
@@ -809,7 +832,7 @@ impl pvalues {
         } else {
             n_lj_y / sqrt_vj_y
         };
-        let P_n_F = normal_probability(n_F);
+        let P_n_F = normal_probability_stable(n_F);
         let E_n_F = -CONST_VAL * (-0.5 * n_F * n_F).exp();
         let p2 = n_lj_y * P_n_F - sqrt_vj_y * E_n_F;
 
@@ -883,7 +906,7 @@ impl pvalues {
         } else {
             m_li_y / sqrt_vi_y
         };
-        let log_P_m_F = normal_probability(m_F).ln();
+        let log_P_m_F = normal_probability_stable(m_F).ln();
         let log_minus_E_m_F = CONST_VAL.ln() + (-0.5 * m_F * m_F);
         let log_minus_sqrt_vi_y_E_m_F = sqrt_vi_y.ln() + log_minus_E_m_F;
         let log_p1 = if m_li_y < 0.0 {
@@ -902,7 +925,7 @@ impl pvalues {
         } else {
             n_lj_y / sqrt_vj_y
         };
-        let log_P_n_F = normal_probability(n_F).ln();
+        let log_P_n_F = normal_probability_stable(n_F).ln();
         let log_minus_E_n_F = CONST_VAL.ln() + (-0.5 * n_F * n_F);
         let log_minus_sqrt_vj_y_E_n_F = sqrt_vj_y.ln() + log_minus_E_n_F;
         let log_p2 = if n_lj_y < 0.0 {
@@ -1041,6 +1064,24 @@ impl pvalues {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn get_p_error_using_splitting_method(
+        par: &ALP_set_of_parameters,
+        blast: bool,
+        score: f64,
+        seq1_len: f64,
+        seq2_len: f64,
+        p: &mut f64,
+        p_error: &mut f64,
+        e: &mut f64,
+        e_error: &mut f64,
+        area_is_1: &mut bool,
+    ) -> Result<(), Error> {
+        Self::get_P_error_using_splitting_method(
+            par, blast, score, seq1_len, seq2_len, p, p_error, e, e_error, area_is_1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn calculate_P_values_range(
         &self,
         Score1: i64,
@@ -1082,6 +1123,32 @@ impl pvalues {
             )?;
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn calculate_p_values_range(
+        &self,
+        score1: i64,
+        score2: i64,
+        seq1_len: f64,
+        seq2_len: f64,
+        parameters: &ALP_set_of_parameters,
+        p_values: &mut Vec<f64>,
+        p_value_errors: &mut Vec<f64>,
+        e_values: &mut Vec<f64>,
+        e_value_errors: &mut Vec<f64>,
+    ) -> Result<(), Error> {
+        self.calculate_P_values_range(
+            score1,
+            score2,
+            seq1_len,
+            seq2_len,
+            parameters,
+            p_values,
+            p_value_errors,
+            e_values,
+            e_value_errors,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1175,6 +1242,32 @@ impl pvalues {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn calculate_p_values(
+        &self,
+        score: f64,
+        seq1_len: f64,
+        seq2_len: f64,
+        parameters: &ALP_set_of_parameters,
+        p_value: &mut f64,
+        p_value_error: &mut f64,
+        e_value: &mut f64,
+        e_value_error: &mut f64,
+        read_sbs_parameters: bool,
+    ) -> Result<(), Error> {
+        self.calculate_P_values(
+            score,
+            seq1_len,
+            seq2_len,
+            parameters,
+            p_value,
+            p_value_error,
+            e_value,
+            e_value_error,
+            read_sbs_parameters,
+        )
+    }
+
     pub fn assert_Gumbel_parameters(par_: &ALP_set_of_parameters) -> bool {
         if !(par_.lambda > 0.0)
             || par_.lambda_error < 0.0
@@ -1218,6 +1311,10 @@ impl pvalues {
             && par_.m_BetaISbs.len() == size_tmp
             && par_.m_BetaJSbs.len() == size_tmp
             && par_.m_TauSbs.len() == size_tmp
+    }
+
+    pub fn assert_gumbel_parameters(parameters: &ALP_set_of_parameters) -> bool {
+        Self::assert_Gumbel_parameters(parameters)
     }
 }
 
@@ -1331,7 +1428,7 @@ pub fn compute_area(p: &AreaParams, score: f64, query_len: f64, subject_len: f64
     } else {
         m_li_y / sqrt_vi_y
     };
-    let p_m_f = normal_probability(m_f);
+    let p_m_f = normal_probability_stable(m_f);
     let e_m_f = -CONST_VAL * (-0.5 * m_f * m_f).exp();
     let p1 = m_li_y * p_m_f - sqrt_vi_y * e_m_f;
 
@@ -1343,7 +1440,7 @@ pub fn compute_area(p: &AreaParams, score: f64, query_len: f64, subject_len: f64
     } else {
         n_lj_y / sqrt_vj_y
     };
-    let p_n_f = normal_probability(n_f);
+    let p_n_f = normal_probability_stable(n_f);
     let e_n_f = -CONST_VAL * (-0.5 * n_f * n_f).exp();
     let p2 = n_lj_y * p_n_f - sqrt_vj_y * e_n_f;
 

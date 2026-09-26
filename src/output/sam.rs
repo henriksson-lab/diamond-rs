@@ -62,7 +62,7 @@ pub fn print_md(r: &HspContext) -> String {
         match i.op {
             EditOperation::Match => {
                 del = 0;
-                matches += i.count;
+                matches = matches.wrapping_add(i.count);
             }
             EditOperation::Substitution => {
                 if matches > 0 {
@@ -103,7 +103,7 @@ pub fn print_cigar(r: &HspContext) -> String {
     for i in r.begin_old() {
         let mapped = map[i.op as usize];
         if mapped == op {
-            n += i.count;
+            n = n.wrapping_add(i.count);
         } else {
             if n > 0 {
                 buf.push_str(&n.to_string());
@@ -173,11 +173,11 @@ pub fn print_match_context<W: Write>(
         print_cigar(r),
         seq_str,
         score_matrix.bitscore(r.score() as f64) as u32,
-        r.length() - r.identities(),
+        r.length().wrapping_sub(r.identities()),
         r.subject_len,
         r.score(),
         format_evalue(r.evalue()),
-        r.identities() * 100 / r.length(),
+        r.identities().wrapping_mul(100) / r.length(),
         frame.signed_frame(),
         r.oriented_query_range().begin + 1,
         print_md(r),
@@ -283,9 +283,16 @@ mod tests {
         let mut buf = Vec::new();
         print_header(&mut buf, 2, "diamond view -f sam").unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.starts_with("@HD\tVN:1.5\tSO:query\n"));
-        assert!(output.contains("@PG\tPN:DIAMOND\tVN:2.1.24\tCL:diamond view -f sam\n"));
-        assert!(output.contains("@mm\tBlastP\n"));
+        assert_eq!(
+            output,
+            concat!(
+                "@HD\tVN:1.5\tSO:query\n",
+                "@PG\tPN:DIAMOND\tVN:2.1.24\tCL:diamond view -f sam\n",
+                "@mm\tBlastP\n",
+                "@CO\tBlastP-like alignments\n",
+                "@CO\tReporting AS: bitScore, ZR: rawScore, ZE: expected, ZI: percent identity, ZL: reference length, ZF: frame, ZS: query start DNA coordinate\n",
+            )
+        );
     }
 
     #[test]
@@ -372,10 +379,13 @@ mod tests {
         let mut buf = Vec::new();
         print_match_context(&mut buf, &ctx, &score_matrix, true, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.starts_with("query\t0\ttarget title<>extra title\t21\t255\t4M"));
-        assert!(output.contains("\tRNDC\t"));
-        assert!(output.contains("\tZL:i:200\tZR:i:80\t"));
-        assert!(output.contains("\tZI:i:75\tZF:i:1\tZS:i:2\tMD:Z:4\tZQ:i:6\n"));
+        assert_eq!(
+            output,
+            format!(
+                "query\t0\ttarget title<>extra title\t21\t255\t4M\t*\t0\t0\tRNDC\t*\tAS:i:{}\tNM:i:1\tZL:i:200\tZR:i:80\tZE:f:1.00e-12\tZI:i:75\tZF:i:1\tZS:i:2\tMD:Z:4\tZQ:i:6\n",
+                score_matrix.bitscore(80.0) as u32
+            )
+        );
     }
 
     #[test]

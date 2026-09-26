@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use crate::align::hsp::HspContext;
 use crate::basic::value::{OId, TaxId};
 use crate::data::taxonomy::TaxonomyTree;
-use crate::output::format::format_evalue;
+use crate::output::format::{format_evalue, OutputFormatSpec};
 use crate::util::sequence::ID_DELIMITERS;
 
 #[derive(Debug, Clone)]
@@ -28,13 +28,18 @@ impl TaxonFormat {
         }
     }
 
+    /// Constructor state inherited from C++ `OutputFormat`.
+    pub fn output_format_spec(&self) -> OutputFormatSpec {
+        OutputFormatSpec::taxon_format(self.include_lineage)
+    }
+
     pub fn print_match(&mut self, r: &HspContext, subject_taxids: &[TaxId], tree: &TaxonomyTree) {
         if subject_taxids.is_empty() {
             return;
         }
         self.evalue = self.evalue.min(r.evalue());
         for &taxid in subject_taxids {
-            self.taxid = tree.lca(self.taxid, taxid);
+            self.taxid = sequence_file_lca(tree, self.taxid, taxid);
         }
     }
 
@@ -68,6 +73,53 @@ impl TaxonFormat {
         self.taxid = 0;
         self.evalue = f64::MAX;
     }
+}
+
+/// Exact `SequenceFile::get_lca` behavior used by the C++ formatter.
+///
+/// This intentionally differs from the generic `TaxonomyTree::lca` fallback:
+/// if the second taxon's parent chain is unavailable, DIAMOND retains the
+/// first taxon instead of returning the root.
+fn sequence_file_lca(tree: &TaxonomyTree, t1: TaxId, t2: TaxId) -> TaxId {
+    const MAX_LINEAGE: usize = 64;
+    if t1 == t2 || t2 <= 0 {
+        return t1;
+    }
+    if t1 <= 0 {
+        return t2;
+    }
+
+    let mut p = t2;
+    let mut lineage = std::collections::BTreeSet::new();
+    lineage.insert(p);
+    let mut n = 0usize;
+    loop {
+        p = tree.parent(p);
+        if p <= 0 {
+            return t1;
+        }
+        lineage.insert(p);
+        n += 1;
+        assert!(n <= MAX_LINEAGE, "Path in taxonomy too long (get_lca).");
+        if p == t1 || p == 1 {
+            break;
+        }
+    }
+    if p == t1 {
+        return p;
+    }
+
+    p = t1;
+    n = 0;
+    while !lineage.contains(&p) {
+        p = tree.parent(p);
+        if p <= 0 {
+            return t2;
+        }
+        n += 1;
+        assert!(n <= MAX_LINEAGE, "Path in taxonomy too long (get_lca).");
+    }
+    p
 }
 
 pub fn taxon_lineage(taxid: TaxId, tree: &TaxonomyTree) -> String {
@@ -213,5 +265,36 @@ mod tests {
         let taxids = vec![vec![10], vec![20, 10]];
         assert_eq!(subject_taxids(1, &taxids), &[20, 10]);
         assert!(subject_taxids(7, &taxids).is_empty());
+    }
+
+    #[test]
+    fn test_taxon_format_retains_prior_taxon_for_missing_parent_chain() {
+        let tree = test_tree();
+        let mut first = Hsp::new();
+        first.evalue = 1.0e-5;
+        let first = HspContext::new(
+            first,
+            0,
+            0,
+            Vec::new(),
+            0,
+            "query",
+            0,
+            0,
+            "",
+            0,
+            0,
+            Vec::new(),
+            0.0,
+            0.0,
+        );
+        let mut second = first.clone();
+        second.hsp.evalue = 1.0e-20;
+
+        let mut format = TaxonFormat::new(false);
+        format.print_match(&first, &[10], &tree);
+        format.print_match(&second, &[999], &tree);
+        assert_eq!(format.taxid, 10);
+        assert_eq!(format.evalue, 1.0e-20);
     }
 }

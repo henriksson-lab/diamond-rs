@@ -1,5 +1,6 @@
 use super::score_matrix::ScoreMatrix;
 use super::target_freq::blast_optimize_target_frequencies;
+use crate::basic::statistics::{StatValue, Statistics};
 use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK, MASK_LETTER, TRUE_AA};
 
 const BLAST_KARLIN_LAMBDA_ACCURACY_DEFAULT: f64 = 1.0e-5;
@@ -225,12 +226,12 @@ pub fn test_to_apply_re_adjustment_conditional(
     let d_q_mat = relative_entropy(query_probs, p_matrix);
     let d_m_q = relative_entropy(match_probs, query_probs);
 
-    let denom = 2.0 * d_m_mat * d_q_mat;
-    let mut angle = if denom == 0.0 {
-        0.0
-    } else {
-        ((d_m_mat * d_m_mat + d_q_mat * d_q_mat - d_m_q * d_m_q) / denom).acos()
-    };
+    // Preserve the C++ evaluation order, including IEEE NaN when either
+    // sequence has zero distance from the matrix background.  Substituting
+    // zero for that undefined angle changes the rule selected when callers
+    // configure a negative angle threshold.
+    let mut angle =
+        ((d_m_mat * d_m_mat + d_q_mat * d_q_mat - d_m_q * d_m_q) / 2.0 / d_m_mat / d_q_mat).acos();
     angle = angle * HALF_CIRCLE_DEGREES / PI;
 
     let len_q = query_len as f64;
@@ -291,6 +292,18 @@ pub struct TargetMatrix {
     pub score_max: i32,
 }
 
+/// Explicit inputs corresponding to the score-matrix globals/configuration
+/// read by C++ `TargetMatrix::TargetMatrix`.
+#[derive(Debug, Clone, Copy)]
+pub struct TargetMatrixAdjustment<'a> {
+    pub matrix_scale: i32,
+    pub joint_probs: &'a [f64],
+    pub background_freqs: &'a [f64],
+    pub freq_ratios: Option<&'a [[f64; NCBI_ALPH]; NCBI_ALPH]>,
+    pub tolerance: f64,
+    pub max_iterations: i32,
+}
+
 impl TargetMatrix {
     pub fn new(scores: Vec<i8>, score_min: i32, score_max: i32) -> Self {
         TargetMatrix {
@@ -306,15 +319,138 @@ impl TargetMatrix {
         score_matrix: &ScoreMatrix,
     ) -> Self {
         let adjusted = hauser_global(query_comp, target_comp, score_matrix);
+        Self::from_adjusted_scores(&adjusted, 1, score_matrix)
+    }
+
+    /// Translation of C++ `TargetMatrix::TargetMatrix`.
+    ///
+    /// `cbs` is retained because it is part of the original constructor
+    /// contract, although the current C++ implementation also selects solely
+    /// on `rule` (the code-specific branches are commented out upstream).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_composition_adjustment(
+        query_comp: &[f64; TRUE_AA as usize],
+        query_len: i32,
+        _cbs: CbsMode,
+        target: &[Letter],
+        stats: &mut Statistics,
+        score_matrix: &ScoreMatrix,
+        rule: MatrixAdjustRule,
+        adjustment: TargetMatrixAdjustment<'_>,
+    ) -> Result<Self, String> {
+        let started = std::time::Instant::now();
+        let target_comp = compute_composition(target);
+        let target_len = count_true_aa(target);
+        let mut adjusted;
+
+        match rule {
+            MatrixAdjustRule::UserSpecifiedRelEntropy => {
+                adjusted = composition_matrix_adjust(
+                    query_len,
+                    target_len,
+                    query_comp,
+                    &target_comp,
+                    adjustment.matrix_scale,
+                    score_matrix
+                        .ideal_lambda()
+                        .unwrap_or_else(|| score_matrix.lambda()),
+                    adjustment.joint_probs,
+                    adjustment.background_freqs,
+                    score_matrix,
+                    adjustment.tolerance,
+                    adjustment.max_iterations,
+                );
+                stats.inc(StatValue::MatrixAdjustCount, 1);
+            }
+            MatrixAdjustRule::CompoScaleOldMatrix => {
+                let freq_ratios = adjustment.freq_ratios.ok_or_else(|| {
+                    "Frequency ratios are required for compositional score scaling.".to_string()
+                })?;
+                adjusted = vec![0; AMINO_ACID_COUNT * AMINO_ACID_COUNT];
+                let mut scaled_input = vec![0; AMINO_ACID_COUNT * AMINO_ACID_COUNT];
+                for i in 0..AMINO_ACID_COUNT {
+                    for j in 0..AMINO_ACID_COUNT {
+                        scaled_input[i * AMINO_ACID_COUNT + j] =
+                            score_matrix.score(i as Letter, j as Letter) * adjustment.matrix_scale;
+                    }
+                }
+                if blast_composition_based_stats(
+                    &mut adjusted,
+                    AMINO_ACID_COUNT,
+                    &scaled_input,
+                    AMINO_ACID_COUNT,
+                    query_comp,
+                    &target_comp,
+                    score_matrix.lambda(),
+                    adjustment.matrix_scale as f64,
+                    freq_ratios,
+                )
+                .is_err()
+                {
+                    stats.inc(StatValue::FailedCompBasedStats, 1);
+                    adjusted = composition_matrix_adjust(
+                        query_len,
+                        target_len,
+                        query_comp,
+                        &target_comp,
+                        adjustment.matrix_scale,
+                        score_matrix
+                            .ideal_lambda()
+                            .unwrap_or_else(|| score_matrix.lambda()),
+                        adjustment.joint_probs,
+                        adjustment.background_freqs,
+                        score_matrix,
+                        adjustment.tolerance,
+                        adjustment.max_iterations,
+                    );
+                } else {
+                    stats.inc(StatValue::CompBasedStatsCount, 1);
+                }
+            }
+            _ => return Err(format!("Unsupported CBS rule: {}", rule as i32)),
+        }
+
+        let matrix = Self::from_adjusted_scores(&adjusted, adjustment.matrix_scale, score_matrix);
+        stats.inc(
+            StatValue::TimeMatrixAdjust,
+            started.elapsed().as_micros().min(i64::MAX as u128) as i64,
+        );
+        Ok(matrix)
+    }
+
+    /// Pack the 26x26 adjustment matrix into the transposed 26x32 target
+    /// profile layout used by DIAMOND's SIMD kernels.
+    fn from_adjusted_scores(
+        adjusted: &[i32],
+        matrix_scale: i32,
+        score_matrix: &ScoreMatrix,
+    ) -> Self {
+        assert_eq!(
+            adjusted.len(),
+            AMINO_ACID_COUNT * AMINO_ACID_COUNT,
+            "adjusted score matrix has the wrong size"
+        );
         let mut scores = vec![0i8; 32 * AMINO_ACID_COUNT];
         let mut score_min = i32::MAX;
         let mut score_max = i32::MIN;
         for i in 0..AMINO_ACID_COUNT {
             for j in 0..AMINO_ACID_COUNT {
-                let s = adjusted[i * AMINO_ACID_COUNT + j];
-                scores[i * 32 + j] = s.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
-                score_min = score_min.min(s);
-                score_max = score_max.max(s);
+                if (i < TRUE_AA as usize || i == MASK_LETTER as usize)
+                    && (j < TRUE_AA as usize || j == MASK_LETTER as usize)
+                {
+                    // C++ indexes `s[j * AMINO_ACID_COUNT + i]`: TargetMatrix
+                    // is deliberately transposed relative to the adjustment
+                    // routines' query-major matrix.
+                    let score = adjusted[j * AMINO_ACID_COUNT + i];
+                    scores[i * 32 + j] = score as i8;
+                    let clamped = score.clamp(i8::MIN as i32, i8::MAX as i32);
+                    score_min = score_min.min(clamped);
+                    score_max = score_max.max(clamped);
+                } else {
+                    let score = (score_matrix.score(i as Letter, j as Letter) * matrix_scale)
+                        .max(i8::MIN as i32);
+                    scores[i * 32 + j] = score as i8;
+                }
             }
         }
         TargetMatrix {
@@ -333,83 +469,7 @@ impl TargetMatrix {
     }
 }
 
-/// Accumulator for vector scores in a sliding window.
-struct VectorScores {
-    scores: [i32; 20],
-}
-
-impl VectorScores {
-    fn new() -> Self {
-        VectorScores { scores: [0; 20] }
-    }
-
-    fn add(&mut self, letter: Letter, score_matrix: &ScoreMatrix) {
-        // C++ VectorScores::operator+= does NOT guard for l < 20 — all letters
-        // including X (23) contribute their scores to the window sum.
-        // C++ derives `l` via `Sequence::operator[]` which applies `LETTER_MASK`
-        // under SEQ_MASK (`diamond/CMakeLists.txt:71` makes SEQ_MASK on by
-        // default). Mask here too so a raw SEED_MASK-bearing byte (0x80 / -128)
-        // doesn't sign-extend through `as usize` into a wild index.
-        let l = (letter & crate::basic::value::LETTER_MASK) as usize;
-        for i in 0..20 {
-            self.scores[i] += score_matrix.score(l as Letter, i as Letter);
-        }
-    }
-
-    fn sub(&mut self, letter: Letter, score_matrix: &ScoreMatrix) {
-        // See `add` for the LETTER_MASK rationale.
-        let l = (letter & crate::basic::value::LETTER_MASK) as usize;
-        for i in 0..20 {
-            self.scores[i] -= score_matrix.score(l as Letter, i as Letter);
-        }
-    }
-}
-
-/// Compute background scores: for each letter, the expected score
-/// against the BLOSUM62 background frequencies.
-pub fn compute_background_scores(score_matrix: &ScoreMatrix) -> [f64; 20] {
-    *score_matrix.background_scores()
-}
-
-pub fn hauser_global(
-    query_comp: &[f64; TRUE_AA as usize],
-    target_comp: &[f64; TRUE_AA as usize],
-    score_matrix: &ScoreMatrix,
-) -> Vec<i32> {
-    let background_scores = compute_background_scores(score_matrix);
-    let mut qscores = [0.0f64; TRUE_AA as usize];
-    let mut tscores = [0.0f64; TRUE_AA as usize];
-
-    for i in 0..TRUE_AA as usize {
-        for j in 0..TRUE_AA as usize {
-            qscores[i] += query_comp[j] * score_matrix.score(i as Letter, j as Letter) as f64;
-            tscores[i] += target_comp[j] * score_matrix.score(i as Letter, j as Letter) as f64;
-        }
-    }
-    for i in 0..TRUE_AA as usize {
-        qscores[i] = background_scores[i] - qscores[i];
-        tscores[i] = background_scores[i] - tscores[i];
-    }
-
-    let mut matrix = vec![0i32; AMINO_ACID_COUNT * AMINO_ACID_COUNT];
-    for i in 0..AMINO_ACID_COUNT {
-        for j in 0..AMINO_ACID_COUNT {
-            let s = score_matrix.score(i as Letter, j as Letter) as f64;
-            let q = if i < TRUE_AA as usize {
-                qscores[i]
-            } else {
-                0.0
-            };
-            let t = if j < TRUE_AA as usize {
-                tscores[j]
-            } else {
-                0.0
-            };
-            matrix[i * AMINO_ACID_COUNT + j] = (s + q.min(t)).round() as i32;
-        }
-    }
-    matrix
-}
+pub use super::hauser_correction::{compute_background_scores, hauser_global};
 
 fn blast_gcd(mut a: i32, mut b: i32) -> i32 {
     b = b.abs();
@@ -430,6 +490,7 @@ fn prob_at(probs: &[f64], min_score: i32, score: i32) -> f64 {
 
 fn nlm_karlin_lambda_nr(
     probs: &[f64],
+    prob_min: i32,
     d: i32,
     low: i32,
     high: i32,
@@ -452,19 +513,19 @@ fn nlm_karlin_lambda_nr(
         is_newton = false;
 
         let mut g = 0.0;
-        f = prob_at(probs, low, low);
+        f = prob_at(probs, prob_min, low);
         let mut i = low + d;
         while i < 0 {
             g = x * g + f;
-            f = f * x + prob_at(probs, low, i);
+            f = f * x + prob_at(probs, prob_min, i);
             i += d;
         }
         g = x * g + f;
-        f = f * x + prob_at(probs, low, 0) - 1.0;
+        f = f * x + prob_at(probs, prob_min, 0) - 1.0;
         i = d;
         while i <= high {
             g = x * g + f;
-            f = f * x + prob_at(probs, low, i);
+            f = f * x + prob_at(probs, prob_min, i);
             i += d;
         }
 
@@ -500,6 +561,54 @@ fn nlm_karlin_lambda_nr(
     -x.ln() / d as f64
 }
 
+/// Safe representation of the fields consumed by C++
+/// `Blast_KarlinLambdaNR`'s `Blast_ScoreFreq` argument.
+#[derive(Debug, Clone, Copy)]
+pub struct BlastScoreFreq<'a> {
+    pub score_min: i32,
+    pub score_max: i32,
+    pub obs_min: i32,
+    pub obs_max: i32,
+    pub score_avg: f64,
+    pub score_probs: &'a [f64],
+}
+
+/// Translation of `Blast_KarlinLambdaNR`.
+pub fn blast_karlin_lambda_nr(score_freq: &BlastScoreFreq<'_>, initial_lambda_guess: f64) -> f64 {
+    if score_freq.score_avg >= 0.0 {
+        return -1.0;
+    }
+
+    let low = score_freq.obs_min;
+    let high = score_freq.obs_max;
+    debug_assert_eq!(
+        score_freq.score_probs.len(),
+        (score_freq.score_max - score_freq.score_min + 1) as usize
+    );
+    let mut d = -low;
+    let mut i = 1;
+    while i <= high - low && d > 1 {
+        // C++'s shifted `sprob[i + low]` is the allocation element at
+        // offset `i` from the lowest score.
+        if score_freq.score_probs[(i + low - score_freq.score_min) as usize] != 0.0 {
+            d = blast_gcd(d, i);
+        }
+        i += 1;
+    }
+
+    nlm_karlin_lambda_nr(
+        score_freq.score_probs,
+        score_freq.score_min,
+        d,
+        low,
+        high,
+        initial_lambda_guess,
+        BLAST_KARLIN_LAMBDA_ACCURACY_DEFAULT,
+        20,
+        20 + BLAST_KARLIN_LAMBDA_ITER_DEFAULT,
+    )
+}
+
 pub fn calc_lambda(probs: &[f64], min_score: i32, max_score: i32, lambda0: f64) -> f64 {
     let score_range = max_score - min_score + 1;
     debug_assert_eq!(probs.len(), score_range as usize);
@@ -507,29 +616,31 @@ pub fn calc_lambda(probs: &[f64], min_score: i32, max_score: i32, lambda0: f64) 
     for i in 0..score_range {
         avg += (min_score + i) as f64 * probs[i as usize];
     }
-    if avg >= 0.0 {
-        return -1.0;
-    }
-
-    let mut d = -min_score;
-    let mut i = 1;
-    while i <= max_score - min_score && d > 1 {
-        if probs[i as usize] != 0.0 {
-            d = blast_gcd(d, i);
-        }
-        i += 1;
-    }
-
-    nlm_karlin_lambda_nr(
-        probs,
-        d,
-        min_score,
-        max_score,
+    blast_karlin_lambda_nr(
+        &BlastScoreFreq {
+            score_min: min_score,
+            score_max: max_score,
+            obs_min: min_score,
+            obs_max: max_score,
+            score_avg: avg,
+            score_probs: probs,
+        },
         lambda0,
-        BLAST_KARLIN_LAMBDA_ACCURACY_DEFAULT,
-        20,
-        20 + BLAST_KARLIN_LAMBDA_ITER_DEFAULT,
     )
+}
+
+/// Translation of `s_GetScoreRange`.
+pub fn get_score_range(matrix: &[i32], row_stride: usize, rows: usize) -> (i32, i32) {
+    let mut obs_min = 0;
+    let mut obs_max = 0;
+    for irow in 0..rows {
+        for aa in 0..TRUE_AA as usize {
+            let score = matrix[irow * row_stride + aa];
+            obs_min = obs_min.min(score);
+            obs_max = obs_max.max(score);
+        }
+    }
+    (obs_min, obs_max)
 }
 
 pub fn matrix_score_probs(
@@ -539,15 +650,7 @@ pub fn matrix_score_probs(
     subject_probs: &[f64],
     query_probs: &[f64],
 ) -> (Vec<f64>, i32, i32) {
-    let mut obs_min = 0;
-    let mut obs_max = 0;
-    for irow in 0..alphsize {
-        for aa in 0..TRUE_AA as usize {
-            let score = matrix[irow * row_stride + aa];
-            obs_min = obs_min.min(score);
-            obs_max = obs_max.max(score);
-        }
-    }
+    let (obs_min, obs_max) = get_score_range(matrix, row_stride, alphsize);
 
     let mut probs = vec![0.0f64; (obs_max - obs_min + 1) as usize];
     for irow in 0..alphsize {
@@ -908,6 +1011,35 @@ pub fn blast_composition_based_stats(
     Ok(lambda_ratio)
 }
 
+/// Translation of the C++ `CompositionBasedStats` convenience wrapper.
+///
+/// The C++ routine reads `config.cbs_matrix_scale`; Rust keeps that mutable
+/// global dependency explicit as `cbs_matrix_scale`.
+#[allow(clippy::too_many_arguments)]
+pub fn composition_based_stats(
+    matrix_in: &[i32],
+    matrix_in_stride: usize,
+    query_probs: &[f64; TRUE_AA as usize],
+    res_probs: &[f64; TRUE_AA as usize],
+    lambda: f64,
+    cbs_matrix_scale: f64,
+    freq_ratios: &[[f64; NCBI_ALPH]; NCBI_ALPH],
+    out: &mut [i32; AMINO_ACID_COUNT * AMINO_ACID_COUNT],
+) -> bool {
+    blast_composition_based_stats(
+        out,
+        AMINO_ACID_COUNT,
+        matrix_in,
+        matrix_in_stride,
+        query_probs,
+        res_probs,
+        lambda,
+        cbs_matrix_scale,
+        freq_ratios,
+    )
+    .is_ok()
+}
+
 pub fn ideal_lambda(score_matrix: &ScoreMatrix) -> Option<f64> {
     let robinson = [
         (0usize, 78.05),
@@ -950,120 +1082,7 @@ pub fn ideal_lambda(score_matrix: &ScoreMatrix) -> Option<f64> {
     }
 }
 
-/// Compute sliding-window Hauser correction for each position in a sequence.
-///
-/// This matches the C++ `HauserCorrection` constructor which uses a sliding window
-/// of composition around each position to compute per-position score adjustments.
-///
-/// The default window size is 40 (matching C++ `config.cbs_window`).
-pub fn hauser_correction(seq: &[Letter], score_matrix: &ScoreMatrix) -> Vec<i8> {
-    hauser_correction_window(seq, score_matrix, 40)
-}
-
-/// Hauser correction with configurable window size.
-pub fn hauser_correction_window(
-    seq: &[Letter],
-    score_matrix: &ScoreMatrix,
-    window: usize,
-) -> Vec<i8> {
-    let len = seq.len();
-    if len == 0 {
-        return Vec::new();
-    }
-
-    let bg_scores = compute_background_scores(score_matrix);
-    let mut corrections = vec![0.0f32; len];
-    let mut vs = VectorScores::new();
-
-    let window_half = window.min(2 * (len - 1)) / 2;
-    let mut n: usize = 0;
-    let mut h: usize = 0; // head (right edge of window)
-    let mut m: usize = 0; // current position
-    let mut t: usize = 0; // tail (left edge of window)
-
-    // Phase 1: build initial half-window
-    while n < window_half && h < len {
-        n += 1;
-        vs.add(seq[h], score_matrix);
-        h += 1;
-    }
-
-    // Phase 2: expand to full window, start producing corrections
-    while n < window + 1 && h < len {
-        n += 1;
-        vs.add(seq[h], score_matrix);
-        let r = (seq[m] & LETTER_MASK) as usize;
-        if r < 20 {
-            let self_score = score_matrix.score(r as Letter, r as Letter);
-            corrections[m] =
-                bg_scores[r] as f32 - (vs.scores[r] - self_score) as f32 / (n - 1) as f32;
-        }
-        h += 1;
-        m += 1;
-    }
-
-    // Phase 3: slide the full window
-    while h < len {
-        vs.add(seq[h], score_matrix);
-        vs.sub(seq[t], score_matrix);
-        let r = (seq[m] & LETTER_MASK) as usize;
-        if r < 20 {
-            let self_score = score_matrix.score(r as Letter, r as Letter);
-            corrections[m] =
-                bg_scores[r] as f32 - (vs.scores[r] - self_score) as f32 / (n - 1) as f32;
-        }
-        h += 1;
-        t += 1;
-        m += 1;
-    }
-
-    // Phase 4: shrink window from the right
-    while m < len && n > window_half + 1 {
-        n -= 1;
-        vs.sub(seq[t], score_matrix);
-        let r = (seq[m] & LETTER_MASK) as usize;
-        if r < 20 {
-            let self_score = score_matrix.score(r as Letter, r as Letter);
-            corrections[m] =
-                bg_scores[r] as f32 - (vs.scores[r] - self_score) as f32 / (n - 1) as f32;
-        }
-        t += 1;
-        m += 1;
-    }
-
-    // Phase 5: remaining positions with shrinking window
-    while m < len {
-        let r = (seq[m] & LETTER_MASK) as usize;
-        if r < 20 && n > 1 {
-            let self_score = score_matrix.score(r as Letter, r as Letter);
-            corrections[m] =
-                bg_scores[r] as f32 - (vs.scores[r] - self_score) as f32 / (n - 1) as f32;
-        }
-        m += 1;
-    }
-
-    // Convert to i8 with rounding (matching C++). Append 32 zero bytes of
-    // trailing padding so SIMD score-profile loaders downstream can over-read
-    // up to one AVX2 vector past `len` without UB. C++ does this explicitly
-    // (`diamond/src/stats/hauser_correction.cpp:107-110`: `reserve(len + PADDING)`
-    // followed by `for (Loc i=0; i<PADDING; ++i) int8.push_back(0)`, with
-    // `PADDING = 32`). Without it, SIMD `bias` lane reads past `int8.size()`
-    // hit either uninitialised heap memory or panic on bounds-checked indexing.
-    //
-    // Callers that index the slice positionally (the current `query_cbs[qi]`
-    // pattern in blastp.rs) get the same numerical result either way since
-    // they only touch `0..len`; the padding is purely for over-read safety.
-    const PADDING: usize = 32;
-    let mut out: Vec<i8> = Vec::with_capacity(len + PADDING);
-    for &f in &corrections {
-        let v = if f < 0.0 { f - 0.5 } else { f + 0.5 };
-        out.push(v as i8);
-    }
-    for _ in 0..PADDING {
-        out.push(0);
-    }
-    out
-}
+pub use super::hauser_correction::{hauser_correction, hauser_correction_window};
 
 #[cfg(test)]
 mod tests {
@@ -1096,7 +1115,7 @@ mod tests {
     fn test_hauser_correction_empty() {
         let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
         let corr = hauser_correction(&[], &sm);
-        assert!(corr.is_empty());
+        assert_eq!(corr, vec![0; super::super::hauser_correction::PADDING]);
     }
 
     #[test]
@@ -1118,6 +1137,26 @@ mod tests {
         assert!(CbsMode::ConditionalMatrixAdjust.conditioned());
         assert!(CbsMode::Hauser.support_translated());
         assert_eq!(CbsMode::MatrixAdjust.tantan(), 0);
+    }
+
+    #[test]
+    fn test_cbs_constructor_threshold_defaults_and_override_quirk() {
+        // Maps C++ `CBS::CBS`: `code` is unused there, while mode behavior is
+        // represented separately by `CbsMode` in Rust.
+        let defaults = CbsThresholds::default();
+        assert_eq!(defaults.query_match_distance_threshold, -1.0);
+        assert_eq!(defaults.length_ratio_threshold, -1.0);
+        assert_eq!(defaults.angle, 50.0);
+
+        let overridden = CbsThresholds::new(0.16, 3.0, 70.0);
+        assert_eq!(overridden.query_match_distance_threshold, 0.16);
+        assert_eq!(overridden.length_ratio_threshold, 3.0);
+        assert_eq!(overridden.angle, 70.0);
+
+        // Preserve upstream's literal `!= 1.0` condition (rather than the
+        // likely intended `!= -1.0`) for database/CLI parity.
+        let one = CbsThresholds::new(1.0, -1.0, -1.0);
+        assert_eq!(one.query_match_distance_threshold, -1.0);
     }
 
     #[test]
@@ -1180,6 +1219,78 @@ mod tests {
     }
 
     #[test]
+    fn test_target_matrix_packing_matches_cpp_transpose_and_valid_cells() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let mut adjusted = vec![0; AMINO_ACID_COUNT * AMINO_ACID_COUNT];
+        for i in 0..AMINO_ACID_COUNT {
+            for j in 0..AMINO_ACID_COUNT {
+                adjusted[i * AMINO_ACID_COUNT + j] = i as i32 - j as i32;
+            }
+        }
+        let matrix = TargetMatrix::from_adjusted_scores(&adjusted, 2, &sm);
+        assert_eq!(matrix.scores[3 * 32 + 7], 4); // adjusted[7][3]
+        assert_eq!(matrix.scores[7 * 32 + 3], -4); // adjusted[3][7]
+        assert_eq!(matrix.scores[MASK_LETTER as usize * 32], -23);
+        // Ambiguous amino-acid cells retain the scaled base matrix.
+        assert_eq!(
+            matrix.scores[20 * 32],
+            (sm.score(20, 0) * 2).max(i8::MIN as i32) as i8
+        );
+        assert_eq!(matrix.score_min, -23);
+        assert_eq!(matrix.score_max, 23);
+    }
+
+    #[test]
+    fn test_target_matrix_composition_constructor_and_counters() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let target = vec![0, 1, 1, 2, 3, 5, 8, 13];
+        let query_comp = compute_composition(&query);
+        let background = [1.0 / TRUE_AA as f64; TRUE_AA as usize];
+        let mut joint = vec![0.0; TRUE_AA as usize * TRUE_AA as usize];
+        for i in 0..TRUE_AA as usize {
+            for j in 0..TRUE_AA as usize {
+                joint[i * TRUE_AA as usize + j] = background[i] * background[j];
+            }
+        }
+        let adjustment = TargetMatrixAdjustment {
+            matrix_scale: 2,
+            joint_probs: &joint,
+            background_freqs: &background,
+            freq_ratios: None,
+            tolerance: 0.0,
+            max_iterations: -1,
+        };
+        let mut stats = Statistics::new();
+        let matrix = TargetMatrix::from_composition_adjustment(
+            &query_comp,
+            query.len() as i32,
+            CbsMode::MatrixAdjust,
+            &target,
+            &mut stats,
+            &sm,
+            MatrixAdjustRule::UserSpecifiedRelEntropy,
+            adjustment,
+        )
+        .unwrap();
+        assert_eq!(matrix.scores.len(), 32 * AMINO_ACID_COUNT);
+        assert_eq!(stats.get(StatValue::MatrixAdjustCount), 1);
+
+        let error = TargetMatrix::from_composition_adjustment(
+            &query_comp,
+            query.len() as i32,
+            CbsMode::ConditionalMatrixAdjust,
+            &target,
+            &mut stats,
+            &sm,
+            MatrixAdjustRule::DontAdjustMatrix,
+            adjustment,
+        )
+        .unwrap_err();
+        assert_eq!(error, "Unsupported CBS rule: -1");
+    }
+
+    #[test]
     fn test_lambda_and_score_prob_helpers() {
         let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
         let uniform = [1.0 / TRUE_AA as f64; TRUE_AA as usize];
@@ -1189,6 +1300,47 @@ mod tests {
         assert!((probs.iter().sum::<f64>() - 1.0).abs() < 1e-9);
         assert!(calc_lambda(&probs, obs_min, obs_max, 0.5) > 0.0);
         assert!(ideal_lambda(&sm).unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_explicit_karlin_and_score_range_surface() {
+        // For P(-1)=3/4 and P(1)=1/4, the non-zero Karlin root is ln(3).
+        let probs = [0.75, 0.0, 0.25];
+        let freq = BlastScoreFreq {
+            score_min: -1,
+            score_max: 1,
+            obs_min: -1,
+            obs_max: 1,
+            score_avg: -0.5,
+            score_probs: &probs,
+        };
+        let lambda = blast_karlin_lambda_nr(&freq, 0.5);
+        assert!((lambda - 3.0f64.ln()).abs() < 1.0e-5);
+        assert_eq!(lambda, calc_lambda(&probs, -1, 1, 0.5));
+
+        // `Blast_ScoreFreq` permits the allocated score range to be wider
+        // than its observed range; C++ indexes through a zero-centred pointer.
+        let padded_probs = [0.0, 0.75, 0.0, 0.25];
+        let padded = BlastScoreFreq {
+            score_min: -2,
+            score_max: 1,
+            score_probs: &padded_probs,
+            ..freq
+        };
+        assert!((blast_karlin_lambda_nr(&padded, 0.5) - lambda).abs() < f64::EPSILON);
+
+        let mut matrix = [0; 40];
+        matrix[0] = -7;
+        matrix[19] = 4;
+        matrix[20] = -3;
+        matrix[39] = 2;
+        assert_eq!(get_score_range(&matrix, 20, 2), (-7, 4));
+
+        let non_negative = BlastScoreFreq {
+            score_avg: 0.0,
+            ..freq
+        };
+        assert_eq!(blast_karlin_lambda_nr(&non_negative, 0.5), -1.0);
     }
 
     #[test]
@@ -1259,6 +1411,24 @@ mod tests {
         .unwrap();
         assert!((LAMBDA_RATIO_LOWER_BOUND..=1.0).contains(&ratio));
         assert!(out[0] > 0);
+
+        let mut wrapped = [0i32; AMINO_ACID_COUNT * AMINO_ACID_COUNT];
+        assert!(composition_based_stats(
+            sm.matrix32(),
+            32,
+            &uniform,
+            &uniform,
+            lambda,
+            1.0,
+            &freq_ratios,
+            &mut wrapped,
+        ));
+        for row in 0..AMINO_ACID_COUNT {
+            assert_eq!(
+                &wrapped[row * AMINO_ACID_COUNT..(row + 1) * AMINO_ACID_COUNT],
+                &out[row * 32..row * 32 + AMINO_ACID_COUNT]
+            );
+        }
     }
 
     #[test]

@@ -54,20 +54,21 @@ impl SeedMatch {
 
 impl PartialOrd for SeedMatch {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for SeedMatch {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // C++ defines only `operator>`: hits with the same target and score
+        // are incomparable unless every stored field is equal.  In
+        // particular, their query/reference coordinates are not tie-breakers.
         if self.id() < other.id()
             || (self.id() == other.id() && self.ungapped_score() > other.ungapped_score())
         {
-            std::cmp::Ordering::Greater
+            Some(std::cmp::Ordering::Greater)
+        } else if other.id() < self.id()
+            || (self.id() == other.id() && other.ungapped_score() > self.ungapped_score())
+        {
+            Some(std::cmp::Ordering::Less)
         } else if self == other {
-            std::cmp::Ordering::Equal
+            Some(std::cmp::Ordering::Equal)
         } else {
-            std::cmp::Ordering::Less
+            None
         }
     }
 }
@@ -82,6 +83,13 @@ pub fn seed_lookup(
 ) -> Vec<SeedMatch> {
     let query_sequence = query.to_vec();
     let mut seed_matches = Vec::new();
+    // The C++ iterator's end pointer precedes its begin pointer for a query
+    // shorter than the shape, so it immediately reports `good() == false`.
+    // Guard explicitly because Rust's saturating index arithmetic otherwise
+    // constructs one invalid candidate position.
+    if query_sequence.len() < seed_shape.length.max(0) as usize {
+        return seed_matches;
+    }
     let mut it = MinimizerIterator::new(&query_sequence, seed_shape, window_size, reduction);
 
     while it.good() {
@@ -150,5 +158,46 @@ mod tests {
         matches.sort();
 
         assert_eq!(matches, vec![(0, 0, 0, 2), (0, 1, 2, 2), (2, 1, 0, 2)]);
+    }
+
+    #[test]
+    fn test_seed_lookup_skips_missing_seeds_and_short_queries() {
+        let reduction = Reduction::default_reduction();
+        let seed_shape = Shape::from_code("11", &reduction);
+        let mut target_seqs = LetterStringSet::new();
+        target_seqs.push_back(&[1, 2]);
+        let index = build_index(&target_seqs, &seed_shape, &reduction, 2);
+
+        assert!(seed_lookup(&[3, 4], &target_seqs, &index, 1, &seed_shape, &reduction).is_empty());
+        assert!(seed_lookup(&[1], &target_seqs, &index, 1, &seed_shape, &reduction).is_empty());
+        assert!(seed_lookup(&[], &target_seqs, &index, 1, &seed_shape, &reduction).is_empty());
+    }
+
+    #[test]
+    fn test_seed_match_accessors_score_update_and_starts() {
+        let mut hit = SeedMatch::new(17, 3, 29, 4);
+        assert_eq!(
+            (hit.i(), hit.id(), hit.j(), hit.ungapped_score()),
+            (17, 3, 29, 4)
+        );
+        assert_eq!((hit.i_start(), hit.j_start()), (13, 25));
+
+        hit.score(7);
+        assert_eq!(hit.ungapped_score(), 7);
+        assert_eq!((hit.i_start(), hit.j_start()), (10, 22));
+    }
+
+    #[test]
+    fn test_seed_match_greater_than_matches_cpp_partial_relation() {
+        let strong = SeedMatch::new(5, 2, 8, 9);
+        let weak = SeedMatch::new(5, 2, 8, 4);
+        let earlier_target = SeedMatch::new(5, 1, 8, 1);
+        assert!(strong > weak);
+        assert!(earlier_target > strong);
+
+        let same_rank_different_coordinates = SeedMatch::new(6, 2, 9, 9);
+        assert!(!(strong > same_rank_different_coordinates));
+        assert!(!(same_rank_different_coordinates > strong));
+        assert_eq!(strong.partial_cmp(&same_rank_different_coordinates), None);
     }
 }

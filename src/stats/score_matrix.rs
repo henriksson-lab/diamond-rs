@@ -3,6 +3,158 @@ use super::standard_matrix::StandardMatrix;
 use crate::basic::value::{Letter, AMINO_ACID_COUNT, TRUE_AA};
 
 use std::f64::consts::LN_2;
+use std::fmt;
+use std::fs;
+use std::path::Path;
+
+const BLOSUM62_BACKGROUND_FREQS: [f64; TRUE_AA as usize] = [
+    7.4216205067993410e-02,
+    5.1614486141284638e-02,
+    4.4645808512757915e-02,
+    5.3626000838554413e-02,
+    2.4687457167944848e-02,
+    3.4259650591416023e-02,
+    5.4311925684587502e-02,
+    7.4146941452644999e-02,
+    2.6212984805266227e-02,
+    6.7917367618953756e-02,
+    9.8907868497150955e-02,
+    5.8155682303079680e-02,
+    2.4990197579643110e-02,
+    4.7418459742284751e-02,
+    3.8538003320306206e-02,
+    5.7229029476494421e-02,
+    5.0891364550287033e-02,
+    1.3029956129972148e-02,
+    3.2281512313758580e-02,
+    7.2919098205619245e-02,
+];
+
+fn build_i8_scores(
+    scores: &[i8; AMINO_ACID_COUNT * AMINO_ACID_COUNT],
+    stop_match_score: i32,
+    bias: i8,
+    modulo: usize,
+    offset: usize,
+) -> [i8; 32 * 32] {
+    let mut data = [i8::MIN; 32 * 32];
+    for i in 0..32 {
+        for j in 0..32 {
+            let j2 = j % modulo + offset;
+            if i < AMINO_ACID_COUNT && j2 < AMINO_ACID_COUNT {
+                data[i * 32 + j] = (scores[i * AMINO_ACID_COUNT + j2] as i16 + bias as i16) as i8;
+            }
+        }
+    }
+    if stop_match_score != 1 {
+        data[24 * 32 + 24] = stop_match_score as i8;
+    }
+    data
+}
+
+fn build_i16_scores(
+    scores: &[i8; AMINO_ACID_COUNT * AMINO_ACID_COUNT],
+    stop_match_score: i32,
+) -> [i16; 32 * 32] {
+    let mut data = [-128i16; 32 * 32];
+    for i in 0..AMINO_ACID_COUNT {
+        for j in 0..AMINO_ACID_COUNT {
+            data[i * 32 + j] = scores[i * AMINO_ACID_COUNT + j] as i16;
+        }
+    }
+    if stop_match_score != 1 {
+        data[24 * 32 + 24] = stop_match_score as i16;
+    }
+    data
+}
+
+fn matrix_low_score(matrix: &[i32; 32 * 32]) -> i8 {
+    let mut low = i8::MAX;
+    for i in 0..AMINO_ACID_COUNT {
+        for j in i + 1..AMINO_ACID_COUNT {
+            low = low.min(matrix[i * 32 + j] as i8);
+        }
+    }
+    low
+}
+
+/// Parse the text format accepted by C++ `custom_scores`.
+pub fn custom_scores_from_str(
+    contents: &str,
+    mask_score: i32,
+) -> Result<[i8; AMINO_ACID_COUNT * AMINO_ACID_COUNT], String> {
+    let mut scores = [mask_score as i8; AMINO_ACID_COUNT * AMINO_ACID_COUNT];
+    let mut lines = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let Some(header) = lines.next() else {
+        return Ok(scores);
+    };
+    let positions = header
+        .split_whitespace()
+        .map(|token| {
+            let bytes = token.as_bytes();
+            if bytes.len() != 1 {
+                return Err("Invalid custom scoring matrix file format.".to_string());
+            }
+            crate::basic::value::AMINO_ACID_ALPHABET
+                .iter()
+                .position(|&letter| letter.eq_ignore_ascii_case(&bytes[0]))
+                .ok_or_else(|| "Invalid custom scoring matrix file format.".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut min_score = i32::MAX;
+    for (row_number, line) in lines.take(positions.len()).enumerate() {
+        let mut fields = line.split_whitespace();
+        let row_token = fields
+            .next()
+            .ok_or_else(|| "Invalid custom scoring matrix file format.".to_string())?;
+        let row_byte = row_token.as_bytes();
+        if row_byte.len() != 1
+            || crate::basic::value::AMINO_ACID_ALPHABET[positions[row_number]].to_ascii_uppercase()
+                != row_byte[0].to_ascii_uppercase()
+        {
+            return Err("Invalid custom scoring matrix file format.".to_string());
+        }
+        for &column in &positions {
+            let value = fields
+                .next()
+                .ok_or_else(|| "Invalid custom scoring matrix file format.".to_string())?
+                .parse::<i32>()
+                .map_err(|_| "Invalid custom scoring matrix file format.".to_string())?;
+            scores[positions[row_number] * AMINO_ACID_COUNT + column] = value as i8;
+            min_score = min_score.min(value);
+        }
+    }
+    if min_score != i32::MAX {
+        let hard_mask = crate::basic::value::SUPER_HARD_MASK as usize;
+        for i in 0..AMINO_ACID_COUNT {
+            scores[i * AMINO_ACID_COUNT + hard_mask] = min_score as i8;
+            scores[hard_mask * AMINO_ACID_COUNT + i] = min_score as i8;
+        }
+    }
+    Ok(scores)
+}
+
+fn area_params_from_alp(p: &super::pvalues::ALP_set_of_parameters) -> super::pvalues::AreaParams {
+    super::pvalues::AreaParams {
+        a_i: p.a_I,
+        b_i: p.b_I,
+        alpha_i: p.alpha_I,
+        beta_i: p.beta_I,
+        a_j: p.a_J,
+        b_j: p.b_J,
+        alpha_j: p.alpha_J,
+        beta_j: p.beta_J,
+        sigma: p.sigma,
+        tau: p.tau,
+        vi_y_thr: p.vi_y_thr,
+        vj_y_thr: p.vj_y_thr,
+        c_y_thr: p.c_y_thr,
+    }
+}
 
 /// Runtime score matrix used for alignment.
 ///
@@ -16,6 +168,12 @@ pub struct ScoreMatrix {
     matrix8: [i8; 32 * 32],
     /// 32x32 unsigned 8-bit scores (biased).
     matrix8u: [u8; 32 * 32],
+    matrix8_low: [i8; 32 * 32],
+    matrix8_high: [i8; 32 * 32],
+    matrix8u_low: [i8; 32 * 32],
+    matrix8u_high: [i8; 32 * 32],
+    matrix16: [i16; 32 * 32],
+    matrix32_scaled: [i32; 32 * 32],
     /// Bias added to make all scores non-negative (for unsigned representation).
     bias: i8,
     /// Gap open penalty.
@@ -38,8 +196,7 @@ pub struct ScoreMatrix {
     /// Matrix name.
     name: String,
     /// Reference to the underlying standard matrix (used for joint_probs, freq_ratios).
-    #[allow(dead_code)]
-    standard_matrix: &'static StandardMatrix,
+    standard_matrix: Option<&'static StandardMatrix>,
     /// Expected score for each true amino acid against BLOSUM62 background.
     background_scores: [f64; TRUE_AA as usize],
     /// ALP area parameters for E-value computation.
@@ -56,6 +213,31 @@ impl ScoreMatrix {
         stop_match_score: i32,
         db_letters: u64,
     ) -> Result<Self, String> {
+        Self::new_scaled(
+            matrix_name,
+            gap_open,
+            gap_extend,
+            frame_shift,
+            stop_match_score,
+            db_letters,
+            1,
+        )
+    }
+
+    /// Named-matrix constructor with the C++ `scale` argument exposed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_scaled(
+        matrix_name: &str,
+        gap_open: i32,
+        gap_extend: i32,
+        frame_shift: i32,
+        stop_match_score: i32,
+        db_letters: u64,
+        scale: i32,
+    ) -> Result<Self, String> {
+        if scale <= 0 {
+            return Err("Score matrix scale must be positive.".to_string());
+        }
         let standard_matrix = matrices::get_matrix(matrix_name)
             .ok_or_else(|| format!("Unknown scoring matrix: {}", matrix_name))?;
 
@@ -71,6 +253,7 @@ impl ScoreMatrix {
         };
 
         let params = standard_matrix.constants(go, ge)?;
+        let matrix_statistics = super::matrix_data::get(standard_matrix);
 
         // Build the 32x32 matrices from the AMINO_ACID_COUNT x AMINO_ACID_COUNT scores.
         // C++ `Scores<T>::Scores` (`diamond/src/stats/score_matrix.h:38-46`) fills
@@ -103,12 +286,7 @@ impl ScoreMatrix {
         }
 
         // Compute bias (minimum score, negated)
-        let min_score = matrix8
-            .iter()
-            .filter(|&&s| s != i8::MIN)
-            .copied()
-            .min()
-            .unwrap_or(0);
+        let min_score = matrix_low_score(&matrix32);
         let bias = if min_score < 0 { -min_score } else { 0 };
 
         // Build unsigned biased matrix. Out-of-range cells must match C++:
@@ -122,33 +300,35 @@ impl ScoreMatrix {
             }
         }
 
+        let matrix8_low = build_i8_scores(&standard_matrix.scores, stop_match_score, 0, 16, 0);
+        let matrix8_high = build_i8_scores(&standard_matrix.scores, stop_match_score, 0, 16, 16);
+        let matrix8u_low = build_i8_scores(&standard_matrix.scores, stop_match_score, bias, 16, 0);
+        let matrix8u_high =
+            build_i8_scores(&standard_matrix.scores, stop_match_score, bias, 16, 16);
+        let matrix16 = build_i16_scores(&standard_matrix.scores, stop_match_score);
+        let mut matrix32_scaled = [-128i32; 32 * 32];
+        for i in 0..32 {
+            for j in 0..32 {
+                if i < AMINO_ACID_COUNT && j < AMINO_ACID_COUNT {
+                    matrix32_scaled[i * 32 + j] = if i < TRUE_AA as usize && j < TRUE_AA as usize {
+                        let ni = super::cbs::ALPH_TO_NCBI[i];
+                        let nj = super::cbs::ALPH_TO_NCBI[j];
+                        (matrix_statistics.freq_ratios[ni][nj].ln()
+                            / standard_matrix.ungapped_constants().lambda
+                            * scale as f64)
+                            .round() as i32
+                    } else {
+                        matrix32[i * 32 + j] * scale
+                    };
+                }
+            }
+        }
+
         let ln_k = params.k.ln();
         let mut background_scores = [0.0f64; TRUE_AA as usize];
-        let bg_freq: [f64; TRUE_AA as usize] = [
-            7.4216205067993410e-02,
-            5.1614486141284638e-02,
-            4.4645808512757915e-02,
-            5.3626000838554413e-02,
-            2.4687457167944848e-02,
-            3.4259650591416023e-02,
-            5.4311925684587502e-02,
-            7.4146941452644999e-02,
-            2.6212984805266227e-02,
-            6.7917367618953756e-02,
-            9.8907868497150955e-02,
-            5.8155682303079680e-02,
-            2.4990197579643110e-02,
-            4.7418459742284751e-02,
-            3.8538003320306206e-02,
-            5.7229029476494421e-02,
-            5.0891364550287033e-02,
-            1.3029956129972148e-02,
-            3.2281512313758580e-02,
-            7.2919098205619245e-02,
-        ];
         for i in 0..TRUE_AA as usize {
             for j in 0..TRUE_AA as usize {
-                background_scores[i] += bg_freq[j] * matrix32[i * 32 + j] as f64;
+                background_scores[i] += BLOSUM62_BACKGROUND_FREQS[j] * matrix32[i * 32 + j] as f64;
             }
         }
 
@@ -190,19 +370,151 @@ impl ScoreMatrix {
             matrix32,
             matrix8,
             matrix8u,
+            matrix8_low,
+            matrix8_high,
+            matrix8u_low,
+            matrix8u_high,
+            matrix16,
+            matrix32_scaled,
             bias,
             gap_open: go,
             gap_extend: ge,
             frame_shift,
             db_letters: db_letters as f64,
             ln_k,
-            scale: 1.0,
+            scale: scale as f64,
             lambda: params.lambda,
             k: params.k,
             name: matrix_name.to_lowercase(),
-            standard_matrix,
+            standard_matrix: Some(standard_matrix),
             background_scores,
             area_params,
+        })
+    }
+
+    /// Construct a score matrix from the custom matrix-file format.
+    pub fn from_custom_file(
+        matrix_file: impl AsRef<Path>,
+        gap_open: i32,
+        gap_extend: i32,
+        stop_match_score: i32,
+        db_letters: u64,
+    ) -> Result<Self, String> {
+        let contents = if matrix_file.as_ref().as_os_str().is_empty() {
+            String::new()
+        } else {
+            fs::read_to_string(matrix_file.as_ref()).map_err(|error| {
+                format!(
+                    "Failed to read custom scoring matrix '{}': {error}",
+                    matrix_file.as_ref().display()
+                )
+            })?
+        };
+        Self::from_custom_str(
+            &contents,
+            gap_open,
+            gap_extend,
+            stop_match_score,
+            db_letters,
+        )
+    }
+
+    /// In-memory counterpart of the custom-file constructor.
+    pub fn from_custom_str(
+        contents: &str,
+        gap_open: i32,
+        gap_extend: i32,
+        stop_match_score: i32,
+        db_letters: u64,
+    ) -> Result<Self, String> {
+        let score_array = custom_scores_from_str(contents, -gap_extend)?;
+        let mut matrix32 = [-128i32; 32 * 32];
+        let mut matrix8 = [i8::MIN; 32 * 32];
+        for i in 0..AMINO_ACID_COUNT {
+            for j in 0..AMINO_ACID_COUNT {
+                let score = score_array[i * AMINO_ACID_COUNT + j];
+                matrix8[i * 32 + j] = score;
+                matrix32[i * 32 + j] = score as i32;
+            }
+        }
+        if stop_match_score != 1 {
+            matrix8[24 * 32 + 24] = stop_match_score as i8;
+            matrix32[24 * 32 + 24] = stop_match_score;
+        }
+        let bias = -matrix_low_score(&matrix32);
+        let mut matrix8u = [128u8; 32 * 32];
+        for i in 0..AMINO_ACID_COUNT {
+            for j in 0..AMINO_ACID_COUNT {
+                matrix8u[i * 32 + j] = (matrix8[i * 32 + j] as i16 + bias as i16) as u8;
+            }
+        }
+        let matrix8_low = build_i8_scores(&score_array, stop_match_score, 0, 16, 0);
+        let matrix8_high = build_i8_scores(&score_array, stop_match_score, 0, 16, 16);
+        let matrix8u_low = build_i8_scores(&score_array, stop_match_score, bias, 16, 0);
+        let matrix8u_high = build_i8_scores(&score_array, stop_match_score, bias, 16, 16);
+        let matrix16 = build_i16_scores(&score_array, stop_match_score);
+        let matrix32_scaled = matrix32;
+
+        let substitution_scores = (0..TRUE_AA as usize)
+            .map(|i| {
+                (0..TRUE_AA as usize)
+                    .map(|j| score_array[i * AMINO_ACID_COUNT + j] as i64)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut evaluer = super::sls_alignment_evaluer::AlignmentEvaluer::new();
+        evaluer
+            .initGapped(
+                TRUE_AA as i64,
+                &substitution_scores,
+                &BLOSUM62_BACKGROUND_FREQS,
+                &BLOSUM62_BACKGROUND_FREQS,
+                gap_open as i64,
+                gap_extend as i64,
+                gap_open as i64,
+                gap_extend as i64,
+                false,
+                0.01,
+                0.05,
+                120.0,
+                1024.0,
+                1,
+                1.07,
+            )
+            .map_err(|_| {
+                "The ALP library failed to compute the statistical parameters for this matrix. It may help to adjust the gap penalty settings."
+                    .to_string()
+            })?;
+        let params = evaluer.parameters();
+        let mut background_scores = [0.0; TRUE_AA as usize];
+        for i in 0..TRUE_AA as usize {
+            for j in 0..TRUE_AA as usize {
+                background_scores[i] += BLOSUM62_BACKGROUND_FREQS[j] * matrix32[i * 32 + j] as f64;
+            }
+        }
+        Ok(Self {
+            matrix32,
+            matrix8,
+            matrix8u,
+            matrix8_low,
+            matrix8_high,
+            matrix8u_low,
+            matrix8u_high,
+            matrix16,
+            matrix32_scaled,
+            bias,
+            gap_open,
+            gap_extend,
+            frame_shift: 0,
+            db_letters: db_letters as f64,
+            ln_k: params.K.ln(),
+            scale: 1.0,
+            lambda: params.lambda,
+            k: params.K,
+            name: "custom".to_string(),
+            standard_matrix: None,
+            background_scores,
+            area_params: area_params_from_alp(params),
         })
     }
 
@@ -465,13 +777,80 @@ impl ScoreMatrix {
         &self.matrix8
     }
 
+    pub fn matrix8_low(&self) -> &[i8; 32 * 32] {
+        &self.matrix8_low
+    }
+
+    pub fn matrix8_high(&self) -> &[i8; 32 * 32] {
+        &self.matrix8_high
+    }
+
+    pub fn matrix8u(&self) -> &[u8; 32 * 32] {
+        &self.matrix8u
+    }
+
+    pub fn matrix8u_low(&self) -> &[i8; 32 * 32] {
+        &self.matrix8u_low
+    }
+
+    pub fn matrix8u_high(&self) -> &[i8; 32 * 32] {
+        &self.matrix8u_high
+    }
+
+    pub fn matrix16(&self) -> &[i16; 32 * 32] {
+        &self.matrix16
+    }
+
     /// Get the raw 32-bit score matrix data.
     pub fn matrix32(&self) -> &[i32; 32 * 32] {
         &self.matrix32
     }
 
+    pub fn matrix32_scaled(&self) -> &[i32; 32 * 32] {
+        &self.matrix32_scaled
+    }
+
+    pub fn matrix32_scaled_rows(&self) -> Vec<&[i32]> {
+        self.matrix32_scaled.chunks_exact(32).collect()
+    }
+
+    pub fn ungapped_lambda(&self) -> Option<f64> {
+        self.standard_matrix
+            .map(|matrix| matrix.ungapped_constants().lambda)
+    }
+
+    pub fn standard_matrix(&self) -> Option<&'static StandardMatrix> {
+        self.standard_matrix
+    }
+
+    pub fn joint_probs(&self) -> Option<&'static [f64; 20 * 20]> {
+        self.standard_matrix
+            .map(|matrix| super::matrix_data::get(matrix).joint_probs)
+    }
+
+    pub fn background_freqs(&self) -> &'static [f64; 20] {
+        self.standard_matrix
+            .map(|matrix| super::matrix_data::get(matrix).background_freqs)
+            .unwrap_or(&BLOSUM62_BACKGROUND_FREQS)
+    }
+
+    pub fn freq_ratios(&self) -> Option<&'static [[f64; 28]; 28]> {
+        self.standard_matrix
+            .map(|matrix| super::matrix_data::get(matrix).freq_ratios)
+    }
+
     pub fn background_scores(&self) -> &[f64; TRUE_AA as usize] {
         &self.background_scores
+    }
+}
+
+impl fmt::Display for ScoreMatrix {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "(Matrix={} Lambda={} K={} Penalties={}/{})",
+            self.name, self.lambda, self.k, self.gap_open, self.gap_extend
+        )
     }
 }
 
@@ -570,6 +949,43 @@ mod tests {
         assert!(sm.report_cutoff(50, 1e-10, 0.0, 1e-5));
         assert!(!sm.report_cutoff(50, 1e-4, 0.0, 1e-5));
         assert!(sm.report_cutoff(50, 1e-4, 10.0, 1e-5));
+        assert_eq!(sm.matrix8_low()[0], 4);
+        assert_eq!(sm.matrix8_high()[0], 0);
+        assert_eq!(sm.matrix8u_low()[0], 16);
+        assert_eq!(sm.matrix16()[0], 4);
+        assert_eq!(sm.matrix32_scaled()[0], 4);
+        assert_eq!(sm.matrix32_scaled_rows().len(), 32);
+        assert_eq!(sm.ungapped_lambda(), Some(0.3176));
+        assert_eq!(
+            sm.to_string(),
+            "(Matrix=blosum62 Lambda=0.267 K=0.041 Penalties=11/1)"
+        );
+    }
+
+    #[test]
+    fn scaled_matrix_and_score_views_match_cpp_layout() {
+        let sm = ScoreMatrix::new_scaled("blosum62", 11, 1, 0, 1, 0, 4).unwrap();
+        assert_eq!(sm.matrix32_scaled()[0], 17);
+        assert_eq!(sm.matrix32_scaled()[31], -128);
+        assert_eq!(sm.matrix8_high()[0], 0); // A-T: high half starts at index 16
+        assert_eq!(sm.matrix8u_high()[0], 12); // A-T (0) plus BLOSUM62 bias 12
+        assert_eq!(sm.matrix8u()[31], 128);
+        assert_eq!(sm.joint_probs().unwrap().len(), 400);
+        assert_eq!(sm.background_freqs(), &BLOSUM62_BACKGROUND_FREQS);
+        assert!((sm.freq_ratios().unwrap()[1][1] - 3.90294070).abs() < 1e-8);
+    }
+
+    #[test]
+    fn custom_score_parser_maps_header_rows_and_hard_mask() {
+        let scores = custom_scores_from_str("# compact matrix\nA R\nA 5 -2\nR -3 7\n", -1).unwrap();
+        assert_eq!(scores[0], 5);
+        assert_eq!(scores[1], -2);
+        assert_eq!(scores[AMINO_ACID_COUNT], -3);
+        assert_eq!(scores[AMINO_ACID_COUNT + 1], 7);
+        let hard_mask = crate::basic::value::SUPER_HARD_MASK as usize;
+        assert_eq!(scores[hard_mask], -3);
+        assert_eq!(scores[hard_mask * AMINO_ACID_COUNT], -3);
+        assert!(custom_scores_from_str("A R\nR 1 2\n", -1).is_err());
     }
 
     #[test]

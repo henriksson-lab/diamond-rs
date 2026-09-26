@@ -1,5 +1,6 @@
 use crate::align::hsp::{Hsp, Match};
 use crate::basic::value::{BlockId, Letter};
+use crate::dna::build_score::Blastn_Score;
 
 pub fn scoring_function(match_score: i32, mismatch: i32, first: Letter, second: Letter) -> i32 {
     if first == second {
@@ -47,24 +48,25 @@ pub fn local_alignment(
     target_seqs: &[Vec<Letter>],
     query_sequence: &[Letter],
     query_id: BlockId,
-    match_score: i32,
-    mismatch: i32,
-    gapopen: i32,
-    gapextend: i32,
+    score_builder: &Blastn_Score,
 ) -> Vec<Match> {
     let mut matches = Vec::new();
 
     for (i, target_sequence) in target_seqs.iter().enumerate() {
-        let mut m = Match::new(query_id, i as u64);
+        let mut m = Match::new_extension(query_id, target_sequence, None, 0, 0, f64::MAX);
+        m.target_oid = i as u64;
         let score = dynamic_programm(
             target_sequence,
             query_sequence,
-            match_score,
-            mismatch,
-            gapopen,
-            gapextend,
+            score_builder.reward(),
+            score_builder.penalty(),
+            score_builder.gap_open(),
+            score_builder.gap_extend(),
         );
-        m.hsps.push(Hsp::with_score(false, score, 0));
+        let mut hsp = Hsp::with_score(false, score, 0);
+        hsp.bit_score = score_builder.blast_bit_score(score);
+        hsp.evalue = score_builder.blast_e_value(score, query_sequence.len() as i32);
+        m.hsps.push(hsp);
         matches.push(m);
     }
 
@@ -106,12 +108,23 @@ mod tests {
     fn test_local_alignment_builds_matches() {
         let query = dna(b"ACGT");
         let targets = vec![dna(b"ACGT"), dna(b"TTTT")];
-        let matches = local_alignment(&targets, &query, 9, 2, -3, 5, 2);
+        let score_builder =
+            Blastn_Score::new_with_parameters(2, -3, 5, 2, 1000, 2, 0.625, 0.41, 1.1);
+        let matches = local_alignment(&targets, &query, 9, &score_builder);
 
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].target_block_id, 9);
         assert_eq!(matches[0].target_oid, 0);
+        assert_eq!(matches[0].seq, targets[0]);
         assert_eq!(matches[0].hsps[0].score, 8);
+        assert_eq!(
+            matches[0].hsps[0].bit_score,
+            score_builder.blast_bit_score(8)
+        );
+        assert_eq!(
+            matches[0].hsps[0].evalue,
+            score_builder.blast_e_value(8, query.len() as i32)
+        );
         assert_eq!(matches[1].target_oid, 1);
         assert_eq!(matches[1].hsps[0].score, 2);
     }

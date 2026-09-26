@@ -1,6 +1,7 @@
 pub mod hamming;
 pub mod hamming_filter;
 pub mod hit;
+pub mod hit_buffer;
 pub mod kmer_ranking;
 pub mod left_most;
 pub mod parallel;
@@ -8,6 +9,7 @@ pub mod seed_array;
 pub mod seed_complexity;
 pub mod seed_match;
 pub mod sensitivity;
+pub mod setup;
 pub mod sse_dist;
 pub mod stage0;
 pub mod stage2;

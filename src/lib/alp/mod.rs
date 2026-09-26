@@ -1,0 +1,15 @@
+pub mod njn_dynprogprob;
+pub mod njn_dynprogproblim;
+pub mod njn_dynprogprobproto;
+pub mod njn_ioutil;
+pub mod njn_localmaxstat;
+pub mod njn_localmaxstatmatrix;
+pub mod njn_localmaxstatutil;
+pub mod njn_random;
+pub mod sls_alignment_evaluer;
+pub mod sls_alp;
+pub mod sls_alp_data;
+pub mod sls_alp_regression;
+pub mod sls_alp_sim;
+pub mod sls_basic;
+pub mod sls_pvalues;

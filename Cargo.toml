@@ -15,7 +15,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-rs"] }
+nalgebra = "0.32.6"
 rayon = "1"
 zstd = "0.13"
 

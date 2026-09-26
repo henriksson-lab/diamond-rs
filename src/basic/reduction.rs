@@ -1,6 +1,34 @@
+//! Alphabet reduction implementation translated from
+//! `diamond/src/basic/basic.cpp` (`Reduction::Reduction` and `decode_seed`).
+
 use super::value::{
     Letter, AMINO_ACID_ALPHABET, DELIMITER_LETTER, MASK_LETTER, STOP_LETTER, TRUE_AA,
 };
+
+/// `Stats::blosum62.background_freqs` in the original implementation.
+/// Order follows DIAMOND's canonical amino-acid alphabet.
+const BLOSUM62_BACKGROUND_FREQS: [f64; TRUE_AA as usize] = [
+    7.4216205067993410e-02,
+    5.1614486141284638e-02,
+    4.4645808512757915e-02,
+    5.3626000838554413e-02,
+    2.4687457167944848e-02,
+    3.4259650591416023e-02,
+    5.4311925684587502e-02,
+    7.4146941452644999e-02,
+    2.6212984805266227e-02,
+    6.7917367618953756e-02,
+    9.8907868497150955e-02,
+    5.8155682303079680e-02,
+    2.4990197579643110e-02,
+    4.7418459742284751e-02,
+    3.8538003320306206e-02,
+    5.7229029476494421e-02,
+    5.0891364550287033e-02,
+    1.3029956129972148e-02,
+    3.2281512313758580e-02,
+    7.2919098205619245e-02,
+];
 
 /// Default reduction definition: maps 20 amino acids to 10 Murphy groups.
 pub const DEFAULT_REDUCTION: &str = "A KR EDNQ C G H ILVM FYW P ST";
@@ -33,10 +61,10 @@ impl Reduction {
         let bit_size_exact = (size as f64).ln() / 2.0_f64.ln();
         let bit_size = bit_size_exact.ceil() as i32;
 
-        let freq = [0.0f64; TRUE_AA as usize];
+        let mut freq = [0.0f64; TRUE_AA as usize];
 
         // Build a simple char->letter lookup from the alphabet
-        let mut char_to_letter = [0u8; 256];
+        let mut char_to_letter = [u8::MAX; 256];
         for (i, &ch) in alphabet.iter().enumerate() {
             char_to_letter[ch as usize] = i as u8;
             char_to_letter[(ch as char).to_ascii_lowercase() as usize] = i as u8;
@@ -44,11 +72,23 @@ impl Reduction {
 
         for (i, token) in tokens.iter().enumerate() {
             for ch in token.bytes() {
-                let letter = char_to_letter[ch as usize] as usize;
+                let letter = char_to_letter[ch as usize];
+                assert_ne!(
+                    letter,
+                    u8::MAX,
+                    "Invalid character in sequence: '{}'",
+                    ch as char
+                );
+                let letter = letter as usize;
                 map[letter] = i as u32;
                 map8[letter] = i as Letter;
                 map8b[letter] = i as Letter;
+                freq[i] += BLOSUM62_BACKGROUND_FREQS[letter];
             }
+        }
+
+        for value in &mut freq {
+            *value = value.ln();
         }
 
         map8[MASK_LETTER as u8 as usize] = size as Letter;
@@ -160,11 +200,26 @@ mod tests {
     }
 
     #[test]
+    fn test_reduction_bucket_frequencies_match_blosum62_groups() {
+        let r = Reduction::default_reduction();
+        assert!((r.freq(0) - BLOSUM62_BACKGROUND_FREQS[0].ln()).abs() < 1e-15);
+        let kr = (BLOSUM62_BACKGROUND_FREQS[11] + BLOSUM62_BACKGROUND_FREQS[1]).ln();
+        assert!((r.freq(1) - kr).abs() < 1e-15);
+        assert!(r.freq(10).is_infinite() && r.freq(10).is_sign_negative());
+    }
+
+    #[test]
     fn test_reduction_display_and_decode_seed() {
         let r = Reduction::default_reduction();
         assert_eq!(format!("{}", r), "[A][RK][NDQE][C][G][H][ILMV][FWY][P][ST]");
         assert_eq!(r.decode_seed(0, 3), "AAA");
         assert_eq!(r.decode_seed(1, 3), "AAR");
         assert_eq!(r.decode_seed(10, 3), "ARA");
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid character in sequence: '!'")]
+    fn test_reduction_rejects_unknown_definition_letters() {
+        let _ = Reduction::new("A !", AMINO_ACID_ALPHABET);
     }
 }

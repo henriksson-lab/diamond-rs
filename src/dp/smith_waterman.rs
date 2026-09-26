@@ -1,18 +1,11 @@
 use crate::basic::packed_transcript::EditOperation;
-use crate::basic::value::{Letter, LETTER_MASK, SEED_MASK};
+use crate::basic::value::{Letter, LETTER_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
 
-/// Score a pair of letters. If either residue carries the soft-mask bit
-/// (high bit / `SEED_MASK`), the match score is zeroed — this matches
-/// C++ DIAMOND's banded swipe score profile, which uses `_mm256_shuffle_epi8`
-/// with the high bit set to make masked positions produce 0 scores. This is
-/// essential for sequences with tantan-masked repeats so that the repeat
-/// region doesn't artificially inflate self-similarity scores.
+/// Score a pair of letters after stripping sequence mask bits, matching the
+/// default C++ `SEQ_MASK` build's `Sequence::operator[]`.
 #[inline]
-fn score_letters(q: Letter, s: Letter, sm: &ScoreMatrix) -> i32 {
-    if ((q | s) & SEED_MASK) != 0 {
-        return 0;
-    }
+pub(crate) fn score_letters(q: Letter, s: Letter, sm: &ScoreMatrix) -> i32 {
     sm.score(q & LETTER_MASK, s & LETTER_MASK)
 }
 
@@ -29,7 +22,7 @@ pub struct SwResult {
     pub mismatches: i32,
     pub gap_openings: i32,
     pub gaps: i32,
-    /// Edit operations (reversed, from end to start).
+    /// Edit operations in forward alignment order.
     pub operations: Vec<(EditOperation, i32)>,
 }
 
@@ -95,10 +88,10 @@ pub fn smith_waterman(
 
     // Fill DP matrix
     let mut dp = DpMatrix::new(qlen, slen);
-    let mut hgap = vec![i32::MIN / 2; qlen + 1]; // horizontal gap scores
+    let mut hgap = vec![i32::MIN + gap_extend; qlen + 1]; // horizontal gap scores
 
     for j in 1..=slen {
-        let mut vgap = i32::MIN / 2; // vertical gap score
+        let mut vgap = i32::MIN + gap_extend; // vertical gap score
         for i in 1..=qlen {
             let match_score = score_letters(query[i - 1], subject[j - 1], score_matrix);
             let diag = dp.get(i - 1, j - 1) + match_score;
@@ -165,9 +158,7 @@ pub fn smith_waterman(
             result.gap_openings += 1;
             i -= gap_len as usize;
         } else {
-            // No path reconstructable — should be unreachable for a valid DP
-            // matrix at this cell; bail out of the trace.
-            break;
+            panic!("Traceback error.");
         }
     }
 
@@ -188,9 +179,6 @@ fn hgap_length(dp: &DpMatrix, i: usize, j: usize, gap_open: i32, gap_extend: i32
         if score == expected {
             return Some(k as i32);
         }
-        if expected < 0 {
-            break;
-        }
     }
     None
 }
@@ -202,9 +190,6 @@ fn vgap_length(dp: &DpMatrix, i: usize, j: usize, gap_open: i32, gap_extend: i32
         let expected = dp.get(i - k, j) - gap_open - (k as i32 - 1) * gap_extend;
         if score == expected {
             return Some(k as i32);
-        }
-        if expected < 0 {
-            break;
         }
     }
     None
@@ -226,10 +211,10 @@ pub fn smith_waterman_cbs(
     let gap_extend = score_matrix.gap_extend();
 
     let mut dp = DpMatrix::new(qlen, slen);
-    let mut hgap = vec![i32::MIN / 2; qlen + 1];
+    let mut hgap = vec![i32::MIN + gap_extend; qlen + 1];
 
     for j in 1..=slen {
-        let mut vgap = i32::MIN / 2;
+        let mut vgap = i32::MIN + gap_extend;
         for i in 1..=qlen {
             let match_score =
                 score_letters(query[i - 1], subject[j - 1], score_matrix) + query_cbs[i - 1] as i32; // CBS correction
@@ -293,7 +278,7 @@ pub fn smith_waterman_cbs(
             result.gap_openings += 1;
             i -= gap_len as usize;
         } else {
-            break;
+            panic!("Traceback error.");
         }
     }
 

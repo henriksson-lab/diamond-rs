@@ -1,3 +1,12 @@
+pub use super::alt_hsp::recompute_alt_hsps;
+pub use super::culling::{
+    append_hits_targets, apply_filters, culling_targets, inner_hsp_culling, match_inner_culling,
+    match_max_hsp_culling, max_hsp_culling, output_range_targets, HspFilterConfig,
+};
+pub use super::full_db::full_db_align;
+pub use super::gapped_final::{
+    add_final_dp_targets, align_targets_final, filter_hspvalues, first_round_filter_all,
+};
 use super::hsp::Match;
 use crate::align::gapped_filter::{
     gapped_filter_seed_hits, load_hits, seed_only_matches, SeedHit, SeedHitList,
@@ -7,13 +16,13 @@ use crate::align::hsp::Hsp;
 use crate::align::ungapped::{ungapped_stage_seed_hits, UngappedStageConfig};
 use crate::basic::consts::MAX_CONTEXT;
 use crate::basic::statistics::{StatValue, Statistics};
-use crate::basic::value::{BlockId, Letter, SUPER_HARD_MASK, TRUE_AA};
+use crate::basic::value::{BlockId, Letter, TRUE_AA};
 use crate::config::Sensitivity;
 use crate::data::block::Block;
 use crate::dp::anchored::{anchored_swipe, AnchoredSwipeConfig};
 use crate::dp::swipe::{
-    bin as swipe_bin, have_coords, swipe, swipe_set, targets as make_dp_targets,
-    Anchor as DpAnchor, CarryOver, DpTarget, Flags, HspValues, Params, Targets,
+    bin as swipe_bin, have_coords, swipe, targets as make_dp_targets, Anchor as DpAnchor,
+    CarryOver, DpTarget, Flags, HspValues, Params, Targets,
 };
 use crate::masking::{mask_sequence, MaskingAlgo};
 use crate::search::hit::Hit;
@@ -22,9 +31,7 @@ use crate::stats::cbs::TargetMatrix;
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::data_structures::FlatArray;
 use crate::util::hsp::{Anchor, ApproxHsp};
-use crate::util::sequence::is_fully_masked;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -123,156 +130,6 @@ impl Target {
         t.filter_score > u.filter_score
             || (t.filter_score == u.filter_score && t.block_id < u.block_id)
     }
-
-    /// Matches C++ `Target::inner_culling`.
-    pub fn inner_culling(
-        &mut self,
-        max_hsps: u32,
-        inner_culling_overlap: f64,
-        query_contexts: usize,
-    ) {
-        if max_hsps == 1 {
-            for i in 0..MAX_CONTEXT as usize {
-                if i as i32 == self.best_context {
-                    self.hsp[i].sort_by(|a, b| {
-                        if a.less_than_score_position(b) {
-                            std::cmp::Ordering::Less
-                        } else if b.less_than_score_position(a) {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Equal
-                        }
-                    });
-                    self.hsp[i].truncate(1);
-                } else {
-                    self.hsp[i].clear();
-                }
-            }
-            return;
-        }
-        let mut hsps = Vec::new();
-        for frame in 0..query_contexts {
-            hsps.append(&mut self.hsp[frame]);
-        }
-        inner_hsp_culling(&mut hsps, max_hsps, inner_culling_overlap);
-        for hsp in hsps {
-            self.hsp[hsp.frame as usize].push(hsp);
-        }
-    }
-
-    /// Matches C++ `Target::max_hsp_culling`.
-    pub fn max_hsp_culling(&mut self, max_hsps: u32, query_contexts: usize) {
-        for frame in 0..query_contexts {
-            max_hsp_culling(&mut self.hsp[frame], max_hsps);
-        }
-    }
-}
-
-/// Matches C++ `output_range()` for `Target` ranges.
-pub fn output_range_targets<F>(
-    targets: &[Target],
-    max_target_seqs: i64,
-    toppercent: Option<f64>,
-    mut bitscore: F,
-) -> usize
-where
-    F: FnMut(i32) -> f64,
-{
-    if targets.is_empty() || targets[0].filter_evalue == f64::MAX {
-        return 0;
-    }
-    if let Some(toppercent) = toppercent {
-        let cutoff = ((1.0 - toppercent / 100.0) * bitscore(targets[0].filter_score)).max(1.0);
-        let mut i = 0;
-        while i < targets.len() && bitscore(targets[i].filter_score) >= cutoff {
-            i += 1;
-        }
-        i
-    } else {
-        let mut i = (max_target_seqs as usize).min(targets.len());
-        while i > 1 && targets[i - 1].filter_evalue == f64::MAX {
-            i -= 1;
-        }
-        i
-    }
-}
-
-/// Matches C++ `culling(std::vector<Target>&, bool, const Search::Config&)`.
-pub fn culling_targets<F>(
-    targets: &mut Vec<Target>,
-    sort_only: bool,
-    max_target_seqs: i64,
-    toppercent: Option<f64>,
-    mut bitscore: F,
-) where
-    F: FnMut(i32) -> f64,
-{
-    if toppercent.is_some() {
-        targets.sort_by(|a, b| {
-            b.filter_score
-                .cmp(&a.filter_score)
-                .then_with(|| a.block_id.cmp(&b.block_id))
-        });
-    } else {
-        targets.sort_by(|a, b| {
-            a.filter_evalue
-                .total_cmp(&b.filter_evalue)
-                .then_with(|| b.filter_score.cmp(&a.filter_score))
-                .then_with(|| a.block_id.cmp(&b.block_id))
-        });
-    }
-    if !sort_only {
-        let end = output_range_targets(targets, max_target_seqs, toppercent, &mut bitscore);
-        targets.truncate(end);
-    }
-}
-
-/// Matches C++ `append_hits(vector<Target>&, begin, end, bool, const Search::Config&)`.
-pub fn append_hits_targets<F>(
-    targets: &mut Vec<Target>,
-    mut hits: Vec<Target>,
-    with_culling: bool,
-    max_target_seqs: i64,
-    toppercent: Option<f64>,
-    mut bitscore: F,
-) -> bool
-where
-    F: FnMut(i32) -> f64,
-{
-    if hits.is_empty() {
-        return false;
-    }
-    let mut new_hits = toppercent.is_none() && targets.len() < max_target_seqs as usize;
-    let mut append = !with_culling || new_hits;
-
-    culling_targets(targets, append, max_target_seqs, toppercent, &mut bitscore);
-
-    let mut max_score = 0;
-    let mut min_evalue = f64::MAX;
-    for hit in &hits {
-        max_score = max_score.max(hit.filter_score);
-        if hit.filter_evalue < min_evalue {
-            min_evalue = hit.filter_evalue;
-        }
-    }
-
-    let range_end = output_range_targets(targets, max_target_seqs, toppercent, &mut bitscore);
-    if targets.is_empty()
-        || range_end == 0
-        || (toppercent.is_none() && min_evalue <= targets[range_end - 1].filter_evalue)
-        || (toppercent.is_some()
-            && max_score
-                >= ((1.0 - toppercent.unwrap() / 100.0)
-                    * targets[range_end - 1].filter_score as f64) as i32)
-    {
-        append = true;
-        new_hits = true;
-    }
-
-    if append {
-        targets.append(&mut hits);
-    }
-    new_hits
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -824,7 +681,6 @@ where
             new_hits = !v.is_empty();
             round_new_hits = new_hits;
             if multi_chunk {
-                let aligned_len_before_append = aligned_targets.len();
                 new_hits = append_hits_targets(
                     &mut aligned_targets,
                     v,
@@ -833,25 +689,6 @@ where
                     cfg.toppercent,
                     |score| score_matrix.bitscore(score as f64),
                 );
-                if (cfg.ext_chunk_size == 0 || cfg.ext_chunk_size <= 128)
-                    && cfg.toppercent.is_none()
-                    && cfg.max_target_seqs <= 25
-                    && cfg.sensitivity < Sensitivity::VerySensitive
-                    && new_hits
-                    && aligned_targets.len() == aligned_len_before_append
-                    && i0 > 0
-                    && seed_hit_list.target_scores[i1 - 1].score
-                        < seed_hit_list.target_scores[i0 - 1].score
-                {
-                    culling_targets(
-                        &mut aligned_targets,
-                        false,
-                        cfg.max_target_seqs,
-                        cfg.toppercent,
-                        |score| score_matrix.bitscore(score as f64),
-                    );
-                    new_hits = false;
-                }
             } else {
                 aligned_targets = v;
             }
@@ -1249,50 +1086,6 @@ where
     )
 }
 
-/// Matches C++ `filter_hspvalues`.
-pub fn filter_hspvalues(cfg: &GappedScoreConfig) -> HspValues {
-    let mut hsp_values = HspValues::NONE;
-    if cfg.max_hsps != 1 {
-        hsp_values = hsp_values | HspValues::QUERY_COORDS | HspValues::TARGET_COORDS;
-    }
-    if cfg.min_id > 0.0 {
-        hsp_values = hsp_values | HspValues::IDENT | HspValues::LENGTH;
-    }
-    if cfg.approx_min_id > 0.0 {
-        hsp_values = hsp_values | HspValues::COORDS;
-    }
-    if cfg.query_cover > 0.0 {
-        hsp_values = hsp_values | HspValues::QUERY_COORDS;
-    }
-    if cfg.subject_cover > 0.0 {
-        hsp_values = hsp_values | HspValues::TARGET_COORDS;
-    }
-    if cfg.query_or_target_cover > 0.0 {
-        hsp_values = hsp_values | HspValues::COORDS;
-    }
-    hsp_values
-}
-
-/// Matches C++ `first_round_filter_all`.
-pub fn first_round_filter_all(cfg: &GappedScoreConfig, first_round_hsp_values: HspValues) -> bool {
-    if cfg.min_id > 0.0 && !first_round_hsp_values.all(HspValues::IDENT | HspValues::LENGTH) {
-        return false;
-    }
-    if cfg.approx_min_id > 0.0 && !first_round_hsp_values.all(HspValues::COORDS) {
-        return false;
-    }
-    if cfg.query_cover > 0.0 && !first_round_hsp_values.all(HspValues::QUERY_COORDS) {
-        return false;
-    }
-    if cfg.subject_cover > 0.0 && !first_round_hsp_values.all(HspValues::TARGET_COORDS) {
-        return false;
-    }
-    if cfg.query_or_target_cover > 0.0 && !first_round_hsp_values.all(HspValues::COORDS) {
-        return false;
-    }
-    true
-}
-
 /// Matches C++ `Extension::band`.
 pub fn band(len: i32, mode: ExtensionMode, padding: i32) -> i32 {
     if padding > 0 {
@@ -1544,6 +1337,7 @@ pub fn align_work_targets(
     if targets.is_empty() {
         return r;
     }
+    let swipe_statistics = Arc::new(Mutex::new(Statistics::new()));
     r.reserve(targets.len());
     let mut cbs_targets = 0;
 
@@ -1615,6 +1409,7 @@ pub fn align_work_targets(
             acfg.subject_cover = cfg.subject_cover;
             acfg.query_or_target_cover = cfg.query_or_target_cover;
             acfg.max_evalue = cfg.max_evalue;
+            acfg.statistics = Some(swipe_statistics.clone());
             anchored_swipe(&mut dp_targets[frame], &acfg)
         } else {
             let mut params = Params::new(&query_seq[frame], score_matrix);
@@ -1633,6 +1428,7 @@ pub fn align_work_targets(
             params.query_or_target_cover = cfg.query_or_target_cover;
             params.approx_min_id = cfg.approx_min_id;
             params.cbs_matrix_scale = cfg.cbs_matrix_scale;
+            params.statistics = Some(swipe_statistics.clone());
             swipe(&dp_targets[frame], &mut params)
         };
         for hsp in hsps {
@@ -1650,6 +1446,7 @@ pub fn align_work_targets(
             }
         }
     }
+    *stat += &swipe_statistics.lock().unwrap();
 
     let mut r2 = Vec::with_capacity(r.len());
     for mut target in r {
@@ -1661,557 +1458,6 @@ pub fn align_work_targets(
         }
     }
     r2
-}
-
-/// Matches C++ `full_db_align`.
-pub fn full_db_align(
-    query_seq: &[Vec<Letter>],
-    query_cbs: &[Vec<i8>],
-    flags: Flags,
-    hsp_values: HspValues,
-    stat: &mut Statistics,
-    target_block: &Block,
-    cfg: &GappedScoreConfig,
-    score_matrix: &ScoreMatrix,
-) -> Vec<Target> {
-    let _ = stat;
-    let ref_seqs = target_block.seqs();
-    let mut hsp = Vec::new();
-
-    for frame in 0..cfg.query_contexts {
-        let cbs = if cfg.comp_based_stats_hauser {
-            query_cbs.get(frame).map(Vec::as_slice)
-        } else {
-            None
-        };
-        let mut params = Params::new(&query_seq[frame], score_matrix);
-        params.query_id = Some("");
-        params.frame = frame as i32;
-        params.query_source_len = query_seq[frame].len() as i32;
-        params.composition_bias = cbs;
-        params.flags = flags | Flags::FULL_MATRIX;
-        params.target_max_len = ref_seqs.max_len(0, ref_seqs.len() as BlockId);
-        params.v = hsp_values;
-        params.cutoff_score_8bit = cfg.cutoff_score_8bit;
-        params.max_swipe_dp = cfg.max_swipe_dp;
-        params.approx_backtrace = cfg.approx_backtrace;
-        params.max_evalue = cfg.max_evalue;
-        params.query_cover = cfg.query_cover;
-        params.subject_cover = cfg.subject_cover;
-        params.query_or_target_cover = cfg.query_or_target_cover;
-        params.approx_min_id = cfg.approx_min_id;
-        params.cbs_matrix_scale = cfg.cbs_matrix_scale;
-        hsp.append(&mut swipe_set(ref_seqs, &mut params));
-    }
-
-    let mut subject_idx = BTreeMap::new();
-    let mut r = Vec::new();
-    for hsp in hsp {
-        let block_id = hsp.swipe_target as BlockId;
-        let idx = if let Some(&idx) = subject_idx.get(&block_id) {
-            idx
-        } else {
-            let idx = r.len();
-            subject_idx.insert(block_id, idx);
-            r.push(Target::new(
-                block_id,
-                ref_seqs.get(block_id as usize),
-                0,
-                None,
-            ));
-            idx
-        };
-        let frame = hsp.frame as usize;
-        let score = hsp.score;
-        let evalue = hsp.evalue;
-        let hsp_frame = hsp.frame;
-        let target = &mut r[idx];
-        target.hsp[frame].push(hsp);
-        if score > target.filter_score {
-            target.filter_evalue = evalue;
-            target.filter_score = score;
-            target.best_context = hsp_frame;
-        }
-    }
-
-    r
-}
-
-/// Matches C++ `add_dp_targets` in `gapped_final.cpp`.
-pub fn add_final_dp_targets(
-    target: &Target,
-    target_idx: usize,
-    query_seq: &[Vec<Letter>],
-    dp_targets: &mut [Targets; MAX_CONTEXT as usize],
-    flags: Flags,
-    hsp_values: HspValues,
-    cfg: &GappedScoreConfig,
-) {
-    let tlen = target.seq.len() as i32;
-    let score_width = target
-        .matrix
-        .as_deref()
-        .map(TargetMatrix::score_width)
-        .unwrap_or(0);
-    for frame in 0..cfg.query_contexts {
-        let qlen = query_seq[frame].len() as i32;
-        for hsp in &target.hsp[frame] {
-            let dp_size = if flags.any(Flags::FULL_MATRIX) {
-                qlen as i64 * tlen as i64
-            } else {
-                DpTarget::banded_cols(qlen, tlen, hsp.d_begin, hsp.d_end) as i64
-                    * (hsp.d_end - hsp.d_begin) as i64
-            };
-            let bin = swipe_bin(
-                hsp_values,
-                if flags.any(Flags::FULL_MATRIX) {
-                    qlen
-                } else {
-                    hsp.d_end - hsp.d_begin
-                },
-                hsp.score,
-                0,
-                dp_size,
-                score_width,
-                0,
-                cfg.cutoff_score_8bit,
-                cfg.max_swipe_dp,
-                cfg.approx_backtrace,
-            );
-            let mut dp = DpTarget::new(
-                target.seq.clone(),
-                tlen,
-                hsp.d_begin,
-                hsp.d_end,
-                target_idx as i64,
-                qlen,
-                CarryOver::default(),
-                DpAnchor::default(),
-            );
-            if let Some(matrix) = target.matrix.clone() {
-                dp = dp.with_matrix(matrix, cfg.cbs_matrix_scale);
-            }
-            dp_targets[frame][bin].push_back(dp);
-        }
-    }
-}
-
-/// Matches C++ `align(vector<Target>&, ...)` in `gapped_final.cpp`.
-pub fn align_targets_final(
-    targets: &mut Vec<Target>,
-    previous_matches: i64,
-    query_seq: &[Vec<Letter>],
-    query_id: &str,
-    query_cbs: &[Vec<i8>],
-    source_query_len: i32,
-    _query_self_aln_score: f64,
-    mut flags: Flags,
-    first_round: HspValues,
-    first_round_culling: bool,
-    mode: ExtensionMode,
-    stat: &mut Statistics,
-    cfg: &GappedScoreConfig,
-    score_matrix: &ScoreMatrix,
-    output_hsp_values: HspValues,
-) -> Vec<Match> {
-    const MIN_STEP: i64 = 16;
-    let mut r = Vec::new();
-    if targets.is_empty() {
-        return r;
-    }
-
-    let mut hsp_values = output_hsp_values;
-    let copy_all = cfg.max_hsps == 1
-        && first_round.all(hsp_values)
-        && first_round_filter_all(cfg, first_round);
-    if copy_all {
-        r.reserve(targets.len());
-    }
-    for target in targets.iter_mut() {
-        if copy_all || target.done {
-            r.push(Match::from_target_hsps(
-                target.block_id,
-                &target.seq,
-                target.matrix.clone(),
-                &mut target.hsp,
-                target.ungapped_score,
-                cfg.query_contexts,
-                cfg.max_hsps,
-            ));
-        }
-    }
-    if r.len() == targets.len() {
-        for m in &mut r {
-            let subject_seq = m.seq.clone();
-            match_apply_filters(
-                m,
-                source_query_len as u32,
-                query_id,
-                &query_seq[0],
-                subject_seq.len() as u32,
-                None,
-                &subject_seq,
-                cfg.min_id,
-                cfg.approx_min_id,
-                cfg.query_cover,
-                cfg.subject_cover,
-                cfg.query_or_target_cover,
-                cfg.no_self_hits,
-            );
-        }
-        return r;
-    }
-
-    if mode == ExtensionMode::Full {
-        flags = flags | Flags::FULL_MATRIX;
-    }
-    if mode == ExtensionMode::Global {
-        flags = flags | Flags::SEMI_GLOBAL;
-    }
-    hsp_values = hsp_values | filter_hspvalues(cfg);
-
-    let mut it = 0usize;
-    let goon = |matches_len: usize| {
-        cfg.toppercent.is_some() || (matches_len as i64 + previous_matches) < cfg.max_target_seqs
-    };
-
-    while it < targets.len() && goon(r.len()) {
-        let mut dp_targets: [Targets; MAX_CONTEXT as usize] =
-            std::array::from_fn(|_| make_dp_targets());
-        let remaining = targets.len() - it;
-        let step_size = if !first_round_culling && cfg.toppercent.is_none() {
-            let want = (cfg.max_target_seqs - r.len() as i64).max(MIN_STEP);
-            let step = ((want + MIN_STEP - 1) / MIN_STEP) * MIN_STEP;
-            step.min(remaining as i64) as usize
-        } else {
-            remaining
-        };
-        r.reserve(step_size);
-        let matches_begin = r.len();
-
-        for target in targets.iter().skip(it).take(step_size) {
-            if target.done {
-                continue;
-            }
-            add_final_dp_targets(
-                target,
-                r.len(),
-                query_seq,
-                &mut dp_targets,
-                flags,
-                hsp_values,
-                cfg,
-            );
-            r.push(Match::new_extension(
-                target.block_id,
-                &target.seq,
-                target.matrix.clone(),
-                target.ungapped_score,
-                0,
-                f64::MAX,
-            ));
-        }
-
-        for frame in 0..cfg.query_contexts {
-            let n: i64 = dp_targets[frame].iter().map(|v| v.size()).sum();
-            if n == 0 {
-                continue;
-            }
-            let cbs = if cfg.comp_based_stats_hauser {
-                query_cbs.get(frame).map(Vec::as_slice)
-            } else {
-                None
-            };
-            let mut params = Params::new(&query_seq[frame], score_matrix);
-            params.query_id = Some(query_id);
-            params.frame = frame as i32;
-            params.query_source_len = source_query_len;
-            params.composition_bias = cbs;
-            params.flags = flags;
-            params.v = hsp_values;
-            params.cutoff_score_8bit = cfg.cutoff_score_8bit;
-            params.max_swipe_dp = cfg.max_swipe_dp;
-            params.approx_backtrace = cfg.approx_backtrace;
-            params.max_evalue = cfg.max_evalue;
-            params.query_cover = cfg.query_cover;
-            params.subject_cover = cfg.subject_cover;
-            params.query_or_target_cover = cfg.query_or_target_cover;
-            params.approx_min_id = cfg.approx_min_id;
-            params.cbs_matrix_scale = cfg.cbs_matrix_scale;
-            let hsps = swipe(&dp_targets[frame], &mut params);
-            for hsp in hsps {
-                let idx = hsp.swipe_target as usize;
-                let score = hsp.score;
-                let evalue = hsp.evalue;
-                let m = &mut r[idx];
-                m.hsps.push(hsp);
-                if score > m.filter_score {
-                    m.filter_evalue = evalue;
-                    m.filter_score = score;
-                }
-            }
-        }
-
-        for m in r.iter_mut().skip(matches_begin) {
-            match_inner_culling(m, cfg.max_hsps, cfg.inner_culling_overlap);
-            // C++ `culling.cpp:84-86` reads `hsp.front()` after a sort by
-            // `Hsp::operator<` (score DESC, d_begin ASC, qpos ASC).
-            // `match_inner_culling` sorts via `less_than_score_position`
-            // which is the same comparator, so `hsps[0]` is the C++-front
-            // element. Rust's `Iterator::max_by` returns the LAST equal-max
-            // element — on score ties this picks the highest d_begin/qpos
-            // (worst by C++ ordering) and inverts the tie-break, perturbing
-            // downstream culling and output row order.
-            if let Some(best) = m.hsps.first() {
-                m.filter_score = best.score;
-                m.filter_evalue = best.evalue;
-            }
-            let subject_seq = m.seq.clone();
-            match_apply_filters(
-                m,
-                source_query_len as u32,
-                query_id,
-                &query_seq[0],
-                subject_seq.len() as u32,
-                None,
-                &subject_seq,
-                cfg.min_id,
-                cfg.approx_min_id,
-                cfg.query_cover,
-                cfg.subject_cover,
-                cfg.query_or_target_cover,
-                cfg.no_self_hits,
-            );
-        }
-        culling_matches(&mut r, cfg.max_target_seqs, cfg.toppercent, |score| {
-            score_matrix.bitscore(score as f64)
-        });
-        stat.inc(StatValue::TargetHits6, step_size as i64);
-        it += step_size;
-    }
-
-    recompute_alt_hsps(
-        &mut r,
-        query_seq,
-        query_cbs,
-        source_query_len,
-        hsp_values,
-        stat,
-        cfg,
-        score_matrix,
-    );
-    r
-}
-
-#[derive(Debug, Clone)]
-struct ActiveTarget {
-    match_index: usize,
-    masked_seq: [Option<Vec<Letter>>; MAX_CONTEXT as usize],
-    active: u32,
-}
-
-impl ActiveTarget {
-    /// Matches C++ `ActiveTarget::ActiveTarget`.
-    fn new(match_index: usize, m: &Match, query_contexts: usize) -> Self {
-        let mut masked_seq: [Option<Vec<Letter>>; MAX_CONTEXT as usize] =
-            std::array::from_fn(|_| None);
-        let mut reserved = 0u32;
-        for h in &m.hsps {
-            let bit = 1u32 << h.frame;
-            if reserved & bit == 0 && (h.frame as usize) < query_contexts {
-                masked_seq[h.frame as usize] = Some(m.seq.clone());
-                reserved |= bit;
-            }
-        }
-        Self {
-            match_index,
-            masked_seq,
-            active: 0,
-        }
-    }
-
-    /// Matches C++ `ActiveTarget::copy_seq`.
-    fn copy_seq(&mut self, m: &Match) {
-        for h in &m.hsps {
-            let frame = h.frame as usize;
-            if let Some(seq) = &mut self.masked_seq[frame] {
-                let begin = h.subject_range.begin.max(0) as usize;
-                let end = h
-                    .subject_range
-                    .end
-                    .max(h.subject_range.begin)
-                    .min(seq.len() as i32) as usize;
-                seq[begin..end].fill(SUPER_HARD_MASK);
-            }
-        }
-    }
-
-    /// Matches C++ `ActiveTarget::check_fully_masked`.
-    fn check_fully_masked(&mut self, query_contexts: usize) -> i32 {
-        let mut n = 0;
-        for i in 0..query_contexts {
-            if self.active & (1u32 << i) != 0 {
-                if self.masked_seq[i].as_deref().is_none_or(is_fully_masked) {
-                    self.active &= !(1u32 << i);
-                } else {
-                    n += 1;
-                }
-            }
-        }
-        n
-    }
-}
-
-/// Matches C++ `recompute_alt_hsps(TargetVec&, ...)`.
-fn recompute_alt_hsps_round(
-    matches: &mut [Match],
-    targets: &mut [ActiveTarget],
-    query_seq: &[Vec<Letter>],
-    query_cbs: &[Vec<i8>],
-    query_source_len: i32,
-    hsp_values: HspValues,
-    cfg: &GappedScoreConfig,
-    score_matrix: &ScoreMatrix,
-) -> Vec<ActiveTarget> {
-    let mut dp_targets: [Targets; MAX_CONTEXT as usize] =
-        std::array::from_fn(|_| make_dp_targets());
-    let qlen = query_seq[0].len() as i32;
-
-    for (target_idx, active) in targets.iter().enumerate() {
-        let m = &matches[active.match_index];
-        let dp_size = qlen as i64 * m.seq.len() as i64;
-        let score_width = m
-            .matrix
-            .as_deref()
-            .map(TargetMatrix::score_width)
-            .unwrap_or(0);
-        let bin = swipe_bin(
-            hsp_values,
-            qlen,
-            0,
-            0,
-            dp_size,
-            score_width,
-            0,
-            cfg.cutoff_score_8bit,
-            cfg.max_swipe_dp,
-            cfg.approx_backtrace,
-        );
-        for context in 0..cfg.query_contexts {
-            if let Some(masked) = &active.masked_seq[context] {
-                let mut dp = DpTarget::full(
-                    masked.clone(),
-                    masked.len() as i32,
-                    target_idx as i64,
-                    CarryOver::default(),
-                );
-                if let Some(matrix) = m.matrix.clone() {
-                    dp = dp.with_matrix(matrix, cfg.cbs_matrix_scale);
-                }
-                dp_targets[context][bin].push_back(dp);
-            }
-        }
-    }
-
-    for context in 0..cfg.query_contexts {
-        let cbs = if cfg.comp_based_stats_hauser {
-            query_cbs.get(context).map(Vec::as_slice)
-        } else {
-            None
-        };
-        let mut params = Params::new(&query_seq[context], score_matrix);
-        params.query_id = Some("");
-        params.frame = context as i32;
-        params.query_source_len = query_source_len;
-        params.composition_bias = cbs;
-        params.flags = Flags::FULL_MATRIX;
-        params.v = hsp_values;
-        params.cutoff_score_8bit = cfg.cutoff_score_8bit;
-        params.max_swipe_dp = cfg.max_swipe_dp;
-        params.approx_backtrace = cfg.approx_backtrace;
-        params.max_evalue = cfg.max_evalue;
-        params.query_cover = cfg.query_cover;
-        params.subject_cover = cfg.subject_cover;
-        params.query_or_target_cover = cfg.query_or_target_cover;
-        params.approx_min_id = cfg.approx_min_id;
-        params.cbs_matrix_scale = cfg.cbs_matrix_scale;
-        let hsps = swipe(&dp_targets[context], &mut params);
-        for hsp in hsps {
-            let active_idx = hsp.swipe_target as usize;
-            let match_idx = targets[active_idx].match_index;
-            let begin = hsp.subject_range.begin.max(0) as usize;
-            let end = hsp
-                .subject_range
-                .end
-                .max(hsp.subject_range.begin)
-                .min(matches[match_idx].seq.len() as i32) as usize;
-            matches[match_idx].hsps.push(hsp);
-            if let Some(masked) = &mut targets[active_idx].masked_seq[context] {
-                masked[begin..end].fill(SUPER_HARD_MASK);
-            }
-            targets[active_idx].active |= 1u32 << context;
-        }
-    }
-
-    let mut out = Vec::new();
-    for active in targets {
-        if active.active != 0 {
-            let m = &mut matches[active.match_index];
-            match_inner_culling(m, cfg.max_hsps, cfg.inner_culling_overlap);
-            // See comment above on `max_by` vs `first()` tie-break ordering.
-            if let Some(best) = m.hsps.first() {
-                m.filter_score = best.score;
-                m.filter_evalue = best.evalue;
-            }
-            if active.check_fully_masked(cfg.query_contexts) > 0
-                && (m.hsps.len() < cfg.max_hsps as usize || cfg.max_hsps == 0)
-            {
-                let mut next = active.clone();
-                for i in 0..cfg.query_contexts {
-                    if next.active & (1u32 << i) == 0 {
-                        next.masked_seq[i] = None;
-                    }
-                }
-                next.active = 0;
-                out.push(next);
-            }
-        }
-    }
-    out
-}
-
-/// Matches C++ `recompute_alt_hsps(vector<Match>::iterator, ...)`.
-pub fn recompute_alt_hsps(
-    matches: &mut [Match],
-    query_seq: &[Vec<Letter>],
-    query_cbs: &[Vec<i8>],
-    query_source_len: i32,
-    hsp_values: HspValues,
-    _stats: &mut Statistics,
-    cfg: &GappedScoreConfig,
-    score_matrix: &ScoreMatrix,
-) {
-    if cfg.max_hsps == 1 {
-        return;
-    }
-    let mut targets = Vec::with_capacity(matches.len());
-    for i in 0..matches.len() {
-        let mut active = ActiveTarget::new(i, &matches[i], cfg.query_contexts);
-        active.copy_seq(&matches[i]);
-        targets.push(active);
-    }
-    while !targets.is_empty() {
-        targets = recompute_alt_hsps_round(
-            matches,
-            &mut targets,
-            query_seq,
-            query_cbs,
-            query_source_len,
-            hsp_values,
-            cfg,
-            score_matrix,
-        );
-    }
 }
 
 /// Target culling — remove redundant targets based on overlap.
@@ -2305,95 +1551,17 @@ pub fn apply_top_percent(matches: &mut Vec<Match>, top_percent: f64) {
     matches.retain(|m| m.top_score() as f64 >= cutoff);
 }
 
-/// Matches C++ `Extension::max_hsp_culling(list<Hsp>&)`.
-pub fn max_hsp_culling(hsps: &mut Vec<Hsp>, max_hsps: u32) {
-    if max_hsps > 0 && hsps.len() > max_hsps as usize {
-        hsps.truncate(max_hsps as usize);
-    }
-}
-
-/// Matches C++ `Extension::inner_culling(list<Hsp>&)`.
-pub fn inner_hsp_culling(hsps: &mut Vec<Hsp>, max_hsps: u32, inner_culling_overlap: f64) {
-    if hsps.len() <= 1 {
-        return;
-    }
-    hsps.sort_by(|a, b| {
-        if a.less_than_score_position(b) {
-            std::cmp::Ordering::Less
-        } else if b.less_than_score_position(a) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    });
-    if max_hsps == 1 {
-        hsps.truncate(1);
-        return;
-    }
-    let overlap = inner_culling_overlap / 100.0;
-    let mut kept = Vec::with_capacity(hsps.len());
-    for hsp in hsps.drain(..) {
-        if !kept
-            .iter()
-            .any(|previous| hsp.is_enveloped_by(previous, overlap))
-        {
-            kept.push(hsp);
-        }
-    }
-    *hsps = kept;
-    if max_hsps > 0 {
-        max_hsp_culling(hsps, max_hsps);
-    }
-}
-
-/// Matches C++ `Match::inner_culling()`.
-pub fn match_inner_culling(m: &mut Match, max_hsps: u32, inner_culling_overlap: f64) {
-    inner_hsp_culling(&mut m.hsps, max_hsps, inner_culling_overlap);
-}
-
-/// Matches C++ `Match::max_hsp_culling()`.
-pub fn match_max_hsp_culling(m: &mut Match, max_hsps: u32) {
-    max_hsp_culling(&mut m.hsps, max_hsps);
-}
-
 /// Matches C++ `output_range()` for `Match` ranges.
 pub fn output_range_matches<F>(
     matches: &[Match],
     max_target_seqs: i64,
     toppercent: Option<f64>,
-    mut bitscore: F,
+    bitscore: F,
 ) -> usize
 where
     F: FnMut(i32) -> f64,
 {
-    if matches.is_empty() {
-        return 0;
-    }
-    // Use cached `filter_evalue` / `filter_score` to match C++
-    // (`diamond/src/align/culling.cpp:201`, `extend.h:58-63`). After
-    // `match_inner_culling` the cached values come from `hsps[0]` (the
-    // max-score HSP under `less_than_score_position` ordering); the
-    // alternative `top_evalue()`/`top_score()` scan over all HSPs and on
-    // CBS-adjusted alignments can pick a lower-score HSP whose evalue is
-    // smaller, which perturbs ordering and the empty-row guard relative to
-    // C++.
-    if matches[0].filter_evalue == f64::MAX {
-        return 0;
-    }
-    if let Some(toppercent) = toppercent {
-        let cutoff = ((1.0 - toppercent / 100.0) * bitscore(matches[0].filter_score)).max(1.0);
-        let mut i = 0;
-        while i < matches.len() && bitscore(matches[i].filter_score) >= cutoff {
-            i += 1;
-        }
-        i
-    } else {
-        let mut i = (max_target_seqs as usize).min(matches.len());
-        while i > 1 && matches[i - 1].filter_evalue == f64::MAX {
-            i -= 1;
-        }
-        i
-    }
+    super::culling::output_range_matches(matches, max_target_seqs, toppercent, bitscore)
 }
 
 /// Matches C++ `culling(std::vector<Match>&, const Search::Config&)`.
@@ -2401,31 +1569,11 @@ pub fn culling_matches<F>(
     matches: &mut Vec<Match>,
     max_target_seqs: i64,
     toppercent: Option<f64>,
-    mut bitscore: F,
+    bitscore: F,
 ) where
     F: FnMut(i32) -> f64,
 {
-    // Match C++ `Match::cmp_evalue` (`extend.h:58-63`): full chain is
-    // `evalue ASC → score DESC → target_block_id ASC`. The block_id tiebreak
-    // is required for deterministic order on equal-evalue-equal-score targets.
-    // Sort by cached filter fields to match C++ `Match::cmp_evalue` /
-    // `cmp_score` in `extend.h:58-72`. See `output_range_matches` above.
-    if toppercent.is_some() {
-        matches.sort_by(|a, b| {
-            b.filter_score
-                .cmp(&a.filter_score)
-                .then_with(|| a.target_block_id.cmp(&b.target_block_id))
-        });
-    } else {
-        matches.sort_by(|a, b| {
-            a.filter_evalue
-                .total_cmp(&b.filter_evalue)
-                .then_with(|| b.filter_score.cmp(&a.filter_score))
-                .then_with(|| a.target_block_id.cmp(&b.target_block_id))
-        });
-    }
-    let end = output_range_matches(matches, max_target_seqs, toppercent, &mut bitscore);
-    matches.truncate(end);
+    super::culling::culling_matches(matches, max_target_seqs, toppercent, bitscore);
 }
 
 /// Matches C++ `culling(std::vector<Match>&, ..., sort_only)`.
@@ -2434,78 +1582,39 @@ pub fn culling_matches_with_sort_only<F>(
     sort_only: bool,
     max_target_seqs: i64,
     toppercent: Option<f64>,
-    mut bitscore: F,
+    bitscore: F,
 ) where
     F: FnMut(i32) -> f64,
 {
-    // See `culling_matches`: sort by cached filter fields, not `top_*`.
-    if toppercent.is_some() {
-        matches.sort_by(|a, b| {
-            b.filter_score
-                .cmp(&a.filter_score)
-                .then_with(|| a.target_block_id.cmp(&b.target_block_id))
-        });
-    } else {
-        matches.sort_by(|a, b| {
-            a.filter_evalue
-                .total_cmp(&b.filter_evalue)
-                .then_with(|| b.filter_score.cmp(&a.filter_score))
-                .then_with(|| a.target_block_id.cmp(&b.target_block_id))
-        });
-    }
-    if !sort_only {
-        let end = output_range_matches(matches, max_target_seqs, toppercent, &mut bitscore);
-        matches.truncate(end);
-    }
+    super::culling::culling_matches_with_sort_only(
+        matches,
+        sort_only,
+        max_target_seqs,
+        toppercent,
+        bitscore,
+    );
 }
 
 /// Matches C++ `append_hits(vector<Match>&, begin, end, bool, const Search::Config&)`.
 pub fn append_hits_matches<F>(
     targets: &mut Vec<Match>,
-    mut hits: Vec<Match>,
+    hits: Vec<Match>,
     with_culling: bool,
     max_target_seqs: i64,
     toppercent: Option<f64>,
-    mut bitscore: F,
+    bitscore: F,
 ) -> bool
 where
     F: FnMut(i32) -> f64,
 {
-    if hits.is_empty() {
-        return false;
-    }
-    let mut new_hits = toppercent.is_none() && targets.len() < max_target_seqs as usize;
-    let mut append = !with_culling || new_hits;
-
-    culling_matches_with_sort_only(targets, append, max_target_seqs, toppercent, &mut bitscore);
-
-    // Compute the batch's best filter_score / filter_evalue for the
-    // "did this batch contribute?" check. Match C++ `append_hits`
-    // (`culling.cpp:127-136`), which uses cached filter fields.
-    let mut max_score = 0;
-    let mut min_evalue = f64::MAX;
-    for hit in &hits {
-        max_score = max_score.max(hit.filter_score);
-        min_evalue = min_evalue.min(hit.filter_evalue);
-    }
-
-    let range_end = output_range_matches(targets, max_target_seqs, toppercent, &mut bitscore);
-    if targets.is_empty()
-        || range_end == 0
-        || (toppercent.is_none() && min_evalue <= targets[range_end - 1].filter_evalue)
-        || (toppercent.is_some()
-            && max_score
-                >= ((1.0 - toppercent.unwrap() / 100.0)
-                    * targets[range_end - 1].filter_score as f64) as i32)
-    {
-        append = true;
-        new_hits = true;
-    }
-
-    if append {
-        targets.append(&mut hits);
-    }
-    new_hits
+    super::culling::append_hits_matches(
+        targets,
+        hits,
+        with_culling,
+        max_target_seqs,
+        toppercent,
+        bitscore,
+    )
 }
 
 /// Matches C++ `filter_hsp(...)` without optional MCL cluster-threshold evaluation.
@@ -2524,14 +1633,21 @@ pub fn filter_hsp(
     query_or_target_cover: f64,
     no_self_hits: bool,
 ) -> bool {
-    let qcov = hsp.query_cover_percent(source_query_len);
-    let tcov = hsp.subject_cover_percent(subject_len);
-    hsp.id_percent() < min_id
-        || (approx_min_id > 0.0 && hsp.approx_id < approx_min_id)
-        || qcov < query_cover
-        || tcov < subject_cover
-        || (qcov < query_or_target_cover && tcov < query_or_target_cover)
-        || (no_self_hits && query_seq == subject_seq && Some(query_title) == subject_title)
+    super::culling::filter_hsp(
+        hsp,
+        source_query_len,
+        query_title,
+        subject_len,
+        subject_title,
+        query_seq,
+        subject_seq,
+        min_id,
+        approx_min_id,
+        query_cover,
+        subject_cover,
+        query_or_target_cover,
+        no_self_hits,
+    )
 }
 
 /// Matches C++ `Match::apply_filters(...)` for an already materialized target sequence.
@@ -2550,33 +1666,21 @@ pub fn match_apply_filters(
     query_or_target_cover: f64,
     no_self_hits: bool,
 ) {
-    m.hsps.retain(|hsp| {
-        !filter_hsp(
-            hsp,
-            source_query_len,
-            query_title,
-            subject_len,
-            subject_title,
-            query_seq,
-            subject_seq,
-            min_id,
-            approx_min_id,
-            query_cover,
-            subject_cover,
-            query_or_target_cover,
-            no_self_hits,
-        )
-    });
-    // See comment above on `max_by` vs `first()` tie-break ordering — this
-    // path runs post-`inner_culling`, where `hsps[0]` is the C++-front
-    // element after sorting by score DESC, d_begin ASC, qpos ASC.
-    if let Some(best) = m.hsps.first() {
-        m.filter_score = best.score;
-        m.filter_evalue = best.evalue;
-    } else {
-        m.filter_score = 0;
-        m.filter_evalue = f64::MAX;
-    }
+    super::culling::match_apply_filters(
+        m,
+        source_query_len,
+        query_title,
+        query_seq,
+        subject_len,
+        subject_title,
+        subject_seq,
+        min_id,
+        approx_min_id,
+        query_cover,
+        subject_cover,
+        query_or_target_cover,
+        no_self_hits,
+    );
 }
 
 /// Matches C++ `apply_filters(vector<Match>::iterator, vector<Match>::iterator, ...)`.
@@ -2595,31 +1699,21 @@ pub fn apply_filters_matches(
     query_or_target_cover: f64,
     no_self_hits: bool,
 ) {
-    if min_id > 0.0
-        || approx_min_id > 0.0
-        || query_cover > 0.0
-        || subject_cover > 0.0
-        || query_or_target_cover > 0.0
-        || no_self_hits
-    {
-        for m in matches {
-            match_apply_filters(
-                m,
-                source_query_len,
-                query_title,
-                query_seq,
-                subject_len,
-                subject_title,
-                subject_seq,
-                min_id,
-                approx_min_id,
-                query_cover,
-                subject_cover,
-                query_or_target_cover,
-                no_self_hits,
-            );
-        }
-    }
+    super::culling::apply_filters_matches(
+        matches,
+        source_query_len,
+        query_title,
+        query_seq,
+        subject_len,
+        subject_title,
+        subject_seq,
+        min_id,
+        approx_min_id,
+        query_cover,
+        subject_cover,
+        query_or_target_cover,
+        no_self_hits,
+    );
 }
 
 #[cfg(test)]
@@ -3103,6 +2197,8 @@ mod tests {
         assert_eq!(out[0].block_id, 4);
         assert!(out[0].filter_score > 0);
         assert_eq!(out[0].hsp[0].len(), 1);
+        assert!(stat.get(StatValue::SwipeTasksTotal) > 0);
+        assert!(stat.get(StatValue::GrossDpCells) > 0);
     }
 
     #[test]

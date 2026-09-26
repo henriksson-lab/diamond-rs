@@ -884,6 +884,28 @@ pub fn banded_3frame_swipe_targets(
     overflow: &mut Vec<DpTarget>,
     dna_len: i32,
 ) -> Vec<Hsp> {
+    banded_3frame_swipe_targets_with_limit(
+        query,
+        targets,
+        score_only,
+        score_matrix,
+        stat,
+        overflow,
+        dna_len,
+        Some(i16::MAX as i32),
+    )
+}
+
+fn banded_3frame_swipe_targets_with_limit(
+    query: [&[Letter]; 3],
+    targets: &[DpTarget],
+    score_only: bool,
+    score_matrix: &ScoreMatrix,
+    stat: &mut DpStat,
+    overflow: &mut Vec<DpTarget>,
+    dna_len: i32,
+    score_limit: Option<i32>,
+) -> Vec<Hsp> {
     let mut out = Vec::new();
     for target in targets {
         let band = target.band().max(0) as usize;
@@ -898,7 +920,7 @@ pub fn banded_3frame_swipe_targets(
             target.d_end,
             score_matrix,
         );
-        if result.sw.score >= i16::MAX as i32 {
+        if score_limit.is_some_and(|limit| result.sw.score >= limit) {
             overflow.push(target.clone());
             continue;
         }
@@ -947,28 +969,62 @@ pub fn banded_3frame_swipe_target_range(
     score_only: bool,
     parallel: bool,
 ) -> Vec<Hsp> {
+    banded_3frame_swipe_target_range_with_limit(
+        query,
+        targets,
+        score_matrix,
+        stat,
+        score_only,
+        parallel,
+        i16::MAX as i32,
+    )
+}
+
+fn banded_3frame_swipe_target_range_with_limit(
+    query: [&[Letter]; 3],
+    targets: &mut [DpTarget],
+    score_matrix: &ScoreMatrix,
+    stat: &mut DpStat,
+    score_only: bool,
+    _parallel: bool,
+    score_only_limit: i32,
+) -> Vec<Hsp> {
     targets.sort_by_key(|target| (target.left_i1(), target.band(), target.cols));
     let mut overflow16 = Vec::new();
     let mut overflow32 = Vec::new();
-    let mut out = banded_3frame_swipe_targets(
-        query,
-        targets,
-        score_only,
-        score_matrix,
-        stat,
-        parallel,
-        &mut overflow16,
-        (query[0].len() * 3) as i32,
-    );
-    out.extend(banded_3frame_swipe_targets(
+    let dna_len = (query[0].len() * 3) as i32;
+    let mut out = if score_only {
+        banded_3frame_swipe_targets_with_limit(
+            query,
+            targets,
+            true,
+            score_matrix,
+            stat,
+            &mut overflow16,
+            dna_len,
+            Some(score_only_limit),
+        )
+    } else {
+        banded_3frame_swipe_targets_with_limit(
+            query,
+            targets,
+            false,
+            score_matrix,
+            stat,
+            &mut overflow16,
+            dna_len,
+            None,
+        )
+    };
+    out.extend(banded_3frame_swipe_targets_with_limit(
         query,
         &overflow16,
         score_only,
         score_matrix,
         stat,
-        false,
         &mut overflow32,
-        (query[0].len() * 3) as i32,
+        dna_len,
+        None,
     ));
     out
 }
@@ -1033,7 +1089,7 @@ fn traceback_to_hsp(
                             hsp.positives += 1;
                         }
                         hsp.transcript
-                            .push_with_letter(EditOperation::Substitution, s);
+                            .push_with_letter(EditOperation::Substitution, s & LETTER_MASK);
                         query_pos.translated += 1;
                         subject_pos += 1;
                     }
@@ -1045,8 +1101,10 @@ fn traceback_to_hsp(
                 }
                 EditOperation::Deletion => {
                     for _ in 0..len {
-                        hsp.transcript
-                            .push_with_letter(EditOperation::Deletion, target.seq[subject_pos]);
+                        hsp.transcript.push_with_letter(
+                            EditOperation::Deletion,
+                            target.seq[subject_pos] & LETTER_MASK,
+                        );
                         subject_pos += 1;
                     }
                 }
@@ -1160,7 +1218,7 @@ mod tests {
         let q1: Vec<Letter> = vec![13; 2];
         let q2: Vec<Letter> = vec![17; 2];
         let target = DpTarget::new(
-            vec![0, 2, 1],
+            vec![0, 2 | crate::basic::value::SEED_MASK, 1],
             3,
             -2,
             2,
@@ -1257,5 +1315,58 @@ mod tests {
         tb.walk_forward_shift();
         tb.walk_reverse_shift();
         let _ = tb.walk_gap(-1, 2, EditOperation::Deletion, 1);
+    }
+
+    #[test]
+    fn test_score_lane_overflow_is_retried_without_being_dropped() {
+        // C++ runs this orchestration first with i16 lanes and then i32 lanes.
+        // A small injected lane ceiling exercises the identical transition
+        // without requiring a >3,000-residue full scalar DP allocation.
+        const TEST_LANE_MAX: i32 = 100;
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 1000, 1, 0).unwrap();
+        let q0 = vec![17 as Letter; 200];
+        let q1 = vec![13 as Letter; 199];
+        let q2 = vec![13 as Letter; 199];
+        let make_target = || {
+            DpTarget::new(
+                q0.clone(),
+                q0.len() as i32,
+                -1,
+                2,
+                77,
+                q0.len() as i32,
+                CarryOver::default(),
+                Anchor::default(),
+            )
+        };
+        let mut targets = vec![make_target()];
+        let mut stat = DpStat::default();
+        let out = banded_3frame_swipe_target_range_with_limit(
+            [&q0, &q1, &q2],
+            &mut targets,
+            &sm,
+            &mut stat,
+            true,
+            false,
+            TEST_LANE_MAX,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].score >= TEST_LANE_MAX);
+        assert_eq!(out[0].swipe_target, 77);
+
+        // Traceback mode mirrors C++ by using i32 directly and must agree.
+        let mut traceback_targets = vec![make_target()];
+        let mut traceback_stat = DpStat::default();
+        let traceback = banded_3frame_swipe_target_range_with_limit(
+            [&q0, &q1, &q2],
+            &mut traceback_targets,
+            &sm,
+            &mut traceback_stat,
+            false,
+            false,
+            TEST_LANE_MAX,
+        );
+        assert_eq!(traceback.len(), 1);
+        assert_eq!(out[0].score, traceback[0].score);
     }
 }

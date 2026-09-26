@@ -57,6 +57,10 @@ pub fn multiply_by_a(beta: f64, y: &mut [f64], alphsize: usize, alpha: f64, x: &
             y[j] += alpha * x[i * alphsize + j];
         }
     }
+    // Keep the second traversal separate, including its floating-point
+    // accumulation order. This is the exact order used by NCBI's
+    // `MultiplyByA`; combining each row into a temporary sum changes Newton
+    // iterations for ill-conditioned composition matrices.
     for i in 1..alphsize {
         for j in 0..alphsize {
             y[i + alphsize - 1] += alpha * x[i * alphsize + j];

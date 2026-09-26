@@ -1,16 +1,21 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use crate::basic::value::{
-    is_amino_acid, letter_mask, Letter, AMINO_ACID_ALPHABET, LETTER_MASK, MASK_LETTER, SEED_MASK,
-    TRUE_AA,
-};
+use crate::basic::sequence::Sequence;
+use crate::basic::value::{Letter, MASK_LETTER, SEED_MASK};
+use crate::util::kmer::{Kmer, KmerIterator};
 
 mod motif_data;
 
+pub const MOTIF_LEN: usize = motif_data::MOTIF_LEN;
+
+/// Rust equivalent of C++ `motif_table`.
+pub static MOTIF_TABLE: OnceLock<MotifTable> = OnceLock::new();
+
 /// A motif table for identifying known low-complexity patterns.
+#[derive(Debug)]
 pub struct MotifTable {
-    table: HashSet<[u8; motif_data::MOTIF_LEN]>,
+    table: HashSet<Kmer<MOTIF_LEN>>,
 }
 
 impl MotifTable {
@@ -18,14 +23,21 @@ impl MotifTable {
     pub fn new() -> Self {
         let mut table = HashSet::with_capacity(motif_data::MOTIFS.len());
         for &motif in motif_data::MOTIFS {
-            table.insert(*motif);
+            // Every source entry is an eight-byte ASCII amino-acid string.
+            table.insert(Kmer::from_ascii(std::str::from_utf8(motif).unwrap()));
         }
         MotifTable { table }
     }
 
     /// Check if a kmer (as amino acid characters) is in the motif table.
-    pub fn contains(&self, kmer: &[u8; motif_data::MOTIF_LEN]) -> bool {
-        self.table.contains(kmer)
+    pub fn contains(&self, kmer: &[u8; MOTIF_LEN]) -> bool {
+        let text = std::str::from_utf8(kmer).expect("motifs must be ASCII");
+        self.table.contains(&Kmer::from_ascii(text))
+    }
+
+    #[inline]
+    pub fn contains_kmer(&self, kmer: Kmer<MOTIF_LEN>) -> bool {
+        self.table.contains(&kmer)
     }
 
     /// Find all motif positions in a sequence.
@@ -33,24 +45,16 @@ impl MotifTable {
     /// Returns a list of positions where motifs start.
     pub fn find_motifs(&self, seq: &[Letter]) -> Vec<usize> {
         let mut positions = Vec::new();
-        if seq.len() < motif_data::MOTIF_LEN {
+        if seq.len() < MOTIF_LEN {
             return positions;
         }
 
-        for i in 0..=(seq.len() - motif_data::MOTIF_LEN) {
-            let mut kmer = [0u8; motif_data::MOTIF_LEN];
-            let mut valid = true;
-            for j in 0..motif_data::MOTIF_LEN {
-                let l = (seq[i + j] & LETTER_MASK) as usize;
-                if l >= AMINO_ACID_ALPHABET.len() {
-                    valid = false;
-                    break;
-                }
-                kmer[j] = AMINO_ACID_ALPHABET[l];
+        let mut iterator = KmerIterator::<MOTIF_LEN>::new(Sequence::new(seq));
+        while iterator.good() {
+            if self.contains_kmer(iterator.get()) {
+                positions.push(iterator.offset_from_start() as usize);
             }
-            if valid && self.contains(&kmer) {
-                positions.push(i);
-            }
+            iterator.increment();
         }
 
         positions
@@ -72,6 +76,15 @@ impl Default for MotifTable {
     }
 }
 
+/// Initialize and return the process-wide motif table.
+///
+/// C++ mutates the global `motif_table` from `init_motif_table`; `OnceLock`
+/// gives the Rust port the same single initialized table without exposing an
+/// unsafe mutable global and makes repeated initialization idempotent.
+pub fn init_motif_table() -> &'static MotifTable {
+    MOTIF_TABLE.get_or_init(MotifTable::new)
+}
+
 /// Default cap from C++ `config.cpp:600`: `("max-motif-len", 0, "", max_motif_len, 30)`.
 const MAX_MOTIF_LEN: usize = 30;
 
@@ -80,38 +93,6 @@ const MAX_MOTIF_LEN: usize = 30;
 /// their letters.
 const ABORT_RATIO_NUM: usize = 1;
 const ABORT_RATIO_DEN: usize = 2;
-
-/// Lookup table built at first use: AA `Letter` value (0..19) → cached so the
-/// rolling kmer code in `mask_motifs` runs without HashSet overhead per byte.
-fn motif_code_set() -> &'static HashSet<u64> {
-    static SET: OnceLock<HashSet<u64>> = OnceLock::new();
-    SET.get_or_init(|| {
-        // Build a HashSet<u64> of motif codes in base-20 over the AA alphabet,
-        // matching C++ `Kmer<8>(const char* s)` in `util/kmer/kmer.h:54`. The
-        // motif strings are stored as AA character bytes (e.g. b'F'); convert
-        // them to letter indices via the alphabet lookup.
-        let mut char_to_letter = [u8::MAX; 256];
-        for (i, &c) in AMINO_ACID_ALPHABET
-            .iter()
-            .enumerate()
-            .take(TRUE_AA as usize)
-        {
-            char_to_letter[c as usize] = i as u8;
-            char_to_letter[(c as char).to_ascii_lowercase() as usize] = i as u8;
-        }
-        let mut set = HashSet::with_capacity(motif_data::MOTIFS.len());
-        for m in motif_data::MOTIFS {
-            let mut code = 0u64;
-            for &c in *m {
-                let l = char_to_letter[c as usize];
-                debug_assert!(l != u8::MAX);
-                code = code * TRUE_AA as u64 + l as u64;
-            }
-            set.insert(code);
-        }
-        set
-    })
-}
 
 /// A recorded motif mask — the byte that was overwritten with `MASK_LETTER`
 /// at `pos` was originally `original`. Used by `restore_motifs` to undo the
@@ -140,11 +121,10 @@ pub struct MotifMaskEntry {
 pub fn mask_motifs(seq: &mut [Letter]) -> Vec<MotifMaskEntry> {
     let mut saved = Vec::new();
     let len = seq.len();
-    if len < motif_data::MOTIF_LEN {
+    if len < MOTIF_LEN {
         return saved;
     }
-    let table = motif_code_set();
-    let modulus = (TRUE_AA as u64).pow(motif_data::MOTIF_LEN as u32 - 1);
+    let table = init_motif_table();
 
     // C++ uses `Mask::Ranges` (`masking/def.h:73-81`) which merges adjacent
     // / overlapping ranges in `push_back`: a new `[begin, end)` either extends
@@ -166,26 +146,13 @@ pub fn mask_motifs(seq: &mut [Letter]) -> Vec<MotifMaskEntry> {
         }
         hits.push((begin, end));
     };
-    let mut code: u64 = 0;
-    let mut filled: usize = 0;
-
-    for i in 0..len {
-        let l = letter_mask(seq[i]);
-        if is_amino_acid(l) && (l as i32) < TRUE_AA {
-            if filled == motif_data::MOTIF_LEN {
-                code %= modulus;
-            } else {
-                filled += 1;
-            }
-            code = code * TRUE_AA as u64 + l as u64;
-            if filled == motif_data::MOTIF_LEN && table.contains(&code) {
-                let start = i + 1 - motif_data::MOTIF_LEN;
-                push_merged(&mut hits, start, start + motif_data::MOTIF_LEN);
-            }
-        } else {
-            code = 0;
-            filled = 0;
+    let mut iterator = KmerIterator::<MOTIF_LEN>::new(Sequence::new(seq));
+    while iterator.good() {
+        if table.contains_kmer(iterator.get()) {
+            let start = iterator.offset_from_start() as usize;
+            push_merged(&mut hits, start, start + MOTIF_LEN);
         }
+        iterator.increment();
     }
 
     let total: usize = hits.iter().map(|(a, b)| b - a).sum();
@@ -274,6 +241,7 @@ fn apply_seed_mask_extension(seq: &mut [Letter], begin: usize, end: usize, templ
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basic::value::{AMINO_ACID_ALPHABET, LETTER_MASK};
 
     #[test]
     fn test_motif_table_init() {
@@ -281,6 +249,15 @@ mod tests {
         // 1000 active motifs (the C++ source has ~8000 but ~7000 are wrapped
         // in a /* ... */ comment and never inserted). No duplicates.
         assert_eq!(table.len(), 1000);
+    }
+
+    #[test]
+    fn init_motif_table_is_idempotent_and_process_wide() {
+        let first = init_motif_table();
+        let second = init_motif_table();
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(first.len(), 1000);
+        assert!(first.contains(b"KVRQYDQV"));
     }
 
     #[test]

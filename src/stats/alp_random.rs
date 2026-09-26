@@ -27,6 +27,24 @@ impl RandomState {
             rK: STATE_LEN - 1,
         }
     }
+
+    fn number(&mut self) -> i64 {
+        let r = self.state[self.rK].wrapping_add(self.state[self.rJ]);
+        self.state[self.rK] = r;
+
+        // C post-decrements both pointers before applying its wrap tests.
+        if self.rJ == 0 {
+            self.rJ = STATE_LEN - 1;
+            self.rK -= 1;
+        } else if self.rK == 0 {
+            self.rK = STATE_LEN - 1;
+            self.rJ -= 1;
+        } else {
+            self.rJ -= 1;
+            self.rK -= 1;
+        }
+        (r >> 1) & 0x7fff_ffff
+    }
 }
 
 static RANDOM_STATE: Mutex<RandomState> = Mutex::new(RandomState::new());
@@ -47,30 +65,14 @@ pub fn seed(x: i64) {
     random.rJ = R_OFF;
     random.rK = STATE_LEN - 1;
 
-    drop(random);
     for _ in 0..(10 * STATE_LEN) {
-        number();
+        random.number();
     }
 }
 
 pub fn number() -> i64 {
     let mut random = RANDOM_STATE.lock().unwrap();
-    let r = random.state[random.rK].wrapping_add(random.state[random.rJ]);
-    let rK = random.rK;
-    random.state[rK] = r;
-
-    if random.rJ == 0 {
-        random.rJ = STATE_LEN - 1;
-        random.rK -= 1;
-    } else if random.rK == 0 {
-        random.rK = STATE_LEN - 1;
-        random.rJ -= 1;
-    } else {
-        random.rJ -= 1;
-        random.rK -= 1;
-    }
-
-    (r >> 1) & 0x7fffffff
+    random.number()
 }
 
 #[cfg(test)]
@@ -99,5 +101,27 @@ mod tests {
         let _guard = TEST_RANDOM_LOCK.lock().unwrap();
         let value = number();
         assert!((0..=0x7fffffff).contains(&value));
+    }
+
+    #[test]
+    fn negative_and_extreme_seeds_retain_signed_long_wrapping() {
+        let _guard = TEST_RANDOM_LOCK.lock().unwrap();
+        seed(-1);
+        let negative: Vec<_> = (0..8).map(|_| number()).collect();
+        assert_eq!(
+            negative,
+            [
+                463_757_167,
+                1_727_264_988,
+                105_497_114,
+                1_446_351_531,
+                938_629_108,
+                1_746_641_206,
+                2_062_592_476,
+                1_337_070_476,
+            ]
+        );
+        seed(i64::MAX);
+        assert_eq!((0..8).map(|_| number()).collect::<Vec<_>>(), negative);
     }
 }

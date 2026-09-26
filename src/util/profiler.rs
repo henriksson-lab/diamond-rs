@@ -30,9 +30,6 @@ impl Profiler {
 
     pub fn print(n: usize) {
         let times = TIMES.lock().unwrap();
-        if n == 0 {
-            return;
-        }
         if let Ok(mut stream) = message_stream().lock() {
             for (key, value) in times.iter() {
                 let micros = *value as f64 / n as f64 / 1e3;

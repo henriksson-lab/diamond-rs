@@ -11,6 +11,37 @@ pub enum CullingResult {
     Include = 2,
 }
 
+/// Explicit replacement for the process-global `config` fields read by the
+/// C++ target-culling hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetCullingConfig {
+    pub query_range_culling: bool,
+    pub taxon_k: u32,
+    pub global_ranking_targets: i64,
+    pub toppercent: Option<f64>,
+    pub query_range_cover: f64,
+}
+
+impl Default for TargetCullingConfig {
+    fn default() -> Self {
+        Self {
+            query_range_culling: false,
+            taxon_k: 0,
+            global_ranking_targets: 0,
+            toppercent: None,
+            query_range_cover: 0.0,
+        }
+    }
+}
+
+/// Borrowed surface of C++ `Target` used by `TargetCulling`.
+#[derive(Debug, Clone, Copy)]
+pub struct CullingTarget<'a> {
+    pub filter_score: i32,
+    pub taxon_rank_ids: &'a [u32],
+    pub hsps: &'a [Hsp],
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalCulling {
     pub max_target_seqs: i64,
@@ -262,6 +293,101 @@ impl TargetCulling {
             Self::Global(GlobalCulling::new(max_target_seqs))
         }
     }
+
+    /// C++ `TargetCulling::get`, with the global selection flag explicit.
+    pub fn from_config(max_target_seqs: i64, config: &TargetCullingConfig) -> Self {
+        Self::get(max_target_seqs, config.query_range_culling)
+    }
+
+    /// Virtual `TargetCulling::cull(const Target&)` dispatch.
+    pub fn cull_target<F>(
+        &self,
+        target: CullingTarget<'_>,
+        config: &TargetCullingConfig,
+        bitscore: F,
+    ) -> (CullingResult, f64)
+    where
+        F: FnMut(i32) -> f64,
+    {
+        match self {
+            Self::Global(culling) => culling.cull_target(
+                target.filter_score,
+                target.taxon_rank_ids,
+                config.taxon_k,
+                config.toppercent,
+                bitscore,
+            ),
+            Self::Range(culling) => {
+                culling.cull_hsps(target.hsps, config.toppercent, config.query_range_cover)
+            }
+        }
+    }
+
+    /// Virtual `TargetCulling::cull(vector<IntermediateRecord>, set<TaxId>)`
+    /// dispatch.
+    pub fn cull_records<F>(
+        &self,
+        target_hsp: &[IntermediateRecord],
+        taxon_ids: &BTreeSet<u32>,
+        config: &TargetCullingConfig,
+        bitscore: F,
+    ) -> CullingResult
+    where
+        F: FnMut(u32) -> f64,
+    {
+        match self {
+            Self::Global(culling) => culling.cull_records(
+                target_hsp,
+                taxon_ids,
+                config.taxon_k,
+                config.global_ranking_targets,
+                config.toppercent,
+                bitscore,
+            ),
+            Self::Range(culling) => {
+                culling.cull_records(target_hsp, config.toppercent, config.query_range_cover)
+            }
+        }
+    }
+
+    /// Virtual `TargetCulling::add(const Target&)` dispatch.
+    pub fn add_target<F>(
+        &mut self,
+        target: CullingTarget<'_>,
+        config: &TargetCullingConfig,
+        bitscore: F,
+    ) where
+        F: FnMut(i32) -> f64,
+    {
+        match self {
+            Self::Global(culling) => culling.add_target(
+                target.filter_score,
+                target.taxon_rank_ids,
+                config.taxon_k,
+                bitscore,
+            ),
+            Self::Range(culling) => culling.add_hsps(target.hsps),
+        }
+    }
+
+    /// Virtual `TargetCulling::add(vector<IntermediateRecord>, set<TaxId>)`
+    /// dispatch.
+    pub fn add_records<F>(
+        &mut self,
+        target_hsp: &[IntermediateRecord],
+        taxon_ids: &BTreeSet<u32>,
+        config: &TargetCullingConfig,
+        bitscore: F,
+    ) where
+        F: FnMut(u32) -> f64,
+    {
+        match self {
+            Self::Global(culling) => {
+                culling.add_records(target_hsp, taxon_ids, config.taxon_k, bitscore)
+            }
+            Self::Range(culling) => culling.add_records(target_hsp),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -347,5 +473,131 @@ mod tests {
             TargetCulling::get(5, true),
             TargetCulling::Range(_)
         ));
+    }
+
+    #[test]
+    fn test_virtual_global_dispatch_preserves_cull_then_add_order() {
+        let config = TargetCullingConfig {
+            taxon_k: 1,
+            ..TargetCullingConfig::default()
+        };
+        let mut culling = TargetCulling::from_config(2, &config);
+        let hsps = [Hsp::new()];
+        let first = CullingTarget {
+            filter_score: 100,
+            taxon_rank_ids: &[7],
+            hsps: &hsps,
+        };
+        assert_eq!(
+            culling.cull_target(first, &config, |score| score as f64),
+            (CullingResult::Include, 0.0)
+        );
+        culling.add_target(first, &config, |score| score as f64);
+
+        let repeated_taxon = CullingTarget {
+            filter_score: 99,
+            taxon_rank_ids: &[7],
+            hsps: &hsps,
+        };
+        assert_eq!(
+            culling.cull_target(repeated_taxon, &config, |score| score as f64),
+            (CullingResult::Next, 0.0)
+        );
+        let new_taxon = CullingTarget {
+            filter_score: 98,
+            taxon_rank_ids: &[8],
+            hsps: &hsps,
+        };
+        assert_eq!(
+            culling.cull_target(new_taxon, &config, |score| score as f64),
+            (CullingResult::Include, 0.0)
+        );
+        culling.add_target(new_taxon, &config, |score| score as f64);
+        assert_eq!(
+            culling
+                .cull_target(
+                    CullingTarget {
+                        filter_score: 97,
+                        taxon_rank_ids: &[9],
+                        hsps: &hsps,
+                    },
+                    &config,
+                    |score| score as f64,
+                )
+                .0,
+            CullingResult::Finished
+        );
+    }
+
+    #[test]
+    fn test_virtual_record_dispatch_global_ranking_precedes_toppercent() {
+        let config = TargetCullingConfig {
+            global_ranking_targets: 1,
+            toppercent: Some(100.0),
+            ..TargetCullingConfig::default()
+        };
+        let mut culling = TargetCulling::from_config(20, &config);
+        let record = IntermediateRecord {
+            score: 100,
+            ..IntermediateRecord::default()
+        };
+        let taxons = BTreeSet::new();
+        assert_eq!(
+            culling.cull_records(&[record.clone()], &taxons, &config, |score| score as f64),
+            CullingResult::Include
+        );
+        culling.add_records(&[record.clone()], &taxons, &config, |score| score as f64);
+        assert_eq!(
+            culling.cull_records(&[record], &taxons, &config, |score| score as f64),
+            CullingResult::Finished
+        );
+    }
+
+    #[test]
+    fn test_virtual_range_dispatch_boundary_and_fraction() {
+        let config = TargetCullingConfig {
+            query_range_culling: true,
+            query_range_cover: 50.0,
+            ..TargetCullingConfig::default()
+        };
+        let mut culling = TargetCulling::from_config(1, &config);
+        let mut accepted = Hsp::new();
+        accepted.score = 100;
+        accepted.query_source_range = Interval::new(0, 100);
+        culling.add_target(
+            CullingTarget {
+                filter_score: 100,
+                taxon_rank_ids: &[],
+                hsps: std::slice::from_ref(&accepted),
+            },
+            &config,
+            |score| score as f64,
+        );
+
+        let mut candidate = Hsp::new();
+        candidate.score = 90;
+        candidate.query_source_range = Interval::new(50, 150);
+        let (result, coverage) = culling.cull_target(
+            CullingTarget {
+                filter_score: 90,
+                taxon_rank_ids: &[],
+                hsps: std::slice::from_ref(&candidate),
+            },
+            &config,
+            |score| score as f64,
+        );
+        assert_eq!(result, CullingResult::Next);
+        assert_eq!(coverage, 0.5);
+
+        let record = IntermediateRecord {
+            score: 90,
+            query_begin: 50,
+            query_end: 149,
+            ..IntermediateRecord::default()
+        };
+        assert_eq!(
+            culling.cull_records(&[record], &BTreeSet::new(), &config, |score| score as f64),
+            CullingResult::Next
+        );
     }
 }

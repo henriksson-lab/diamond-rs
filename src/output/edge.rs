@@ -36,9 +36,20 @@ impl EdgeData {
     }
 }
 
+/// Rust translation of C++ `Output::Format::Edge`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Edge;
+
+impl Edge {
+    /// Matches C++ `Output::Format::Edge::print_match`.
+    pub fn print_match<W: Write>(&self, writer: &mut W, r: &HspContext) -> io::Result<()> {
+        EdgeData::from_context(r).write(writer)
+    }
+}
+
 /// Matches C++ `Output::Format::Edge::print_match(r)`.
 pub fn print_match<W: Write>(writer: &mut W, r: &HspContext) -> io::Result<()> {
-    EdgeData::from_context(r).write(writer)
+    Edge.print_match(writer, r)
 }
 
 #[cfg(test)]
@@ -100,12 +111,16 @@ mod tests {
             0.0,
         );
         let mut buf = Vec::new();
-        print_match(&mut buf, &ctx).unwrap();
+        Edge.print_match(&mut buf, &ctx).unwrap();
         assert_eq!(buf.len(), EdgeData::SIZE);
         assert_eq!(u64::from_ne_bytes(buf[0..8].try_into().unwrap()), 3);
         assert_eq!(u64::from_ne_bytes(buf[8..16].try_into().unwrap()), 5);
         assert_eq!(f32::from_ne_bytes(buf[16..20].try_into().unwrap()), 50.0);
         assert_eq!(f32::from_ne_bytes(buf[20..24].try_into().unwrap()), 50.0);
         assert_eq!(f64::from_ne_bytes(buf[24..32].try_into().unwrap()), 19.5);
+
+        let mut compatibility = Vec::new();
+        print_match(&mut compatibility, &ctx).unwrap();
+        assert_eq!(compatibility, buf);
     }
 }

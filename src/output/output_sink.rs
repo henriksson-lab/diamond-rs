@@ -1,3 +1,4 @@
+use crate::util::data_structures::ReorderQueue;
 use crate::util::misc::megabytes;
 use std::io::{self, Write};
 use std::time::Duration;
@@ -14,6 +15,15 @@ impl<W> OutputWriter<W> {
     /// Matches C++ `OutputWriter::OutputWriter(file, sep, first)`.
     pub fn new(file: W, sep: u8, first: bool) -> Self {
         Self { file, first, sep }
+    }
+
+    /// C++ constructor defaults: `sep = '\0'`, `first = true`.
+    pub fn from_writer(file: W) -> Self {
+        Self::new(file, 0, true)
+    }
+
+    pub fn into_inner(self) -> W {
+        self.file
     }
 }
 
@@ -34,6 +44,20 @@ pub trait HeartbeatOutputSink {
     fn next(&mut self) -> usize;
     fn size(&self) -> usize;
     fn max_size(&self) -> usize;
+}
+
+impl<T> HeartbeatOutputSink for ReorderQueue<T> {
+    fn next(&mut self) -> usize {
+        ReorderQueue::next(self)
+    }
+
+    fn size(&self) -> usize {
+        ReorderQueue::size(self)
+    }
+
+    fn max_size(&self) -> usize {
+        ReorderQueue::max_size(self)
+    }
 }
 
 /// `Search::Config` surface used by C++ `heartbeat_worker`.
@@ -88,6 +112,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::data_structures::AllocSize;
 
     #[derive(Debug)]
     struct TestSink {
@@ -142,6 +167,49 @@ mod tests {
         writer.consume(b"one").unwrap();
         writer.consume(b"two").unwrap();
         assert_eq!(writer.file, b"onetwo");
+    }
+
+    #[derive(Debug)]
+    struct Buffer(Vec<u8>);
+
+    impl AllocSize for Buffer {
+        fn alloc_size(&self) -> usize {
+            self.0.capacity()
+        }
+    }
+
+    #[test]
+    fn test_reorder_queue_and_output_writer_preserve_cpp_binary_order() {
+        let mut queue = ReorderQueue::new(1);
+        let mut writer = OutputWriter::new(Vec::new(), b'|', true);
+
+        queue.push(2, Some(Buffer(b"two".to_vec())), |buf| {
+            writer.consume(&buf.0).unwrap()
+        });
+        assert_eq!(queue.next(), 1);
+        assert!(queue.size() >= 3);
+        assert!(queue.max_size() >= 3);
+
+        queue.push(1, Some(Buffer(b"one".to_vec())), |buf| {
+            writer.consume(&buf.0).unwrap()
+        });
+        assert_eq!(queue.next(), 3);
+        assert_eq!(writer.file, b"one|two");
+
+        queue.push(4, Some(Buffer(b"four".to_vec())), |buf| {
+            writer.consume(&buf.0).unwrap()
+        });
+        queue.push(3, None, |buf: Buffer| writer.consume(&buf.0).unwrap());
+        assert_eq!(queue.next(), 5);
+        assert_eq!(writer.file, b"one|two|four");
+    }
+
+    #[test]
+    fn test_output_writer_cpp_constructor_defaults() {
+        let mut writer = OutputWriter::from_writer(Vec::new());
+        writer.consume(b"a").unwrap();
+        writer.consume(b"b").unwrap();
+        assert_eq!(writer.into_inner(), b"ab");
     }
 
     #[test]

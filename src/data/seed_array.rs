@@ -1,3 +1,6 @@
+//! Partitioned seed storage translated from `data/seed_array.cpp` and
+//! `data/seed_array.h`.
+
 use crate::basic::packed_loc::PackedLoc;
 use crate::basic::seed::{
     seed_partition, seed_partition_offset, seedp_mask, PackedSeed, SeedOffset,
@@ -171,21 +174,27 @@ impl<SeedLoc: SeedLocation> SeedArray<SeedLoc> {
         let partition = enum_cfg
             .partition
             .ok_or_else(|| "EnumCfg::partition is required.".to_string())?;
+        if partition.len() < 2 {
+            return Err("EnumCfg::partition must contain at least two boundaries.".to_string());
+        }
+        if hst.len() != partition.len() - 1 {
+            return Err(
+                "Shape histogram row count must match sequence partition count.".to_string(),
+            );
+        }
         let mut callbacks: Vec<BuildCallback<SeedLoc>> = (0..partition.len() - 1)
-            .map(|_| BuildCallback::new(*range, &iterators, seedp_bits))
+            .map(|_| BuildCallback::new(*range, seedp_bits))
             .collect();
         let stats = enum_seeds_block(seqs, &mut callbacks, filter, enum_cfg, ctx)?;
 
-        for cb in callbacks {
-            for (shape, row) in cb.entries.into_iter().enumerate() {
-                for (part, entries) in row.into_iter().enumerate() {
-                    let mut dst = iterators[shape][part];
-                    for entry in entries {
-                        data[dst] = entry;
-                        dst += 1;
-                    }
-                    iterators[shape][part] = dst;
+        for (sequence_partition, cb) in callbacks.into_iter().enumerate() {
+            for (part, entries) in cb.it.out.into_iter().enumerate() {
+                let mut dst = iterators[sequence_partition][part];
+                for entry in entries {
+                    data[dst] = entry;
+                    dst += 1;
                 }
+                iterators[sequence_partition][part] = dst;
             }
         }
 
@@ -368,33 +377,20 @@ fn build_iterators(
 }
 
 struct BuildCallback<SeedLoc: SeedLocation> {
-    range: SeedPartitionRange,
     it: BufferedWriter<SeedLoc>,
-    entries: Vec<Vec<Vec<SeedArrayEntry<SeedLoc>>>>,
 }
 
 impl<SeedLoc: SeedLocation> BuildCallback<SeedLoc> {
-    fn new(range: SeedPartitionRange, iterators: &[Vec<usize>], seedp_bits: i32) -> Self {
+    fn new(range: SeedPartitionRange, seedp_bits: i32) -> Self {
         Self {
-            range,
             it: BufferedWriter::new(range, seedp_bits),
-            entries: vec![vec![Vec::new(); range.size() as usize]; iterators.len()],
         }
     }
 }
 
 impl<SeedLoc: SeedLocation> EnumSeedsCallback for BuildCallback<SeedLoc> {
-    fn call(&mut self, seed: u64, pos: usize, block_id: usize, shape: i32) -> bool {
+    fn call(&mut self, seed: u64, pos: usize, block_id: usize, _shape: i32) -> bool {
         self.it.push(seed, pos, block_id as u32);
-        let p = seed_partition(seed, self.it.seedp_mask);
-        if self.range.contains(p) {
-            let d = (p - self.range.begin()) as usize;
-            self.entries[shape as usize][d].push(SeedArrayEntry::with_block_id(
-                seed_partition_offset(seed, self.it.seedp_bits as u64),
-                PackedLoc::new(pos as u64),
-                block_id as u32,
-            ));
-        }
         true
     }
 }
@@ -470,7 +466,7 @@ mod tests {
     use crate::basic::shape_config::ShapeConfig;
     use crate::basic::value::SequenceType;
     use crate::data::flags::NO_FILTER;
-    use crate::data::seed_histogram::SeedPartitionRange;
+    use crate::data::seed_histogram::{SeedHistogram, SeedPartitionRange};
     use crate::masking::MaskingAlgo;
 
     fn enum_cfg<'a>(partition: Option<&'a Vec<u32>>, code: SeedEncoding) -> EnumCfg<'a> {
@@ -590,9 +586,23 @@ mod tests {
         };
         let mut block = block();
         let range = SeedPartitionRange::with_bounds(0, 4);
-        let partition = vec![0, 1, 2];
+        let histogram_cfg = enum_cfg(None, SeedEncoding::SpacedFactor);
+        let histogram = SeedHistogram::from_block(
+            &mut block,
+            false,
+            &NO_FILTER,
+            &histogram_cfg,
+            2,
+            2,
+            &shapes,
+            &reduction,
+            0,
+            1,
+        )
+        .unwrap();
+        let partition = histogram.partition().clone();
         let cfg = enum_cfg(Some(&partition), SeedEncoding::SpacedFactor);
-        let hst = vec![vec![2, 1, 1, 1]];
+        let hst = histogram.get(0).clone();
         let sa = SeedArray::<PackedLocId>::from_histogram(
             &mut block, &hst, &range, 2, &NO_FILTER, &cfg, &ctx,
         )
@@ -602,6 +612,87 @@ mod tests {
         assert_eq!(sa.begin(0).len(), 2);
         assert!(sa.begin(0).iter().any(|e| e.value.block_id == 0));
         assert!(sa.begin(0).iter().any(|e| e.value.block_id == 1));
+    }
+
+    #[test]
+    fn two_pass_uses_sequence_partition_rows_for_nonzero_shape() {
+        let reduction = Reduction::default_reduction();
+        let shapes =
+            ShapeConfig::from_codes(&["11".to_string(), "101".to_string()], 0, &reduction).unwrap();
+        let ctx = EnumSeedsContext {
+            shapes: &shapes,
+            reduction: &reduction,
+            min_query_len: 0,
+            query_contexts: 1,
+        };
+        let mut block = block();
+        let histogram_cfg = enum_cfg(None, SeedEncoding::SpacedFactor);
+        let histogram = SeedHistogram::from_block(
+            &mut block,
+            false,
+            &NO_FILTER,
+            &histogram_cfg,
+            0,
+            2,
+            &shapes,
+            &reduction,
+            0,
+            1,
+        )
+        .unwrap();
+        let partition = histogram.partition().clone();
+        let mut cfg = enum_cfg(Some(&partition), SeedEncoding::SpacedFactor);
+        cfg.shape_begin = 1;
+        cfg.shape_end = 2;
+        let range = SeedPartitionRange::with_bounds(0, 1);
+        let sa = SeedArray::<PackedLocId>::from_histogram(
+            &mut block,
+            histogram.get(1),
+            &range,
+            0,
+            &NO_FILTER,
+            &cfg,
+            &ctx,
+        )
+        .unwrap();
+
+        assert_eq!(sa.size(), 3);
+        let block_ids: Vec<u32> = sa
+            .begin(0)
+            .iter()
+            .map(|entry| entry.value.block_id)
+            .collect();
+        assert_eq!(block_ids, vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn two_pass_rejects_histogram_partition_mismatch() {
+        let reduction = Reduction::default_reduction();
+        let shapes = ShapeConfig::from_codes(&["11".to_string()], 0, &reduction).unwrap();
+        let ctx = EnumSeedsContext {
+            shapes: &shapes,
+            reduction: &reduction,
+            min_query_len: 0,
+            query_contexts: 1,
+        };
+        let mut block = block();
+        let partition = vec![0, 1, 2];
+        let cfg = enum_cfg(Some(&partition), SeedEncoding::SpacedFactor);
+        let mismatched_histogram = vec![vec![0; 4]];
+        let err = SeedArray::<PackedLoc>::from_histogram(
+            &mut block,
+            &mismatched_histogram,
+            &SeedPartitionRange::with_bounds(0, 4),
+            2,
+            &NO_FILTER,
+            &cfg,
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Shape histogram row count must match sequence partition count."
+        );
     }
 
     #[test]

@@ -4,6 +4,13 @@ use crate::data::sequence_set::SequenceSet;
 use crate::search::kmer_ranking::{KmerRanking, PackedLocId};
 use crate::util::math::bit_length;
 
+pub mod stage1_2;
+pub use stage1_2::{
+    keep_target_id, run_stage1_packed_loc, run_stage1_packed_loc_id, stage1_dispatch_packed_loc,
+    stage1_dispatch_packed_loc_id, Stage1DispatchConfig, Stage1KernelKind, Stage1RunError,
+    Stage1Statistics, WorkSet,
+};
+
 pub type Container = Vec<[Letter; 48]>;
 
 pub trait SeedLoc: Copy {
@@ -39,86 +46,6 @@ impl SeedLoc for PackedLocId {
     fn block_id(self, _seqs: &SequenceSet) -> usize {
         self.block_id as usize
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stage1KernelKind {
-    Stage1,
-    Stage1Self,
-    Stage1QueryLin,
-    Stage1QueryLinRanked,
-    Stage1TargetLin,
-    Stage1LongestComboLin,
-    Stage1MutualCov,
-    Stage1SelfMutualCov,
-    Stage1MutualCovQueryLin,
-    Stage1MutualCovTargetLin,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Stage1DispatchConfig {
-    pub lin_stage1_combo: bool,
-    pub lin_stage1_query: bool,
-    pub lin_stage1_target: bool,
-    pub min_length_ratio: f64,
-    pub self_search: bool,
-    pub current_ref_block: u32,
-    pub global_ranking_targets: bool,
-    pub hit_keep_target_id: bool,
-}
-
-/// Matches C++ `stage1_dispatch(const Search::Config*, PackedLocId)`.
-pub fn stage1_dispatch_packed_loc_id(cfg: &Stage1DispatchConfig) -> Stage1KernelKind {
-    if cfg.lin_stage1_combo {
-        return Stage1KernelKind::Stage1LongestComboLin;
-    }
-    if cfg.lin_stage1_query {
-        return if cfg.min_length_ratio > 0.0 {
-            Stage1KernelKind::Stage1MutualCovQueryLin
-        } else {
-            Stage1KernelKind::Stage1QueryLinRanked
-        };
-    }
-    if cfg.lin_stage1_target {
-        return if cfg.min_length_ratio > 0.0 {
-            Stage1KernelKind::Stage1MutualCovTargetLin
-        } else {
-            Stage1KernelKind::Stage1TargetLin
-        };
-    }
-    if cfg.min_length_ratio > 0.0 {
-        return if cfg.self_search && cfg.current_ref_block == 0 {
-            Stage1KernelKind::Stage1SelfMutualCov
-        } else {
-            Stage1KernelKind::Stage1MutualCov
-        };
-    }
-    if cfg.self_search && cfg.current_ref_block == 0 {
-        return Stage1KernelKind::Stage1Self;
-    }
-    Stage1KernelKind::Stage1
-}
-
-/// Matches C++ `stage1_dispatch(const Search::Config*, PackedLoc)`.
-pub fn stage1_dispatch_packed_loc(cfg: &Stage1DispatchConfig) -> Stage1KernelKind {
-    if cfg.lin_stage1_query {
-        Stage1KernelKind::Stage1QueryLin
-    } else if cfg.lin_stage1_target {
-        Stage1KernelKind::Stage1TargetLin
-    } else if cfg.self_search && cfg.current_ref_block == 0 {
-        Stage1KernelKind::Stage1Self
-    } else {
-        Stage1KernelKind::Stage1
-    }
-}
-
-/// Matches C++ `keep_target_id(const Search::Config*)`.
-pub fn keep_target_id(cfg: &Stage1DispatchConfig) -> bool {
-    cfg.hit_keep_target_id
-        || cfg.min_length_ratio != 0.0
-        || cfg.global_ranking_targets
-        || (cfg.self_search && cfg.current_ref_block == 0)
-        || cfg.lin_stage1_combo
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

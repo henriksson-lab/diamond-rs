@@ -357,15 +357,21 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Queue<T> {
     capacity: usize,
     producer_count: i32,
     consumer_count: i32,
     poison_pill: T,
+    state: std::sync::Mutex<QueueState<T>>,
+    items: std::sync::Condvar,
+    spaces: std::sync::Condvar,
+}
+
+#[derive(Debug)]
+struct QueueState<T> {
     data: std::collections::VecDeque<T>,
     pills_received: usize,
-    closed: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -444,14 +450,17 @@ impl<T: Clone + PartialEq> Queue<T> {
             producer_count,
             consumer_count,
             poison_pill,
-            data: std::collections::VecDeque::new(),
-            pills_received: 0,
-            closed: false,
+            state: std::sync::Mutex::new(QueueState {
+                data: std::collections::VecDeque::new(),
+                pills_received: 0,
+            }),
+            items: std::sync::Condvar::new(),
+            spaces: std::sync::Condvar::new(),
         }
     }
 
     pub const fn is_power_of_two(x: usize) -> bool {
-        (x & (x - 1)) == 0
+        (x & x.wrapping_sub(1)) == 0
     }
 
     pub fn round_up_to_power_of_two(mut x: usize) -> usize {
@@ -467,18 +476,27 @@ impl<T: Clone + PartialEq> Queue<T> {
         x + 1
     }
 
-    pub fn enqueue(&mut self, v: T) {
-        assert!(self.data.len() < self.capacity);
-        self.data.push_back(v);
+    pub fn enqueue(&self, v: T) {
+        let mut state = self.state.lock().unwrap();
+        while state.data.len() == self.capacity {
+            state = self.spaces.wait(state).unwrap();
+        }
+        state.data.push_back(v);
+        self.items.notify_one();
     }
 
-    pub fn wait_and_dequeue(&mut self) -> Option<T> {
+    pub fn wait_and_dequeue(&self) -> Option<T> {
         loop {
-            let out = self.data.pop_front()?;
+            let mut state = self.state.lock().unwrap();
+            while state.data.is_empty() {
+                state = self.items.wait(state).unwrap();
+            }
+            let out = state.data.pop_front().expect("queue was nonempty");
+            self.spaces.notify_one();
             if out == self.poison_pill {
                 if self.producer_count > 1 {
-                    self.pills_received += 1;
-                    if self.pills_received == self.producer_count as usize {
+                    state.pills_received += 1;
+                    if state.pills_received == self.producer_count as usize {
                         return None;
                     }
                     continue;
@@ -498,14 +516,13 @@ impl<T: Clone + PartialEq> Queue<T> {
     }
 
     pub fn approx_size(&self) -> usize {
-        self.data.len()
+        self.state.lock().unwrap().data.len()
     }
 
-    pub fn close(&mut self) {
+    pub fn close(&self) {
         for _ in 0..self.consumer_count {
             self.enqueue(self.poison_pill.clone());
         }
-        self.closed = true;
     }
 
     pub fn producer_count(&self) -> i32 {
@@ -1856,7 +1873,7 @@ mod tests {
 
     #[test]
     fn test_queue() {
-        let mut q = Queue::new(3, 1, 2, -1);
+        let q = Queue::new(3, 1, 2, -1);
         assert_eq!(q.capacity(), 4);
         assert_eq!(q.producer_count(), 1);
         assert!(q.empty());
@@ -1868,10 +1885,12 @@ mod tests {
         assert_eq!(q.wait_and_dequeue(), Some(8));
         assert_eq!(q.wait_and_dequeue(), None);
 
-        let mut q = Queue::new(2, 2, 1, 0);
+        let q = Queue::new(2, 2, 1, 0);
         q.enqueue(1);
         q.enqueue(0);
         assert_eq!(q.wait_and_dequeue(), Some(1));
+        // One poison pill is required from each configured producer.
+        q.enqueue(0);
         assert_eq!(q.wait_and_dequeue(), None);
     }
 

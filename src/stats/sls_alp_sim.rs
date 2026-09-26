@@ -7,8 +7,12 @@ use crate::stats::sls_alp_data::{alp_data, array_positive, mb_bytes};
 use crate::stats::sls_alp_regression::alp_reg;
 use crate::stats::sls_basic::{get_current_time, round, Error, Tmax, Tmin};
 
-pub static calculate_C_S_constant_flag: bool = true;
-pub const quick_tests_trials_number: i64 = 100;
+pub const CALCULATE_C_S_CONSTANT_FLAG: bool = true;
+pub const QUICK_TESTS_TRIALS_NUMBER: i64 = 100;
+#[allow(non_upper_case_globals)]
+pub const calculate_C_S_constant_flag: bool = CALCULATE_C_S_CONSTANT_FLAG;
+#[allow(non_upper_case_globals)]
+pub const quick_tests_trials_number: i64 = QUICK_TESTS_TRIALS_NUMBER;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct struct_for_lambda_calculation {
@@ -82,7 +86,9 @@ pub struct alp_sim {
 }
 
 impl alp_sim {
-    pub fn new(alp_data_: alp_data) -> Result<Self, Error> {
+    /// Allocate simulation state without running the source constructor's
+    /// simulation workflow. This is useful for focused kernel calls.
+    pub fn new_empty(alp_data_: alp_data) -> Result<Self, Error> {
         let mut result = Self {
             d_alp_data: alp_data_,
             d_alp_obj: Vec::new(),
@@ -132,8 +138,9 @@ impl alp_sim {
         Ok(result)
     }
 
-    pub fn new_with_simulation(alp_data_: alp_data) -> Result<Self, Error> {
-        let mut result = Self::new(alp_data_)?;
+    /// Full equivalent of the C++ `alp_sim(alp_data*)` constructor.
+    pub fn new(alp_data_: alp_data) -> Result<Self, Error> {
+        let mut result = Self::new_empty(alp_data_)?;
 
         let memory_before1 = result.d_alp_data.d_memory_size_in_MB;
         let mut time_before1 = 0.0;
@@ -159,7 +166,7 @@ impl alp_sim {
         result.d_C_tmp_errors = array_positive::new(None)?;
 
         result.quick_test(
-            quick_tests_trials_number,
+            QUICK_TESTS_TRIALS_NUMBER,
             result.d_alp_data.d_max_time_for_quick_tests,
         )?;
 
@@ -785,6 +792,11 @@ impl alp_sim {
         Ok(result)
     }
 
+    /// Compatibility spelling retained for established callers.
+    pub fn new_with_simulation(alp_data_: alp_data) -> Result<Self, Error> {
+        Self::new(alp_data_)
+    }
+
     pub fn round_double(mut val_: f64, digits_: i64) -> f64 {
         for _ in 0..digits_ {
             val_ *= 10.0;
@@ -839,6 +851,62 @@ impl alp_sim {
             ));
         }
         Ok(exp_array_[i_ as usize])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn memory_release_for_calculate_fsc(
+        exp_array: &mut Vec<f64>,
+        delta_e: &mut Vec<f64>,
+        delta_e_error: &mut Vec<f64>,
+        delta_e_e: &mut Vec<f64>,
+        delta_e_e_error: &mut Vec<f64>,
+        delta_i: &mut Vec<f64>,
+        delta_i_error: &mut Vec<f64>,
+        delta_j: &mut Vec<f64>,
+        delta_j_error: &mut Vec<f64>,
+        delta_i_i: &mut Vec<f64>,
+        delta_i_i_error: &mut Vec<f64>,
+        delta_i_j: &mut Vec<f64>,
+        delta_i_j_error: &mut Vec<f64>,
+        delta_j_j: &mut Vec<f64>,
+        delta_j_j_error: &mut Vec<f64>,
+        cov_j_j: &mut Vec<f64>,
+        cov_j_j_error: &mut Vec<f64>,
+        cov_i_j: &mut Vec<f64>,
+        cov_i_j_error: &mut Vec<f64>,
+        cov_i_i: &mut Vec<f64>,
+        cov_i_i_error: &mut Vec<f64>,
+        cov_e_e: &mut Vec<f64>,
+        cov_e_e_error: &mut Vec<f64>,
+    ) {
+        for values in [
+            exp_array,
+            delta_e,
+            delta_e_error,
+            delta_e_e,
+            delta_e_e_error,
+            delta_i,
+            delta_i_error,
+            delta_j,
+            delta_j_error,
+            delta_i_i,
+            delta_i_i_error,
+            delta_i_j,
+            delta_i_j_error,
+            delta_j_j,
+            delta_j_j_error,
+            cov_j_j,
+            cov_j_j_error,
+            cov_i_j,
+            cov_i_j_error,
+            cov_i_i,
+            cov_i_i_error,
+            cov_e_e,
+            cov_e_e_error,
+        ] {
+            values.clear();
+            values.shrink_to_fit();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1023,7 +1091,7 @@ impl alp_sim {
         Ok(())
     }
 
-    pub fn check_K_criterion(
+    pub fn check_k_criterion(
         &self,
         nalp_: i64,
         ind1_: i64,
@@ -1078,7 +1146,7 @@ impl alp_sim {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn check_K_criterion_during_killing(
+    pub fn check_k_criterion_during_killing(
         &self,
         ind1_: i64,
         ind2_: i64,
@@ -1227,7 +1295,7 @@ impl alp_sim {
             let mut C_error = 0.0;
             let mut Sc = 0.0;
             let mut Sc_error = 0.0;
-            Self::calculate_C(
+            Self::calculate_c(
                 0,
                 upto_nalp_,
                 alp_distr,
@@ -1386,7 +1454,7 @@ impl alp_sim {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn calculate_C(
+    pub fn calculate_c(
         starting_point: i64,
         nalp_: i64,
         alp_distr: &[array_positive<f64>],
@@ -1557,7 +1625,7 @@ impl alp_sim {
             exp_lambda_error,
         );
         let den = (1.0 - (-lambda_).exp()) * E_T_beta_diff_aver;
-        let (nom, nom_error) = if calculate_C_S_constant_flag {
+        let (nom, nom_error) = if CALCULATE_C_S_CONSTANT_FLAG {
             *Sc_error_ = E_aver_error;
             *Sc_ = E_aver;
             (
@@ -1584,7 +1652,7 @@ impl alp_sim {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn calculate_FSC(
+    pub fn calculate_fsc(
         &self,
         nalp_: i64,
         ind1_: i64,
@@ -1644,7 +1712,7 @@ impl alp_sim {
         let mut cov_E_E_error = vec![0.0; n];
 
         let mut C_S_constant = 1.0;
-        if calculate_C_S_constant_flag && Sc_ > 0.0 {
+        if CALCULATE_C_S_CONSTANT_FLAG && Sc_ > 0.0 {
             C_S_constant = Sc_;
         }
         let one_div_C_S_constant = 1.0 / C_S_constant;
@@ -2174,7 +2242,7 @@ impl alp_sim {
         lambda_mult_error[0] = *lambda_error;
 
         for k in 1..=self.d_mult_number {
-            Self::calculate_C(
+            Self::calculate_c(
                 0,
                 nalp_for_lambda_simulation,
                 &alp_mult_distr[k as usize],
@@ -2193,7 +2261,7 @@ impl alp_sim {
 
         let mut Sc = 0.0;
         let mut Sc_error = 0.0;
-        Self::calculate_C(
+        Self::calculate_c(
             0,
             nalp_for_lambda_simulation,
             &alp_distr,
@@ -2214,7 +2282,7 @@ impl alp_sim {
         nr_tmp = 0;
         for k in 1..=self.d_mult_number {
             nr_tmp += d_mult_realizations[k as usize];
-            self.calculate_FSC(
+            self.calculate_fsc(
                 nalp_for_lambda_simulation,
                 nr_tmp - d_mult_realizations[k as usize],
                 nr_tmp - 1,
@@ -2245,7 +2313,7 @@ impl alp_sim {
             alpha_J_mult2_error += alpha_J_mult[k as usize] * alpha_J_mult[k as usize];
         }
 
-        self.calculate_FSC(
+        self.calculate_fsc(
             nalp_for_lambda_simulation,
             0,
             final_realizations_number_lambda_ - 1,
@@ -2287,7 +2355,7 @@ impl alp_sim {
             nr_tmp += d_mult_K_realizations[k as usize];
             let mut recommended_level = 0;
             let mut diff_opt = 0;
-            self.check_K_criterion_during_killing(
+            self.check_k_criterion_during_killing(
                 nr_tmp - d_mult_K_realizations[k as usize],
                 nr_tmp - 1,
                 lambda_mult[k as usize],
@@ -2315,7 +2383,7 @@ impl alp_sim {
 
         let mut recommended_level = 0;
         let mut diff_opt = 0;
-        self.check_K_criterion_during_killing(
+        self.check_k_criterion_during_killing(
             0,
             final_realizations_number_killing_ - 1,
             *lambda,
@@ -2661,7 +2729,7 @@ impl alp_sim {
                 }
             }
 
-            flag = self.check_K_criterion_during_killing(
+            flag = self.check_k_criterion_during_killing(
                 ind1_,
                 ind2_,
                 lambda_,
@@ -2935,7 +3003,7 @@ impl alp_sim {
                 }
 
                 if criterion_flag {
-                    criterion_flag = self.check_K_criterion(
+                    criterion_flag = self.check_k_criterion(
                         *nalp_,
                         ind1_,
                         ind2_,
@@ -3211,7 +3279,7 @@ mod tests {
 
     #[test]
     fn test_get_single_realization_allocates_and_sets_flags() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         let mut obj = None;
         let mut success = false;
         let mut eps = 0.0;
@@ -3227,7 +3295,7 @@ mod tests {
 
     #[test]
     fn test_generate_random_permulation_contains_each_index() {
-        let sim = alp_sim::new(test_data()).unwrap();
+        let sim = alp_sim::new_empty(test_data()).unwrap();
         let mut perm = sim.generate_random_permulation(8).unwrap();
         perm.sort();
         assert_eq!(perm, vec![0, 1, 2, 3, 4, 5, 6, 7]);
@@ -3235,7 +3303,7 @@ mod tests {
 
     #[test]
     fn test_randomize_realizations_ind_bounds_and_noop() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         sim.d_n_alp_obj = 1;
         sim.d_alp_obj
             .push(Some(Box::new(alp::new(test_data()).unwrap())));
@@ -3245,7 +3313,7 @@ mod tests {
 
     #[test]
     fn test_symmetric_parameters_for_symmetric_scheme_averages_pairs() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         sim.m_AI = 2.0;
         sim.m_AJ = 4.0;
         sim.m_AIError = 0.2;
@@ -3267,7 +3335,7 @@ mod tests {
     fn test_symmetric_parameters_for_asymmetric_scheme_keeps_values() {
         let mut data = test_data();
         data.d_RR2 = vec![0.25, 0.75];
-        let mut sim = alp_sim::new(data).unwrap();
+        let mut sim = alp_sim::new_empty(data).unwrap();
         sim.m_AI = 2.0;
         sim.m_AJ = 4.0;
         sim.symmetric_parameters_for_symmetric_scheme();
@@ -3277,7 +3345,7 @@ mod tests {
 
     #[test]
     fn test_get_and_allocate_alp_distribution_accumulates_weighted_scores() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         let mut a1 = alp::new(test_data()).unwrap();
         let mut a2 = alp::new(test_data()).unwrap();
         a1.d_alp.set_elem(1, 2);
@@ -3300,7 +3368,7 @@ mod tests {
 
     #[test]
     fn test_check_k_criterion_known_counts() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         let mut a = alp::new(test_data()).unwrap();
         a.d_alp.set_elem(1, 4);
         a.d_alp_weights.set_elem(1, 2.0);
@@ -3310,7 +3378,7 @@ mod tests {
         sim.d_n_alp_obj = 1;
         let mut m_min = 0;
         let ok = sim
-            .check_K_criterion(1, 0, 0, 1.0, 0.5, &mut m_min)
+            .check_k_criterion(1, 0, 0, 1.0, 0.5, &mut m_min)
             .unwrap();
         assert!(ok);
         assert_eq!(m_min, 4);
@@ -3318,7 +3386,7 @@ mod tests {
 
     #[test]
     fn test_check_k_criterion_during_killing_known_counts() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         let mut a = alp::new(test_data()).unwrap();
         a.d_M = 4;
         a.d_nalp_killing = 0;
@@ -3332,7 +3400,7 @@ mod tests {
         let mut kc = 0.0;
         let mut kc_error = 0.0;
         let ok = sim
-            .check_K_criterion_during_killing(
+            .check_k_criterion_during_killing(
                 0,
                 0,
                 1.0,
@@ -3353,7 +3421,7 @@ mod tests {
 
     #[test]
     fn test_the_criterion_sets_lambda_and_flags() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         let mut a = alp::new(test_data()).unwrap();
         a.d_alp.set_elem(1, 0);
         a.d_alp_weights.set_elem(1, 1.0);
@@ -3398,13 +3466,13 @@ mod tests {
 
     #[test]
     fn test_quick_test_rejects_nonpositive_trials() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         assert!(sim.quick_test(0, 0.0).is_err());
     }
 
     #[test]
     fn test_get_minimal_simulation_rejects_inconsistent_object_range() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         sim.d_n_alp_obj = 2;
         let mut m_min = 0;
         let mut nalp = 0;
@@ -3425,7 +3493,7 @@ mod tests {
 
     #[test]
     fn test_calculate_main_parameters2m_rejects_killing_more_than_lambda() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         let mut inside = false;
         let mut lambda = 0.0;
         let mut lambda_error = 0.0;
@@ -3550,7 +3618,7 @@ mod tests {
 
     #[test]
     fn test_output_main_parameters2m_new_propagates_main_parameter_error() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         let mut inside = false;
         assert!(sim
             .output_main_parameters2m_new(1, 0, &mut inside, 6, 7)
@@ -3559,7 +3627,7 @@ mod tests {
 
     #[test]
     fn test_calculate_lambda_single_alp_distribution() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         let mut distr = array_positive::new(None).unwrap();
         distr.set_elem(0, 0.25);
         distr.set_elem(1, 0.75);
@@ -3609,7 +3677,7 @@ mod tests {
         let mut c_error = -1.0;
         let mut sc = -1.0;
         let mut sc_error = -1.0;
-        alp_sim::calculate_C(
+        alp_sim::calculate_c(
             0,
             1,
             &alp_distr,
@@ -3630,7 +3698,7 @@ mod tests {
 
     #[test]
     fn test_calculate_fsc_single_alp_path() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         let mut a = alp::new(test_data()).unwrap();
         a.d_alp.set_elem(0, 0);
         a.d_alp.set_elem(1, 1);
@@ -3654,7 +3722,7 @@ mod tests {
         let mut alpha_i_error = -1.0;
         let mut alpha_j = -1.0;
         let mut alpha_j_error = -1.0;
-        sim.calculate_FSC(
+        sim.calculate_fsc(
             1,
             0,
             0,
@@ -3685,7 +3753,7 @@ mod tests {
 
     #[test]
     fn test_kill_uses_existing_successful_realization() {
-        let mut sim = alp_sim::new(test_data()).unwrap();
+        let mut sim = alp_sim::new_empty(test_data()).unwrap();
         let mut a = alp::new(test_data()).unwrap();
         a.d_is_now = false;
         a.d_M = 4;

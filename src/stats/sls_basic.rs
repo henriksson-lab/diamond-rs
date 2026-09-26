@@ -76,6 +76,10 @@ pub fn Tmax<T: PartialOrd + Copy>(i_: T, j_: T) -> T {
     }
 }
 
+pub fn tmax<T: PartialOrd + Copy>(left: T, right: T) -> T {
+    Tmax(left, right)
+}
+
 pub fn Tmin<T: PartialOrd + Copy>(i_: T, j_: T) -> T {
     if i_ < j_ {
         i_
@@ -84,20 +88,40 @@ pub fn Tmin<T: PartialOrd + Copy>(i_: T, j_: T) -> T {
     }
 }
 
+pub fn tmin<T: PartialOrd + Copy>(left: T, right: T) -> T {
+    Tmin(left, right)
+}
+
 pub fn Tmax3<T: PartialOrd + Copy>(x_: T, y_: T, z_: T) -> T {
     Tmax(Tmax(x_, y_), z_)
+}
+
+pub fn tmax3<T: PartialOrd + Copy>(x: T, y: T, z: T) -> T {
+    Tmax3(x, y, z)
 }
 
 pub fn Tmin3<T: PartialOrd + Copy>(x_: T, y_: T, z_: T) -> T {
     Tmin(Tmin(x_, y_), z_)
 }
 
+pub fn tmin3<T: PartialOrd + Copy>(x: T, y: T, z: T) -> T {
+    Tmin3(x, y, z)
+}
+
 pub fn Tmax4<T: PartialOrd + Copy>(x_: T, y_: T, z_: T, w_: T) -> T {
     Tmax(Tmax(x_, y_), Tmax(z_, w_))
 }
 
+pub fn tmax4<T: PartialOrd + Copy>(x: T, y: T, z: T, w: T) -> T {
+    Tmax4(x, y, z, w)
+}
+
 pub fn Tmin4<T: PartialOrd + Copy>(x_: T, y_: T, z_: T, w_: T) -> T {
     Tmin(Tmin(x_, y_), Tmin(z_, w_))
+}
+
+pub fn tmin4<T: PartialOrd + Copy>(x: T, y: T, z: T, w: T) -> T {
+    Tmin4(x, y, z, w)
 }
 
 pub fn assert_mem<T>(pointer_: *const T) -> Result<(), Error> {

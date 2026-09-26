@@ -1,5 +1,7 @@
 use std::f64::consts::LN_2;
 
+use crate::blast::blastn_score::{blast_karlin_blk_nucl_gapped_calc, BlastKarlinBlock};
+
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Blastn_Score {
@@ -15,9 +17,48 @@ pub struct Blastn_Score {
     db_size_: i64,
 }
 
-#[allow(non_snake_case)]
 impl Blastn_Score {
     pub fn new(
+        reward: i32,
+        penalty: i32,
+        gapopen: i32,
+        gapextend: i32,
+        db_letters: u64,
+        sequence_count: i64,
+    ) -> Result<Self, String> {
+        let mut parameters = BlastKarlinBlock::default();
+        let mut round_down = false;
+        let mut errors = None;
+        let status = blast_karlin_blk_nucl_gapped_calc(
+            &mut parameters,
+            gapopen,
+            gapextend,
+            reward,
+            penalty,
+            &BlastKarlinBlock::default(),
+            &mut round_down,
+            Some(&mut errors),
+        );
+        if status != 0 || parameters.lambda <= 0.0 {
+            return Err(errors
+                .map(|message| message.message)
+                .unwrap_or_else(|| "Failed to initialize Karlin blocks".to_owned()));
+        }
+        Ok(Self::new_with_parameters(
+            reward,
+            penalty,
+            gapopen,
+            gapextend,
+            db_letters,
+            sequence_count,
+            parameters.lambda,
+            parameters.k,
+            parameters.h,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_parameters(
         reward: i32,
         penalty: i32,
         gapopen: i32,
@@ -42,11 +83,11 @@ impl Blastn_Score {
         }
     }
 
-    pub fn blast_bit_Score(&self, raw_score: i32) -> f64 {
+    pub fn blast_bit_score(&self, raw_score: i32) -> f64 {
         ((raw_score as f64 * self.lambda) - self.log_k) / LN_2
     }
 
-    pub fn blast_eValue(&self, raw_score: i32, query_length: i32) -> f64 {
+    pub fn blast_e_value(&self, raw_score: i32, query_length: i32) -> f64 {
         let searchspace = self.calculate_length_adjustment(
             query_length as u64,
             query_length,
@@ -58,6 +99,16 @@ impl Blastn_Score {
             self.db_size_,
         );
         self.blast_karlin_stoe_simple(raw_score, searchspace as i64)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn blast_bit_Score(&self, raw_score: i32) -> f64 {
+        self.blast_bit_score(raw_score)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn blast_eValue(&self, raw_score: i32, query_length: i32) -> f64 {
+        self.blast_e_value(raw_score, query_length)
     }
 
     pub fn reward(&self) -> i32 {
@@ -116,7 +167,7 @@ mod tests {
     use super::*;
 
     fn score() -> Blastn_Score {
-        Blastn_Score::new(2, -3, 5, 2, 1_000_000, 2_000, 0.625, 0.41, 1.1)
+        Blastn_Score::new_with_parameters(2, -3, 5, 2, 1_000_000, 2_000, 0.625, 0.41, 1.1)
     }
 
     #[test]
@@ -132,7 +183,7 @@ mod tests {
     fn test_blast_bit_score_matches_cpp_formula() {
         let s = score();
         let expected = ((80.0 * 0.625) - 0.41_f64.ln()) / LN_2;
-        assert!((s.blast_bit_Score(80) - expected).abs() < 1e-12);
+        assert!((s.blast_bit_score(80) - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -155,6 +206,16 @@ mod tests {
 
         let searchspace = (q_eff * db_eff) as i64;
         let expected_e = searchspace as f64 * (-(0.625 * 80.0) + 0.41_f64.ln()).exp();
-        assert!((s.blast_eValue(80, 100) - expected_e).abs() < expected_e * 1e-12);
+        assert!((s.blast_e_value(80, 100) - expected_e).abs() < expected_e * 1e-12);
+    }
+
+    #[test]
+    fn test_constructor_uses_vendored_nucleotide_statistics() {
+        let score = Blastn_Score::new(1, -3, 2, 2, 1_000_000, 2_000).unwrap();
+        assert_eq!((score.reward(), score.penalty()), (1, -3));
+        assert!((score.lambda - 1.37).abs() < 1e-12);
+        assert!((score.k - 0.70).abs() < 1e-12);
+        assert!((score.h - 1.2).abs() < 1e-12);
+        assert!(Blastn_Score::new(1, -3, 0, 1, 100, 1).is_err());
     }
 }

@@ -152,7 +152,25 @@ The previous 389-query benchmark input was not reproducible from files in this c
 
 Speedup is C++ wall time divided by Rust wall time. Peak RSS ratio is Rust peak resident memory divided by C++ peak resident memory; lower is better.
 
-The native Rust pipeline produces matching scores, coordinates, and bit scores. When built on a non-Windows target with `--features ffi`, the `--legacy` flag falls back to C++ FFI for conformance testing.
+Reproduce and refresh the comparison with:
+
+```bash
+scripts/compare_cpp_rust.sh
+```
+
+The harness builds both release binaries, uses the bundled 389-sequence
+protein dataset, reports median wall time and peak RSS for `makedb` and
+`blastp`, and compares a stable 12-column blastp output byte-for-byte. It exits
+nonzero and retains a unified diff when parity fails. Quick smoke runs can use
+`REPETITIONS=1`; `REFERENCE_FASTA`, `QUERY_FASTA`, `THREADS`, `RUST_BIN`, and
+`CPP_BIN` can be overridden for later scaling experiments.
+
+The current quick fixture has matching bytes for every shared output row, but
+the Rust pipeline reports four additional reciprocal hits (735 rows versus
+731), so strict end-to-end parity is not yet achieved. The comparison script is
+the authoritative gate while this is optimized. When built on a non-Windows
+target with `--features ffi`, the `--legacy` flag falls back to C++ FFI for
+conformance testing.
 
 ## Architecture
 

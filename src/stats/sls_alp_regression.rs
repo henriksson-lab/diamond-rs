@@ -471,8 +471,8 @@ impl alp_reg {
         }
         array_vect.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-        for i in 0..N_points as usize {
-            remove_flag[array_vect[i].1 as usize] = false;
+        for i in 0..N_points {
+            remove_flag[array_vect[i as usize].1 as usize] = false;
         }
 
         let mut res = 0.0;

@@ -52,13 +52,21 @@ impl Default for LocalMaxStat {
 }
 
 impl LocalMaxStat {
+    pub fn set_time(time: f64) {
+        assert!(time >= 0.0);
+        *S_TIME.lock().unwrap() = time;
+    }
+
+    pub fn get_time() -> f64 {
+        *S_TIME.lock().unwrap()
+    }
+
     pub fn setTime(time_: f64) {
-        assert!(time_ >= 0.0);
-        *S_TIME.lock().unwrap() = time_;
+        Self::set_time(time_);
     }
 
     pub fn getTime() -> f64 {
-        *S_TIME.lock().unwrap()
+        Self::get_time()
     }
 
     pub fn new(dimension_: usize, score_: Option<&[i64]>, prob_: Option<&[f64]>) -> Self {
@@ -197,15 +205,19 @@ impl LocalMaxStat {
         self.d_delta = util::delta(self.getDimension(), self.getScore());
         self.d_thetaMinusDelta =
             util::thetaMinusDelta(self.getLambda(), self.getDimension(), self.getScore());
-        self.dynProgCalc();
+        self.dyn_prog_calc();
     }
 
     pub fn out(&self) -> String {
         String::new()
     }
 
-    pub fn getR(&self, theta_: f64) -> f64 {
-        util::r(self.d_dimension, &self.d_score_p, &self.d_prob_p, theta_)
+    pub fn get_r(&self, theta: f64) -> f64 {
+        util::r(self.d_dimension, &self.d_score_p, &self.d_prob_p, theta)
+    }
+
+    pub fn getR(&self, theta: f64) -> f64 {
+        self.get_r(theta)
     }
 
     pub fn getA(&self) -> f64 {
@@ -314,7 +326,7 @@ impl LocalMaxStat {
         self.d_terminated = false;
     }
 
-    fn dynProgCalc(&mut self) {
+    fn dyn_prog_calc(&mut self) {
         let mut eSumAlpha = 0.0;
         let mut eOneMinusExpSumAlpha = 0.0;
         let dimension = self.getDimension();
@@ -332,7 +344,7 @@ impl LocalMaxStat {
             self.getMuAssoc(),
             self.getThetaMin(),
             self.getRMin(),
-            Self::getTime(),
+            Self::get_time(),
             Some(&mut self.d_terminated),
         );
 

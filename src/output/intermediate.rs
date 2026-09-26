@@ -140,7 +140,12 @@ impl IntermediateRecord {
             if (self.flag & (1 << 6)) == 0 {
                 self.query_begin % 3
             } else {
-                3 + ((query_source_len as u32 - 1 - self.query_begin) % 3)
+                // `query_begin` is unsigned in C++, so the original expression
+                // has unsigned wrapping semantics even for malformed records.
+                3 + (query_source_len as u32)
+                    .wrapping_sub(1)
+                    .wrapping_sub(self.query_begin)
+                    % 3
             }
         } else {
             0
@@ -149,9 +154,15 @@ impl IntermediateRecord {
 
     pub fn absolute_query_range(&self) -> Interval {
         if self.query_begin < self.query_end {
-            Interval::new(self.query_begin as i32, self.query_end as i32 + 1)
+            Interval::new(
+                self.query_begin as i32,
+                self.query_end.wrapping_add(1) as i32,
+            )
         } else {
-            Interval::new(self.query_end as i32, self.query_begin as i32 + 1)
+            Interval::new(
+                self.query_end as i32,
+                self.query_begin.wrapping_add(1) as i32,
+            )
         }
     }
 
@@ -163,7 +174,11 @@ impl IntermediateRecord {
     }
 
     pub fn finish_query(buf: &mut [u8], seek_pos: usize) {
-        let n = (buf.len() - seek_pos - std::mem::size_of::<u32>() * 2) as u32;
+        let payload_len = buf
+            .len()
+            .checked_sub(seek_pos + std::mem::size_of::<u32>() * 2)
+            .expect("invalid intermediate query seek position");
+        let n = u32::try_from(payload_len).expect("intermediate query payload exceeds uint32");
         buf[seek_pos + std::mem::size_of::<u32>()..seek_pos + std::mem::size_of::<u32>() * 2]
             .copy_from_slice(&n.to_ne_bytes());
     }
@@ -220,6 +235,30 @@ impl IntermediateRecord {
         writer.write_all(&target_oid.to_ne_bytes())?;
         let s = score.min(u16::MAX as i32) as u16;
         writer.write_all(&s.to_ne_bytes())
+    }
+
+    /// Matches the C++ overload taking a target block id and `Search::Config`.
+    ///
+    /// Rust passes the two pieces of configuration actually used by the
+    /// original function explicitly: the block-to-OID mapping and database
+    /// sequence count. `write_target_score` remains as the compatibility API
+    /// for callers that already resolved the OID.
+    pub fn write_target_block_score<W, F>(
+        writer: &mut W,
+        target_block_id: u32,
+        score: i32,
+        db_seqs: u64,
+        block_id_to_oid: F,
+    ) -> io::Result<()>
+    where
+        W: Write,
+        F: FnOnce(u32) -> OId,
+    {
+        // C++ explicitly casts the mapped OID to uint32_t before its bound
+        // assertion; retain that order and its truncating cast semantics.
+        let target_oid = block_id_to_oid(target_block_id) as u32;
+        assert!((target_oid as u64) < db_seqs);
+        Self::write_target_score(writer, target_oid, score)
     }
 
     pub fn finish_file<W: Write>(writer: &mut W) -> io::Result<()> {
@@ -484,6 +523,25 @@ mod tests {
         IntermediateRecord::write_target_score(&mut buf, 9, i32::MAX).unwrap();
         assert_eq!(u32::from_ne_bytes(buf[0..4].try_into().unwrap()), 9);
         assert_eq!(u16::from_ne_bytes(buf[4..6].try_into().unwrap()), u16::MAX);
+
+        let mut negative = Vec::new();
+        IntermediateRecord::write_target_score(&mut negative, 4, -1).unwrap();
+        assert_eq!(
+            u16::from_ne_bytes(negative[4..6].try_into().unwrap()),
+            u16::MAX
+        );
+    }
+
+    #[test]
+    fn test_write_target_block_score_maps_and_checks_oid() {
+        let mut buf = Vec::new();
+        IntermediateRecord::write_target_block_score(&mut buf, 7, 123, 100, |block| {
+            assert_eq!(block, 7);
+            42
+        })
+        .unwrap();
+        assert_eq!(u32::from_ne_bytes(buf[0..4].try_into().unwrap()), 42);
+        assert_eq!(u16::from_ne_bytes(buf[4..6].try_into().unwrap()), 123);
     }
 
     #[test]

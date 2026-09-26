@@ -1,5 +1,8 @@
+pub mod basic;
 pub mod cigar;
+pub mod config;
 pub mod consts;
+pub mod hssp;
 pub mod packed_loc;
 pub mod packed_sequence;
 pub mod packed_transcript;

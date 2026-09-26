@@ -1,3 +1,8 @@
+//! Contiguous sequence storage translated from `data/sequence_set.cpp`,
+//! `data/sequence_set.h`, and the inherited `data/string_set.h` template.
+
+use std::io::{self, Write};
+
 use crate::basic::value::{BlockId, Letter, Loc, DELIMITER_LETTER};
 
 pub trait StringSetValue: Copy + Default {
@@ -228,45 +233,143 @@ pub fn max_id_len(ids: &StringSet) -> usize {
 /// A collection of sequences stored contiguously in memory.
 ///
 /// Sequences are stored end-to-end separated by DELIMITER_LETTER bytes,
-/// with an offset array for O(1) random access to any sequence.
+/// with an offset array for O(1) random access to any sequence. As in the C++
+/// `StringSetBase`, the first sequence begins after 256 delimiter bytes. The
+/// Rust implementation eagerly restores the trailing 256-byte perimeter after
+/// mutating operations, which is equivalent to the C++ finalized state and
+/// keeps direct SIMD consumers safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequenceSet {
     /// Raw data: all sequences concatenated with delimiter separators.
     data: Vec<Letter>,
     /// Offsets into data where each sequence starts.
     /// offsets[i] is the start of sequence i, offsets[i+1]-1 is the end (exclusive of delimiter).
-    ///
-    /// NOTE: C++ `StringSetBase<Letter, DELIMITER, 1>` carries a 256-byte
-    /// PERIMETER_PADDING on both ends so SIMD score-profile loaders can
-    /// over-read by up to 32 bytes. The simple Rust SequenceSet does NOT
-    /// have that padding. Today's live blastp pipeline survives because
-    /// every SIMD consumer copies sequences into a fresh `Vec` before
-    /// loading (see `swipe_set`, `WorkTarget::new`, `make_profile8` callers
-    /// in `gapped_filter`). If any future caller passes `block.seqs().get(i)`
-    /// directly into a SIMD profile builder or `_mm256_loadu_si256`, it can
-    /// read uninitialised memory. See [[block-set-padding]] in memory.
     offsets: Vec<usize>,
 }
 
+/// Explicit replacement for the C++ `align_mode` fields used by this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequenceSetConfig {
+    pub query_contexts: usize,
+    pub query_translated: bool,
+}
+
+impl Default for SequenceSetConfig {
+    fn default() -> Self {
+        Self {
+            query_contexts: 1,
+            query_translated: false,
+        }
+    }
+}
+
+/// Borrowed equivalent of C++ `TranslatedSequence` for sequence-set views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranslatedSequenceView<'a> {
+    source: &'a [Letter],
+    translated: [&'a [Letter]; 6],
+}
+
+impl<'a> TranslatedSequenceView<'a> {
+    pub fn source(&self) -> &'a [Letter] {
+        self.source
+    }
+
+    pub fn frame(&self, frame: usize) -> &'a [Letter] {
+        self.translated[frame]
+    }
+}
+
 impl SequenceSet {
+    pub const PERIMETER_PADDING: usize = 256;
+
     pub fn new() -> Self {
         SequenceSet {
-            data: vec![DELIMITER_LETTER], // sentinel at start
-            offsets: vec![1],             // first sequence starts after sentinel
+            data: vec![DELIMITER_LETTER; Self::PERIMETER_PADDING],
+            offsets: vec![Self::PERIMETER_PADDING],
         }
+    }
+
+    fn truncate_trailing_padding(&mut self) {
+        self.data.truncate(self.raw_len());
+    }
+
+    /// Matches C++ `StringSetBase::finish_reserve()`.
+    pub fn finish_reserve(&mut self) {
+        self.data
+            .resize(self.raw_len() + Self::PERIMETER_PADDING, DELIMITER_LETTER);
+    }
+
+    /// Reserve one sequence of `n` letters, to be populated with `assign`.
+    pub fn reserve(&mut self, n: usize) {
+        self.truncate_trailing_padding();
+        self.offsets.push(self.raw_len() + n + 1);
+    }
+
+    /// Matches the two-argument C++ `StringSetBase::reserve` overload.
+    pub fn reserve_capacity(&mut self, entries: usize, letters: usize) {
+        self.offsets.reserve(entries + 1);
+        self.data
+            .reserve(letters + 2 * Self::PERIMETER_PADDING + entries);
+    }
+
+    pub fn assign(&mut self, i: usize, seq: &[Letter]) {
+        assert_eq!(seq.len(), self.seq_length(i) as usize);
+        if self.data.len() < self.raw_len() + Self::PERIMETER_PADDING {
+            self.finish_reserve();
+        }
+        let begin = self.ptr(i);
+        let end = begin + seq.len();
+        self.data[begin..end].copy_from_slice(seq);
+        self.data[end] = DELIMITER_LETTER;
     }
 
     /// Add a sequence to the set.
     pub fn push(&mut self, seq: &[Letter]) {
+        self.truncate_trailing_padding();
         self.data.extend_from_slice(seq);
         self.data.push(DELIMITER_LETTER);
         self.offsets.push(self.data.len());
+        self.finish_reserve();
     }
 
     /// Matches C++ `StringSetBase::fill(n, value)`.
     pub fn fill(&mut self, n: usize, value: Letter) {
+        self.truncate_trailing_padding();
         self.data.extend(std::iter::repeat_n(value, n));
         self.data.push(DELIMITER_LETTER);
         self.offsets.push(self.data.len());
+        self.finish_reserve();
+    }
+
+    pub fn append(&mut self, other: &Self) {
+        for i in 0..other.len() {
+            self.push(other.get(i));
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.offsets.clear();
+        self.offsets.push(Self::PERIMETER_PADDING);
+        self.data.resize(Self::PERIMETER_PADDING, DELIMITER_LETTER);
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.offsets.shrink_to_fit();
+        self.data.shrink_to_fit();
+    }
+
+    pub fn subset(&self, indices: &[usize]) -> Self {
+        let mut result = Self::new();
+        result.reserve_capacity(indices.len(), 0);
+        for &i in indices {
+            result.reserve(self.seq_length(i) as usize);
+        }
+        result.finish_reserve();
+        for (dst, &src) in indices.iter().enumerate() {
+            result.assign(dst, self.get(src));
+        }
+        result
     }
 
     /// Number of sequences.
@@ -300,6 +403,24 @@ impl SequenceSet {
         self.offsets[i]
     }
 
+    pub fn check_idx(&self, i: usize) -> usize {
+        assert!(i < self.len(), "Sequence set index out of bounds.");
+        i
+    }
+
+    pub fn raw_len(&self) -> usize {
+        *self.offsets.last().unwrap()
+    }
+
+    pub fn mem_size(&self) -> usize {
+        self.data.len() * std::mem::size_of::<Letter>()
+            + self.offsets.len() * std::mem::size_of::<usize>()
+    }
+
+    pub fn back(&self) -> &[Letter] {
+        self.get(self.len() - 1)
+    }
+
     /// Matches C++ `StringSetBase::limits_begin()`.
     pub fn offsets(&self) -> &[usize] {
         &self.offsets
@@ -316,7 +437,6 @@ impl SequenceSet {
             Ok(i) => i,
             Err(i) => i - 1,
         };
-        assert!(i < self.len());
         (i, p - self.offsets[i])
     }
 
@@ -326,11 +446,10 @@ impl SequenceSet {
         let mut max = 0;
         for i in 0..self.len() {
             let l = self.seq_length(i);
-            if l < min_len {
-                continue;
-            }
-            min = min.min(l);
             max = max.max(l);
+            if l >= min_len {
+                min = min.min(l);
+            }
         }
         (min, max)
     }
@@ -358,8 +477,16 @@ impl SequenceSet {
         query_contexts: usize,
     ) -> Vec<u32> {
         assert!(n_part > 0);
+        assert!(query_contexts > 0);
         let target_letters = (self.letters() + n_part as u64 - 1) / n_part as u64;
         let contexts = if context_reduced { query_contexts } else { 1 };
+        if context_reduced {
+            assert_eq!(
+                self.len() % contexts,
+                0,
+                "translated sequence count must be a multiple of query contexts"
+            );
+        }
         let mut partitions = Vec::with_capacity(n_part as usize + 1);
         if !shortened {
             partitions.push(0);
@@ -369,9 +496,6 @@ impl SequenceSet {
             let mut letters = 0u64;
             while i < self.len() && letters < target_letters {
                 for _ in 0..contexts {
-                    if i >= self.len() {
-                        break;
-                    }
                     letters += self.seq_length(i) as u64;
                     i += 1;
                 }
@@ -398,6 +522,43 @@ impl SequenceSet {
         }
     }
 
+    /// Matches C++ `SequenceSet::translated_seq`, with the former global
+    /// `align_mode.query_translated` supplied explicitly.
+    pub fn translated_seq<'a>(
+        &'a self,
+        source: &'a [Letter],
+        i: usize,
+        query_translated: bool,
+    ) -> TranslatedSequenceView<'a> {
+        if !query_translated {
+            let seq = self.get(i);
+            return TranslatedSequenceView {
+                source: seq,
+                translated: [seq, &[], &[], &[], &[], &[]],
+            };
+        }
+        TranslatedSequenceView {
+            source,
+            translated: [
+                self.get(i),
+                self.get(i + 1),
+                self.get(i + 2),
+                self.get(i + 3),
+                self.get(i + 4),
+                self.get(i + 5),
+            ],
+        }
+    }
+
+    pub fn translated_seq_with_config<'a>(
+        &'a self,
+        source: &'a [Letter],
+        i: usize,
+        config: SequenceSetConfig,
+    ) -> TranslatedSequenceView<'a> {
+        self.translated_seq(source, i, config.query_translated)
+    }
+
     /// Matches C++ `SequenceSet::avg_len()`.
     pub fn avg_len(&self) -> usize {
         self.letters() as usize / self.len()
@@ -419,6 +580,7 @@ impl SequenceSet {
 
     /// Matches C++ `SequenceSet::source_length(i)`.
     pub fn source_length_with_contexts(&self, i: usize, query_contexts: usize) -> Loc {
+        assert!(query_contexts > 0);
         if query_contexts == 1 {
             self.seq_length(i)
         } else {
@@ -427,13 +589,37 @@ impl SequenceSet {
         }
     }
 
+    pub fn source_length_with_config(&self, i: usize, config: SequenceSetConfig) -> Loc {
+        self.source_length_with_contexts(i, config.query_contexts)
+    }
+
+    pub fn partition_with_config(
+        &self,
+        n_part: u32,
+        shortened: bool,
+        context_reduced: bool,
+        config: SequenceSetConfig,
+    ) -> Vec<u32> {
+        self.partition_with_contexts(n_part, shortened, context_reduced, config.query_contexts)
+    }
+
+    /// C++ `print_stats` rendered without the process-global verbose stream.
+    pub fn stats_line(&self) -> String {
+        format!(
+            "Sequences = {}, letters = {}, average length = {}\n",
+            self.len(),
+            self.letters(),
+            self.avg_len()
+        )
+    }
+
+    pub fn write_stats<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(self.stats_line().as_bytes())
+    }
+
     /// Total letters across all sequences.
     pub fn letters(&self) -> u64 {
-        let mut total = 0u64;
-        for i in 0..self.len() {
-            total += self.seq_length(i) as u64;
-        }
-        total
+        (self.raw_len() - self.len() - Self::PERIMETER_PADDING) as u64
     }
 
     /// Get the raw data (for SIMD access or direct manipulation).
@@ -462,6 +648,20 @@ impl SequenceSet {
 impl Default for SequenceSet {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// C++ exposes a move constructor from the underlying letter string set.
+impl From<LetterStringSet> for SequenceSet {
+    fn from(storage: LetterStringSet) -> Self {
+        Self {
+            data: storage.data,
+            offsets: storage
+                .limits
+                .into_iter()
+                .map(|offset| offset as usize)
+                .collect(),
+        }
     }
 }
 
@@ -561,14 +761,14 @@ mod tests {
         ss.push(&[0, 1, 2, 3]);
         ss.push(&[4, 5, 6]);
 
-        assert_eq!(ss.ptr(0), 1);
-        assert_eq!(ss.ptr(1), 6);
-        assert_eq!(ss.position(0, 2), 3);
-        assert_eq!(ss.position(1, 1), 7);
-        assert_eq!(ss.local_position(1), (0, 0));
-        assert_eq!(ss.local_position(4), (0, 3));
-        assert_eq!(ss.local_position(6), (1, 0));
-        assert_eq!(ss.local_position(8), (1, 2));
+        assert_eq!(ss.ptr(0), 256);
+        assert_eq!(ss.ptr(1), 261);
+        assert_eq!(ss.position(0, 2), 258);
+        assert_eq!(ss.position(1, 1), 262);
+        assert_eq!(ss.local_position(256), (0, 0));
+        assert_eq!(ss.local_position(259), (0, 3));
+        assert_eq!(ss.local_position(261), (1, 0));
+        assert_eq!(ss.local_position(263), (1, 2));
     }
 
     #[test]
@@ -580,7 +780,8 @@ mod tests {
 
         assert_eq!(ss.length(1), 3);
         assert_eq!(ss.len_bounds(3), (3, 4));
-        assert_eq!(ss.len_bounds(5), (Loc::MAX, 0));
+        // C++ applies the threshold only to the minimum; maximum is global.
+        assert_eq!(ss.len_bounds(5), (Loc::MAX, 4));
         assert_eq!(ss.max_len(0, 2), 4);
         assert_eq!(ss.avg_len(), 3);
         assert_eq!(ss.lengths(), vec![(4, 0), (3, 1), (2, 2)]);
@@ -610,6 +811,103 @@ mod tests {
         }
         assert_eq!(ss.partition_with_contexts(2, false, true, 6), vec![0, 1, 2]);
         assert_eq!(ss.partition_with_contexts(2, true, true, 6), vec![1, 2]);
+    }
+
+    #[test]
+    fn sequence_set_has_cpp_perimeter_and_reserve_storage() {
+        let mut ss = SequenceSet::new();
+        assert_eq!(ss.raw_len(), SequenceSet::PERIMETER_PADDING);
+        assert!(ss.data().iter().all(|&x| x == DELIMITER_LETTER));
+
+        ss.reserve(3);
+        ss.reserve(2);
+        ss.finish_reserve();
+        ss.assign(0, &[1, 2, 3]);
+        ss.assign(1, &[4, 5]);
+
+        assert_eq!(ss.offsets(), &[256, 260, 263]);
+        assert_eq!(ss.get(0), &[1, 2, 3]);
+        assert_eq!(ss.get(1), &[4, 5]);
+        assert_eq!(ss.data()[255], DELIMITER_LETTER);
+        assert_eq!(ss.data()[259], DELIMITER_LETTER);
+        assert!(ss.data()[ss.raw_len()..]
+            .iter()
+            .all(|&x| x == DELIMITER_LETTER));
+
+        let subset = ss.subset(&[1, 0]);
+        assert_eq!(subset.get(0), &[4, 5]);
+        assert_eq!(subset.get(1), &[1, 2, 3]);
+
+        let mut appended = SequenceSet::new();
+        appended.push(&[9]);
+        appended.append(&subset);
+        assert_eq!(appended.get(0), &[9]);
+        assert_eq!(appended.get(1), &[4, 5]);
+        assert_eq!(appended.get(2), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn sequence_set_partition_and_length_sort_match_cpp() {
+        let mut ss = SequenceSet::new();
+        for n in [2, 2, 3, 3, 1, 1] {
+            ss.fill(n, 7);
+        }
+        let config = SequenceSetConfig {
+            query_contexts: 2,
+            query_translated: true,
+        };
+        assert_eq!(
+            ss.partition_with_config(3, false, true, config),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            ss.partition_with_config(5, true, true, config),
+            vec![1, 2, 3, 3, 3]
+        );
+
+        let mut lengths = ss.lengths();
+        lengths.sort_unstable();
+        assert_eq!(
+            lengths,
+            vec![(1, 4), (1, 5), (2, 0), (2, 1), (3, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn translated_view_and_stats_are_explicit() {
+        let mut ss = SequenceSet::new();
+        for frame in 0..6 {
+            ss.push(&[frame as Letter]);
+        }
+        let source = [10, 11, 12, 13];
+        let translated = ss.translated_seq(&source, 0, true);
+        assert_eq!(translated.source(), &source);
+        for frame in 0..6 {
+            assert_eq!(translated.frame(frame), &[frame as Letter]);
+        }
+
+        let protein = ss.translated_seq(&source, 2, false);
+        assert_eq!(protein.source(), &[2]);
+        assert_eq!(protein.frame(0), &[2]);
+        assert!(protein.frame(1).is_empty());
+
+        let mut out = Vec::new();
+        ss.write_stats(&mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Sequences = 6, letters = 6, average length = 1\n"
+        );
+    }
+
+    #[test]
+    fn sequence_set_converts_from_cpp_base_storage() {
+        let mut storage = LetterStringSet::new();
+        storage.push_back(&[3, 4]);
+        storage.finish_reserve();
+        let ss = SequenceSet::from(storage);
+        assert_eq!(ss.get(0), &[3, 4]);
+        assert_eq!(ss.ptr(0), 256);
+        assert_eq!(ss.data().len(), ss.raw_len() + 256);
     }
 
     #[test]

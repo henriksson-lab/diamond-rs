@@ -2,12 +2,15 @@ use crate::align::gapped_filter::SeedHit;
 use crate::basic::consts::MAX_CONTEXT;
 use crate::basic::statistics::Statistics;
 use crate::basic::value::{BlockId, Letter, Loc, TRUE_AA};
-use crate::chaining::{hamming_ext, run as chaining_run, HammingExtConfig};
+use crate::chaining::{
+    hamming_ext, run_with_config as chaining_run_with_config, GreedyAlignConfig, HammingExtConfig,
+};
 use crate::data::block::Block;
 use crate::dp::ungapped::{xdrop_ungapped_with_cbs, DiagonalSegment};
 use crate::search::sensitivity::ExtensionMode;
 use crate::stats::cbs::{
     adjust_matrix, count_true_aa, CbsMode, CbsThresholds, MatrixAdjustRule, TargetMatrix,
+    TargetMatrixAdjustment,
 };
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::data_structures::FlatArray;
@@ -20,14 +23,18 @@ pub struct UngappedStageConfig {
     pub query_contexts: usize,
     pub query_translated: bool,
     pub hamming_ext: HammingExtConfig,
+    pub mutual_cover: bool,
     pub lin_stage1_query: bool,
     pub lin_stage1_target: bool,
     pub comp_based_stats: CbsMode,
     pub anchored_swipe: bool,
     pub log_extend: bool,
-    pub no_chaining_merge_hsps: bool,
+    pub chaining: GreedyAlignConfig,
     pub xdrop: i32,
     pub matrix_adjust_thresholds: CbsThresholds,
+    pub cbs_matrix_scale: i32,
+    pub matrix_adjust_tolerance: f64,
+    pub matrix_adjust_max_iterations: i32,
 }
 
 impl Default for UngappedStageConfig {
@@ -36,14 +43,18 @@ impl Default for UngappedStageConfig {
             query_contexts: 1,
             query_translated: false,
             hamming_ext: HammingExtConfig::default(),
+            mutual_cover: false,
             lin_stage1_query: false,
             lin_stage1_target: false,
             comp_based_stats: CbsMode::Disabled,
             anchored_swipe: false,
             log_extend: false,
-            no_chaining_merge_hsps: false,
+            chaining: GreedyAlignConfig::default(),
             xdrop: 20,
             matrix_adjust_thresholds: CbsThresholds::default(),
+            cbs_matrix_scale: 1,
+            matrix_adjust_tolerance: 0.0,
+            matrix_adjust_max_iterations: -1,
         }
     }
 }
@@ -67,7 +78,7 @@ impl WorkTarget {
         query_len_true_aa: Loc,
         query_comp: &[f64; TRUE_AA as usize],
         _max_target_len: Loc,
-        _stats: &mut Statistics,
+        stats: &mut Statistics,
         score_matrix: &ScoreMatrix,
         cfg: &UngappedStageConfig,
     ) -> Self {
@@ -89,12 +100,37 @@ impl WorkTarget {
                 cfg.matrix_adjust_thresholds,
             );
             if rule != MatrixAdjustRule::DontAdjustMatrix {
-                let target_comp = crate::stats::cbs::compute_composition(&target.seq);
-                target.matrix = Some(Arc::new(TargetMatrix::from_hauser_global(
-                    query_comp,
-                    &target_comp,
-                    score_matrix,
-                )));
+                target.matrix = if let (Some(joint_probs), Some(freq_ratios)) =
+                    (score_matrix.joint_probs(), score_matrix.freq_ratios())
+                {
+                    Some(Arc::new(
+                        TargetMatrix::from_composition_adjustment(
+                            query_comp,
+                            query_len_true_aa,
+                            cfg.comp_based_stats,
+                            &target.seq,
+                            stats,
+                            score_matrix,
+                            rule,
+                            TargetMatrixAdjustment {
+                                matrix_scale: cfg.cbs_matrix_scale,
+                                joint_probs,
+                                background_freqs: score_matrix.background_freqs(),
+                                freq_ratios: Some(freq_ratios),
+                                tolerance: cfg.matrix_adjust_tolerance,
+                                max_iterations: cfg.matrix_adjust_max_iterations,
+                            },
+                        )
+                        .expect("matrix adjustment rule was selected by adjust_matrix"),
+                    ))
+                } else {
+                    let target_comp = crate::stats::cbs::compute_composition(&target.seq);
+                    Some(Arc::new(TargetMatrix::from_hauser_global(
+                        query_comp,
+                        &target_comp,
+                        score_matrix,
+                    )))
+                };
             }
         }
         let _ = query;
@@ -133,6 +169,7 @@ pub fn ungapped_stage_target(
     let with_diag_filter = (cfg.hamming_ext.hamming_ext
         || cfg.hamming_ext.diag_filter_cov.is_some()
         || cfg.hamming_ext.diag_filter_id.is_some())
+        && !cfg.mutual_cover
         && cfg.query_contexts == 1;
 
     if mode == ExtensionMode::Full {
@@ -225,25 +262,14 @@ pub fn ungapped_stage_target(
         }
         diagonal_segments[frame]
             .sort_by(|x, y| x.diag().cmp(&y.diag()).then_with(|| x.j.cmp(&y.j)));
-        // Chaining `max_shift` (= C++ `config.chaining_maxgap`, default 2000
-        // per `diamond/src/basic/config.cpp:546`). This bounds the diagonal
-        // shift between two linkable segments inside `backtrace_old` at
-        // `chaining.rs:910`. We previously passed `gap_open + 6` (= 17 on
-        // BLOSUM62) which silently broke chaining whenever a true HSP had
-        // gaps wider than ~17 diagonals — CD209-family (Q8MIS5) alignments
-        // have three large gaps with net ~150-letter subject insertions, so
-        // 17 truncates the chain to the C-terminal high-density cluster and
-        // produces short alignments (q=102..240 instead of q=1..240).
-        const CHAINING_MAXGAP: i32 = 2000;
-        let (_score, mut hsps) = chaining_run(
+        let (_score, mut hsps) = chaining_run_with_config(
             &query_seq[frame],
             &target.seq,
             &diagonal_segments[frame],
             cfg.log_extend,
             frame as u32,
-            CHAINING_MAXGAP,
             score_matrix,
-            cfg.no_chaining_merge_hsps,
+            &cfg.chaining,
         );
         hsps.sort_by(|x, y| x.frame.cmp(&y.frame).then_with(|| x.d_min.cmp(&y.d_min)));
         target.hsp[frame] = hsps;
@@ -366,6 +392,64 @@ mod tests {
         assert_eq!(wt.ungapped_score[0], 27);
         assert!(wt.hsp[0].is_empty());
         assert!(!wt.done);
+    }
+
+    #[test]
+    fn work_target_uses_standard_matrix_adjustment_tables() {
+        let score_matrix = sm();
+        let query = (0..TRUE_AA as Letter).collect::<Vec<_>>();
+        let target = query.iter().copied().rev().collect::<Vec<_>>();
+        let comp = compute_composition(&query);
+        let mut stats = Statistics::new();
+        let cfg = UngappedStageConfig {
+            comp_based_stats: CbsMode::MatrixAdjust,
+            cbs_matrix_scale: 2,
+            ..UngappedStageConfig::default()
+        };
+        let work = WorkTarget::new(
+            0,
+            &target,
+            &query,
+            query.len() as Loc,
+            &comp,
+            target.len() as Loc,
+            &mut stats,
+            &score_matrix,
+            &cfg,
+        );
+        assert!(work.matrix.is_some());
+        assert_eq!(
+            stats.get(crate::basic::statistics::StatValue::MatrixAdjustCount),
+            1
+        );
+    }
+
+    #[test]
+    fn test_mutual_cover_disables_full_mode_diagonal_filter() {
+        let score_matrix = sm();
+        let query = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let block = block_with_sequences(&[&query]);
+        let comp = compute_composition(&query);
+        let mut hits = vec![SeedHit::new(1, 1, 27, 0)];
+        let mut stats = Statistics::new();
+        let mut cfg = UngappedStageConfig::default();
+        cfg.hamming_ext.hamming_ext = true;
+        cfg.mutual_cover = true;
+        let wt = ungapped_stage_target(
+            &mut hits,
+            &[query],
+            &[],
+            &comp,
+            0,
+            0,
+            &mut stats,
+            &block,
+            ExtensionMode::Full,
+            &cfg,
+            &score_matrix,
+        );
+        assert_eq!(wt.ungapped_score[0], 27);
+        assert!(wt.hsp[0].is_empty());
     }
 
     #[test]

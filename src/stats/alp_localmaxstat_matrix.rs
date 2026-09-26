@@ -29,6 +29,36 @@ impl Default for LocalMaxStatMatrix {
 }
 
 impl LocalMaxStatMatrix {
+    /// Rust-spelled equivalent of the primary C++ `copy` overload.
+    pub fn copy_matrix(
+        &mut self,
+        dim_matrix: usize,
+        score_matrix: &[Vec<i64>],
+        p: &[f64],
+        p2: Option<&[f64]>,
+        dim_matrix2: usize,
+    ) {
+        self.copy(dim_matrix, score_matrix, p, p2, dim_matrix2);
+    }
+
+    /// Rust-spelled equivalent of the C++ `copy(LocalMaxStat, ...)` overload.
+    pub fn copy_with_base(
+        &mut self,
+        local_max_stat: LocalMaxStat,
+        dim_matrix: usize,
+        score_matrix: &[Vec<i64>],
+        p: &[f64],
+        p2: Option<&[f64]>,
+        dim_matrix2: usize,
+    ) {
+        self.copy_base(local_max_stat, dim_matrix, score_matrix, p, p2, dim_matrix2);
+    }
+
+    /// Rust-spelled equivalent of the inline matrix copy overload.
+    pub fn copy_from(&mut self, other: &Self) {
+        self.copy_local(other);
+    }
+
     pub fn new(
         dimMatrix_: usize,
         scoreMatrix_: Option<&[Vec<i64>]>,
@@ -253,6 +283,83 @@ impl LocalMaxStatMatrix {
 
     pub fn getDimMatrix2(&self) -> usize {
         self.d_dimMatrix2
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.bool_()
+    }
+
+    pub fn get_r(&self, theta: f64) -> f64 {
+        self.getR(theta)
+    }
+    pub fn get_a(&self) -> f64 {
+        self.getA()
+    }
+    pub fn get_alpha(&self) -> f64 {
+        self.getAlpha()
+    }
+    pub fn dimension(&self) -> usize {
+        self.getDimension()
+    }
+    pub fn scores(&self) -> &[i64] {
+        self.getScore()
+    }
+    pub fn probabilities(&self) -> &[f64] {
+        self.getProb()
+    }
+    pub fn lambda(&self) -> f64 {
+        self.getLambda()
+    }
+    pub fn k(&self) -> f64 {
+        self.getK()
+    }
+    pub fn c(&self) -> f64 {
+        self.getC()
+    }
+    pub fn terminated(&self) -> bool {
+        self.getTerminated()
+    }
+    pub fn theta_min(&self) -> f64 {
+        self.getThetaMin()
+    }
+    pub fn r_min(&self) -> f64 {
+        self.getRMin()
+    }
+    pub fn delta(&self) -> i64 {
+        self.getDelta()
+    }
+    pub fn theta_minus_delta(&self) -> f64 {
+        self.getThetaMinusDelta()
+    }
+    pub fn mu(&self) -> f64 {
+        self.getMu()
+    }
+    pub fn sigma(&self) -> f64 {
+        self.getSigma()
+    }
+    pub fn mu_assoc(&self) -> f64 {
+        self.getMuAssoc()
+    }
+    pub fn sigma_assoc(&self) -> f64 {
+        self.getSigmaAssoc()
+    }
+    pub fn mean_wdle(&self) -> f64 {
+        self.getMeanWDLE()
+    }
+    pub fn dim_matrix(&self) -> usize {
+        self.getDimMatrix()
+    }
+    pub fn score_matrix(&self) -> &[Vec<i64>] {
+        self.getScoreMatrix()
+    }
+    pub fn p(&self) -> &[f64] {
+        self.getP()
+    }
+    pub fn p2(&self) -> &[f64] {
+        self.getP2()
+    }
+    pub fn dim_matrix2(&self) -> usize {
+        self.getDimMatrix2()
     }
 
     fn init(&mut self, dimMatrix_: usize, dimMatrix2_: usize) {

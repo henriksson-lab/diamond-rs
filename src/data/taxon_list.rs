@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 
 use crate::basic::value::{OId, TaxId};
 use crate::data::compact_array::CompactArray;
-use crate::util::algo::write_varuint32;
+use crate::util::algo::{join_sorted_lists, write_varuint32};
 use crate::util::sequence::{get_accession, AccessionParsing};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +20,17 @@ impl TaxonList {
 
     pub fn get(&self, i: usize) -> Result<Vec<i32>, String> {
         self.array.get(i)
+    }
+
+    /// C++ `TaxonList(Deserializer&, size, data_size)`.
+    pub fn read_from<R: Read>(
+        mut reader: R,
+        size: usize,
+        data_size: usize,
+    ) -> Result<Self, String> {
+        let mut data = vec![0; data_size];
+        reader.read_exact(&mut data).map_err(|e| e.to_string())?;
+        Self::new(data, size, data_size)
     }
 
     pub fn size(&self) -> usize {
@@ -40,32 +51,17 @@ impl TaxonList {
         let mut sorted_acc2oid = acc2oid.to_vec();
         sorted_acc2oid.sort();
 
+        let joined = join_sorted_lists(
+            &sorted_acc2oid,
+            &acc2taxid,
+            |row| row.0.clone(),
+            |row| row.0.clone(),
+            |oid, taxid| (oid.1, taxid.1),
+        )?;
+        let acc_matched = joined.len();
         let mut oid2taxids: BTreeMap<OId, BTreeSet<TaxId>> = BTreeMap::new();
-        let mut i = 0usize;
-        let mut j = 0usize;
-        let mut acc_matched = 0usize;
-        while i < sorted_acc2oid.len() && j < acc2taxid.len() {
-            match sorted_acc2oid[i].0.cmp(&acc2taxid[j].0) {
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
-                std::cmp::Ordering::Equal => {
-                    let acc = sorted_acc2oid[i].0.clone();
-                    let oid_begin = i;
-                    while i < sorted_acc2oid.len() && sorted_acc2oid[i].0 == acc {
-                        i += 1;
-                    }
-                    let tax_begin = j;
-                    while j < acc2taxid.len() && acc2taxid[j].0 == acc {
-                        j += 1;
-                    }
-                    for oid_row in &sorted_acc2oid[oid_begin..i] {
-                        for tax_row in &acc2taxid[tax_begin..j] {
-                            oid2taxids.entry(oid_row.1).or_default().insert(tax_row.1);
-                            acc_matched += 1;
-                        }
-                    }
-                }
-            }
+        for (oid, taxid) in joined {
+            oid2taxids.entry(oid).or_default().insert(taxid);
         }
 
         let mut data = Vec::new();
@@ -114,13 +110,24 @@ pub fn mapping_file_format(header: &str) -> Result<i32, String> {
     if field1 == "accession" && field2 == "accession.version" {
         let field3 = fields.next().unwrap_or("");
         let field4 = fields.next().unwrap_or("");
-        if field3 == "taxid" && field4 == "gi" && fields.next().is_none() {
+        if field3 == "taxid" && field4 == "gi" && only_optional_trailing_empty(fields) {
             return Ok(0);
         }
-    } else if field1 == "accession.version" && field2 == "taxid" && fields.next().is_none() {
+    } else if field1 == "accession.version"
+        && field2 == "taxid"
+        && only_optional_trailing_empty(fields)
+    {
         return Ok(1);
     }
     Err("Accession mapping file header has to be in one of these formats:\naccession\taccession.version\ttaxid\tgi\naccession.version\ttaxid".to_string())
+}
+
+fn only_optional_trailing_empty<'a>(mut fields: impl Iterator<Item = &'a str>) -> bool {
+    match fields.next() {
+        None => true,
+        Some("") => fields.next().is_none(),
+        Some(_) => false,
+    }
 }
 
 pub fn load_mapping_file<R: BufRead>(
@@ -130,8 +137,9 @@ pub fn load_mapping_file<R: BufRead>(
     let mut lines = reader.lines();
     let header = lines
         .next()
-        .ok_or_else(|| "Missing accession mapping file header.".to_string())?
-        .map_err(|e| e.to_string())?;
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
     let format = mapping_file_format(&header)?;
     let mut rows = Vec::new();
     let mut stats = AccessionParsing::default();
@@ -159,6 +167,7 @@ pub fn load_mapping_file<R: BufRead>(
             return Err(format!("Empty accession field in line {line_count}"));
         }
         let taxid = taxid
+            .trim_start_matches(|c: char| c.is_ascii_whitespace())
             .parse::<TaxId>()
             .map_err(|_| format!("Malformed input in line {line_count}"))?;
         if !no_parse_seqids {
@@ -195,6 +204,12 @@ mod tests {
             0
         );
         assert_eq!(mapping_file_format("accession.version\ttaxid").unwrap(), 1);
+        // C++ tokenizer accepts one delimiter immediately before its NUL.
+        assert_eq!(
+            mapping_file_format("accession.version\ttaxid\t").unwrap(),
+            1
+        );
+        assert!(mapping_file_format("accession.version\ttaxid\t\t").is_err());
         assert!(mapping_file_format("accession\ttaxid").is_err());
     }
 
@@ -233,6 +248,19 @@ mod tests {
             load_mapping_file("accession.version\ttaxid\nA\tx\n".as_bytes(), false).unwrap_err(),
             "Malformed input in line 2"
         );
+        assert!(load_mapping_file("".as_bytes(), false)
+            .unwrap_err()
+            .starts_with("Accession mapping file header"));
+
+        let duplicate_after_sort = "accession.version\ttaxid\nA\t1\nB\t2\nA\t3\n";
+        let err = TaxonList::build(
+            &[("A".into(), 0), ("B".into(), 1)],
+            duplicate_after_sort,
+            2,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(err, "Duplicate keys: A");
     }
 
     #[test]
@@ -242,8 +270,12 @@ mod tests {
         set.insert(2);
         let mut data = Vec::new();
         serialize_taxid_set(&set, &mut data);
+        assert_eq!(data, vec![5, 5, 15]);
         let list = TaxonList::new(data.clone(), 1, data.len()).unwrap();
         assert_eq!(list.get(0).unwrap(), vec![2, 7]);
+        let from_reader = TaxonList::read_from(data.as_slice(), 1, data.len()).unwrap();
+        assert_eq!(from_reader.get(0).unwrap(), vec![2, 7]);
+        assert!(TaxonList::read_from(&data[..2], 1, data.len()).is_err());
     }
 
     #[test]
@@ -261,6 +293,7 @@ mod tests {
         assert_eq!(build.taxon_list.get(1).unwrap(), Vec::<i32>::new());
         assert_eq!(build.taxon_list.get(2).unwrap(), Vec::<i32>::new());
         assert_eq!(build.taxon_list.get(3).unwrap(), Vec::<i32>::new());
+        assert_eq!(build.taxon_list.data(), &[3, 21, 1, 1, 1]);
         assert_eq!(
             build.stats,
             TaxonListStats {

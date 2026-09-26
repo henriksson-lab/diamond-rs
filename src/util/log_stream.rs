@@ -7,9 +7,9 @@ use std::time::Instant;
 pub static MESSAGE_STREAM: LazyLock<Mutex<MessageStream>> =
     LazyLock::new(|| Mutex::new(MessageStream::new(true, false)));
 pub static VERBOSE_STREAM: LazyLock<Mutex<MessageStream>> =
-    LazyLock::new(|| Mutex::new(MessageStream::new(true, false)));
+    LazyLock::new(|| Mutex::new(MessageStream::new(false, false)));
 pub static LOG_STREAM: LazyLock<Mutex<MessageStream>> =
-    LazyLock::new(|| Mutex::new(MessageStream::new(true, false)));
+    LazyLock::new(|| Mutex::new(MessageStream::new(false, false)));
 
 #[derive(Debug, Clone)]
 pub struct MessageStream {
@@ -206,6 +206,7 @@ impl Drop for TaskTimer {
 }
 
 pub fn exit_with_error<E: Display>(e: E) -> ! {
+    eprintln!("Error: {e}");
     if let Ok(mut stream) = LOG_STREAM.lock() {
         let _ = stream
             .write("Error: ")
@@ -226,6 +227,13 @@ mod tests {
         assert!(!stream.to_file());
         stream.write("abc").unwrap().endl().unwrap();
         stream.flush().unwrap();
+    }
+
+    #[test]
+    fn global_stream_defaults_match_cpp_definitions() {
+        assert!(MESSAGE_STREAM.lock().unwrap().to_cout());
+        assert!(!VERBOSE_STREAM.lock().unwrap().to_cout());
+        assert!(!LOG_STREAM.lock().unwrap().to_cout());
     }
 
     #[test]

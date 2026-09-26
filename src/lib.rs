@@ -31,7 +31,11 @@
 //! ```
 
 pub mod align;
+#[path = "lib/alp/mod.rs"]
+pub mod alp;
 pub mod basic;
+#[path = "lib/blast/mod.rs"]
+pub mod blast;
 pub mod chaining;
 pub mod cluster;
 pub mod commands;
@@ -39,12 +43,18 @@ pub mod config;
 pub mod data;
 pub mod dna;
 pub mod dp;
-#[cfg(all(feature = "ffi", not(windows)))]
 pub mod ffi;
 pub mod masking;
+pub mod mcl;
+#[path = "lib/murmurhash/mod.rs"]
+pub mod murmurhash;
 pub mod output;
+pub mod run;
 pub mod search;
 pub mod stats;
+pub mod tools;
+#[path = "test/mod.rs"]
+pub mod upstream_test;
 pub mod util;
 
 /// Convenient re-exports for common types.

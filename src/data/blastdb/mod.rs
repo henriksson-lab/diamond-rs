@@ -1,5 +1,10 @@
 pub mod asn1;
 pub mod ber;
+pub mod blastdb;
 pub mod db;
+pub mod pal;
+pub mod phr;
+pub mod pin;
+pub mod psq;
 pub mod taxdmp;
 pub mod volume;

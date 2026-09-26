@@ -12,6 +12,20 @@ use std::sync::Mutex;
 
 pub type ShapeHistogram = Vec<Vec<u32>>;
 
+/// Explicit dependencies that replace the C++ constructor's process globals
+/// (`config.threads_`, `shapes`, reduction and alignment-mode context count).
+#[derive(Clone, Copy)]
+pub struct SeedHistogramBuildConfig<'a, 'cfg> {
+    pub serial: bool,
+    pub enum_cfg: &'a EnumCfg<'cfg>,
+    pub seedp_bits: i32,
+    pub threads: u32,
+    pub shapes: &'a ShapeConfig,
+    pub reduction: &'a Reduction,
+    pub min_query_len: Loc,
+    pub query_contexts: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SeedPartitionRange {
     begin: SeedPartition,
@@ -108,6 +122,42 @@ impl SeedHistogram {
     where
         Filter: EnumSeedsFilter,
     {
+        Self::from_block_with_config(
+            seqs,
+            filter,
+            &SeedHistogramBuildConfig {
+                serial,
+                enum_cfg,
+                seedp_bits,
+                threads,
+                shapes,
+                reduction,
+                min_query_len,
+                query_contexts,
+            },
+        )
+    }
+
+    /// The C++ templated constructor with every non-block dependency grouped
+    /// explicitly. `from_block` is retained as a source-compatible wrapper.
+    pub fn from_block_with_config<Filter>(
+        seqs: &mut Block,
+        filter: &Filter,
+        config: &SeedHistogramBuildConfig<'_, '_>,
+    ) -> Result<Self, String>
+    where
+        Filter: EnumSeedsFilter,
+    {
+        let SeedHistogramBuildConfig {
+            serial,
+            enum_cfg,
+            seedp_bits,
+            threads,
+            shapes,
+            reduction,
+            min_query_len,
+            query_contexts,
+        } = *config;
         let p = seqs.seqs().partition(threads, false, false);
         let seedp = seedp_count(seedp_bits) as usize;
         let n_shapes = shapes.count() as usize;
@@ -166,6 +216,11 @@ impl SeedHistogram {
 
     /// Matches C++ `SeedHistogram::max_chunk_size(index_chunks)`.
     pub fn max_chunk_size(&self, index_chunks: i32) -> usize {
+        // C++ `Partition<int>` keeps a negative/zero `parts` value and both
+        // loops execute zero chunks. Avoid changing that into a huge `usize`.
+        if index_chunks <= 0 {
+            return 0;
+        }
         let mut max = 0usize;
         let p = Partition::new(self.seedp() as usize, index_chunks as usize);
         for shape in 0..self.data.len() {
@@ -209,7 +264,8 @@ impl SeedHistogramCallback {
 
 impl EnumSeedsCallback for SeedHistogramCallback {
     fn call(&mut self, seed: u64, _pos: usize, _block_id: usize, shape: i32) -> bool {
-        self.rows[shape as usize][seed_partition(seed, self.seedp_mask) as usize] += 1;
+        let count = &mut self.rows[shape as usize][seed_partition(seed, self.seedp_mask) as usize];
+        *count = count.wrapping_add(1);
         true
     }
 }
@@ -266,6 +322,8 @@ mod tests {
         assert_eq!(h.seedp(), 4);
         assert_eq!(h.get(1)[0], vec![2, 0, 1, 0]);
         assert_eq!(h.max_chunk_size(2), 22);
+        assert_eq!(h.max_chunk_size(0), 0);
+        assert_eq!(h.max_chunk_size(-3), 0);
     }
 
     #[test]
@@ -409,5 +467,102 @@ mod tests {
         assert_eq!(serial.partition(), parallel.partition());
         assert_eq!(serial.get(0), parallel.get(0));
         assert_eq!(serial.get(1), parallel.get(1));
+    }
+
+    #[test]
+    fn test_seed_histogram_partitioned_exact_counts_with_explicit_config() {
+        let reduction = Reduction::default_reduction();
+        let shapes =
+            ShapeConfig::from_codes(&["11".to_string(), "101".to_string()], 0, &reduction).unwrap();
+        let mut block = Block::new();
+        block
+            .push_back(
+                &[0, 1, 2, 3],
+                Some("s0"),
+                None,
+                0,
+                SequenceType::AminoAcid,
+                0,
+                false,
+            )
+            .unwrap();
+        block
+            .push_back(
+                &[1, 2, 3],
+                Some("s1"),
+                None,
+                1,
+                SequenceType::AminoAcid,
+                0,
+                false,
+            )
+            .unwrap();
+        let enum_cfg = EnumCfg {
+            partition: None,
+            shape_begin: 0,
+            shape_end: shapes.count(),
+            code: SeedEncoding::SpacedFactor,
+            skip: None,
+            filter_masked_seeds: false,
+            mask_seeds: false,
+            seed_cut: 0.0,
+            soft_masking: MaskingAlgo::None,
+            minimizer_window: 0,
+            filter_low_complexity_seeds: false,
+            mask_low_complexity_seeds: false,
+            sketch_size: 0,
+        };
+        let config = SeedHistogramBuildConfig {
+            serial: false,
+            enum_cfg: &enum_cfg,
+            seedp_bits: 2,
+            threads: 2,
+            shapes: &shapes,
+            reduction: &reduction,
+            min_query_len: 0,
+            query_contexts: 1,
+        };
+        let histogram =
+            SeedHistogram::from_block_with_config(&mut block, &NO_FILTER, &config).unwrap();
+
+        assert_eq!(histogram.partition(), &vec![0, 1, 2]);
+        assert_eq!(
+            histogram
+                .get(0)
+                .iter()
+                .map(partition_size_all)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert_eq!(
+            histogram
+                .get(1)
+                .iter()
+                .map(partition_size_all)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(
+            histogram
+                .data
+                .iter()
+                .flatten()
+                .flatten()
+                .copied()
+                .sum::<u32>(),
+            8
+        );
+    }
+
+    fn partition_size_all(row: &Vec<u32>) -> u32 {
+        row.iter().copied().sum()
+    }
+
+    #[test]
+    fn test_callback_count_wraps_like_cpp_unsigned() {
+        let mut callback = SeedHistogramCallback::new(0, 1, 1);
+        callback.rows[0][0] = u32::MAX;
+        assert!(callback.call(0, 0, 0, 0));
+        assert_eq!(callback.rows[0][0], 0);
     }
 }

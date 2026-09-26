@@ -80,13 +80,17 @@ impl DynProgProb {
             d_dimInputProb: 0,
             d_inputProb_p: Vec::new(),
         };
-        this.setValueFct(valueFct_);
-        this.setInput(dimInputProb_, inputProb_);
+        this.set_value_fct(valueFct_);
+        this.set_input(dimInputProb_, inputProb_);
         this.clear(valueLower_, valueUpper_, prob_);
         this
     }
 
     pub fn bool_(&self) -> bool {
+        self.is_ready()
+    }
+
+    pub fn is_ready(&self) -> bool {
         self.getArrayCapacity() != 0
             && self.d_valueFct.is_some()
             && self.d_dimInputProb != 0
@@ -97,13 +101,43 @@ impl DynProgProb {
         *self = dynProgProb_.clone();
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_state(
+        &mut self,
+        step: usize,
+        arrays: &[Vec<f64>; 2],
+        array_capacity: usize,
+        value_begin: i64,
+        value_lower: i64,
+        value_upper: i64,
+        value_fct: Option<ValueFct>,
+        dim_input_prob: usize,
+        input_prob: Option<&[f64]>,
+    ) {
+        if array_capacity != self.getArrayCapacity() {
+            self.free_arrays();
+            self.init(array_capacity);
+        }
+        self.d_step = step;
+        for (destination, source) in self.d_array_p.iter_mut().zip(arrays) {
+            destination.copy_from_slice(&source[..array_capacity]);
+        }
+        self.d_valueBegin = value_begin;
+        self.d_valueLower = value_lower;
+        self.d_valueUpper = value_upper;
+        self.set_value_fct(value_fct);
+        self.set_input(dim_input_prob, input_prob);
+    }
+
     pub fn clear(&mut self, valueLower_: i64, valueUpper_: i64, prob_: Option<&[f64]>) {
         if let Some(prob) = prob_ {
             assert!(valueLower_ < valueUpper_);
-            for &p in prob {
+            let array_capacity = (valueUpper_ - valueLower_) as usize;
+            assert!(prob.len() >= array_capacity);
+            for &p in prob.iter().take(array_capacity) {
                 assert!(0.0 <= p);
             }
-            self.clear_capacity(valueLower_, (valueUpper_ - valueLower_) as usize);
+            self.clear_capacity(valueLower_, array_capacity);
             self.d_valueLower = valueLower_;
             self.d_valueUpper = valueUpper_;
             let array_capacity = self.getArrayCapacity();
@@ -128,22 +162,34 @@ impl DynProgProb {
     }
 
     pub fn setValueFct(&mut self, valueFct_: Option<ValueFct>) {
-        self.d_valueFct = valueFct_;
+        self.set_value_fct(valueFct_);
     }
 
     pub fn setInput(&mut self, dimInputProb_: usize, inputProb_: Option<&[f64]>) {
-        if dimInputProb_ != self.getDimInputProb() {
-            self.d_inputProb_p = vec![0.0; dimInputProb_];
-            self.d_dimInputProb = dimInputProb_;
+        self.set_input(dimInputProb_, inputProb_);
+    }
+
+    pub fn set_value_fct(&mut self, value_fct: Option<ValueFct>) {
+        self.d_valueFct = value_fct;
+    }
+
+    pub fn set_input(&mut self, dim_input_prob: usize, input_prob: Option<&[f64]>) {
+        if dim_input_prob != self.getDimInputProb() {
+            self.free_input();
+            self.init_input(dim_input_prob);
         }
         if self.getDimInputProb() > 0 {
             let dim_input_prob = self.getDimInputProb();
             self.d_inputProb_p
-                .copy_from_slice(&inputProb_.expect("inputProb_")[..dim_input_prob]);
+                .copy_from_slice(&input_prob.expect("input probability array")[..dim_input_prob]);
         }
     }
 
     pub fn update(&mut self) {
+        self.update_state();
+    }
+
+    pub(crate) fn update_state(&mut self) {
         assert!(self.getValueFct().is_some());
         assert!(self.getDimInputProb() != 0);
         assert!(!self.getInputProb().is_empty());
@@ -176,7 +222,7 @@ impl DynProgProb {
                         valueBegin -= (ARRAY_FAC as i64 - 1) * self.getArrayCapacity() as i64;
                     }
                     self.reserve(ARRAY_FAC * self.getArrayCapacity());
-                    self.setValueBegin(valueBegin);
+                    self.set_value_begin(valueBegin);
                 }
 
                 if value < valueLower {
@@ -196,48 +242,88 @@ impl DynProgProb {
     }
 
     pub fn getProb(&self, value_: i64) -> f64 {
-        if value_ < self.getValueBegin() {
+        self.get_prob(value_)
+    }
+
+    pub fn get_prob(&self, value: i64) -> f64 {
+        if value < self.getValueBegin() {
             return 0.0;
         }
-        if self.getValueEnd() <= value_ {
+        if self.getValueEnd() <= value {
             return 0.0;
         }
-        self.d_array_p[self.getStep() % 2][self.getArrayPos(value_) as usize]
+        self.d_array_p[self.getStep() % 2][self.getArrayPos(value) as usize]
     }
 
     pub fn getStep(&self) -> usize {
+        self.step()
+    }
+
+    pub fn step(&self) -> usize {
         self.d_step
     }
 
     pub fn getArray(&self) -> &[Vec<f64>; 2] {
+        self.arrays()
+    }
+
+    pub fn arrays(&self) -> &[Vec<f64>; 2] {
         &self.d_array_p
     }
 
     pub fn getArrayCapacity(&self) -> usize {
+        self.array_capacity()
+    }
+
+    pub fn array_capacity(&self) -> usize {
         self.d_arrayCapacity
     }
 
     pub fn getValueBegin(&self) -> i64 {
+        self.value_begin()
+    }
+
+    pub fn value_begin(&self) -> i64 {
         self.d_valueBegin
     }
 
     pub fn getValueLower(&self) -> i64 {
+        self.value_lower()
+    }
+
+    pub fn value_lower(&self) -> i64 {
         self.d_valueLower
     }
 
     pub fn getValueUpper(&self) -> i64 {
+        self.value_upper()
+    }
+
+    pub fn value_upper(&self) -> i64 {
         self.d_valueUpper
     }
 
     pub fn getValueFct(&self) -> Option<ValueFct> {
+        self.value_fct()
+    }
+
+    pub fn value_fct(&self) -> Option<ValueFct> {
         self.d_valueFct
     }
 
     pub fn getDimInputProb(&self) -> usize {
+        self.input_dimension()
+    }
+
+    pub fn input_dimension(&self) -> usize {
         self.d_dimInputProb
     }
 
     pub fn getInputProb(&self) -> &[f64] {
+        self.input_prob()
+    }
+
+    pub fn input_prob(&self) -> &[f64] {
         &self.d_inputProb_p
     }
 
@@ -246,6 +332,7 @@ impl DynProgProb {
     }
 
     fn clear_capacity(&mut self, valueBegin_: i64, arrayCapacity_: usize) {
+        self.free_arrays();
         self.init(arrayCapacity_);
         self.d_valueBegin = valueBegin_;
         self.d_step = 0;
@@ -254,6 +341,21 @@ impl DynProgProb {
     fn init(&mut self, arrayCapacity_: usize) {
         self.d_array_p = [vec![0.0; arrayCapacity_], vec![0.0; arrayCapacity_]];
         self.d_arrayCapacity = arrayCapacity_;
+    }
+
+    fn free_arrays(&mut self) {
+        self.d_array_p = [Vec::new(), Vec::new()];
+        self.d_arrayCapacity = 0;
+    }
+
+    fn init_input(&mut self, dim_input_prob: usize) {
+        self.d_inputProb_p = vec![0.0; dim_input_prob];
+        self.d_dimInputProb = dim_input_prob;
+    }
+
+    fn free_input(&mut self) {
+        self.d_inputProb_p.clear();
+        self.d_dimInputProb = 0;
     }
 
     pub(crate) fn getArrayPos(&self, value_: i64) -> i64 {
@@ -273,6 +375,10 @@ impl DynProgProb {
     }
 
     pub(crate) fn setValueBegin(&mut self, valueBegin_: i64) {
+        self.set_value_begin(valueBegin_);
+    }
+
+    pub(crate) fn set_value_begin(&mut self, valueBegin_: i64) {
         assert!(valueBegin_ <= self.getValueBegin());
         let offSet = (self.getValueBegin() - valueBegin_) as usize;
         if offSet == 0 {
