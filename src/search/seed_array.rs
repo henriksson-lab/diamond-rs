@@ -810,8 +810,10 @@ pub fn sort_merge_seed_matches(
 }
 
 /// Sort and emit `SeedMatch` values directly, allowing the caller to skip a
-/// whole joined key block. The predicate receives the first query entry for the
-/// block and the matching seed key.
+/// whole joined key block. The predicate receives all query entries for the
+/// block, the decoded first query location, and the matching seed key. Passing
+/// the whole block lets stage 0 preserve C++'s low-complexity marker bits on
+/// every query occurrence of a rejected joined seed.
 pub fn sort_merge_seed_matches_with_complexity<F>(
     query_part: &mut [SeedEntry],
     ref_part: &mut [SeedEntry],
@@ -822,7 +824,7 @@ pub fn sort_merge_seed_matches_with_complexity<F>(
     mut keep_query_block: F,
 ) -> Vec<SeedMatch>
 where
-    F: FnMut(SeedEntry, (u32, u32), u32) -> bool,
+    F: FnMut(&[SeedEntry], (u32, u32), u32) -> bool,
 {
     if query_part.is_empty() || ref_part.is_empty() {
         return Vec::new();
@@ -851,7 +853,7 @@ where
                 ri += 1;
             }
             if !keep_query_block(
-                query_part[qi_start],
+                &query_part[qi_start..qi],
                 decode_seq_pos(query_offsets, query_part[qi_start]),
                 qk,
             ) {

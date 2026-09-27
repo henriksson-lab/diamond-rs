@@ -51,6 +51,8 @@ pub mod simd_trace;
 
 #[path = "swipe/simd_trace_narrow.rs"]
 mod simd_trace_narrow;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod simd_trace_upstream;
 
 #[path = "swipe/simd_trace_narrow_portable.rs"]
 mod simd_trace_narrow_portable;

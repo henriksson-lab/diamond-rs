@@ -86,8 +86,11 @@ pub fn verify_hit_with_range(
             }
         }
     }
-    let fq = FingerPrint::from_seq_center(q, center + 16);
-    let fs = FingerPrint::from_seq_center(s, center + 16);
+    // C++ `FingerPrint::load(p)` reads `[p - 16, p + 32)`. `center` is the
+    // candidate seed pointer relative to these slices, so it is the actual
+    // fingerprint centre; adding 16 shifts the comparison window right.
+    let fq = FingerPrint::from_seq_center(q, center);
+    let fs = FingerPrint::from_seq_center(s, center);
     fq.match_count(&fs) >= hamming_filter_id
 }
 
@@ -216,14 +219,17 @@ pub fn left_most_filter_with_range(
     window = window.min(window_left + 1 + WINDOW_RIGHT as usize);
 
     let subject_clipped = sequence::clip(&s0[..window.min(s0.len())], window_left as i32);
-    window = window.saturating_sub(s0[..window.min(s0.len())].len() - subject_clipped.len());
 
     let clipped_start = subject_clipped.as_ptr() as usize - s0.as_ptr() as usize;
     let clipped_start = clipped_start / std::mem::size_of::<Letter>();
     let q = &q0[clipped_start..];
     let s = &s0[clipped_start..];
     window_left -= clipped_start;
-    window -= clipped_start;
+    // C++ first trims `window` to `subject_clipped.end()`, then subtracts
+    // `subject_clipped.data() - s`. The resulting span is exactly the clipped
+    // slice length. Subtracting `original_len - clipped_len` and then the
+    // clipped prefix again double-counts the left trim at sequence boundaries.
+    window = subject_clipped.len();
 
     let match_mask = reduced_match(q, s, window as i32, context.reduction);
     let query_seed_mask = !seed_mask(q, window as i32);
@@ -472,6 +478,31 @@ mod tests {
             0,
             false,
             48,
+        ));
+    }
+
+    #[test]
+    fn verify_hit_fingerprint_is_centered_on_candidate() {
+        let reduction = Reduction::default_reduction();
+        let shape = Shape::from_code("111", &reduction);
+        let q: Vec<Letter> = (0..96).map(|i| (i % 20) as Letter).collect();
+        let mut s = q.clone();
+        let center = 24;
+        for letter in &mut s[center + 32..center + 48] {
+            *letter = (*letter + 7) % 20;
+        }
+        assert!(verify_hit(
+            &q,
+            &s,
+            center,
+            0,
+            false,
+            0,
+            &shape,
+            false,
+            48,
+            seedp_mask(8),
+            &reduction,
         ));
     }
 }

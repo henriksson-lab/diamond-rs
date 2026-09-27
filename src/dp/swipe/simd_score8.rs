@@ -225,23 +225,6 @@ unsafe fn pack_full_column(targets: &[&[Letter]], column: usize) -> (V, V, V) {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn pack_banded_column(targets: &[ScoreTarget<'_>], column: usize) -> (V, V) {
-    let mut subject = [0i8; 32];
-    let mut seeded = [0i8; 32];
-    for lane in 0..targets.len() {
-        if let Some(&letter) = targets[lane].subject.get(column) {
-            subject[lane] = (letter & LETTER_MASK) as i8;
-            seeded[lane] = if letter & SEED_MASK != 0 { -1 } else { 0 };
-        }
-    }
-    (
-        arch::_mm256_loadu_si256(subject.as_ptr().cast()),
-        arch::_mm256_loadu_si256(seeded.as_ptr().cast()),
-    )
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
 unsafe fn build_profile(matrix: &[i8; 1024], subject: V, seeded: V) -> [V; 32] {
     let low_index = arch::_mm256_and_si256(subject, arch::_mm256_set1_epi8(15));
     let high_mask = arch::_mm256_cmpgt_epi8(subject, arch::_mm256_set1_epi8(15));
@@ -316,94 +299,90 @@ unsafe fn score_impl(
         };
     }
     let zero = arch::_mm256_set1_epi8(delta);
-    let neg = arch::_mm256_set1_epi8(i8::MIN);
-    scratch.prev_h.resize(band + 1, zero);
-    scratch.curr_h.resize(band + 1, zero);
-    scratch.prev_e.resize(band + 1, neg);
-    scratch.curr_e.resize(band + 1, neg);
+    // Mirror upstream banded_swipe.h: expand every lane to a common moving
+    // band. Each row then addresses one query letter for all SIMD lanes.
+    let i1 = targets
+        .iter()
+        .map(|target| (target.d_end - 1).max(0))
+        .min()
+        .unwrap_or(0);
+    let i0 = i1 + 1 - band as i32;
+    let mut subject_start = [0i32; 32];
+    let mut band_offset = [0usize; 32];
+    let mut columns = 0usize;
+    for (lane, target) in targets.iter().enumerate() {
+        let expanded_begin = target.d_end - band as i32;
+        subject_start[lane] = i1 - (target.d_end - 1);
+        band_offset[lane] = (target.d_begin - expanded_begin).max(0) as usize;
+        let subject_end =
+            ((query.len() as i32 - 1 - expanded_begin).min(target.subject.len() as i32 - 1) + 1)
+                .max(0);
+        columns = columns.max((subject_end - subject_start[lane]).max(0) as usize);
+    }
+    scratch.prev_h.resize(band, zero);
+    scratch.prev_e.resize(band + 1, zero);
     scratch.prev_h.fill(zero);
-    scratch.prev_e.fill(neg);
+    scratch.prev_e.fill(zero);
     let go_v = arch::_mm256_set1_epi8(go);
     let ge_v = arch::_mm256_set1_epi8(ge);
     let max_v = arch::_mm256_set1_epi8(i8::MAX);
     let mut best = zero;
     let mut overflow = arch::_mm256_setzero_si256();
-    let max_len = targets
-        .iter()
-        .map(|target| target.subject.len())
-        .max()
-        .unwrap_or(0);
-
-    for j in 0..max_len {
-        let (subject, seeded) = pack_banded_column(targets, j);
-        let profile_v = build_profile(matrix, subject, seeded);
-        let mut profile = [[0i8; 32]; 32];
-        for (letter, vector) in profile_v.into_iter().enumerate() {
-            arch::_mm256_storeu_si256(profile[letter].as_mut_ptr().cast(), vector);
-        }
-        scratch.curr_h[band] = zero;
-        scratch.curr_e[band] = neg;
-        let mut vertical = neg;
-        for r in 0..band {
-            let mut scores = [0i8; 32];
-            let mut valid = [0i8; 32];
+    let row_masks: Vec<V> = (0..band)
+        .map(|row| {
+            let mut lanes = [0i8; 32];
             for lane in 0..targets.len() {
-                let target = targets[lane];
-                let q = target.d_begin + j as i32 + r as i32;
-                if j >= target.subject.len()
-                    || r >= (target.d_end - target.d_begin).max(0) as usize
-                    || q < 0
-                    || q >= query.len() as i32
-                {
-                    continue;
+                if row >= band_offset[lane] {
+                    lanes[lane] = -1;
                 }
-                valid[lane] = -1;
-                let q = q as usize;
-                let value = profile[(query[q] & LETTER_MASK) as usize][lane] as i32
-                    + cbs.get(q).copied().unwrap_or(0) as i32;
-                if !(i8::MIN as i32..=i8::MAX as i32).contains(&value) {
-                    valid[lane] = 0;
-                    overflow = arch::_mm256_or_si256(
-                        overflow,
-                        arch::_mm256_cmpeq_epi8(
-                            arch::_mm256_set1_epi8(lane as i8),
-                            arch::_mm256_setr_epi8(
-                                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
-                                19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-                            ),
-                        ),
-                    );
-                }
-                scores[lane] = value.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
             }
-            let mask = arch::_mm256_loadu_si256(valid.as_ptr().cast());
-            let subst = arch::_mm256_loadu_si256(scores.as_ptr().cast());
+            arch::_mm256_loadu_si256(lanes.as_ptr().cast())
+        })
+        .collect();
+    for column in 0..columns {
+        let mut subject = [0i8; 32];
+        let mut active = [0i8; 32];
+        let mut seeded = [0i8; 32];
+        for lane in 0..targets.len() {
+            let pos = subject_start[lane] + column as i32;
+            if pos >= 0 && pos < targets[lane].subject.len() as i32 {
+                let letter = targets[lane].subject[pos as usize];
+                subject[lane] = (letter & LETTER_MASK) as i8;
+                active[lane] = -1;
+                seeded[lane] = if letter & SEED_MASK != 0 { -1 } else { 0 };
+            }
+        }
+        let subject = arch::_mm256_loadu_si256(subject.as_ptr().cast());
+        let active = arch::_mm256_loadu_si256(active.as_ptr().cast());
+        let seeded = arch::_mm256_loadu_si256(seeded.as_ptr().cast());
+        let profile = build_profile(matrix, subject, seeded);
+        let moving_i0 = i0 + column as i32;
+        let query_begin = moving_i0.max(0);
+        let query_end = (i1 + column as i32).min(query.len() as i32 - 1) + 1;
+        let mut vertical = zero;
+        let mut col_best = zero;
+        for q in query_begin..query_end {
+            let r = (q - moving_i0) as usize;
+            let cell_mask = arch::_mm256_and_si256(active, row_masks[r]);
+            let base = profile[(query[q as usize] & LETTER_MASK) as usize];
+            let bias = arch::_mm256_set1_epi8(cbs.get(q as usize).copied().unwrap_or(0));
+            let subst = arch::_mm256_adds_epi8(base, bias);
             let diag = arch::_mm256_adds_epi8(scratch.prev_h[r], subst);
             let horizontal = scratch.prev_e[r + 1];
             let mut h = arch::_mm256_max_epi8(diag, horizontal);
             h = arch::_mm256_max_epi8(h, vertical);
             h = arch::_mm256_max_epi8(h, zero);
-            h = arch::_mm256_or_si256(
-                arch::_mm256_and_si256(mask, h),
-                arch::_mm256_andnot_si256(mask, zero),
-            );
+            h = arch::_mm256_blendv_epi8(zero, h, cell_mask);
             overflow = arch::_mm256_or_si256(overflow, arch::_mm256_cmpeq_epi8(h, max_v));
             let open = arch::_mm256_subs_epi8(h, go_v);
             let e = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(horizontal, ge_v), open);
             vertical = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(vertical, ge_v), open);
-            scratch.curr_h[r] = h;
-            scratch.curr_e[r] = arch::_mm256_or_si256(
-                arch::_mm256_and_si256(mask, e),
-                arch::_mm256_andnot_si256(mask, neg),
-            );
-            vertical = arch::_mm256_or_si256(
-                arch::_mm256_and_si256(mask, vertical),
-                arch::_mm256_andnot_si256(mask, neg),
-            );
-            best = arch::_mm256_max_epi8(best, h);
+            scratch.prev_h[r] = h;
+            scratch.prev_e[r] = arch::_mm256_blendv_epi8(zero, e, cell_mask);
+            vertical = arch::_mm256_blendv_epi8(zero, vertical, cell_mask);
+            col_best = arch::_mm256_max_epi8(col_best, h);
         }
-        std::mem::swap(&mut scratch.prev_h, &mut scratch.curr_h);
-        std::mem::swap(&mut scratch.prev_e, &mut scratch.curr_e);
+        best = arch::_mm256_max_epi8(best, col_best);
     }
     let mut raw = [0i8; 32];
     arch::_mm256_storeu_si256(raw.as_mut_ptr().cast(), best);

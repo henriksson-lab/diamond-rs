@@ -212,6 +212,66 @@ fn sequence_set_letter(
     }
 }
 
+#[inline]
+fn load_sequence_set_fingerprint(
+    seqs: &[&[Letter]],
+    restores: &[Vec<(usize, Letter)>],
+    seq_id: u32,
+    pos: u32,
+) -> [Letter; FP_LEN] {
+    std::array::from_fn(|i| {
+        sequence_set_letter(
+            seqs,
+            restores,
+            seq_id as usize,
+            pos as isize + i as isize - FP_BEFORE as isize,
+        )
+    })
+}
+
+/// Visit a joined seed group's passing q×r pairs without materializing that
+/// cross product. Fingerprints are loaded once per location and reused, as in
+/// C++ `all_vs_all`.
+pub(crate) fn visit_hamming_group<F>(
+    query_locs: &[(u32, u32)],
+    target_locs: &[(u32, u32)],
+    query_seqs: &[&[Letter]],
+    query_restores: &[Vec<(usize, Letter)>],
+    ref_seqs: &[&[Letter]],
+    ref_restores: &[Vec<(usize, Letter)>],
+    hamming_filter_id: u32,
+    mut visit: F,
+) where
+    F: FnMut((u32, u32), (u32, u32)),
+{
+    const TILE_SIZE: usize = 64;
+    let mut scratch = FINGERPRINT_SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    scratch.query.clear();
+    scratch.target.clear();
+    scratch.query.extend(query_locs.iter().map(|&(id, pos)| {
+        (
+            (id, pos),
+            load_sequence_set_fingerprint(query_seqs, query_restores, id, pos),
+        )
+    }));
+    scratch.target.extend(target_locs.iter().map(|&(id, pos)| {
+        (
+            (id, pos),
+            load_sequence_set_fingerprint(ref_seqs, ref_restores, id, pos),
+        )
+    }));
+    for &(query_loc, ref query_fp) in &scratch.query {
+        for target_tile in scratch.target.chunks(TILE_SIZE) {
+            for &(target_loc, ref target_fp) in target_tile {
+                if fingerprint_equal_count(query_fp, target_fp) >= hamming_filter_id {
+                    visit(query_loc, target_loc);
+                }
+            }
+        }
+    }
+    FINGERPRINT_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
+}
+
 pub(crate) fn retain_hamming_filter_sequence_set(
     matches: &mut Vec<SeedMatch>,
     query_seqs: &[&[Letter]],
@@ -221,23 +281,6 @@ pub(crate) fn retain_hamming_filter_sequence_set(
     hamming_filter_id: u32,
 ) {
     const TILE_SIZE: usize = 64;
-
-    #[inline]
-    fn load(
-        seqs: &[&[Letter]],
-        restores: &[Vec<(usize, Letter)>],
-        seq_id: u32,
-        pos: u32,
-    ) -> [Letter; FP_LEN] {
-        std::array::from_fn(|i| {
-            sequence_set_letter(
-                seqs,
-                restores,
-                seq_id as usize,
-                pos as isize + i as isize - FP_BEFORE as isize,
-            )
-        })
-    }
 
     // `sort_merge_seed_matches*` emits one contiguous cross product for each
     // shared seed key, in q-major order. Mirror C++ `load_fps/all_vs_all`:
@@ -265,8 +308,10 @@ pub(crate) fn retain_hamming_filter_sequence_set(
 
         if group_end == group_begin + 1 {
             let m = matches[group_begin];
-            let query_fp = load(query_seqs, query_restores, m.query_id, m.query_pos);
-            let target_fp = load(ref_seqs, ref_restores, m.ref_id, m.ref_pos);
+            let query_fp =
+                load_sequence_set_fingerprint(query_seqs, query_restores, m.query_id, m.query_pos);
+            let target_fp =
+                load_sequence_set_fingerprint(ref_seqs, ref_restores, m.ref_id, m.ref_pos);
             if fingerprint_equal_count(&query_fp, &target_fp) >= hamming_filter_id {
                 matches[write] = m;
                 write += 1;
@@ -285,12 +330,18 @@ pub(crate) fn retain_hamming_filter_sequence_set(
         for m in &matches[group_begin..group_end] {
             let query = (m.query_id, m.query_pos);
             if last_query != Some(query) {
-                query_fps.push((query, load(query_seqs, query_restores, query.0, query.1)));
+                query_fps.push((
+                    query,
+                    load_sequence_set_fingerprint(query_seqs, query_restores, query.0, query.1),
+                ));
                 last_query = Some(query);
             }
             if query == first_query {
                 let target = (m.ref_id, m.ref_pos);
-                target_fps.push((target, load(ref_seqs, ref_restores, target.0, target.1)));
+                target_fps.push((
+                    target,
+                    load_sequence_set_fingerprint(ref_seqs, ref_restores, target.0, target.1),
+                ));
             }
         }
 
@@ -356,6 +407,45 @@ mod tests {
         let r = q.clone();
         // Anchor in the middle so the whole 48-letter window is in-range.
         assert_eq!(fingerprint_match(&q, &r, 32, 32), FP_LEN as u32);
+    }
+
+    #[test]
+    fn streaming_group_matches_materialized_filter() {
+        let query_a: Vec<Letter> = (0..96).map(|i| (i % 20) as Letter).collect();
+        let query_b: Vec<Letter> = (0..96).map(|i| ((i + 3) % 20) as Letter).collect();
+        let target_a = query_a.clone();
+        let target_b: Vec<Letter> = (0..96).map(|i| ((i + 7) % 20) as Letter).collect();
+        let queries: Vec<&[Letter]> = vec![&query_a, &query_b];
+        let targets: Vec<&[Letter]> = vec![&target_a, &target_b];
+        let restores = vec![Vec::new(), Vec::new()];
+        let query_locs = vec![(0, 32), (1, 40)];
+        let target_locs = vec![(0, 32), (1, 40)];
+        let mut expected = Vec::new();
+        for &query in &query_locs {
+            for &target in &target_locs {
+                if fingerprint_match(
+                    queries[query.0 as usize],
+                    targets[target.0 as usize],
+                    query.1 as usize,
+                    target.1 as usize,
+                ) >= 20
+                {
+                    expected.push((query, target));
+                }
+            }
+        }
+        let mut actual = Vec::new();
+        visit_hamming_group(
+            &query_locs,
+            &target_locs,
+            &queries,
+            &restores,
+            &targets,
+            &restores,
+            20,
+            |query, target| actual.push((query, target)),
+        );
+        assert_eq!(actual, expected);
     }
 
     #[test]

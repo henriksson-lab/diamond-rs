@@ -194,8 +194,103 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
         complexity_cut,
         freq_sd,
         min_query_len,
+        None,
         |matches| matches,
     )
+}
+
+/// Collect the low-complexity query positions produced by the joined seed
+/// groups without retaining the cross product.  Blastp uses this as a masking
+/// prepass so its partition consumer can run the left-most filter immediately.
+pub fn collect_low_complexity_positions_partitioned_min_query_len(
+    query_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: usize,
+) -> Vec<(u32, u32)> {
+    if complexity_cut <= 0.0 {
+        return Vec::new();
+    }
+    let seedp_bits = DEFAULT_SEEDP_BITS;
+    let mut query_sa = SeedArray::build_with_complexity_cut_and_min_query_len(
+        query_seqs,
+        shape,
+        reduction,
+        seedp_bits,
+        0.0,
+        min_query_len,
+    );
+    let mut ref_sa =
+        SeedArray::build_with_complexity_cut(ref_seqs, shape, reduction, seedp_bits, 0.0);
+    let num_partitions = query_sa.num_partitions();
+    let query_offsets = query_sa.seq_offsets().to_vec();
+
+    fn split_into_partitions(
+        sa: &mut SeedArray,
+        num_partitions: usize,
+    ) -> Vec<&mut [super::seed_array::SeedEntry]> {
+        let offsets: Vec<usize> = (0..=num_partitions)
+            .map(|partition| sa.partition_offset(partition))
+            .collect();
+        let mut remaining = sa.data_mut();
+        let mut partitions = Vec::with_capacity(num_partitions);
+        for partition in 0..num_partitions {
+            let len = offsets[partition + 1] - offsets[partition];
+            let (current, rest) = remaining.split_at_mut(len);
+            partitions.push(current);
+            remaining = rest;
+        }
+        partitions
+    }
+
+    let mut query_parts = split_into_partitions(&mut query_sa, num_partitions);
+    let mut ref_parts = split_into_partitions(&mut ref_sa, num_partitions);
+    let collect_partition =
+        |query_part: &mut [super::seed_array::SeedEntry],
+         ref_part: &mut [super::seed_array::SeedEntry]| {
+            let blocks = match_blocks(query_part, ref_part);
+            let mut masked = Vec::new();
+            for block in blocks.blocks {
+                let first = super::seed_array::decode_seq_pos(
+                    &query_offsets,
+                    query_part[block.q_start as usize],
+                );
+                let query = query_seqs[first.0 as usize];
+                let pos = first.1 as usize;
+                if pos >= query.len()
+                    || !seed_complexity::seed_is_complex(
+                        &query[pos..],
+                        shape,
+                        complexity_cut,
+                        reduction,
+                    )
+                {
+                    masked.extend((block.q_start..block.q_start + block.q_count).map(|index| {
+                        super::seed_array::decode_seq_pos(
+                            &query_offsets,
+                            query_part[index as usize],
+                        )
+                    }));
+                }
+            }
+            masked
+        };
+    let per_partition: Vec<Vec<(u32, u32)>> = if rayon::current_num_threads() == 1 {
+        query_parts
+            .iter_mut()
+            .zip(ref_parts.iter_mut())
+            .map(|(query_part, ref_part)| collect_partition(query_part, ref_part))
+            .collect()
+    } else {
+        query_parts
+            .par_iter_mut()
+            .zip(ref_parts.par_iter_mut())
+            .map(|(query_part, ref_part)| collect_partition(query_part, ref_part))
+            .collect()
+    };
+    per_partition.into_iter().flatten().collect()
 }
 
 /// Join and apply the stage-1 Hamming filter inside each partition worker.
@@ -214,9 +309,82 @@ pub fn find_seed_matches_partitioned_filtered_hamming_min_query_len(
     min_query_len: usize,
     hamming_filter_id: u32,
 ) -> (Vec<SeedMatch>, usize) {
+    let (matches, raw_count, _) =
+        find_seed_matches_partitioned_filtered_hamming_min_query_len_with_masked_positions(
+            query_seqs,
+            query_restores,
+            ref_seqs,
+            ref_restores,
+            shape,
+            reduction,
+            complexity_cut,
+            freq_sd,
+            min_query_len,
+            hamming_filter_id,
+        );
+    (matches, raw_count)
+}
+
+/// Stage-1 join plus the query positions that C++ marks with `SEED_MASK` when
+/// a joined seed group fails the low-complexity filter. Those bits are consumed
+/// later by `left_most_filter`; merely dropping the group loses that state.
+pub fn find_seed_matches_partitioned_filtered_hamming_min_query_len_with_masked_positions(
+    query_seqs: &[&[Letter]],
+    query_restores: &[Vec<(usize, Letter)>],
+    ref_seqs: &[&[Letter]],
+    ref_restores: &[Vec<(usize, Letter)>],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    freq_sd: f64,
+    min_query_len: usize,
+    hamming_filter_id: u32,
+) -> (Vec<SeedMatch>, usize, Vec<(u32, u32)>) {
+    let (matches, raw_count, masked_positions) =
+        map_seed_matches_partitioned_filtered_hamming_min_query_len_with_masked_positions(
+            query_seqs,
+            query_restores,
+            ref_seqs,
+            ref_restores,
+            shape,
+            reduction,
+            complexity_cut,
+            freq_sd,
+            min_query_len,
+            hamming_filter_id,
+            |matches| matches,
+        );
+    (matches, raw_count, masked_positions)
+}
+
+/// Run a partition-local consumer immediately after stage-1 filtering.
+///
+/// Unlike returning every Hamming survivor, this permits stage 2 to discard
+/// candidates before the next partition is joined.  The peak lifetime is then
+/// bounded by one joined partition per worker instead of all seed pairs across
+/// every shape.
+pub fn map_seed_matches_partitioned_filtered_hamming_min_query_len_with_masked_positions<T, F>(
+    query_seqs: &[&[Letter]],
+    query_restores: &[Vec<(usize, Letter)>],
+    ref_seqs: &[&[Letter]],
+    ref_restores: &[Vec<(usize, Letter)>],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    freq_sd: f64,
+    min_query_len: usize,
+    hamming_filter_id: u32,
+    map_partition: F,
+) -> (Vec<T>, usize, Vec<(u32, u32)>)
+where
+    T: Send,
+    F: Fn(Vec<SeedMatch>) -> Vec<T> + Sync,
+{
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     let raw_count = AtomicUsize::new(0);
+    let masked_positions = Mutex::new(Vec::new());
     let matches = find_seed_matches_partitioned_filtered_min_query_len_impl(
         query_seqs,
         ref_seqs,
@@ -225,6 +393,7 @@ pub fn find_seed_matches_partitioned_filtered_hamming_min_query_len(
         complexity_cut,
         freq_sd,
         min_query_len,
+        Some(&masked_positions),
         |mut matches| {
             raw_count.fetch_add(matches.len(), Ordering::Relaxed);
             crate::search::hamming_filter::retain_hamming_filter_sequence_set(
@@ -235,13 +404,169 @@ pub fn find_seed_matches_partitioned_filtered_hamming_min_query_len(
                 ref_restores,
                 hamming_filter_id,
             );
-            matches
+            map_partition(matches)
         },
     );
-    (matches, raw_count.into_inner())
+    (
+        matches,
+        raw_count.into_inner(),
+        masked_positions.into_inner().unwrap(),
+    )
 }
 
-fn find_seed_matches_partitioned_filtered_min_query_len_impl<F>(
+/// Streaming stage-1 join. Matching-key cross products are evaluated through
+/// the fingerprint kernel and delivered to `map_batch` in q-major batches of
+/// at most 32; no `Vec<SeedMatch>` proportional to q_count*r_count is built.
+pub fn map_seed_matches_partitioned_streaming_hamming_min_query_len<T, F>(
+    query_seqs: &[&[Letter]],
+    query_restores: &[Vec<(usize, Letter)>],
+    ref_seqs: &[&[Letter]],
+    ref_restores: &[Vec<(usize, Letter)>],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: usize,
+    hamming_filter_id: u32,
+    map_batch: F,
+) -> (Vec<Vec<T>>, usize)
+where
+    T: Send,
+    F: Fn(&[SeedMatch]) -> Vec<T> + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let seedp_bits = DEFAULT_SEEDP_BITS;
+    let mut query_sa = SeedArray::build_with_complexity_cut_and_min_query_len(
+        query_seqs,
+        shape,
+        reduction,
+        seedp_bits,
+        0.0,
+        min_query_len,
+    );
+    let mut ref_sa =
+        SeedArray::build_with_complexity_cut(ref_seqs, shape, reduction, seedp_bits, 0.0);
+    let num_partitions = query_sa.num_partitions();
+    let query_offsets = query_sa.seq_offsets().to_vec();
+    let ref_offsets = ref_sa.seq_offsets().to_vec();
+
+    fn split_into_partitions(
+        sa: &mut SeedArray,
+        num_partitions: usize,
+    ) -> Vec<&mut [super::seed_array::SeedEntry]> {
+        let offsets: Vec<usize> = (0..=num_partitions)
+            .map(|partition| sa.partition_offset(partition))
+            .collect();
+        let mut remaining = sa.data_mut();
+        let mut partitions = Vec::with_capacity(num_partitions);
+        for partition in 0..num_partitions {
+            let len = offsets[partition + 1] - offsets[partition];
+            let (current, rest) = remaining.split_at_mut(len);
+            partitions.push(current);
+            remaining = rest;
+        }
+        partitions
+    }
+
+    let mut query_parts = split_into_partitions(&mut query_sa, num_partitions);
+    let mut ref_parts = split_into_partitions(&mut ref_sa, num_partitions);
+    let raw_count = AtomicUsize::new(0);
+    let process = |partition: usize,
+                   query_part: &mut [super::seed_array::SeedEntry],
+                   ref_part: &mut [super::seed_array::SeedEntry]| {
+        let blocks = match_blocks(query_part, ref_part);
+        let mut output = Vec::new();
+        for block in blocks.blocks {
+            let first_query = super::seed_array::decode_seq_pos(
+                &query_offsets,
+                query_part[block.q_start as usize],
+            );
+            if complexity_cut > 0.0 {
+                let query = query_seqs[first_query.0 as usize];
+                let pos = first_query.1 as usize;
+                if pos >= query.len()
+                    || !seed_complexity::seed_is_complex(
+                        &query[pos..],
+                        shape,
+                        complexity_cut,
+                        reduction,
+                    )
+                {
+                    continue;
+                }
+            }
+            raw_count.fetch_add(
+                block.q_count as usize * block.r_count as usize,
+                Ordering::Relaxed,
+            );
+            let query_locs: Vec<(u32, u32)> = (block.q_start..block.q_start + block.q_count)
+                .map(|index| {
+                    super::seed_array::decode_seq_pos(&query_offsets, query_part[index as usize])
+                })
+                .collect();
+            let target_locs: Vec<(u32, u32)> = (block.r_start..block.r_start + block.r_count)
+                .map(|index| {
+                    super::seed_array::decode_seq_pos(&ref_offsets, ref_part[index as usize])
+                })
+                .collect();
+            let key = query_part[block.q_start as usize].key;
+            let seed = ((key as PackedSeed) << seedp_bits) | partition as PackedSeed;
+            let mut batch = Vec::with_capacity(32);
+            let mut last_query = None;
+            crate::search::hamming_filter::visit_hamming_group(
+                &query_locs,
+                &target_locs,
+                query_seqs,
+                query_restores,
+                ref_seqs,
+                ref_restores,
+                hamming_filter_id,
+                |query, target| {
+                    if last_query.is_some() && last_query != Some(query) && !batch.is_empty() {
+                        output.extend(map_batch(&batch));
+                        batch.clear();
+                    }
+                    last_query = Some(query);
+                    batch.push(SeedMatch {
+                        query_id: query.0,
+                        query_pos: query.1,
+                        ref_id: target.0,
+                        ref_pos: target.1,
+                        seed,
+                        shape_id: 0,
+                    });
+                    if batch.len() == 32 {
+                        output.extend(map_batch(&batch));
+                        batch.clear();
+                    }
+                },
+            );
+            if !batch.is_empty() {
+                output.extend(map_batch(&batch));
+            }
+        }
+        output
+    };
+
+    let output = if rayon::current_num_threads() == 1 {
+        query_parts
+            .iter_mut()
+            .zip(ref_parts.iter_mut())
+            .enumerate()
+            .map(|(partition, (query_part, ref_part))| process(partition, query_part, ref_part))
+            .collect()
+    } else {
+        query_parts
+            .par_iter_mut()
+            .zip(ref_parts.par_iter_mut())
+            .enumerate()
+            .map(|(partition, (query_part, ref_part))| process(partition, query_part, ref_part))
+            .collect()
+    };
+    (output, raw_count.into_inner())
+}
+
+fn find_seed_matches_partitioned_filtered_min_query_len_impl<F, T>(
     query_seqs: &[&[Letter]],
     ref_seqs: &[&[Letter]],
     shape: &Shape,
@@ -249,10 +574,12 @@ fn find_seed_matches_partitioned_filtered_min_query_len_impl<F>(
     complexity_cut: f64,
     freq_sd: f64,
     min_query_len: usize,
+    masked_positions: Option<&std::sync::Mutex<Vec<(u32, u32)>>>,
     process_partition: F,
-) -> Vec<SeedMatch>
+) -> Vec<T>
 where
-    F: Fn(Vec<SeedMatch>) -> Vec<SeedMatch> + Sync,
+    T: Send,
+    F: Fn(Vec<SeedMatch>) -> Vec<T> + Sync,
 {
     let seedp_bits = DEFAULT_SEEDP_BITS;
     let single_thread = rayon::current_num_threads() == 1;
@@ -319,16 +646,25 @@ where
                         &ref_offsets,
                         p as u32,
                         seedp_bits,
-                        |_, (query_id, query_pos), _| {
+                        |query_entries, (query_id, query_pos), _| {
                             let query = query_seqs[query_id as usize];
                             let pos = query_pos as usize;
-                            pos < query.len()
+                            let keep = pos < query.len()
                                 && seed_complexity::seed_is_complex(
                                     &query[pos..],
                                     shape,
                                     complexity_cut,
                                     reduction,
-                                )
+                                );
+                            if !keep {
+                                if let Some(masked) = masked_positions {
+                                    let mut masked = masked.lock().unwrap();
+                                    masked.extend(query_entries.iter().map(|entry| {
+                                        super::seed_array::decode_seq_pos(&query_offsets, *entry)
+                                    }));
+                                }
+                            }
+                            keep
                         },
                     )
                 } else {
@@ -405,16 +741,25 @@ where
                     &ref_offsets,
                     p as u32,
                     seedp_bits,
-                    |_, (query_id, query_pos), _| {
+                    |query_entries, (query_id, query_pos), _| {
                         let query = query_seqs[query_id as usize];
                         let pos = query_pos as usize;
-                        pos < query.len()
+                        let keep = pos < query.len()
                             && seed_complexity::seed_is_complex(
                                 &query[pos..],
                                 shape,
                                 complexity_cut,
                                 reduction,
-                            )
+                            );
+                        if !keep {
+                            if let Some(masked) = masked_positions {
+                                let mut masked = masked.lock().unwrap();
+                                masked.extend(query_entries.iter().map(|entry| {
+                                    super::seed_array::decode_seq_pos(&query_offsets, *entry)
+                                }));
+                            }
+                        }
+                        keep
                     },
                 )
             } else {
@@ -829,5 +1174,35 @@ mod tests {
         };
         assert_eq!(raw_count, raw.len());
         assert_eq!(signature(&fused), signature(&expected));
+    }
+
+    #[test]
+    fn joined_low_complexity_groups_return_all_query_marker_positions() {
+        let reduction = Reduction::default_reduction();
+        let shape = Shape::from_code("1111", &reduction);
+        let query_data = [vec![0; 12], vec![0; 12]];
+        let ref_data = [vec![0; 12]];
+        let query_seqs: Vec<&[Letter]> = query_data.iter().map(Vec::as_slice).collect();
+        let ref_seqs: Vec<&[Letter]> = ref_data.iter().map(Vec::as_slice).collect();
+        let query_restores = vec![Vec::new(); query_seqs.len()];
+        let ref_restores = vec![Vec::new(); ref_seqs.len()];
+        let (matches, _, mut masked) =
+            find_seed_matches_partitioned_filtered_hamming_min_query_len_with_masked_positions(
+                &query_seqs,
+                &query_restores,
+                &ref_seqs,
+                &ref_restores,
+                &shape,
+                &reduction,
+                1.0,
+                0.0,
+                0,
+                0,
+            );
+        masked.sort_unstable();
+        assert!(matches.is_empty());
+        assert_eq!(masked.len(), 18);
+        assert_eq!(masked.first(), Some(&(0, 0)));
+        assert_eq!(masked.last(), Some(&(1, 8)));
     }
 }

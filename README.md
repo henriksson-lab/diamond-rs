@@ -144,12 +144,62 @@ println!("E-value: {:.2e}, Bit score: {:.1}", evalue, bitscore);
 
 Original benchmark baseline: vendored upstream DIAMOND from `https://github.com/bbuchfink/diamond.git`, commit `1d162b4fefb5` (`v2.1.24-2-g1d162b4f-dirty`).
 
-The previous 389-query benchmark input was not reproducible from files in this checkout. The table below uses bundled test data, measured with `RUSTFLAGS="-C target-cpu=native"`, `-p1`, and `/usr/bin/time` (median of 3 runs):
+### Native `blastp` comparison
+
+These measurements use the reproducible AVX2 build
+`RUSTFLAGS="-C target-cpu=x86-64-v3"`. Times and peak resident set sizes are
+medians from alternating C++/Rust runs. The speed ratio is C++ time divided by
+Rust time, so values above 1 mean Rust is faster. The RSS ratio is Rust divided
+by C++, so values below 1 mean Rust uses less memory.
+
+| Dataset | Threads | Runs | C++ time | Rust time | Speed ratio | C++ RSS | Rust RSS | RSS ratio | Byte parity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| Human Swiss-Prot, 2,000 ref / 1,000 query | 1 | 5 | 1.55 s | 2.11 s | 0.735x | 30,064 KiB | 23,156 KiB | 0.770x | PASS |
+| Human Swiss-Prot, 2,000 ref / 1,000 query | 4 | 5 | 0.80 s | 0.76 s | 1.053x | 36,308 KiB | 30,940 KiB | 0.852x | PASS |
+| NCBI AMRFinderPlus AMR proteins, 1,000 ref / 500 query | 1 | 5 | 2.25 s | 4.81 s | 0.468x | 21,812 KiB | 16,372 KiB | 0.751x | PASS |
+| NCBI AMRFinderPlus AMR proteins, 1,000 ref / 500 query | 4 | 5 | 1.00 s | 2.07 s | 0.483x | 29,404 KiB | 23,760 KiB | 0.808x | PASS |
+
+The human workload uses 1,120,714 reference and 546,969 query residues. Its
+reference, query, and output SHA-256 hashes are respectively
+`b10d71548bf9be8318c40ed3a47b4ee5c1628b58bd22002b9bd69bf2e140c6bd`,
+`eed1277c3133ce2c88c35c42f32e392d2fccd2528a90fe0ada114f088217c244`,
+and `da8d5858689815795c9121cc45994e446d8f92696c455d6e9357f72b19374172`.
+
+The independent AMR workload uses 346,146 reference and 170,358 query
+residues. Its source is the NCBI AMRFinderPlus `2026-03-24.1` `AMRProt.fa`
+snapshot (SHA-256
+`6b5b02061f2a3132e516f951f296ae766381e875b09dbe12867c1c4693646be4`).
+Its reference, query, and byte-identical output SHA-256 hashes are respectively
+`a59a1d3f96d14fe7ad814f4635b65d804a16e6d2e1a43c29288bb905dde04da0`,
+`fa0c0f05486af5ad5849c8f52ebe455a2c1c6571a8497a930782b4be96c729e9`,
+and `51847a3bde8172949ad6d934af235a3163a040a51c681bbe476f8e92f126eb71`.
+
+The larger 4,000-reference / 2,000-query AMR stress run evaluates 81.7 million
+raw seed pairs without materializing the cross product. A final four-thread
+parity run measured Rust at 15.11 s / 173,948 KiB, down from 32.47 s /
+4,526,948 KiB before streaming (2.15x faster and 96.2% lower peak RSS). The
+corresponding C++ diagnostic was 5.89 s / 66,612 KiB, giving current speed and
+RSS ratios of 0.390x and 2.611x. Both emitted the same 40,297 lines with
+SHA-256 `6ea16d64c71f833970aa8f045adbf0cd22a35c2706c69cebbc883f0643911653`.
+
+Other jobs were active on the benchmark host. Alternating implementation order
+and medians reduce bias. Final timing ranges were human C++/Rust 1.27–1.71 s /
+2.09–3.45 s at one thread and 0.78–0.83 s / 0.73–0.95 s at four threads;
+AMR ranges were 2.19–2.35 s / 4.66–4.95 s and 0.95–1.07 s / 2.05–2.48 s.
+
+The benchmark driver and full fixture details are in
+`scripts/compare_real_cpp_rust.sh` and
+`translation/optimization_benchmark.md`.
+
+### Bundled smoke benchmark
+
+The table below uses bundled test data, measured with the same reproducible
+x86-64-v3 build, one thread, and `/usr/bin/time` (median of 5 runs):
 
 | Operation | Input | C++ Original | Rust (Native) | Speedup | Peak RSS Ratio (Rust/C++) |
 |-----------|-------|--------------|---------------|---------|---------------------------|
-| `blastp` | `5.faa` (389 queries) vs `data.dmnd` | 0.14s, 12.5 MiB | 0.08s, 9.0 MiB | **1.8x** | **0.72x** |
-| `makedb` | `data.faa` (389 sequences) | 0.03s, 12.2 MiB | 0.03s, 8.4 MiB | 1.0x | **0.69x** |
+| `blastp` | `5.faa` (389 queries) vs `data.dmnd` | 0.59s, 20.8 MiB | 1.00s, 11.2 MiB | 0.590x | **0.540x** |
+| `makedb` | `data.faa` (389 sequences) | 0.03s, 12.2 MiB | 0.02s, 4.4 MiB | **1.500x** | **0.359x** |
 
 Speedup is C++ wall time divided by Rust wall time. Peak RSS ratio is Rust peak resident memory divided by C++ peak resident memory; lower is better.
 
@@ -176,14 +226,14 @@ REAL_PROTEIN_FASTA=/path/to/reviewed-proteins.fasta \
 
 It deterministically selects disjoint reference/query records, defaults to
 2,000 references and 1,000 queries. Use four threads for throughput comparison
-or one thread for a roughly five-second, low-noise profiling run. See
+or one thread for a hardware-counter profiling run. See
 `translation/optimization_benchmark.md` for fixture hashes and calibration.
 
-Both the bundled quick fixture and the evenly sampled real-sequence optimization
-fixture currently have byte-identical C++ and Rust output. Any future mismatch
-causes the harness to exit nonzero and retain its raw outputs and unified diff.
-When built on a non-Windows target with `--features ffi`, the `--legacy` flag
-falls back to C++ FFI for conformance testing.
+The bundled quick fixture, human real-sequence fixture, and both AMR fixtures
+currently have byte-identical C++ and Rust output. Every harness run checks
+parity, exits nonzero on a mismatch, and retains its raw outputs and unified
+diff. When built on a non-Windows target with `--features ffi`, the `--legacy`
+flag falls back to C++ FFI for conformance testing.
 
 ## Architecture
 

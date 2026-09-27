@@ -1,5 +1,4 @@
 use std::io::{self, BufWriter, Write};
-use std::ops::Range;
 use std::path::Path;
 use std::time::Instant;
 
@@ -22,10 +21,212 @@ use crate::masking::{MaskingAlgo, MaskingMode};
 use crate::output::format::{self, FieldId, Hsp as OutputHsp};
 use crate::search::hit::Hit;
 use crate::search::left_most::{left_most_filter_with_range, Context as LeftMostContext};
+use crate::search::seed_match::SeedMatch;
 use crate::search::{parallel, sensitivity};
 use crate::stats::cbs::CbsMode;
 use crate::stats::score_matrix::{CutoffTable2D, ScoreMatrix};
 use crate::util::algo::PatternMatcher;
+
+#[inline]
+fn stage2_query_bounds(query_len: usize, seed_pos: usize) -> (usize, usize) {
+    let window = crate::dp::ungapped_window::UNGAPPED_WINDOW;
+    (
+        seed_pos.saturating_sub(window),
+        seed_pos.saturating_add(window).min(query_len),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct StoredHit {
+    subject: u64,
+    query_id: u32,
+    seed_offset: u32,
+    score: u16,
+}
+
+#[derive(Clone, Copy)]
+struct CompactHit {
+    subject: u64,
+    seed_offset: u32,
+    score: u16,
+}
+
+/// Consume one stage-1 partition and retain only candidates that pass the
+/// ungapped window filter.  This is deliberately partition-local: retaining
+/// all Hamming survivors was the multi-gigabyte RSS bottleneck on repetitive
+/// real databases.
+fn filter_partition_to_hits(
+    matches: &[SeedMatch],
+    queries: &[Vec<Letter>],
+    db_block: &Block,
+    cutoffs: &[i32],
+    score_matrix: &ScoreMatrix,
+    shape: &Shape,
+    left_most_context: &LeftMostContext<'_>,
+    first_shape: bool,
+    chunked: bool,
+    use_left_most_range: bool,
+    skip_left_most: bool,
+    index_chunks: usize,
+    min_identities: u32,
+) -> Vec<StoredHit> {
+    let mut out = Vec::new();
+    let ref_seq_data = db_block.seqs().data();
+    let mut group_begin = 0usize;
+    while group_begin < matches.len() {
+        let query_id = matches[group_begin].query_id as usize;
+        let q_pos = matches[group_begin].query_pos as usize;
+        let mut group_end = group_begin + 1;
+        while group_end < matches.len()
+            && matches[group_end].query_id as usize == query_id
+            && matches[group_end].query_pos as usize == q_pos
+        {
+            group_end += 1;
+        }
+        let Some(query) = queries.get(query_id) else {
+            group_begin = group_end;
+            continue;
+        };
+        let (q_start, q_end) = stage2_query_bounds(query.len(), q_pos);
+        let window_left = q_pos - q_start;
+        let window_clipped = q_end - q_start;
+        let query_window = &query[q_start..q_end];
+        let cutoff = cutoffs[query_id];
+        let interval_mod = (q_pos % 32) as i32;
+        let interval_overhang = (window_left as i32 - interval_mod).max(0) as usize;
+        let left_q_start = q_start + interval_overhang;
+        let left_seed_offset = window_left.saturating_sub(interval_overhang);
+        if left_q_start >= q_end {
+            group_begin = group_end;
+            continue;
+        }
+        let left_len = q_end - left_q_start;
+
+        for chunk in matches[group_begin..group_end].chunks(32) {
+            let mut subject_starts = [0isize; 32];
+            for (start, hit) in subject_starts.iter_mut().zip(chunk) {
+                *start = db_block
+                    .seqs()
+                    .position(hit.ref_id as usize, hit.ref_pos as usize)
+                    as isize
+                    - window_left as isize;
+            }
+            let subject_storage;
+            let mut subject_windows = [&[][..]; 32];
+            if subject_starts[..chunk.len()]
+                .iter()
+                .all(|&start| start >= 0)
+            {
+                for (window, &start) in subject_windows.iter_mut().zip(&subject_starts) {
+                    *window = &ref_seq_data[start as usize..];
+                }
+            } else {
+                subject_storage = subject_starts[..chunk.len()]
+                    .iter()
+                    .map(|&start| {
+                        (0..window_clipped)
+                            .map(|n| {
+                                let pos = start + n as isize;
+                                if pos < 0 {
+                                    crate::basic::value::DELIMITER_LETTER
+                                } else {
+                                    ref_seq_data
+                                        .get(pos as usize)
+                                        .copied()
+                                        .unwrap_or(crate::basic::value::DELIMITER_LETTER)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                for (window, storage) in subject_windows.iter_mut().zip(&subject_storage) {
+                    *window = storage;
+                }
+            }
+            let mut scores = [i32::MAX; 32];
+            if cutoff != 0 {
+                crate::dp::simd_ungapped::window_ungapped_best_into(
+                    query_window,
+                    &subject_windows[..chunk.len()],
+                    window_clipped,
+                    score_matrix,
+                    &mut scores[..chunk.len()],
+                );
+            }
+            for (hit, &score) in chunk.iter().zip(&scores) {
+                if score <= cutoff {
+                    continue;
+                }
+                let subject = db_block
+                    .seqs()
+                    .position(hit.ref_id as usize, hit.ref_pos as usize);
+                let left_subject_start =
+                    subject as isize - window_left as isize + interval_overhang as isize;
+                let subject_storage;
+                let subject_window = if left_subject_start >= 0
+                    && left_subject_start as usize + left_len <= ref_seq_data.len()
+                {
+                    &ref_seq_data
+                        [left_subject_start as usize..left_subject_start as usize + left_len]
+                } else {
+                    subject_storage = (0..left_len)
+                        .map(|n| {
+                            let pos = left_subject_start + n as isize;
+                            if pos < 0 {
+                                crate::basic::value::DELIMITER_LETTER
+                            } else {
+                                ref_seq_data
+                                    .get(pos as usize)
+                                    .copied()
+                                    .unwrap_or(crate::basic::value::DELIMITER_LETTER)
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    &subject_storage
+                };
+                let current_range = if use_left_most_range {
+                    let partitions = seedp_count(10) as usize;
+                    let chunk_size = partitions.div_ceil(index_chunks);
+                    let partition = seed_partition(hit.seed, seedp_mask(10)) as usize;
+                    let begin = (partition / chunk_size) * chunk_size;
+                    let end = (begin + chunk_size).min(partitions);
+                    Some(SeedPartitionRange::with_bounds(begin as u32, end as u32))
+                } else {
+                    None
+                };
+                if !skip_left_most
+                    && !left_most_filter_with_range(
+                        &query[left_q_start..q_end],
+                        subject_window,
+                        left_seed_offset as i32,
+                        shape.length,
+                        left_most_context,
+                        first_shape,
+                        shape,
+                        cutoff,
+                        chunked,
+                        min_identities,
+                        current_range,
+                    )
+                {
+                    continue;
+                }
+                out.push(StoredHit {
+                    subject: subject as u64,
+                    query_id: hit.query_id,
+                    seed_offset: hit.query_pos,
+                    score: if score == i32::MAX {
+                        u16::MAX
+                    } else {
+                        score.min(u16::MAX as i32) as u16
+                    },
+                });
+            }
+        }
+        group_begin = group_end;
+    }
+    out
+}
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 unsafe extern "C" {
@@ -221,6 +422,29 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             .for_each(|r| hard_mask(&mut r.sequence));
     }
 
+    // Keep compact, alignment-ready sequence storage before motif masking.
+    // This duplicates only the residue bytes (a few MB in the benchmark), and
+    // lets partition-local stage 2 run while the record copies remain masked
+    // for seed enumeration.  It replaces the former multi-GB pair retention.
+    let mut stage2_queries: Vec<Vec<Letter>> = query_records
+        .iter()
+        .map(|record| record.sequence.clone())
+        .collect();
+    let mut db_block = Block::new();
+    for (idx, record) in db_records.iter().enumerate() {
+        db_block
+            .push_back(
+                &record.sequence,
+                Some(&record.id),
+                None,
+                idx as u64,
+                SequenceType::AminoAcid,
+                0,
+                false,
+            )
+            .map_err(io::Error::other)?;
+    }
+
     // Motif masking — ports C++ `Block::soft_mask(MOTIF)` invoked from
     // `enum_seeds` (enum_seeds.h:202). At default sensitivity DIAMOND
     // hard-masks any 8-letter window matching a curated motif before seed
@@ -321,12 +545,73 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // competes with the inner reference seed-array work and scales worse on
     // small real query blocks; collecting in shape order preserves the previous
     // output order.
-    let mut all_seed_matches = Vec::new();
+    let ungapped_evalue = traits.ungapped_evalue as f64;
+    let short_query_ungapped_cutoff = if ungapped_evalue > 0.0 {
+        score_matrix.rawscore_int(25.0)
+    } else {
+        0
+    };
+    let ungapped_cutoffs: Vec<i32> = stage2_queries
+        .iter()
+        .map(|query| {
+            crate::search::stage2::ungapped_cutoff(
+                query.len() as i32,
+                ungapped_evalue,
+                60,
+                short_query_ungapped_cutoff,
+                false,
+                |q| score_matrix.ungapped_cutoff(q as usize, ungapped_evalue),
+                |q| score_matrix.ungapped_cutoff(q as usize, ungapped_evalue),
+            )
+        })
+        .collect();
+    // Left-most filtering consumes SEED_MASK bits.  Gather them first without
+    // retaining joined pairs, then the search pass can discard rejected pairs
+    // inside each partition instead of keeping them until query extension.
+    let mut low_complexity_query_positions = Vec::new();
+    for shape in &shapes {
+        let complexity_cut = traits.seed_cut * std::f64::consts::LN_2 * shape.weight as f64;
+        low_complexity_query_positions.extend(
+            parallel::collect_low_complexity_positions_partitioned_min_query_len(
+                &query_seqs,
+                &db_seqs,
+                shape,
+                &reduction,
+                complexity_cut,
+                config.min_query_len,
+            ),
+        );
+    }
+    let template_len = shapes.iter().map(|shape| shape.length).max().unwrap_or(0);
+    for (query, saved) in stage2_queries.iter_mut().zip(&query_motif_saves) {
+        crate::masking::motifs::restore_motifs(query, saved, template_len);
+    }
+    for &(query_id, query_pos) in &low_complexity_query_positions {
+        if let Some(letter) = stage2_queries
+            .get_mut(query_id as usize)
+            .and_then(|query| query.get_mut(query_pos as usize))
+        {
+            *letter |= SEED_MASK;
+        }
+    }
+    // The masking prepass builds and releases full seed arrays. Return those
+    // pages before the search pass so they do not inflate its RSS high-water
+    // mark on large databases.
+    trim_freed_heap_pages();
+
+    let chunked = traits.index_chunks > 1;
+    let use_left_most_range = chunked
+        && (config.ext_chunk_size == 0 || config.ext_chunk_size <= 128)
+        && config.max_target_seqs <= 25;
+    let skip_left_most = config.sensitivity >= Sensitivity::VerySensitive;
+    let mut hits_by_query: Vec<Vec<CompactHit>> =
+        (0..stage2_queries.len()).map(|_| Vec::new()).collect();
+    let mut retained_hit_count = 0usize;
     let mut raw_seed_matches = 0usize;
     for (shape_id, shape) in shapes.iter().enumerate() {
         let complexity_cut = traits.seed_cut * std::f64::consts::LN_2 * shape.weight as f64;
-        let (mut matches, shape_raw_seed_matches) =
-            parallel::find_seed_matches_partitioned_filtered_hamming_min_query_len(
+        let (shape_partitions, shape_raw_seed_matches) =
+            parallel::map_seed_matches_partitioned_streaming_hamming_min_query_len(
                 &query_seqs,
                 &query_hamming_restores,
                 &db_seqs,
@@ -334,25 +619,46 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 shape,
                 &reduction,
                 complexity_cut,
-                0.0,
                 config.min_query_len,
                 traits.min_identities,
+                |matches| {
+                    filter_partition_to_hits(
+                        matches,
+                        &stage2_queries,
+                        &db_block,
+                        &ungapped_cutoffs,
+                        &score_matrix,
+                        shape,
+                        &left_most_contexts[shape_id],
+                        shape_id == 0,
+                        chunked,
+                        use_left_most_range,
+                        skip_left_most,
+                        traits.index_chunks as usize,
+                        traits.min_identities,
+                    )
+                },
             );
         raw_seed_matches += shape_raw_seed_matches;
-        for m in &mut matches {
-            m.shape_id = shape_id as u32;
+        for shape_hits in shape_partitions {
+            retained_hit_count += shape_hits.len();
+            for hit in shape_hits {
+                if let Some(query_hits) = hits_by_query.get_mut(hit.query_id as usize) {
+                    query_hits.push(CompactHit {
+                        subject: hit.subject,
+                        seed_offset: hit.seed_offset,
+                        score: hit.score,
+                    });
+                }
+            }
         }
-        all_seed_matches.append(&mut matches);
     }
     // C++ stage0/stage2 preserves shape + seed-partition join emission order
     // inside a query. Only group by query so range building is cheap without
     // imposing a Rust-only target/position tie-breaker on ranking boundaries.
-    all_seed_matches.sort_by_key(|m| m.query_id);
-
     eprintln!(
-        "Seed matches: {} (raw) -> {} (hamming)",
-        raw_seed_matches,
-        all_seed_matches.len(),
+        "Seed matches: {} (raw) -> {} (left-most)",
+        raw_seed_matches, retained_hit_count,
     );
 
     // Restore motif-masked positions before alignment so the gapped extension
@@ -371,33 +677,30 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // `[motif_begin - template_len + 1, motif_begin + motif_len)`. The DB-side
     // restore (stage0.cpp:142-144 with `mask_seeds=false`) just rewrites
     // letters. `template_len` is `max(shape.length_)` — derive from active shapes.
-    let template_len = shapes.iter().map(|s| s.length).max().unwrap_or(0);
     for (record, saved) in db_records.iter_mut().zip(db_motif_saves.iter()) {
         crate::masking::motifs::restore_motifs(&mut record.sequence, saved, 0);
     }
     for (record, saved) in query_records.iter_mut().zip(query_motif_saves.iter()) {
         crate::masking::motifs::restore_motifs(&mut record.sequence, saved, template_len);
     }
-
-    let mut db_block = Block::new();
-    // `Block` owns the compact sequence/title representation used by every
-    // remaining stage. Consume the input records here so their individual
-    // sequence and title allocations are released as soon as each record has
-    // been copied into the block, rather than retaining a duplicate database
-    // throughout alignment and output.
-    for (idx, record) in db_records.into_iter().enumerate() {
-        db_block
-            .push_back(
-                &record.sequence,
-                Some(&record.id),
-                None,
-                idx as u64,
-                SequenceType::AminoAcid,
-                0,
-                false,
-            )
-            .map_err(io::Error::other)?;
+    // C++ `Search::mask_seeds` sets the high bit on every query occurrence in
+    // a joined seed group rejected by the low-complexity test. Stage 2's
+    // left-most filter uses those bits to suppress alternative seed starts.
+    // The join workers return the compact (query id, position) list so we can
+    // apply it after releasing the immutable sequence views.
+    for (query_id, query_pos) in low_complexity_query_positions {
+        if let Some(letter) = query_records
+            .get_mut(query_id as usize)
+            .and_then(|record| record.sequence.get_mut(query_pos as usize))
+        {
+            *letter |= SEED_MASK;
+        }
     }
+
+    // Stage 2 used the pre-motif copies above; release both seed-enumeration
+    // record storage and the temporary query copy before extension.
+    drop(db_records);
+    drop(stage2_queries);
     drop(db_motif_saves);
     drop(query_motif_saves);
     trim_freed_heap_pages();
@@ -446,65 +749,12 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     };
     let gapped_filter_diag_score = score_matrix.rawscore_int(GAPPED_FILTER_DIAG_BITS);
 
-    // `all_seed_matches` is sorted by query id before the hamming filter, and
-    // the filter preserves order. Store dense ranges instead of hashing each
-    // query into a small Vec of references.
-    let mut query_match_ranges: Vec<Range<usize>> = vec![0..0; query_records.len()];
-    let mut i = 0usize;
-    while i < all_seed_matches.len() {
-        let query_id = all_seed_matches[i].query_id as usize;
-        let begin = i;
-        while i < all_seed_matches.len() && all_seed_matches[i].query_id as usize == query_id {
-            i += 1;
-        }
-        if query_id < query_match_ranges.len() {
-            query_match_ranges[query_id] = begin..i;
-        }
-    }
-
     // Process each query in input order. Native blastp keeps lazy target
     // masking disabled, so the C++-style extension path can read the shared
     // target block without serializing all queries.
     let process_query =
         |(query_idx, query_rec): (usize, &fasta::FastaRecord)| -> io::Result<Vec<u8>> {
             let query = &query_rec.sequence;
-
-            // Compute ungapped score cutoff for this query length.
-            // C++ `CutoffTable` (`util/scores/cutoff_table.h`) uses the NORMALIZED
-            // 1e9-letter database size via `bitscore_norm`/`rawscore`, NOT the
-            // actual DB size — the cutoff is a property of the query length only.
-            //
-            // The evalue threshold comes from sensitivity traits:
-            //   - Faster/Fast/Shapes6x10/Shapes30x10/Linclust*: 0 (no filter)
-            //   - Default/MidSensitive/Sensitive/MoreSensitive: 10000
-            //   - VerySensitive: 100000
-            //   - UltraSensitive: 300000
-            // The previous hardcoded `10000.0` matched only Default and lost
-            // recall on VerySensitive/UltraSensitive runs and over-filtered
-            // Faster/Fast/Shapes paths.
-            let ungapped_evalue = traits.ungapped_evalue as f64;
-            // C++ `Search::ungapped_cutoff` (`diamond/src/search/stage2.h:39-54`)
-            // dispatches on query length: for `query_len <= short_query_max_len`
-            // (default 60) it returns a fixed cutoff derived from
-            // `short_query_ungapped_bitscore` (default 25.0 bits); only longer
-            // queries go through the 1e9-letter `CutoffTable`. Previously this
-            // call site went straight to `cutoff_table`, over-filtering very
-            // short queries. The `query_translated && qlen <= 85` branch is
-            // blastx-only.
-            let short_query_ungapped_cutoff = if ungapped_evalue > 0.0 {
-                score_matrix.rawscore_int(25.0)
-            } else {
-                0
-            };
-            let ungapped_cutoff = crate::search::stage2::ungapped_cutoff(
-                query.len() as i32,
-                ungapped_evalue,
-                60,
-                short_query_ungapped_cutoff,
-                false,
-                |q| score_matrix.ungapped_cutoff(q as usize, ungapped_evalue),
-                |q| score_matrix.ungapped_cutoff(q as usize, ungapped_evalue),
-            );
 
             // CBS (composition-based statistics) correction per query position.
             // C++ default is comp-based-stats=1 (Hauser correction, window=40).
@@ -540,176 +790,13 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 ..GappedScoreConfig::default()
             };
 
-            // Get seed matches for this query.
-            let query_seed_matches = &all_seed_matches[query_match_ranges[query_idx].clone()];
-
-            // Stage-2 filter: 96-letter ungapped window walk (C++
-            // `dp/ungapped_align.cpp:ungapped_window`). Surviving hits are
-            // passed to the same batched extension/ranking path used by the
-            // lower-level Rust translation of C++ `Extension::extend`.
-            let mut hits = Vec::new();
-            hits.reserve(query_seed_matches.len());
-            let ref_seq_data = db_block.seqs().data();
-            let mut group_begin = 0usize;
-            while group_begin < query_seed_matches.len() {
-                let sid = query_seed_matches[group_begin].shape_id as usize;
-                let q_pos = query_seed_matches[group_begin].query_pos as usize;
-                let mut group_end = group_begin + 1;
-                while group_end < query_seed_matches.len()
-                    && query_seed_matches[group_end].shape_id as usize == sid
-                    && query_seed_matches[group_end].query_pos as usize == q_pos
-                {
-                    group_end += 1;
-                }
-
-                let q_start = q_pos.saturating_sub(crate::dp::ungapped_window::UNGAPPED_WINDOW);
-                let window_left = q_pos - q_start;
-                let q_end =
-                    (q_start + crate::dp::ungapped_window::UNGAPPED_WINDOW * 2).min(query.len());
-                let window_clipped = q_end - q_start;
-                let shape = &shapes[sid];
-                let interval_mod = (q_pos % 32) as i32;
-                let interval_overhang = (window_left as i32 - interval_mod).max(0) as usize;
-                let left_q_start = q_start + interval_overhang;
-                let left_seed_offset = window_left.saturating_sub(interval_overhang);
-                if left_q_start >= q_end {
-                    group_begin = group_end;
-                    continue;
-                }
-                let left_len = q_end - left_q_start;
-                let query_window = &query[q_start..q_end];
-
-                let mut chunk_begin = group_begin;
-                while chunk_begin < group_end {
-                    let chunk_end = (chunk_begin + 32).min(group_end);
-                    let chunk = &query_seed_matches[chunk_begin..chunk_end];
-                    let mut subjects = [0isize; 32];
-                    for (subject_start, hit) in subjects.iter_mut().zip(chunk) {
-                        *subject_start = db_block
-                            .seqs()
-                            .position(hit.ref_id as usize, hit.ref_pos as usize)
-                            as isize
-                            - window_left as isize;
-                    }
-
-                    let subject_storage;
-                    let mut subject_windows = [&[][..]; 32];
-                    if subjects[..chunk.len()].iter().all(|&start| start >= 0) {
-                        for (window, &start) in subject_windows.iter_mut().zip(&subjects) {
-                            *window = &ref_seq_data[start as usize..];
-                        }
-                    } else {
-                        subject_storage = subjects[..chunk.len()]
-                            .iter()
-                            .map(|&start| {
-                                (0..window_clipped)
-                                    .map(|n| {
-                                        let si = start + n as isize;
-                                        if si < 0 {
-                                            crate::basic::value::DELIMITER_LETTER
-                                        } else {
-                                            ref_seq_data
-                                                .get(si as usize)
-                                                .copied()
-                                                .unwrap_or(crate::basic::value::DELIMITER_LETTER)
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .collect::<Vec<_>>();
-                        for (window, storage) in subject_windows.iter_mut().zip(&subject_storage) {
-                            *window = storage;
-                        }
-                    }
-                    let mut scores = [i32::MAX; 32];
-                    if ungapped_cutoff != 0 {
-                        crate::dp::simd_ungapped::window_ungapped_best_into(
-                            query_window,
-                            &subject_windows[..chunk.len()],
-                            window_clipped,
-                            &score_matrix,
-                            &mut scores[..chunk.len()],
-                        );
-                    }
-
-                    for (chunk_idx, hit) in chunk.iter().enumerate() {
-                        let score = scores[chunk_idx];
-                        if score <= ungapped_cutoff {
-                            continue;
-                        }
-                        let subject = db_block
-                            .seqs()
-                            .position(hit.ref_id as usize, hit.ref_pos as usize);
-                        let left_subject_start = subjects[chunk_idx] + interval_overhang as isize;
-                        let subject_storage;
-                        let subject_window = if left_subject_start >= 0
-                            && (left_subject_start as usize + left_len) <= ref_seq_data.len()
-                        {
-                            &ref_seq_data[left_subject_start as usize
-                                ..left_subject_start as usize + left_len]
-                        } else {
-                            subject_storage = (0..left_len)
-                                .map(|n| {
-                                    let si = left_subject_start + n as isize;
-                                    if si < 0 {
-                                        crate::basic::value::DELIMITER_LETTER
-                                    } else {
-                                        ref_seq_data
-                                            .get(si as usize)
-                                            .copied()
-                                            .unwrap_or(crate::basic::value::DELIMITER_LETTER)
-                                    }
-                                })
-                                .collect::<Vec<_>>();
-                            &subject_storage
-                        };
-                        let chunked = traits.index_chunks > 1;
-                        let use_left_most_range = chunked
-                            && (config.ext_chunk_size == 0 || config.ext_chunk_size <= 128)
-                            && config.max_target_seqs <= 25;
-                        let current_range = if use_left_most_range {
-                            let partitions = seedp_count(10) as usize;
-                            let chunk_size = partitions.div_ceil(traits.index_chunks as usize);
-                            let partition = seed_partition(hit.seed, seedp_mask(10)) as usize;
-                            let begin = (partition / chunk_size) * chunk_size;
-                            let end = (begin + chunk_size).min(partitions);
-                            Some(SeedPartitionRange::with_bounds(begin as u32, end as u32))
-                        } else {
-                            None
-                        };
-                        let skip_left_most = config.sensitivity >= Sensitivity::VerySensitive;
-                        if !skip_left_most
-                            && !left_most_filter_with_range(
-                                &query[left_q_start..q_end],
-                                subject_window,
-                                left_seed_offset as i32,
-                                shape.length,
-                                &left_most_contexts[sid],
-                                sid == 0,
-                                shape,
-                                ungapped_cutoff,
-                                chunked,
-                                traits.min_identities,
-                                current_range,
-                            )
-                        {
-                            continue;
-                        }
-                        hits.push(Hit::with_score(
-                            0,
-                            subject as u64,
-                            hit.query_pos as u32,
-                            if score == i32::MAX {
-                                u16::MAX
-                            } else {
-                                score.min(u16::MAX as i32) as u16
-                            },
-                        ));
-                    }
-                    chunk_begin = chunk_end;
-                }
-                group_begin = group_end;
-            }
+            let query_hits = &hits_by_query[query_idx];
+            let mut hits = Vec::with_capacity(query_hits.len());
+            hits.extend(
+                query_hits
+                    .iter()
+                    .map(|hit| Hit::with_score(0, hit.subject, hit.seed_offset, hit.score)),
+            );
             let mut stat = Statistics::new();
             let output_hsp_values = HspValues::COORDS
                 | HspValues::IDENT
@@ -841,6 +928,13 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage2_window_keeps_anchor_relative_right_edge_when_left_clipped() {
+        assert_eq!(stage2_query_bounds(232, 3), (0, 51));
+        assert_eq!(stage2_query_bounds(232, 100), (52, 148));
+        assert_eq!(stage2_query_bounds(120, 100), (52, 120));
+    }
 
     #[test]
     fn test_blastp_with_dmnd() {
