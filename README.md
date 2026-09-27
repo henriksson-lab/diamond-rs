@@ -63,8 +63,8 @@ sudo apt-get install g++ cmake zlib1g-dev libsqlite3-dev
 ```bash
 cargo build --release
 
-# With native CPU optimizations (recommended for benchmarks)
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+# Reproducible AVX2 benchmark build on x86-64
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
 
 # Build the non-Windows C++ FFI backend for conformance testing
 cargo build --features ffi
@@ -166,12 +166,24 @@ nonzero and retains a unified diff when parity fails. Quick smoke runs can use
 `REPETITIONS=1`; `REFERENCE_FASTA`, `QUERY_FASTA`, `THREADS`, `RUST_BIN`, and
 `CPP_BIN` can be overridden for later scaling experiments.
 
-The current quick fixture has matching bytes for every shared output row, but
-the Rust pipeline reports four additional reciprocal hits (735 rows versus
-731), so strict end-to-end parity is not yet achieved. The comparison script is
-the authoritative gate while this is optimized. When built on a non-Windows
-target with `--features ffi`, the `--legacy` flag falls back to C++ FFI for
-conformance testing.
+For optimization work, use the larger real-sequence harness rather than
+duplicating the bundled records:
+
+```bash
+REAL_PROTEIN_FASTA=/path/to/reviewed-proteins.fasta \
+  scripts/compare_real_cpp_rust.sh
+```
+
+It deterministically selects disjoint reference/query records, defaults to
+2,000 references and 1,000 queries. Use four threads for throughput comparison
+or one thread for a roughly five-second, low-noise profiling run. See
+`translation/optimization_benchmark.md` for fixture hashes and calibration.
+
+Both the bundled quick fixture and the evenly sampled real-sequence optimization
+fixture currently have byte-identical C++ and Rust output. Any future mismatch
+causes the harness to exit nonzero and retain its raw outputs and unified diff.
+When built on a non-Windows target with `--features ffi`, the `--legacy` flag
+falls back to C++ FFI for conformance testing.
 
 ## Architecture
 

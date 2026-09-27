@@ -1186,36 +1186,6 @@ pub fn dispatch_swipe(
                     }
                 })
                 .collect();
-            // Very small groups cannot amortize lane packing and compact
-            // trace-mask extraction. The exact scalar kernel wins on the
-            // realistic fixture for one- and two-target query groups while
-            // preserving all score-bin semantics (there is no saturation).
-            if trace_targets.len() <= 2 {
-                for (&target, trace_target) in lane_targets.iter().zip(&trace_targets) {
-                    let sw = banded_sw_cbs_range(
-                        p.query,
-                        trace_target.subject,
-                        trace_target.d_begin,
-                        trace_target.d_end,
-                        p.score_matrix,
-                        bias,
-                        target.matrix.as_deref(),
-                        target.matrix_scale(),
-                        &mut traceback_scratch,
-                    );
-                    if let Some(hsp) = traceback_hsp(
-                        target,
-                        trace_target.subject,
-                        trace_target.d_begin,
-                        trace_target.d_end,
-                        sw,
-                        p,
-                    ) {
-                        out.push(hsp);
-                    }
-                }
-                continue;
-            }
             let Some(batch) = simd_trace::trace_batch_tier_avx2(
                 p.query,
                 &trace_targets,

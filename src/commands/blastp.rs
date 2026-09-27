@@ -802,9 +802,9 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         };
     let mut total_alignments = 0u64;
     // Preserve input order without retaining every query's formatted output.
-    // A small batch gives Rayon enough work to balance threads while bounding
-    // buffered output to O(thread-count), even for high-cardinality searches.
-    let output_batch_size = rayon::current_num_threads().max(1) * 2;
+    // A moderately sized batch gives Rayon enough work to balance variable
+    // protein lengths while keeping buffered output proportional to threads.
+    let output_batch_size = rayon::current_num_threads().max(1) * 32;
     for (batch_idx, query_batch) in query_records.chunks(output_batch_size).enumerate() {
         let query_begin = batch_idx * output_batch_size;
         let batch_output: Vec<Vec<u8>> = if rayon::current_num_threads() == 1 {

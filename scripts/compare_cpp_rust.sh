@@ -25,7 +25,18 @@ fi
 
 if [[ ${SKIP_BUILD:-0} != 1 ]]; then
     echo "Building Rust release binary..." >&2
-    RUSTFLAGS=${RUSTFLAGS:--C target-cpu=native} cargo build \
+    benchmark_rustflags=${RUSTFLAGS:-}
+    if [[ -z "$benchmark_rustflags" ]]; then
+        benchmark_arch=$(uname -m)
+        if [[ "$benchmark_arch" == x86_64 ]]; then
+            # Keep LLVM from introducing AVX-512 into the explicitly AVX2
+            # kernels on AVX-512 hosts. That code is slower for this workload.
+            benchmark_rustflags='-C target-cpu=x86-64-v3'
+        else
+            benchmark_rustflags='-C target-cpu=native'
+        fi
+    fi
+    RUSTFLAGS="$benchmark_rustflags" cargo build \
         --manifest-path "$repo_dir/Cargo.toml" --release --offline
     if [[ ! -x "$cpp_bin" ]]; then
         echo "Building vendored C++ release binary..." >&2
@@ -49,6 +60,24 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+fasta_stats() {
+    awk '
+        /^>/ { ++records; next }
+        { gsub(/[[:space:]]/, ""); residues += length }
+        END { printf "%d\t%d\n", records + 0, residues + 0 }
+    ' "$1"
+}
+
+IFS=$'\t' read -r reference_records reference_residues < <(fasta_stats "$reference")
+IFS=$'\t' read -r query_records query_residues < <(fasta_stats "$query")
+printf 'Workload: reference=%s records/%s residues; query=%s records/%s residues; threads=%s; runs=%s\n' \
+    "$reference_records" "$reference_residues" "$query_records" "$query_residues" \
+    "$threads" "$repetitions"
+printf 'Reference SHA-256: '
+sha256sum "$reference" | awk '{ print $1 }'
+printf 'Query SHA-256: '
+sha256sum "$query" | awk '{ print $1 }'
 
 metrics="$work_dir/metrics.tsv"
 printf 'implementation\toperation\trun\tseconds\tpeak_rss_kib\n' > "$metrics"
@@ -122,6 +151,26 @@ median() {
         | awk '{ values[NR] = $1 } END { if (NR % 2) print values[(NR + 1) / 2]; else print (values[NR / 2] + values[NR / 2 + 1]) / 2 }'
 }
 
+spread() {
+    local implementation=$1
+    local operation=$2
+    awk -F '\t' -v impl="$implementation" -v op="$operation" '
+        $1 == impl && $2 == op {
+            ++n
+            sum += $4
+            sumsq += $4 * $4
+            if (n == 1 || $4 < min) min = $4
+            if (n == 1 || $4 > max) max = $4
+        }
+        END {
+            mean = sum / n
+            variance = sumsq / n - mean * mean
+            if (variance < 0) variance = 0
+            printf "mean %.3f s, SD %.3f s, range %.2f-%.2f s", mean, sqrt(variance), min, max
+        }
+    ' "$metrics"
+}
+
 printf '\n%-8s %-8s %12s %14s\n' implementation operation seconds peak_rss_kib
 for operation in makedb blastp; do
     for implementation in cpp rust; do
@@ -140,6 +189,8 @@ awk -v cpp="$cpp_seconds" -v rust="$rust_seconds" \
     'BEGIN { printf "\nblastp speedup (C++/Rust): %.3fx\n", cpp / rust }'
 awk -v cpp="$cpp_rss" -v rust="$rust_rss" \
     'BEGIN { printf "blastp RSS ratio (Rust/C++): %.3fx\n", rust / cpp }'
+printf 'C++ blastp timing: %s\n' "$(spread cpp blastp)"
+printf 'Rust blastp timing: %s\n' "$(spread rust blastp)"
 printf 'blastp byte parity: %s\n' "$parity"
 printf 'C++ SHA-256: '
 sha256sum "$cpp_output" | awk '{print $1}'
