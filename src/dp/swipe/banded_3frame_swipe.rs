@@ -4,6 +4,9 @@
 //! API compatibility; this module supplies the original translated-sequence
 //! dispatch boundary and re-exports its matrix/worker surface.
 
+#[path = "banded_3frame_simd.rs"]
+pub mod simd;
+
 pub use crate::dp::banded_3frame::{
     banded_3frame_swipe_range, banded_3frame_swipe_targets, banded_3frame_swipe_worker,
     Banded3FrameSwipeMatrix, Banded3FrameSwipeTracebackMatrix, ColumnIterator, DpStat,

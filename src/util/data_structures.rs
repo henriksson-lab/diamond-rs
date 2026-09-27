@@ -100,11 +100,8 @@ where
         let hash = H::hash(key);
         let p = M::modulo(hash >> 8, self.size as u64) as usize;
         let window = &self.table[p..p + Self::PADDING];
-        if !window.iter().any(|&x| x == 0) {
-            return true;
-        }
         let f = Self::finger_print(hash);
-        window.iter().any(|&x| x == f)
+        contains_fingerprint(window, f)
     }
 
     pub fn insert(&mut self, key: u64) {
@@ -169,6 +166,72 @@ where
             }
         }
     }
+}
+
+/// Search one DIAMOND hash-table probe group.
+///
+/// The table always carries [`HashSet::PADDING`] bytes after its logical end,
+/// so this mirrors C++ `HashSet::contains`: compare all 16 slots with zero and
+/// the requested fingerprint in one SSE2/NEON register.  A completely full
+/// group is conservatively reported as present, because linear probing may
+/// have continued beyond it when the table was built.
+#[inline]
+fn contains_fingerprint(window: &[u8], fingerprint: u8) -> bool {
+    debug_assert!(window.len() >= 16);
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("sse2") {
+            // SAFETY: SSE2 support is checked above, and `window` contains at
+            // least the 16 bytes loaded by the kernel.
+            return unsafe { contains_fingerprint_sse2(window.as_ptr(), fingerprint) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is mandatory on AArch64. `window` has at least 16 bytes.
+        return unsafe { contains_fingerprint_neon(window.as_ptr(), fingerprint) };
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        if !window.iter().take(16).any(|&x| x == 0) {
+            return true;
+        }
+        window.iter().take(16).any(|&x| x == fingerprint)
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn contains_fingerprint_sse2(window: *const u8, fingerprint: u8) -> bool {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let values = _mm_loadu_si128(window.cast());
+    let zero_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(values, _mm_setzero_si128()));
+    if zero_mask == 0 {
+        return true;
+    }
+    let needle = _mm_set1_epi8(fingerprint as i8);
+    _mm_movemask_epi8(_mm_cmpeq_epi8(values, needle)) != 0
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn contains_fingerprint_neon(window: *const u8, fingerprint: u8) -> bool {
+    use std::arch::aarch64::*;
+
+    let values = vld1q_u8(window);
+    let zero_matches = vceqq_u8(values, vdupq_n_u8(0));
+    if vmaxvq_u8(zero_matches) == 0 {
+        return true;
+    }
+    let fingerprint_matches = vceqq_u8(values, vdupq_n_u8(fingerprint));
+    vmaxvq_u8(fingerprint_matches) != 0
 }
 
 pub trait HashTableHash<Key> {
@@ -1066,6 +1129,14 @@ impl BitVector {
     }
 
     pub fn one_count(&self) -> usize {
+        #[cfg(target_arch = "aarch64")]
+        {
+            // AArch64 guarantees NEON.  Count two words per vector, matching
+            // DIAMOND's `bit_vector.h` vectorized population-count path.
+            return unsafe { bit_vector_one_count_neon(&self.data) };
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
         self.data.iter().map(|x| x.count_ones() as usize).sum()
     }
 
@@ -1086,6 +1157,26 @@ impl BitVector {
         }
         v
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn bit_vector_one_count_neon(data: &[u64]) -> usize {
+    use std::arch::aarch64::{vaddvq_u8, vcntq_u8, vld1q_u8};
+
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i + 2 <= data.len() {
+        // SAFETY: the loop condition guarantees sixteen readable bytes and
+        // `vld1q_u8` permits unaligned addresses.
+        let block = unsafe { vld1q_u8(data.as_ptr().add(i).cast::<u8>()) };
+        count += vaddvq_u8(vcntq_u8(block)) as usize;
+        i += 2;
+    }
+    if i < data.len() {
+        count += data[i].count_ones() as usize;
+    }
+    count
 }
 
 impl std::ops::BitOrAssign<&BitVector> for BitVector {

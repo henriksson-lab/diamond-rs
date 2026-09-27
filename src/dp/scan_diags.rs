@@ -123,6 +123,43 @@ fn scan_diags_fixed_from<const LANES: usize>(
     let i0 = d_begin + j0;
     let j1 = (qlen - d_begin).min(j_end);
     assert!(j1 <= subject.len() as i32);
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if arithmetic == ScanArithmetic::Saturating8
+        && LANES % 32 == 0
+        && std::arch::is_x86_feature_detected!("avx2")
+    {
+        // SAFETY: AVX2 was detected above. LongScoreProfile guarantees the
+        // padding required for each unaligned LANES-byte profile read.
+        unsafe {
+            scan_diags_avx2::<LANES>(qp, subject, i0, j0, j1, out);
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if arithmetic == ScanArithmetic::Saturating8 && LANES % 16 == 0 {
+        // SAFETY: Advanced SIMD is mandatory in AArch64 and the profile owns
+        // the padding needed by each unaligned 16-byte load.
+        unsafe {
+            scan_diags_neon::<LANES>(qp, subject, i0, j0, j1, out);
+        }
+        return;
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if arithmetic == ScanArithmetic::Saturating8
+        && LANES % 16 == 0
+        && std::arch::is_x86_feature_detected!("sse4.1")
+    {
+        // SAFETY: SSE4.1 was detected above. LongScoreProfile guarantees the
+        // padding required for each unaligned LANES-byte profile read.
+        unsafe {
+            scan_diags_sse41::<LANES>(qp, subject, i0, j0, j1, out);
+        }
+        return;
+    }
+
     let mut v = [0i32; LANES];
     let mut max = [0i32; LANES];
     let mut i = i0;
@@ -141,6 +178,140 @@ fn scan_diags_fixed_from<const LANES: usize>(
         j += 1;
     }
     out[..LANES].copy_from_slice(&max);
+}
+
+/// AArch64 NEON translation of C++'s 16-lane `ScoreVector<int8_t>` path.
+/// The `SCHAR_MIN` bias turns signed saturating addition into a local score
+/// accumulator in 0..=255, exactly as in the SSE4.1 implementation.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn scan_diags_neon<const LANES: usize>(
+    qp: &LongScoreProfile<i8>,
+    subject: &[Letter],
+    i0: i32,
+    j0: i32,
+    j1: i32,
+    out: &mut [i32],
+) {
+    use std::arch::aarch64::*;
+
+    const MAX_VECTORS: usize = 8;
+    debug_assert!(LANES % 16 == 0 && LANES <= MAX_VECTORS * 16);
+    let vector_count = LANES / 16;
+    let bias = vdupq_n_s8(i8::MIN);
+    let mut score = [bias; MAX_VECTORS];
+    let mut best = [bias; MAX_VECTORS];
+    let mut i = i0;
+    let mut j = j0;
+    while j < j1 {
+        let profile = profile_get_signed(qp, subject[j as usize], i);
+        for block in 0..vector_count {
+            let delta = vld1q_s8(profile.as_ptr().add(block * 16));
+            score[block] = vqaddq_s8(score[block], delta);
+            best[block] = vmaxq_s8(best[block], score[block]);
+        }
+        i += 1;
+        j += 1;
+    }
+
+    let mut bytes = [i8::MIN; MAX_VECTORS * 16];
+    for block in 0..vector_count {
+        vst1q_s8(bytes.as_mut_ptr().add(block * 16), best[block]);
+    }
+    for (dst, &value) in out[..LANES].iter_mut().zip(&bytes[..LANES]) {
+        *dst = i32::from(value) - i32::from(i8::MIN);
+    }
+}
+
+/// AVX2 translation of C++ `scan_diags{,64,128}`. Values remain biased by
+/// `SCHAR_MIN` in registers, making signed saturating addition equivalent to
+/// local-alignment accumulation in the range 0..=255.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_diags_avx2<const LANES: usize>(
+    qp: &LongScoreProfile<i8>,
+    subject: &[Letter],
+    i0: i32,
+    j0: i32,
+    j1: i32,
+    out: &mut [i32],
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    const MAX_VECTORS: usize = 4;
+    debug_assert!(LANES % 32 == 0 && LANES <= MAX_VECTORS * 32);
+    let vector_count = LANES / 32;
+    let bias = _mm256_set1_epi8(i8::MIN);
+    let mut score = [bias; MAX_VECTORS];
+    let mut best = [bias; MAX_VECTORS];
+    let mut i = i0;
+    let mut j = j0;
+    while j < j1 {
+        let profile = profile_get_signed(qp, subject[j as usize], i);
+        for block in 0..vector_count {
+            let delta = _mm256_loadu_si256(profile.as_ptr().add(block * 32).cast());
+            score[block] = _mm256_adds_epi8(score[block], delta);
+            best[block] = _mm256_max_epi8(best[block], score[block]);
+        }
+        i += 1;
+        j += 1;
+    }
+
+    let mut bytes = [i8::MIN; MAX_VECTORS * 32];
+    for block in 0..vector_count {
+        _mm256_storeu_si256(bytes.as_mut_ptr().add(block * 32).cast(), best[block]);
+    }
+    for (dst, &value) in out[..LANES].iter_mut().zip(&bytes[..LANES]) {
+        *dst = i32::from(value) - i32::from(i8::MIN);
+    }
+}
+
+/// SSE4.1 translation of C++ `scan_diags{,64,128}`. As in the AVX2
+/// implementation, `SCHAR_MIN` is the zero bias for signed saturating lanes.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn scan_diags_sse41<const LANES: usize>(
+    qp: &LongScoreProfile<i8>,
+    subject: &[Letter],
+    i0: i32,
+    j0: i32,
+    j1: i32,
+    out: &mut [i32],
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    const MAX_VECTORS: usize = 8;
+    debug_assert!(LANES % 16 == 0 && LANES <= MAX_VECTORS * 16);
+    let vector_count = LANES / 16;
+    let bias = _mm_set1_epi8(i8::MIN);
+    let mut score = [bias; MAX_VECTORS];
+    let mut best = [bias; MAX_VECTORS];
+    let mut i = i0;
+    let mut j = j0;
+    while j < j1 {
+        let profile = profile_get_signed(qp, subject[j as usize], i);
+        for block in 0..vector_count {
+            let delta = _mm_loadu_si128(profile.as_ptr().add(block * 16).cast());
+            score[block] = _mm_adds_epi8(score[block], delta);
+            best[block] = _mm_max_epi8(best[block], score[block]);
+        }
+        i += 1;
+        j += 1;
+    }
+
+    let mut bytes = [i8::MIN; MAX_VECTORS * 16];
+    for block in 0..vector_count {
+        _mm_storeu_si128(bytes.as_mut_ptr().add(block * 16).cast(), best[block]);
+    }
+    for (dst, &value) in out[..LANES].iter_mut().zip(&bytes[..LANES]) {
+        *dst = i32::from(value) - i32::from(i8::MIN);
+    }
 }
 
 fn profile_get_signed(qp: &LongScoreProfile<i8>, letter: Letter, i: i32) -> &[i8] {
@@ -303,6 +474,98 @@ mod tests {
             ScanArithmetic::Scalar,
         );
         assert_eq!(masked_out, plain);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn avx2_scans_match_saturating_reference() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let sm = ScoreMatrix::new("BLOSUM62", -1, -1, -1, 1, 0).unwrap();
+        let query: Vec<_> = (0..173).map(|i| ((i * 7 + 3) % 25) as Letter).collect();
+        let subject: Vec<_> = (0..91).map(|i| ((i * 13 + 2) % 25) as Letter).collect();
+        let qp = make_profile8(&query, None, 128, &sm);
+        for d_begin in [-40, -7, 0, 23] {
+            let j0 = 0.max(-(d_begin + 128 - 1));
+            let i0 = d_begin + j0;
+            let j1 = (qp.length() as i32 - d_begin).min(subject.len() as i32);
+            // Convert the unbounded scalar reference to the exact saturating
+            // recurrence rather than merely clamping its final score.
+            let mut saturating = [0; 128];
+            let mut running = [0; 128];
+            for j in j0..j1 {
+                let row = profile_get_signed(&qp, subject[j as usize], i0 + j - j0);
+                for lane in 0..128 {
+                    running[lane] = (running[lane] + i32::from(row[lane])).clamp(0, 255);
+                    saturating[lane] = saturating[lane].max(running[lane]);
+                }
+            }
+            let mut actual = [0; 128];
+            unsafe {
+                scan_diags_avx2::<128>(&qp, &subject, i0, j0, j1, &mut actual);
+            }
+            assert_eq!(actual, saturating, "d_begin={d_begin}");
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn sse41_scans_match_saturating_reference() {
+        if !std::arch::is_x86_feature_detected!("sse4.1") {
+            return;
+        }
+        let sm = ScoreMatrix::new("BLOSUM62", -1, -1, -1, 1, 0).unwrap();
+        let query: Vec<_> = (0..173).map(|i| ((i * 7 + 3) % 25) as Letter).collect();
+        let subject: Vec<_> = (0..91).map(|i| ((i * 13 + 2) % 25) as Letter).collect();
+        let qp = make_profile8(&query, None, 128, &sm);
+        for d_begin in [-40, -7, 0, 23] {
+            let j0 = 0.max(-(d_begin + 128 - 1));
+            let i0 = d_begin + j0;
+            let j1 = (qp.length() as i32 - d_begin).min(subject.len() as i32);
+            let mut saturating = [0; 128];
+            let mut running = [0; 128];
+            for j in j0..j1 {
+                let row = profile_get_signed(&qp, subject[j as usize], i0 + j - j0);
+                for lane in 0..128 {
+                    running[lane] = (running[lane] + i32::from(row[lane])).clamp(0, 255);
+                    saturating[lane] = saturating[lane].max(running[lane]);
+                }
+            }
+            let mut actual = [0; 128];
+            unsafe {
+                scan_diags_sse41::<128>(&qp, &subject, i0, j0, j1, &mut actual);
+            }
+            assert_eq!(actual, saturating, "d_begin={d_begin}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_scans_match_saturating_reference() {
+        let sm = ScoreMatrix::new("BLOSUM62", -1, -1, -1, 1, 0).unwrap();
+        let query: Vec<_> = (0..173).map(|i| ((i * 7 + 3) % 25) as Letter).collect();
+        let subject: Vec<_> = (0..91).map(|i| ((i * 13 + 2) % 25) as Letter).collect();
+        let qp = make_profile8(&query, None, 128, &sm);
+        for d_begin in [-40, -7, 0, 23] {
+            let j0 = 0.max(-(d_begin + 128 - 1));
+            let i0 = d_begin + j0;
+            let j1 = (qp.length() as i32 - d_begin).min(subject.len() as i32);
+            let mut expected = [0; 128];
+            let mut running = [0; 128];
+            for j in j0..j1 {
+                let row = profile_get_signed(&qp, subject[j as usize], i0 + j - j0);
+                for lane in 0..128 {
+                    running[lane] = (running[lane] + i32::from(row[lane])).clamp(0, 255);
+                    expected[lane] = expected[lane].max(running[lane]);
+                }
+            }
+            let mut actual = [0; 128];
+            unsafe {
+                scan_diags_neon::<128>(&qp, &subject, i0, j0, j1, &mut actual);
+            }
+            assert_eq!(actual, expected, "d_begin={d_begin}");
+        }
     }
 
     #[test]

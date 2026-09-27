@@ -1,4 +1,18 @@
 pub fn factor_ltriang_pos_def(a: &mut [Vec<f64>], n: usize) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if n == 40
+        && a.len() >= 40
+        && a.iter().take(40).all(|row| row.len() >= 40)
+        && super::target_freq_simd::available()
+    {
+        // SAFETY: dimensions and runtime feature support are checked above.
+        unsafe { super::target_freq_simd::factor_lower(a) };
+        return;
+    }
+    factor_ltriang_pos_def_scalar(a, n);
+}
+
+fn factor_ltriang_pos_def_scalar(a: &mut [Vec<f64>], n: usize) {
     for i in 0..n {
         for j in 0..i {
             let mut temp = a[i][j];
@@ -16,6 +30,21 @@ pub fn factor_ltriang_pos_def(a: &mut [Vec<f64>], n: usize) {
 }
 
 pub fn solve_ltriang_pos_def(x: &mut [f64], n: usize, l: &[Vec<f64>]) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if n == 40
+        && x.len() >= 40
+        && l.len() >= 40
+        && l.iter().take(40).all(|row| row.len() >= 40)
+        && super::target_freq_simd::available()
+    {
+        // SAFETY: dimensions and runtime feature support are checked above.
+        unsafe { super::target_freq_simd::solve_lower(x, l) };
+        return;
+    }
+    solve_ltriang_pos_def_scalar(x, n, l);
+}
+
+fn solve_ltriang_pos_def_scalar(x: &mut [f64], n: usize, l: &[Vec<f64>]) {
     for i in 0..n {
         let mut temp = x[i];
         for j in 0..i {
@@ -99,5 +128,46 @@ mod tests {
         let x = [2.0, 4.0, 6.0];
         let step = [-1.0, -4.0, 3.0];
         assert_eq!(step_bound(&x, 3, &step, 10.0), 1.0);
+    }
+
+    #[test]
+    fn randomized_fixed_40_factor_and_solve_match_scalar() {
+        let n = 40;
+        let mut state = 0x1729_ace5_d40f_b681u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 11) as f64 / ((1u64 << 53) as f64)) - 0.5
+        };
+        let mut lower = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..i {
+                lower[i][j] = next() * 0.05;
+            }
+            lower[i][i] = 1.0 + next().abs();
+        }
+        let mut matrix = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..=i {
+                matrix[i][j] = (0..=j).map(|k| lower[i][k] * lower[j][k]).sum();
+            }
+        }
+        let mut expected_factor = matrix.clone();
+        factor_ltriang_pos_def_scalar(&mut expected_factor, n);
+        let mut actual_factor = matrix;
+        factor_ltriang_pos_def(&mut actual_factor, n);
+        for i in 0..n {
+            for j in 0..=i {
+                assert!((actual_factor[i][j] - expected_factor[i][j]).abs() < 2.0e-14);
+            }
+        }
+
+        let rhs = (0..n).map(|_| next()).collect::<Vec<_>>();
+        let mut expected = rhs.clone();
+        solve_ltriang_pos_def_scalar(&mut expected, n, &expected_factor);
+        let mut actual = rhs;
+        solve_ltriang_pos_def(&mut actual, n, &actual_factor);
+        for i in 0..n {
+            assert!((actual[i] - expected[i]).abs() < 2.0e-13, "x[{i}]");
+        }
     }
 }

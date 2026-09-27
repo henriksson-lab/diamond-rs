@@ -24,6 +24,23 @@ impl ReNewtonSystem {
 }
 
 pub fn scaled_symmetric_product_a(w: &mut [Vec<f64>], diagonal: &[f64], alphsize: usize) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if alphsize == super::target_freq_simd::ALPHABET
+        && w.len() >= super::target_freq_simd::CONSTRAINTS
+        && w.iter()
+            .take(super::target_freq_simd::CONSTRAINTS)
+            .all(|row| row.len() >= super::target_freq_simd::CONSTRAINTS)
+        && diagonal.len() >= super::target_freq_simd::CELLS
+        && super::target_freq_simd::available()
+    {
+        // SAFETY: matrix dimensions and runtime feature support are checked.
+        unsafe { super::target_freq_simd::scaled_symmetric_product(w, diagonal) };
+        return;
+    }
+    scaled_symmetric_product_a_scalar(w, diagonal, alphsize);
+}
+
+fn scaled_symmetric_product_a_scalar(w: &mut [Vec<f64>], diagonal: &[f64], alphsize: usize) {
     let m = 2 * alphsize - 1;
     for (row_w, row) in w.iter_mut().enumerate().take(m) {
         for value in row.iter_mut().take(row_w + 1) {
@@ -43,6 +60,21 @@ pub fn scaled_symmetric_product_a(w: &mut [Vec<f64>], diagonal: &[f64], alphsize
 }
 
 pub fn multiply_by_a(beta: f64, y: &mut [f64], alphsize: usize, alpha: f64, x: &[f64]) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if alphsize == super::target_freq_simd::ALPHABET
+        && y.len() >= super::target_freq_simd::CONSTRAINTS
+        && x.len() >= super::target_freq_simd::CELLS
+        && super::target_freq_simd::available()
+    {
+        // SAFETY: `available` establishes SSE2 and the callee performs its own
+        // AVX2 runtime check. Slice lengths are checked above.
+        unsafe { super::target_freq_simd::multiply_by_a(beta, y, alpha, x) };
+        return;
+    }
+    multiply_by_a_scalar(beta, y, alphsize, alpha, x);
+}
+
+fn multiply_by_a_scalar(beta: f64, y: &mut [f64], alphsize: usize, alpha: f64, x: &[f64]) {
     if beta == 0.0 {
         for yi in y.iter_mut().take(2 * alphsize - 1) {
             *yi = 0.0;
@@ -69,6 +101,26 @@ pub fn multiply_by_a(beta: f64, y: &mut [f64], alphsize: usize, alpha: f64, x: &
 }
 
 pub fn multiply_by_a_transpose(beta: f64, y: &mut [f64], alphsize: usize, alpha: f64, x: &[f64]) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if alphsize == super::target_freq_simd::ALPHABET
+        && y.len() >= super::target_freq_simd::CELLS
+        && x.len() >= super::target_freq_simd::CONSTRAINTS
+        && super::target_freq_simd::available()
+    {
+        // SAFETY: see `multiply_by_a` above.
+        unsafe { super::target_freq_simd::multiply_by_a_transpose(beta, y, alpha, x) };
+        return;
+    }
+    multiply_by_a_transpose_scalar(beta, y, alphsize, alpha, x);
+}
+
+fn multiply_by_a_transpose_scalar(
+    beta: f64,
+    y: &mut [f64],
+    alphsize: usize,
+    alpha: f64,
+    x: &[f64],
+) {
     if beta == 0.0 {
         for yk in y.iter_mut().take(alphsize * alphsize) {
             *yk = 0.0;
@@ -113,6 +165,17 @@ pub fn dual_residuals(
     let n = alphsize * alphsize;
     if constrain_rel_entropy {
         let eta = z[2 * alphsize - 1];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if alphsize == super::target_freq_simd::ALPHABET && super::target_freq_simd::available() {
+            // SAFETY: fixed-size buffers are guaranteed by the optimizer and
+            // runtime feature detection is complete.
+            unsafe { super::target_freq_simd::dual_residuals(resids_x, &grads[0], &grads[1], eta) };
+        } else {
+            for i in 0..n {
+                resids_x[i] = -grads[0][i] + eta * grads[1][i];
+            }
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
         for i in 0..n {
             resids_x[i] = -grads[0][i] + eta * grads[1][i];
         }
@@ -242,6 +305,19 @@ pub fn evaluate_re_functions(
     scores: &[f64],
     constrain_rel_entropy: bool,
 ) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if constrain_rel_entropy
+        && alphsize == super::target_freq_simd::ALPHABET
+        && super::target_freq_simd::available()
+    {
+        let (first, rest) = grads.split_at_mut(1);
+        // SAFETY: fixed-size optimizer buffers and x86 feature support were
+        // checked above; split_at_mut proves the gradient rows disjoint.
+        unsafe {
+            super::target_freq_simd::evaluate_re(values, &mut first[0], &mut rest[0], x, q, scores)
+        };
+        return;
+    }
     values[0] = 0.0;
     values[1] = 0.0;
     for k in 0..alphsize * alphsize {
@@ -264,6 +340,20 @@ pub fn compute_scores_from_probs(
     row_freqs: &[f64],
     col_freqs: &[f64],
 ) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if alphsize == super::target_freq_simd::ALPHABET
+        && scores.len() >= super::target_freq_simd::CELLS
+        && target_freqs.len() >= super::target_freq_simd::CELLS
+        && row_freqs.len() >= super::target_freq_simd::ALPHABET
+        && col_freqs.len() >= super::target_freq_simd::ALPHABET
+        && super::target_freq_simd::available()
+    {
+        // SAFETY: lengths and runtime CPU support are checked above.
+        unsafe {
+            super::target_freq_simd::compute_scores(scores, target_freqs, row_freqs, col_freqs)
+        };
+        return;
+    }
     for i in 0..alphsize {
         for j in 0..alphsize {
             let k = i * alphsize + j;
@@ -520,5 +610,118 @@ mod tests {
             new_optimize_target_frequencies(&mut x, 19, &q, &row, &col, 0.0, 1e-10, 50);
         assert_eq!(bad_status, -1);
         assert_eq!(bad_iterations, 0);
+    }
+
+    #[test]
+    fn randomized_fixed_size_simd_linear_maps_match_scalar() {
+        let mut state = 0x7a4d_93e2_61c8_05bfu64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 11) as f64 / ((1u64 << 53) as f64)) * 4.0 - 2.0
+        };
+        for &(beta, alpha) in &[(0.0, 1.0), (1.0, -1.0), (0.37, 1.91)] {
+            let x = (0..400).map(|_| next()).collect::<Vec<_>>();
+            let initial_a = (0..39).map(|_| next()).collect::<Vec<_>>();
+            let mut expected_a = initial_a.clone();
+            multiply_by_a_scalar(beta, &mut expected_a, 20, alpha, &x);
+            let mut actual_a = initial_a;
+            multiply_by_a(beta, &mut actual_a, 20, alpha, &x);
+            for (i, (&actual, &expected)) in actual_a.iter().zip(&expected_a).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 2.0e-13,
+                    "A[{i}]: {actual} != {expected}"
+                );
+            }
+
+            let constraints = (0..39).map(|_| next()).collect::<Vec<_>>();
+            let initial_at = (0..400).map(|_| next()).collect::<Vec<_>>();
+            let mut expected_at = initial_at.clone();
+            multiply_by_a_transpose_scalar(beta, &mut expected_at, 20, alpha, &constraints);
+            let mut actual_at = initial_at;
+            multiply_by_a_transpose(beta, &mut actual_at, 20, alpha, &constraints);
+            for (i, (&actual, &expected)) in actual_at.iter().zip(&expected_at).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 2.0e-13,
+                    "AT[{i}]: {actual} != {expected}"
+                );
+            }
+        }
+
+        let diagonal = (0..400).map(|_| next().abs()).collect::<Vec<_>>();
+        let mut expected_w = vec![vec![9.0; 40]; 40];
+        scaled_symmetric_product_a_scalar(&mut expected_w, &diagonal, 20);
+        let mut actual_w = vec![vec![9.0; 40]; 40];
+        scaled_symmetric_product_a(&mut actual_w, &diagonal, 20);
+        for i in 0..39 {
+            for j in 0..=i {
+                assert_eq!(actual_w[i][j], expected_w[i][j], "W[{i}][{j}]");
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_dual_residual_simd_matches_scalar() {
+        let mut state = 0xd1b5_4a32_d192_ed03u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
+            ((state >> 11) as f64 / ((1u64 << 53) as f64)) * 2.0 - 1.0
+        };
+        let grads = vec![
+            (0..400).map(|_| next()).collect::<Vec<_>>(),
+            (0..400).map(|_| next()).collect::<Vec<_>>(),
+        ];
+        let z = (0..40).map(|_| next()).collect::<Vec<_>>();
+        let mut expected = vec![0.0; 400];
+        let eta = z[39];
+        for i in 0..400 {
+            expected[i] = -grads[0][i] + eta * grads[1][i];
+        }
+        multiply_by_a_transpose_scalar(1.0, &mut expected, 20, 1.0, &z);
+        let mut actual = vec![0.0; 400];
+        dual_residuals(&mut actual, 20, &grads, &z, true);
+        for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 2.0e-13,
+                "dual[{i}]: {actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn randomized_score_and_re_simd_match_scalar_formulas() {
+        let mut state = 0x49c1_7d32_a85e_60fbu64;
+        let mut next_positive = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            1.0e-4 + (state >> 11) as f64 / ((1u64 << 53) as f64)
+        };
+        let row = (0..20).map(|_| next_positive()).collect::<Vec<_>>();
+        let col = (0..20).map(|_| next_positive()).collect::<Vec<_>>();
+        let target = (0..400).map(|_| next_positive()).collect::<Vec<_>>();
+        let mut scores = vec![0.0; 400];
+        compute_scores_from_probs(&mut scores, 20, &target, &row, &col);
+        for i in 0..20 {
+            for j in 0..20 {
+                let k = i * 20 + j;
+                assert_eq!(scores[k], (target[k] / (row[i] * col[j])).ln());
+            }
+        }
+
+        let q = (0..400).map(|_| next_positive()).collect::<Vec<_>>();
+        let x = (0..400).map(|_| next_positive()).collect::<Vec<_>>();
+        let mut values = [0.0; 2];
+        let mut grads = vec![vec![0.0; 400], vec![0.0; 400]];
+        evaluate_re_functions(&mut values, &mut grads, 20, &x, &q, &scores, true);
+        let mut expected_values = [0.0; 2];
+        for k in 0..400 {
+            let t = (x[k] / q[k]).ln();
+            let u = t + scores[k];
+            expected_values[0] += x[k] * t;
+            expected_values[1] += x[k] * u;
+            assert_eq!(grads[0][k], t + 1.0);
+            assert_eq!(grads[1][k], u + 1.0);
+        }
+        assert_eq!(values, expected_values);
     }
 }

@@ -115,7 +115,7 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].target_block_id, 9);
         assert_eq!(matches[0].target_oid, 0);
-        assert_eq!(matches[0].seq, targets[0]);
+        assert_eq!(matches[0].seq.as_ref(), targets[0].as_slice());
         assert_eq!(matches[0].hsps[0].score, 8);
         assert_eq!(
             matches[0].hsps[0].bit_score,

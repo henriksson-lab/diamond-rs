@@ -123,6 +123,24 @@ pub fn transpose(data: &[&[i8]], n: usize, out: &mut [i8], width: usize) {
     assert!(width == 16 || width == 32);
     assert!(n <= width);
     assert!(out.len() >= width * width);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        if width == 32 && std::arch::is_x86_feature_detected!("avx2") {
+            transpose_32_avx2(data, n, out);
+            return;
+        }
+        if width == 16 && std::arch::is_x86_feature_detected!("sse2") {
+            transpose_16_sse2(data, n, out);
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        if width == 16 {
+            transpose_16_neon(data, n, out);
+            return;
+        }
+    }
     out[..width * width].fill(0);
     let row_offset = width - n;
     for row in 0..n {
@@ -130,6 +148,171 @@ pub fn transpose(data: &[&[i8]], n: usize, out: &mut [i8], width: usize) {
         for col in 0..width {
             out[col * width + row_offset + row] = data[row][col];
         }
+    }
+}
+
+#[inline]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+fn bit_reverse(value: usize, bits: u32) -> usize {
+    value.reverse_bits() >> (usize::BITS - bits)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn transpose_16_sse2(data: &[&[i8]], n: usize, out: &mut [i8]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let zero = _mm_setzero_si128();
+    let mut rows = [zero; 16];
+    let row0 = 16 - n;
+    for (dst, src) in rows[row0..].iter_mut().zip(data.iter().take(n)) {
+        debug_assert!(src.len() >= 16);
+        *dst = _mm_loadu_si128(src.as_ptr().cast());
+    }
+    for group in (0..16).step_by(2) {
+        let a = rows[group];
+        let b = rows[group + 1];
+        rows[group] = _mm_unpacklo_epi8(a, b);
+        rows[group + 1] = _mm_unpackhi_epi8(a, b);
+    }
+    for group in (0..16).step_by(4) {
+        for offset in 0..2 {
+            let a = rows[group + offset];
+            let b = rows[group + offset + 2];
+            rows[group + offset] = _mm_unpacklo_epi16(a, b);
+            rows[group + offset + 2] = _mm_unpackhi_epi16(a, b);
+        }
+    }
+    for group in (0..16).step_by(8) {
+        for offset in 0..4 {
+            let a = rows[group + offset];
+            let b = rows[group + offset + 4];
+            rows[group + offset] = _mm_unpacklo_epi32(a, b);
+            rows[group + offset + 4] = _mm_unpackhi_epi32(a, b);
+        }
+    }
+    for offset in 0..8 {
+        let a = rows[offset];
+        let b = rows[offset + 8];
+        rows[offset] = _mm_unpacklo_epi64(a, b);
+        rows[offset + 8] = _mm_unpackhi_epi64(a, b);
+    }
+    for column in 0..16 {
+        _mm_storeu_si128(
+            out.as_mut_ptr().add(column * 16).cast(),
+            rows[bit_reverse(column, 4)],
+        );
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose_32_avx2(data: &[&[i8]], n: usize, out: &mut [i8]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let zero = _mm256_setzero_si256();
+    let mut rows = [zero; 32];
+    let row0 = 32 - n;
+    for (dst, src) in rows[row0..].iter_mut().zip(data.iter().take(n)) {
+        debug_assert!(src.len() >= 32);
+        *dst = _mm256_loadu_si256(src.as_ptr().cast());
+    }
+    for group in (0..32).step_by(2) {
+        let a = rows[group];
+        let b = rows[group + 1];
+        rows[group] = _mm256_unpacklo_epi8(a, b);
+        rows[group + 1] = _mm256_unpackhi_epi8(a, b);
+    }
+    for group in (0..32).step_by(4) {
+        for offset in 0..2 {
+            let a = rows[group + offset];
+            let b = rows[group + offset + 2];
+            rows[group + offset] = _mm256_unpacklo_epi16(a, b);
+            rows[group + offset + 2] = _mm256_unpackhi_epi16(a, b);
+        }
+    }
+    for group in (0..32).step_by(8) {
+        for offset in 0..4 {
+            let a = rows[group + offset];
+            let b = rows[group + offset + 4];
+            rows[group + offset] = _mm256_unpacklo_epi32(a, b);
+            rows[group + offset + 4] = _mm256_unpackhi_epi32(a, b);
+        }
+    }
+    for group in (0..32).step_by(16) {
+        for offset in 0..8 {
+            let a = rows[group + offset];
+            let b = rows[group + offset + 8];
+            rows[group + offset] = _mm256_unpacklo_epi64(a, b);
+            rows[group + offset + 8] = _mm256_unpackhi_epi64(a, b);
+        }
+    }
+    for offset in 0..16 {
+        let a = rows[offset];
+        let b = rows[offset + 16];
+        rows[offset] = _mm256_permute2x128_si256(a, b, 0x20);
+        rows[offset + 16] = _mm256_permute2x128_si256(a, b, 0x31);
+    }
+    for column in 0..32 {
+        let register = (column & 16) + bit_reverse(column & 15, 4);
+        _mm256_storeu_si256(out.as_mut_ptr().add(column * 32).cast(), rows[register]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn transpose_16_neon(data: &[&[i8]], n: usize, out: &mut [i8]) {
+    use std::arch::aarch64::*;
+
+    let zero = vdupq_n_s8(0);
+    let mut rows = [zero; 16];
+    let row0 = 16 - n;
+    for (dst, src) in rows[row0..].iter_mut().zip(data.iter().take(n)) {
+        debug_assert!(src.len() >= 16);
+        *dst = vld1q_s8(src.as_ptr());
+    }
+    for group in (0..16).step_by(2) {
+        let pair = vtrnq_s8(rows[group], rows[group + 1]);
+        rows[group] = pair.0;
+        rows[group + 1] = pair.1;
+    }
+    for group in (0..16).step_by(4) {
+        for offset in 0..2 {
+            let pair = vtrnq_s16(
+                vreinterpretq_s16_s8(rows[group + offset]),
+                vreinterpretq_s16_s8(rows[group + offset + 2]),
+            );
+            rows[group + offset] = vreinterpretq_s8_s16(pair.0);
+            rows[group + offset + 2] = vreinterpretq_s8_s16(pair.1);
+        }
+    }
+    for group in (0..16).step_by(8) {
+        for offset in 0..4 {
+            let pair = vtrnq_s32(
+                vreinterpretq_s32_s8(rows[group + offset]),
+                vreinterpretq_s32_s8(rows[group + offset + 4]),
+            );
+            rows[group + offset] = vreinterpretq_s8_s32(pair.0);
+            rows[group + offset + 4] = vreinterpretq_s8_s32(pair.1);
+        }
+    }
+    for column in 0..8 {
+        let low = vcombine_s8(
+            vget_low_s8(rows[bit_reverse(column, 3)]),
+            vget_low_s8(rows[bit_reverse(column, 3) + 8]),
+        );
+        let high = vcombine_s8(
+            vget_high_s8(rows[bit_reverse(column, 3)]),
+            vget_high_s8(rows[bit_reverse(column, 3) + 8]),
+        );
+        vst1q_s8(out.as_mut_ptr().add(column * 16), low);
+        vst1q_s8(out.as_mut_ptr().add((column + 8) * 16), high);
     }
 }
 
@@ -218,6 +401,17 @@ mod tests {
             .collect()
     }
 
+    fn scalar_transpose(rows: &[Vec<i8>], width: usize) -> Vec<i8> {
+        let mut out = vec![0; width * width];
+        let row_offset = width - rows.len();
+        for (row, input) in rows.iter().enumerate() {
+            for column in 0..width {
+                out[column * width + row_offset + row] = input[column];
+            }
+        }
+        out
+    }
+
     #[test]
     fn test_features_and_arch_are_callable() {
         let mut info = [0; 4];
@@ -261,6 +455,20 @@ mod tests {
         transpose_offset(&refs, 32, 1, &mut out, 32);
         assert_eq!(out[0], rows[0][32]);
         assert_eq!(out[32 * 31 + 31], rows[31][63]);
+    }
+
+    #[test]
+    fn transposes_match_scalar_for_every_batch_size() {
+        for width in [16, 32] {
+            for n in 0..=width {
+                let rows = rows(width, n);
+                let refs: Vec<_> = rows.iter().map(Vec::as_slice).collect();
+                let expected = scalar_transpose(&rows, width);
+                let mut actual = vec![0x55; width * width];
+                transpose(&refs, n, &mut actual, width);
+                assert_eq!(actual, expected, "width={width}, n={n}");
+            }
+        }
     }
 
     #[test]

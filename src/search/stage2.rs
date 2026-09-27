@@ -109,7 +109,7 @@ pub fn search_query_offset<SeedLoc>(
 where
     SeedLoc: SeedLocation,
 {
-    const LANES: usize = 16;
+    const MAX_LANES: usize = 32;
 
     let query_id = q.block_id(query_seqs) as u32;
     let seed_offset = q.loc() as Loc - query_seqs.position(query_id as usize, 0) as Loc;
@@ -134,27 +134,27 @@ where
     let mut out = SearchQueryOffsetResult::default();
     let mut i = 0usize;
     while i < hits.len() {
-        let n = LANES.min(hits.len() - i);
-        let mut subjects = Vec::with_capacity(n);
-        let mut subject_indices = Vec::with_capacity(n);
+        let n = simd_ungapped::preferred_lane_count().min(hits.len() - i);
+        let mut subjects: [&[crate::basic::value::Letter]; MAX_LANES] = [&[]; MAX_LANES];
+        let mut subject_indices = [0usize; MAX_LANES];
         for j in 0..n {
             let subject_index = hits[i + j] as usize;
             let subject_pos = s[subject_index].loc();
             let subject_start = subject_pos.saturating_sub(window_left);
-            subjects.push(&ref_seqs.data()[subject_start..]);
-            subject_indices.push(subject_index);
+            subjects[j] = &ref_seqs.data()[subject_start..];
+            subject_indices[j] = subject_index;
         }
 
-        let scores = if cfg.score_cutoff != 0 {
-            simd_ungapped::window_ungapped_multi(
+        let mut scores = [i32::MAX; MAX_LANES];
+        if cfg.score_cutoff != 0 {
+            simd_ungapped::window_ungapped_best_into(
                 query_clipped,
-                &subjects,
+                &subjects[..n],
                 window_clipped,
                 cfg.score_matrix,
-            )
-        } else {
-            vec![i32::MAX; n]
-        };
+                &mut scores[..n],
+            );
+        }
 
         for j in 0..n {
             let score = scores[j];

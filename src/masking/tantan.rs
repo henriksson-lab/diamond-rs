@@ -10,6 +10,9 @@
 use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK, MASK_LETTER, SEED_MASK, TRUE_AA};
 use crate::masking::Ranges;
 use crate::stats::score_matrix::ScoreMatrix;
+#[cfg(all(test, target_arch = "x86_64"))]
+use std::cell::Cell;
+use std::cell::RefCell;
 
 /// Default tantan parameters matching C++ DIAMOND.
 const P_REPEAT: f32 = 0.005;
@@ -17,6 +20,47 @@ const P_REPEAT_END: f32 = 0.05;
 const REPEAT_GROWTH: f32 = 1.0 / 0.9;
 const DEFAULT_MIN_MASK_PROB: f32 = 0.9;
 const WINDOW: usize = 50;
+const EMISSION_ROWS: usize = (LETTER_MASK as usize) + 1;
+
+#[derive(Default)]
+struct TantanScratch {
+    emission: [Vec<f32>; EMISSION_ROWS],
+    forward_background: Vec<f32>,
+    scale: Vec<f32>,
+}
+
+thread_local! {
+    /// Match the upstream implementation's thread-local work buffers. Tantan
+    /// runs once per sequence, so allocating 32 emission matrices for every
+    /// record otherwise creates substantial allocator traffic under Rayon.
+    static TANTAN_SCRATCH: RefCell<TantanScratch> = RefCell::new(TantanScratch::default());
+    #[cfg(all(test, target_arch = "x86_64"))]
+    static FORCE_SCALAR: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum X86Backend {
+    Avx2,
+    Sse,
+    Scalar,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn x86_backend() -> X86Backend {
+    #[cfg(test)]
+    if FORCE_SCALAR.with(Cell::get) {
+        return X86Backend::Scalar;
+    }
+    if super::tantan_simd::has_avx2_fma() {
+        X86Backend::Avx2
+    } else if super::tantan_simd::has_sse41_ssse3() {
+        X86Backend::Sse
+    } else {
+        X86Backend::Scalar
+    }
+}
 
 /// Compute lambda for the likelihood ratio matrix using bisection.
 ///
@@ -249,6 +293,7 @@ pub fn mask_tantan_with_score_matrix(seq: &mut [Letter], score_matrix: &ScoreMat
 }
 
 /// Scalar forward step (generic fallback).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn forward_step_scalar(
     f: &mut [f32; 50],
     d: &[f32; 50],
@@ -271,6 +316,7 @@ fn forward_step_scalar(
 }
 
 /// Scalar backward step (generic fallback).
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn backward_step_scalar(
     f: &mut [f32; 50],
     d: &[f32; 50],
@@ -306,10 +352,40 @@ fn forward_step(
     f_sum_prev: f32,
 ) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if super::tantan_simd::has_avx2_fma() {
-        // SAFETY: runtime feature detection above established AVX2 support.
-        return unsafe {
-            super::tantan_simd::forward_step_avx2(
+    match x86_backend() {
+        // SAFETY: runtime dispatch established the required target features.
+        X86Backend::Avx2 => unsafe {
+            return super::tantan_simd::forward_step_avx2(
+                f,
+                d,
+                e_seg,
+                b,
+                f2f,
+                p_repeat_end,
+                b2b,
+                f_sum_prev,
+            );
+        },
+        X86Backend::Sse => unsafe {
+            return super::tantan_simd::forward_step_sse(
+                f,
+                d,
+                e_seg,
+                b,
+                f2f,
+                p_repeat_end,
+                b2b,
+                f_sum_prev,
+            );
+        },
+        X86Backend::Scalar => {}
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: Advanced SIMD is mandatory on AArch64.
+        unsafe {
+            super::tantan_simd::forward_step_neon(
                 f,
                 d,
                 e_seg,
@@ -319,10 +395,12 @@ fn forward_step(
                 b2b,
                 f_sum_prev,
             )
-        };
+        }
     }
-
-    forward_step_scalar(f, d, e_seg, b, f2f, p_repeat_end, b2b, f_sum_prev)
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        forward_step_scalar(f, d, e_seg, b, f2f, p_repeat_end, b2b, f_sum_prev)
+    }
 }
 
 /// Advance the backward probabilities by one residue and return `tsum`.
@@ -339,17 +417,36 @@ fn backward_step(
     b2b: f32,
 ) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if super::tantan_simd::has_avx2_fma() {
+    match x86_backend() {
         // The architecture helper performs the same update but does not expose
         // C++'s otherwise-unused `tsum`. Recover it from the defining equation.
-        let b_old = *b;
-        unsafe {
+        X86Backend::Avx2 => unsafe {
+            let b_old = *b;
             super::tantan_simd::backward_step_avx2(f, d, e_seg, b, f2f, p_repeat_end, b2b);
-        }
-        return *b - b2b * b_old;
+            return *b - b2b * b_old;
+        },
+        X86Backend::Sse => unsafe {
+            let b_old = *b;
+            super::tantan_simd::backward_step_sse(f, d, e_seg, b, f2f, p_repeat_end, b2b);
+            return *b - b2b * b_old;
+        },
+        X86Backend::Scalar => {}
     }
 
-    backward_step_scalar(f, d, e_seg, b, f2f, p_repeat_end, b2b)
+    #[cfg(target_arch = "aarch64")]
+    {
+        // The architecture helper updates `b`; recover C++'s otherwise-unused
+        // `tsum` from the defining equation, as in the AVX2 dispatch.
+        let b_old = *b;
+        unsafe {
+            super::tantan_simd::backward_step_neon(f, d, e_seg, b, f2f, p_repeat_end, b2b);
+        }
+        *b - b2b * b_old
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        backward_step_scalar(f, d, e_seg, b, f2f, p_repeat_end, b2b)
+    }
 }
 
 /// Run the tantan forward-backward masker.
@@ -367,149 +464,161 @@ pub fn mask(
     mask_mode: i32,
 ) -> Ranges {
     let len = seq.len();
-    let mut ranges = Ranges::new();
     if len == 0 {
-        return ranges;
+        return Ranges::new();
     }
 
-    let alphabet_size = AMINO_ACID_COUNT;
-    // letter_mask strips to 5 bits → idx in 0..32. Allocate emission rows for
-    // the full 32-row range so we can index `e[ltr]` safely; rows beyond
-    // AMINO_ACID_COUNT stay zero (matching C++'s typically-zero UB on the
-    // uninitialized tail of likelihoodRatioMatrixf_).
-    let emission_rows = (LETTER_MASK as usize) + 1;
+    TANTAN_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let TantanScratch {
+            emission,
+            forward_background: pb,
+            scale,
+        } = &mut *scratch;
+        let mut ranges = Ranges::new();
 
-    // Tantan HMM parameters
-    let b2b = 1.0f32 - p_repeat;
-    let f2f = 1.0f32 - p_repeat_end;
-    // C++ calls the floating-point overload `std::pow(float, float)` here.
-    let b2f0 = p_repeat * (1.0 - repeat_growth) / (1.0 - repeat_growth.powf(WINDOW as f32));
+        let alphabet_size = AMINO_ACID_COUNT;
+        // letter_mask strips to 5 bits → idx in 0..32. Allocate emission rows for
+        // the full 32-row range so we can index `e[ltr]` safely; rows beyond
+        // AMINO_ACID_COUNT stay zero (matching C++'s typically-zero UB on the
+        // uninitialized tail of likelihoodRatioMatrixf_).
+        let emission_rows = EMISSION_ROWS;
 
-    // Repeat-state entry distribution (geometric decay over window positions)
-    let mut d = [0.0f32; WINDOW];
-    d[WINDOW - 1] = b2f0;
-    for i in (0..WINDOW - 1).rev() {
-        d[i] = d[i + 1] * repeat_growth;
-    }
+        // Tantan HMM parameters
+        let b2b = 1.0f32 - p_repeat;
+        let f2f = 1.0f32 - p_repeat_end;
+        // C++ calls the floating-point overload `std::pow(float, float)` here.
+        let b2f0 = p_repeat * (1.0 - repeat_growth) / (1.0 - repeat_growth.powf(WINDOW as f32));
 
-    // Pre-compute emission vectors matching C++ tantan.cpp:152-164. C++ fills an
-    // `e[aa]` row for every aa in 0..AMINO_ACID_COUNT (=26), and writes
-    // `L[letter_mask(seq[j])]` without bounds-checking idx — meaning ambiguous
-    // letters (B/J/Z/X/*/_, ids 20..25) DO contribute non-zero emissions via the
-    // populated 26x26 lr_matrix block. Only DELIMITER (31) and similarly-stripped
-    // values read past the 26-column initialized region (C++ UB, typically zero).
-    let mut e: Vec<Vec<f32>> = Vec::with_capacity(emission_rows);
-    for aa in 0..emission_rows {
-        let mut ev = vec![0.0f32; len + WINDOW];
-        if aa < alphabet_size {
-            for j in 0..len {
-                let idx = (seq[j] & LETTER_MASK) as usize;
-                if idx < alphabet_size {
-                    ev[len - 1 - j] = likelihood_ratio_matrix[aa][idx];
+        // Repeat-state entry distribution (geometric decay over window positions)
+        let mut d = [0.0f32; WINDOW];
+        d[WINDOW - 1] = b2f0;
+        for i in (0..WINDOW - 1).rev() {
+            d[i] = d[i + 1] * repeat_growth;
+        }
+
+        // Pre-compute emission vectors matching C++ tantan.cpp:152-164. C++ fills an
+        // `e[aa]` row for every aa in 0..AMINO_ACID_COUNT (=26), and writes
+        // `L[letter_mask(seq[j])]` without bounds-checking idx — meaning ambiguous
+        // letters (B/J/Z/X/*/_, ids 20..25) DO contribute non-zero emissions via the
+        // populated 26x26 lr_matrix block. Only DELIMITER (31) and similarly-stripped
+        // values read past the 26-column initialized region (C++ UB, typically zero).
+        for aa in 0..emission_rows {
+            let ev = &mut emission[aa];
+            ev.resize(len + WINDOW, 0.0);
+            if aa < alphabet_size {
+                for j in 0..len {
+                    let idx = (seq[j] & LETTER_MASK) as usize;
+                    ev[len - 1 - j] = likelihood_ratio_matrix[aa].get(idx).copied().unwrap_or(0.0);
                 }
+                ev[len..len + WINDOW].fill(0.0);
             }
         }
-        e.push(ev);
-    }
 
-    let mut f = [0.0f32; WINDOW];
-    let mut d_arr = [0.0f32; WINDOW];
-    d_arr.copy_from_slice(&d);
-    let mut pb = vec![0.0f32; len];
-    let mut scale = vec![0.0f32; (len + 15) / 16];
-    let mut b = 1.0f32;
-    let mut f_sum = 0.0f32;
+        let mut f = [0.0f32; WINDOW];
+        let mut d_arr = [0.0f32; WINDOW];
+        d_arr.copy_from_slice(&d);
+        pb.resize(len, 0.0);
+        scale.resize((len + 15) / 16, 0.0);
+        let mut b = 1.0f32;
+        let mut f_sum = 0.0f32;
 
-    // Forward pass
-    for i in 0..len {
-        let ltr = (seq[i] & LETTER_MASK) as usize;
-        let e_seg = &e[ltr][len - i..];
+        // Forward pass
+        for i in 0..len {
+            let ltr = (seq[i] & LETTER_MASK) as usize;
+            let e_seg = &emission[ltr][len - i..];
 
-        f_sum = forward_step(&mut f, &d_arr, e_seg, &mut b, f2f, p_repeat_end, b2b, f_sum);
+            f_sum = forward_step(&mut f, &d_arr, e_seg, &mut b, f2f, p_repeat_end, b2b, f_sum);
 
-        // Rescale every 16 positions to avoid underflow
-        if (i & 15) == 15 {
-            let s = 1.0 / b;
-            scale[i / 16] = s;
-            b *= s;
-            #[cfg(target_arch = "x86_64")]
-            if super::tantan_simd::has_avx2_fma() {
-                unsafe {
-                    super::tantan_simd::scale_avx2(&mut f, s);
+            // Rescale every 16 positions to avoid underflow
+            if (i & 15) == 15 {
+                let s = 1.0 / b;
+                scale[i / 16] = s;
+                b *= s;
+                #[cfg(target_arch = "x86_64")]
+                match x86_backend() {
+                    X86Backend::Avx2 => unsafe { super::tantan_simd::scale_avx2(&mut f, s) },
+                    X86Backend::Sse => unsafe { super::tantan_simd::scale_sse(&mut f, s) },
+                    X86Backend::Scalar => f.iter_mut().for_each(|v| *v *= s),
                 }
-            } else {
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    super::tantan_simd::scale_neon(&mut f, s);
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                for v in f.iter_mut() {
+                    *v *= s;
+                }
+                f_sum *= s;
+            }
+            pb[i] = b;
+        }
+
+        // Terminal probability
+        let f_total = {
+            #[cfg(target_arch = "x86_64")]
+            match x86_backend() {
+                X86Backend::Avx2 => unsafe { super::tantan_simd::sum_avx2(&f) },
+                X86Backend::Sse => unsafe { super::tantan_simd::sum_sse(&f) },
+                X86Backend::Scalar => f.iter().sum::<f32>(),
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                f.iter().sum::<f32>()
+            }
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                super::tantan_simd::sum_neon(&f)
+            }
+        };
+        let z = b * b2b + f_total * p_repeat_end;
+        let zinv = 1.0 / z;
+
+        // Backward pass
+        b = b2b;
+        f.fill(p_repeat_end);
+
+        for i in (0..len).rev() {
+            let pf = 1.0 - (pb[i] * b * zinv);
+
+            // Rescale
+            if (i & 15) == 15 {
+                let s = scale[i / 16];
+                b *= s;
+                #[cfg(target_arch = "x86_64")]
+                match x86_backend() {
+                    X86Backend::Avx2 => unsafe { super::tantan_simd::scale_avx2(&mut f, s) },
+                    X86Backend::Sse => unsafe { super::tantan_simd::scale_sse(&mut f, s) },
+                    X86Backend::Scalar => f.iter_mut().for_each(|v| *v *= s),
+                }
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    super::tantan_simd::scale_neon(&mut f, s);
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                 for v in f.iter_mut() {
                     *v *= s;
                 }
             }
-            #[cfg(not(target_arch = "x86_64"))]
-            for v in f.iter_mut() {
-                *v *= s;
-            }
-            f_sum *= s;
-        }
-        pb[i] = b;
-    }
 
-    // Terminal probability
-    let f_total = {
-        #[cfg(target_arch = "x86_64")]
-        if super::tantan_simd::has_avx2_fma() {
-            unsafe { super::tantan_simd::sum_avx2(&f) }
-        } else {
-            f.iter().sum::<f32>()
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            f.iter().sum::<f32>()
-        }
-    };
-    let z = b * b2b + f_total * p_repeat_end;
-    let zinv = 1.0 / z;
+            let ltr = (seq[i] & LETTER_MASK) as usize;
+            let e_seg = &emission[ltr][len - i..];
 
-    // Backward pass
-    b = b2b;
-    f.fill(p_repeat_end);
+            backward_step(&mut f, &d_arr, e_seg, &mut b, f2f, p_repeat_end, b2b);
 
-    for i in (0..len).rev() {
-        let pf = 1.0 - (pb[i] * b * zinv);
-
-        // Rescale
-        if (i & 15) == 15 {
-            let s = scale[i / 16];
-            b *= s;
-            #[cfg(target_arch = "x86_64")]
-            if super::tantan_simd::has_avx2_fma() {
-                unsafe {
-                    super::tantan_simd::scale_avx2(&mut f, s);
+            if pf >= p_mask {
+                if mask_mode == 1 {
+                    seq[i] = MASK_LETTER;
+                } else if mask_mode == 2 {
+                    seq[i] |= SEED_MASK;
                 }
-            } else {
-                for v in f.iter_mut() {
-                    *v *= s;
-                }
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            for v in f.iter_mut() {
-                *v *= s;
+                ranges.push_front(i as i32);
             }
         }
 
-        let ltr = (seq[i] & LETTER_MASK) as usize;
-        let e_seg = &e[ltr][len - i..];
-
-        backward_step(&mut f, &d_arr, e_seg, &mut b, f2f, p_repeat_end, b2b);
-
-        if pf >= p_mask {
-            if mask_mode == 1 {
-                seq[i] = MASK_LETTER;
-            } else if mask_mode == 2 {
-                seq[i] |= SEED_MASK;
-            }
-            ranges.push_front(i as i32);
-        }
-    }
-
-    ranges
+        ranges
+    })
 }
 
 #[cfg(test)]
@@ -519,6 +628,37 @@ mod tests {
     fn flat_ranges(ranges: &Ranges) -> Vec<(i32, i32)> {
         let (a, b) = ranges.as_slices();
         a.iter().chain(b).copied().collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn forced_scalar_mask_matches_runtime_simd() {
+        if !super::super::tantan_simd::has_sse41_ssse3() {
+            return;
+        }
+        let source: Vec<Letter> = (0..777)
+            .map(|i| {
+                if (180..310).contains(&i) {
+                    [14, 14, 16, 14, 14, 16][i % 6]
+                } else {
+                    ((i * 13 + i / 7) % TRUE_AA as usize) as Letter
+                }
+            })
+            .collect();
+        let mut simd = source.clone();
+        mask_tantan(&mut simd);
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FORCE_SCALAR.with(|forced| forced.set(false));
+            }
+        }
+        FORCE_SCALAR.with(|forced| forced.set(true));
+        let _reset = Reset;
+        let mut scalar = source;
+        mask_tantan(&mut scalar);
+        assert_eq!(simd, scalar);
     }
 
     #[test]

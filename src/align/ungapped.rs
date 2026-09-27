@@ -62,7 +62,8 @@ impl Default for UngappedStageConfig {
 #[derive(Debug, Clone)]
 pub struct WorkTarget {
     pub block_id: BlockId,
-    pub seq: Vec<Letter>,
+    /// Immutable target sequence shared by all later extension stages.
+    pub seq: Arc<[Letter]>,
     pub ungapped_score: [i32; MAX_CONTEXT as usize],
     pub hsp: [Vec<ApproxHsp>; MAX_CONTEXT as usize],
     pub matrix: Option<Arc<TargetMatrix>>,
@@ -84,7 +85,7 @@ impl WorkTarget {
     ) -> Self {
         let mut target = WorkTarget {
             block_id,
-            seq: seq.to_vec(),
+            seq: Arc::from(seq),
             ungapped_score: [0; MAX_CONTEXT as usize],
             hsp: std::array::from_fn(|_| Vec::new()),
             matrix: None,
@@ -388,7 +389,7 @@ mod tests {
             &score_matrix,
         );
         assert_eq!(wt.block_id, 0);
-        assert_eq!(wt.seq, target);
+        assert_eq!(wt.seq.as_ref(), target.as_slice());
         assert_eq!(wt.ungapped_score[0], 27);
         assert!(wt.hsp[0].is_empty());
         assert!(!wt.done);

@@ -12,6 +12,7 @@ use crate::dna::extension::DnaExtensionAlgo;
 use crate::dna::extension_seed_matches::merge_and_extend_seeds;
 use crate::dna::seed_set_dna::SeedMatch;
 use crate::util::interval::Interval;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ChainExtensionConfig<'a> {
@@ -80,7 +81,7 @@ pub fn build_map_hsp(
         map_hsp.n_anchors = chain.anchors.len() as i32;
 
         map_hsp.transcript.push_terminator();
-        map_hsp.target_seq = target.to_vec();
+        map_hsp.target_seq = Arc::from(target);
         map_hsp.query_source_range = map_hsp.query_range;
         map_hsp.subject_source_range = if chain.reverse {
             Interval::new(map_hsp.subject_range.end, map_hsp.subject_range.begin)

@@ -36,7 +36,8 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone)]
 pub struct Target {
     pub block_id: BlockId,
-    pub seq: Vec<Letter>,
+    /// Immutable target sequence shared with work and DP targets.
+    pub seq: Arc<[Letter]>,
     pub filter_score: i32,
     pub filter_evalue: f64,
     pub best_context: i32,
@@ -56,7 +57,7 @@ impl Target {
     ) -> Self {
         Self {
             block_id,
-            seq: seq.to_vec(),
+            seq: Arc::from(seq),
             filter_score: 0,
             filter_evalue: f64::MAX,
             best_context: 0,
@@ -67,9 +68,9 @@ impl Target {
         }
     }
 
-    fn from_vec(
+    fn from_shared(
         block_id: BlockId,
-        seq: Vec<Letter>,
+        seq: Arc<[Letter]>,
         ungapped_score: i32,
         matrix: Option<Arc<TargetMatrix>>,
     ) -> Self {
@@ -1344,7 +1345,7 @@ pub fn align_work_targets(
     for i in 0..targets.len() {
         let matrix = targets[i].matrix.clone();
         if targets[i].done {
-            let mut target = Target::from_vec(
+            let mut target = Target::from_shared(
                 targets[i].block_id,
                 std::mem::take(&mut targets[i].seq),
                 targets[i].ungapped_score[0],
@@ -1370,7 +1371,7 @@ pub fn align_work_targets(
                 mode,
                 cfg,
             );
-            r.push(Target::from_vec(
+            r.push(Target::from_shared(
                 targets[i].block_id,
                 std::mem::take(&mut targets[i].seq),
                 targets[i].ungapped_score[0],
@@ -2053,7 +2054,7 @@ mod tests {
     fn test_add_dp_targets_full_and_banded() {
         let mut work = crate::align::ungapped::WorkTarget {
             block_id: 0,
-            seq: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            seq: vec![0, 1, 2, 3, 4, 5, 6, 7].into(),
             ungapped_score: [0; MAX_CONTEXT as usize],
             hsp: std::array::from_fn(|_| Vec::new()),
             matrix: None,
@@ -2078,7 +2079,7 @@ mod tests {
 
         let mut work = crate::align::ungapped::WorkTarget {
             block_id: 0,
-            seq: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            seq: vec![0, 1, 2, 3, 4, 5, 6, 7].into(),
             ungapped_score: [0; MAX_CONTEXT as usize],
             hsp: std::array::from_fn(|_| Vec::new()),
             matrix: None,
@@ -2124,7 +2125,7 @@ mod tests {
         let query = vec![0, 1, 2, 3, 4, 5, 6, 7];
         let mut done = crate::align::ungapped::WorkTarget {
             block_id: 3,
-            seq: query.clone(),
+            seq: query.clone().into(),
             ungapped_score: [0; MAX_CONTEXT as usize],
             hsp: std::array::from_fn(|_| Vec::new()),
             matrix: None,
@@ -2162,7 +2163,7 @@ mod tests {
 
         let mut work = crate::align::ungapped::WorkTarget {
             block_id: 4,
-            seq: query.clone(),
+            seq: query.clone().into(),
             ungapped_score: [0; MAX_CONTEXT as usize],
             hsp: std::array::from_fn(|_| Vec::new()),
             matrix: None,
@@ -2497,7 +2498,7 @@ mod tests {
             100,
         );
         assert_eq!(seed_only.len(), 1);
-        assert_eq!(seed_only[0].seq, query);
+        assert_eq!(seed_only[0].seq.as_ref(), query.as_slice());
         assert_eq!(seed_only[0].filter_score, 40);
         assert!(seed_only[0].hsps[0].seed_only);
 

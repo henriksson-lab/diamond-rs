@@ -67,7 +67,8 @@ pub struct Hsp {
     /// Subject range in source coordinates.
     pub subject_source_range: Interval,
     /// Target sequence data (for output).
-    pub target_seq: Vec<Letter>,
+    /// Immutable target sequence shared with the owning match/DP target.
+    pub target_seq: Arc<[Letter]>,
     /// Composition-adjusted target matrix used for this HSP, when present.
     pub matrix: Option<Arc<TargetMatrix>>,
     /// Alignment transcript (CIGAR-like edit operations).
@@ -105,7 +106,7 @@ impl Default for Hsp {
             subject_range: Interval::default(),
             query_source_range: Interval::default(),
             subject_source_range: Interval::default(),
-            target_seq: Vec::new(),
+            target_seq: Arc::from([]),
             matrix: None,
             transcript: PackedTranscript::new(),
             swipe_target: 0,
@@ -1131,7 +1132,8 @@ pub struct Match {
     pub target_block_id: u32,
     /// Target sequence original ID.
     pub target_oid: u64,
-    pub seq: Vec<Letter>,
+    /// Immutable target sequence shared by this match and its HSPs.
+    pub seq: Arc<[Letter]>,
     pub matrix: Option<Arc<TargetMatrix>>,
     pub filter_score: Score,
     pub filter_evalue: f64,
@@ -1145,7 +1147,7 @@ impl Match {
         Match {
             target_block_id,
             target_oid,
-            seq: Vec::new(),
+            seq: Arc::from([]),
             matrix: None,
             filter_score: 0,
             filter_evalue: f64::MAX,
@@ -1163,10 +1165,28 @@ impl Match {
         filter_score: Score,
         filter_evalue: f64,
     ) -> Self {
+        Self::new_extension_shared(
+            target_block_id,
+            Arc::from(seq),
+            matrix,
+            ungapped_score,
+            filter_score,
+            filter_evalue,
+        )
+    }
+
+    pub fn new_extension_shared(
+        target_block_id: u32,
+        seq: Arc<[Letter]>,
+        matrix: Option<Arc<TargetMatrix>>,
+        ungapped_score: Score,
+        filter_score: Score,
+        filter_evalue: f64,
+    ) -> Self {
         Match {
             target_block_id,
             target_oid: 0,
-            seq: seq.to_vec(),
+            seq,
             matrix,
             filter_score,
             filter_evalue,
@@ -1189,7 +1209,7 @@ impl Match {
     /// Matches C++ `Match::Match(BlockId, Sequence, TargetMatrix, array<list<Hsp>>, int)`.
     pub fn from_target_hsps(
         target_block_id: u32,
-        seq: &[Letter],
+        seq: Arc<[Letter]>,
         matrix: Option<Arc<TargetMatrix>>,
         hsps: &mut [Vec<Hsp>; MAX_CONTEXT as usize],
         ungapped_score: Score,
@@ -1199,7 +1219,8 @@ impl Match {
         if max_hsps != 1 {
             panic!("Match::Match max_hsps != 1.");
         }
-        let mut m = Match::new_extension(target_block_id, seq, matrix, ungapped_score, 0, f64::MAX);
+        let mut m =
+            Match::new_extension_shared(target_block_id, seq, matrix, ungapped_score, 0, f64::MAX);
         for frame_hsps in hsps.iter_mut().take(query_contexts) {
             m.hsps.append(frame_hsps);
         }

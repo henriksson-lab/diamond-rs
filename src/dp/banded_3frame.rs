@@ -906,6 +906,21 @@ fn banded_3frame_swipe_targets_with_limit(
     dna_len: i32,
     score_limit: Option<i32>,
 ) -> Vec<Hsp> {
+    // `None` denotes the i32 overflow retry. Do not dispatch saturated lanes
+    // back into the narrow SIMD kernel.
+    if score_only && score_limit.is_some() {
+        if let Some(out) = banded_3frame_score_only_simd(
+            query,
+            targets,
+            score_matrix,
+            stat,
+            overflow,
+            dna_len,
+            score_limit,
+        ) {
+            return out;
+        }
+    }
     let mut out = Vec::new();
     for target in targets {
         let band = target.band().max(0) as usize;
@@ -938,6 +953,77 @@ fn banded_3frame_swipe_targets_with_limit(
         ));
     }
     out
+}
+
+/// Run the original target-parallel i16 score-only specialization.
+///
+/// Returning `None` leaves non-AVX2 machines and unusual penalty ranges on the
+/// existing scalar i32 path. Saturated lanes are returned through `overflow`
+/// and retried by the caller in i32, matching the C++ dispatch.
+fn banded_3frame_score_only_simd(
+    query: [&[Letter]; 3],
+    targets: &[DpTarget],
+    score_matrix: &ScoreMatrix,
+    stat: &mut DpStat,
+    overflow: &mut Vec<DpTarget>,
+    dna_len: i32,
+    score_limit: Option<i32>,
+) -> Option<Vec<Hsp>> {
+    use crate::dp::swipe::banded_3frame_swipe::simd::{
+        native_lane_count, score_batch_simd, Scratch,
+    };
+
+    let mut out = Vec::new();
+    let mut scratch = Scratch::default();
+    let lanes = native_lane_count();
+    if lanes == 1 {
+        return None;
+    }
+    for batch in targets.chunks(lanes) {
+        let scores = score_batch_simd(query, batch, score_matrix, &mut scratch)?;
+        for (lane, target) in batch.iter().enumerate() {
+            let band = target.band().max(0) as usize;
+            stat.gross_cells += band * target.cols.max(0) as usize * 3;
+            let lane_score = scores.lanes[lane];
+            if scores.overflow_mask & (1 << lane) != 0
+                || score_limit.is_some_and(|limit| lane_score.score >= limit)
+            {
+                overflow.push(target.clone());
+                continue;
+            }
+            if lane_score.score <= 0 {
+                continue;
+            }
+
+            // The score-only C++ specialization does not retain traceback.
+            // Preserve its inexpensive coordinate estimate: the end point is
+            // exact, while the beginning follows the end-point diagonal.
+            let diagonal = lane_score.query_end - lane_score.subject_end;
+            let query_begin = diagonal.max(0);
+            let subject_begin = (-diagonal).max(0);
+            let result = ThreeFrameSwResult {
+                sw: SwResult {
+                    score: lane_score.score,
+                    query_begin,
+                    query_end: lane_score.query_end,
+                    subject_begin,
+                    subject_end: lane_score.subject_end,
+                    ..Default::default()
+                },
+                frame_begin: lane_score.frame_end,
+                frame_end: lane_score.frame_end,
+            };
+            out.push(traceback_to_hsp(
+                result,
+                query,
+                target,
+                true,
+                score_matrix,
+                dna_len,
+            ));
+        }
+    }
+    Some(out)
 }
 
 pub fn banded_3frame_swipe_worker(

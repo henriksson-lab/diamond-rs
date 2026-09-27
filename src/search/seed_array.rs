@@ -751,6 +751,8 @@ pub fn emit_seed_matches_filtered(
     blocks: &PartitionBlocks,
     q_max: u32,
     r_max: u32,
+    partition: u32,
+    seedp_bits: i32,
 ) -> Vec<SeedMatch> {
     let capacity = blocks
         .blocks
@@ -763,6 +765,8 @@ pub fn emit_seed_matches_filtered(
         if b.q_count > q_max || b.r_count > r_max {
             continue;
         }
+        let key = query_part[b.q_start as usize].key;
+        let seed = ((key as PackedSeed) << seedp_bits) | partition as PackedSeed;
         for q in b.q_start..b.q_start + b.q_count {
             let q_entry = query_part[q as usize];
             let (query_id, query_pos) = decode_seq_pos(query_offsets, q_entry);
@@ -774,7 +778,7 @@ pub fn emit_seed_matches_filtered(
                     query_pos,
                     ref_id,
                     ref_pos,
-                    seed: 0,
+                    seed,
                     shape_id: 0,
                 });
             }

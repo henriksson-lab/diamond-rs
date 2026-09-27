@@ -6,7 +6,7 @@ use super::{get_current_rss, get_peak_rss};
 #[cfg(windows)]
 use std::ffi::c_void;
 #[cfg(not(windows))]
-use std::ffi::{c_void, CString};
+use std::ffi::{c_char, c_void, CString};
 #[cfg(target_os = "linux")]
 use std::os::raw::{c_int, c_long};
 
@@ -191,7 +191,7 @@ pub fn total_ram() -> f64 {
 
 #[cfg(not(windows))]
 unsafe extern "C" {
-    fn open(pathname: *const i8, flags: i32) -> i32;
+    fn open(pathname: *const c_char, flags: i32) -> i32;
     fn mmap(
         addr: *mut c_void,
         length: usize,

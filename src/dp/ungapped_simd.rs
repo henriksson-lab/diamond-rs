@@ -1,14 +1,23 @@
 //! Translation of `diamond/src/dp/ungapped_simd.{h,cpp}`.
 //!
-//! Upstream uses SIMD only as a lane-parallel implementation detail. Each
-//! lane is a signed saturating i8 accumulator biased by `SCHAR_MIN`; this
-//! architecture-neutral translation preserves those exact lane semantics on
-//! every target.
+//! Each lane is a signed saturating i8 accumulator biased by `SCHAR_MIN`.
+//! x86-64 hosts use the 32-lane AVX2 layout and ARM NEON hosts the 16-lane
+//! layout from upstream; other hosts retain the architecture-neutral path.
 
 use crate::basic::value::{Letter, LETTER_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
 
 const SCORE_BIAS: i8 = i8::MIN;
+
+/// Number of subjects handled by one production stage-2 batch.
+#[inline]
+pub fn preferred_lane_count() -> usize {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return 32;
+    }
+    16
+}
 
 /// C++ `window_ungapped(...)`, returning an owned Rust result vector.
 pub fn window_ungapped(
@@ -31,8 +40,258 @@ pub fn window_ungapped_into(
     out: &mut [i32],
 ) {
     validate_buffers(query, subjects, window, out);
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if subjects.len() <= 32 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was detected above and validate_buffers established
+        // that every input has at least `window` accessible letters.
+        unsafe {
+            window_ungapped_avx2(query, subjects, window, score_matrix, out);
+        }
+        return;
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if subjects.len() <= 16
+        && std::arch::is_x86_feature_detected!("ssse3")
+        && std::arch::is_x86_feature_detected!("sse4.1")
+    {
+        // SAFETY: SSSE3 and SSE4.1 were detected above and validate_buffers
+        // established that every input has `window` accessible letters.
+        unsafe {
+            window_ungapped_sse41(query, subjects, window, score_matrix, out);
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if subjects.len() <= 16 {
+        // SAFETY: NEON is mandatory on AArch64; validate_buffers established
+        // that all reads are in bounds.
+        unsafe {
+            window_ungapped_neon(query, subjects, window, score_matrix, out);
+        }
+        return;
+    }
+
     for (score, subject) in out.iter_mut().zip(subjects) {
         *score = saturating_window_score(query, subject, window, score_matrix);
+    }
+}
+
+/// C++ AArch64 `window_ungapped`: one subject per signed-byte NEON lane.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn window_ungapped_neon(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+    out: &mut [i32],
+) {
+    use std::arch::aarch64::*;
+
+    debug_assert!(subjects.len() <= 16);
+    let mut subject_block = [0i8; 16 * 16];
+    let mut subject_rows = [&[][..]; 16];
+    let mut best_bytes = [SCORE_BIAS; 16];
+    let mut score = vdupq_n_s8(SCORE_BIAS);
+    let mut best = score;
+    let low_nibble = vdupq_n_s8(0x0f);
+    let high_start = vdupq_n_s8(16);
+
+    let lane_offset = 16 - subjects.len();
+    for block_begin in (0..window).step_by(16) {
+        let block_len = (window - block_begin).min(16);
+        if block_len == 16 {
+            for (row, subject) in subject_rows.iter_mut().zip(subjects) {
+                *row = &subject[block_begin..];
+            }
+            crate::util::simd::transpose_16(
+                &subject_rows[..subjects.len()],
+                subjects.len(),
+                &mut subject_block,
+            );
+        } else {
+            subject_block.fill(0);
+            for position in 0..block_len {
+                for (lane, subject) in subjects.iter().enumerate() {
+                    subject_block[position * 16 + lane_offset + lane] =
+                        subject[block_begin + position];
+                }
+            }
+        }
+        for position in 0..block_len {
+            let letters = vandq_s8(
+                vld1q_s8(subject_block.as_ptr().add(position * 16)),
+                vdupq_n_s8(LETTER_MASK),
+            );
+
+            let query_letter = (query[block_begin + position] & LETTER_MASK) as usize;
+            let row = score_matrix.matrix8().as_ptr().add(query_letter * 32);
+            let match_scores = {
+                let indices = vreinterpretq_u8_s8(vandq_s8(letters, low_nibble));
+                let low_scores = vqtbl1q_s8(vld1q_s8(row), indices);
+                let high_scores = vqtbl1q_s8(vld1q_s8(row.add(16)), indices);
+                let high_mask = vcgeq_s8(letters, high_start);
+                vbslq_s8(high_mask, high_scores, low_scores)
+            };
+            score = vqaddq_s8(score, match_scores);
+            best = vmaxq_s8(best, score);
+        }
+    }
+
+    vst1q_s8(best_bytes.as_mut_ptr(), best);
+    for (dst, &value) in out.iter_mut().zip(&best_bytes[lane_offset..]) {
+        *dst = i32::from(value) - i32::from(SCORE_BIAS);
+    }
+}
+
+/// C++ `ARCH_AVX2::window_ungapped`: one subject per signed-byte lane.
+///
+/// Upstream transposes subject letters and performs a vector score lookup. A
+/// direct gather into a stack vector would leave most of the lookup scalar, so
+/// this uses two lane-local `vpshufb` tables for the 32-entry matrix row.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn window_ungapped_avx2(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+    out: &mut [i32],
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    debug_assert!(subjects.len() <= 32);
+    let mut subject_block = [0i8; 32 * 32];
+    let mut subject_rows = [&[][..]; 32];
+    let mut best_bytes = [SCORE_BIAS; 32];
+    let mut score = _mm256_set1_epi8(SCORE_BIAS);
+    let mut best = score;
+    let low_nibble = _mm256_set1_epi8(0x0f);
+
+    let lane_offset = 32 - subjects.len();
+    for block_begin in (0..window).step_by(32) {
+        let block_len = (window - block_begin).min(32);
+        if block_len == 32 {
+            for (row, subject) in subject_rows.iter_mut().zip(subjects) {
+                *row = &subject[block_begin..];
+            }
+            crate::util::simd::transpose_32(
+                &subject_rows[..subjects.len()],
+                subjects.len(),
+                &mut subject_block,
+            );
+        } else {
+            subject_block.fill(0);
+            for position in 0..block_len {
+                for (lane, subject) in subjects.iter().enumerate() {
+                    subject_block[position * 32 + lane_offset + lane] =
+                        subject[block_begin + position];
+                }
+            }
+        }
+        for position in 0..block_len {
+            let letters = _mm256_and_si256(
+                _mm256_loadu_si256(subject_block.as_ptr().add(position * 32).cast()),
+                _mm256_set1_epi8(LETTER_MASK),
+            );
+            let indices = _mm256_and_si256(letters, low_nibble);
+
+            let query_letter = (query[block_begin + position] & LETTER_MASK) as usize;
+            let row = score_matrix.matrix8().as_ptr().add(query_letter * 32);
+            let row_low = _mm256_broadcastsi128_si256(_mm_loadu_si128(row.cast()));
+            let row_high = _mm256_broadcastsi128_si256(_mm_loadu_si128(row.add(16).cast()));
+            let low_scores = _mm256_shuffle_epi8(row_low, indices);
+            let high_scores = _mm256_shuffle_epi8(row_high, indices);
+            // Bit 4 is set precisely for alphabet codes 16..31. Its byte value is
+            // positive, so turn it into blendv's sign-bit mask with a left shift.
+            let high_mask = _mm256_slli_epi16(_mm256_and_si256(letters, _mm256_set1_epi8(0x10)), 3);
+            let match_scores = _mm256_blendv_epi8(low_scores, high_scores, high_mask);
+
+            score = _mm256_adds_epi8(score, match_scores);
+            best = _mm256_max_epi8(best, score);
+        }
+    }
+
+    _mm256_storeu_si256(best_bytes.as_mut_ptr().cast(), best);
+    for (dst, &value) in out.iter_mut().zip(&best_bytes[lane_offset..]) {
+        *dst = i32::from(value) - i32::from(SCORE_BIAS);
+    }
+}
+
+/// C++ `ARCH_SSE4_1::window_ungapped`: one subject per signed-byte lane.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3,sse4.1")]
+unsafe fn window_ungapped_sse41(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+    out: &mut [i32],
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    debug_assert!(subjects.len() <= 16);
+    let mut subject_block = [0i8; 16 * 16];
+    let mut subject_rows = [&[][..]; 16];
+    let mut best_bytes = [SCORE_BIAS; 16];
+    let mut score = _mm_set1_epi8(SCORE_BIAS);
+    let mut best = score;
+    let low_nibble = _mm_set1_epi8(0x0f);
+
+    let lane_offset = 16 - subjects.len();
+    for block_begin in (0..window).step_by(16) {
+        let block_len = (window - block_begin).min(16);
+        if block_len == 16 {
+            for (row, subject) in subject_rows.iter_mut().zip(subjects) {
+                *row = &subject[block_begin..];
+            }
+            crate::util::simd::transpose_16(
+                &subject_rows[..subjects.len()],
+                subjects.len(),
+                &mut subject_block,
+            );
+        } else {
+            subject_block.fill(0);
+            for position in 0..block_len {
+                for (lane, subject) in subjects.iter().enumerate() {
+                    subject_block[position * 16 + lane_offset + lane] =
+                        subject[block_begin + position];
+                }
+            }
+        }
+        for position in 0..block_len {
+            let letters = _mm_and_si128(
+                _mm_loadu_si128(subject_block.as_ptr().add(position * 16).cast()),
+                _mm_set1_epi8(LETTER_MASK),
+            );
+            let indices = _mm_and_si128(letters, low_nibble);
+
+            let query_letter = (query[block_begin + position] & LETTER_MASK) as usize;
+            let row = score_matrix.matrix8().as_ptr().add(query_letter * 32);
+            let row_low = _mm_loadu_si128(row.cast());
+            let row_high = _mm_loadu_si128(row.add(16).cast());
+            let low_scores = _mm_shuffle_epi8(row_low, indices);
+            let high_scores = _mm_shuffle_epi8(row_high, indices);
+            let high_mask = _mm_slli_epi16(_mm_and_si128(letters, _mm_set1_epi8(0x10)), 3);
+            let match_scores = _mm_blendv_epi8(low_scores, high_scores, high_mask);
+
+            score = _mm_adds_epi8(score, match_scores);
+            best = _mm_max_epi8(best, score);
+        }
+    }
+
+    _mm_storeu_si128(best_bytes.as_mut_ptr().cast(), best);
+    for (dst, &value) in out.iter_mut().zip(&best_bytes[lane_offset..]) {
+        *dst = i32::from(value) - i32::from(SCORE_BIAS);
     }
 }
 
@@ -223,6 +482,110 @@ mod tests {
             &mut output,
         );
         assert_eq!(output, [0, 0, 93]);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn avx2_matches_scalar_for_all_batch_sizes_and_masked_letters() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let score_matrix = matrix();
+        let query: Vec<Letter> = (0..113)
+            .map(|i| ((i * 17 + 3) % 25) as Letter | if i % 7 == 0 { i8::MIN } else { 0 })
+            .collect();
+        let subject_data: Vec<Vec<Letter>> = (0..32)
+            .map(|lane| {
+                (0..113)
+                    .map(|i| {
+                        ((i * 11 + lane * 7 + 5) % 25) as Letter
+                            | if (i + lane) % 9 == 0 { i8::MIN } else { 0 }
+                    })
+                    .collect()
+            })
+            .collect();
+        for count in 1..=32 {
+            let subjects: Vec<&[Letter]> =
+                subject_data[..count].iter().map(Vec::as_slice).collect();
+            let expected: Vec<_> = subjects
+                .iter()
+                .map(|subject| saturating_window_score(&query, subject, 113, &score_matrix))
+                .collect();
+            let mut actual = vec![0; count];
+            unsafe {
+                window_ungapped_avx2(&query, &subjects, 113, &score_matrix, &mut actual);
+            }
+            assert_eq!(actual, expected, "batch size {count}");
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn sse41_matches_scalar_for_all_batch_sizes_and_masked_letters() {
+        if !std::arch::is_x86_feature_detected!("ssse3")
+            || !std::arch::is_x86_feature_detected!("sse4.1")
+        {
+            return;
+        }
+        let score_matrix = matrix();
+        let query: Vec<Letter> = (0..113)
+            .map(|i| ((i * 17 + 3) % 25) as Letter | if i % 7 == 0 { i8::MIN } else { 0 })
+            .collect();
+        let subject_data: Vec<Vec<Letter>> = (0..16)
+            .map(|lane| {
+                (0..113)
+                    .map(|i| {
+                        ((i * 11 + lane * 7 + 5) % 25) as Letter
+                            | if (i + lane) % 9 == 0 { i8::MIN } else { 0 }
+                    })
+                    .collect()
+            })
+            .collect();
+        for count in 1..=16 {
+            let subjects: Vec<&[Letter]> =
+                subject_data[..count].iter().map(Vec::as_slice).collect();
+            let expected: Vec<_> = subjects
+                .iter()
+                .map(|subject| saturating_window_score(&query, subject, 113, &score_matrix))
+                .collect();
+            let mut actual = vec![0; count];
+            unsafe {
+                window_ungapped_sse41(&query, &subjects, 113, &score_matrix, &mut actual);
+            }
+            assert_eq!(actual, expected, "batch size {count}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_matches_scalar_for_all_batch_sizes_and_masked_letters() {
+        let score_matrix = matrix();
+        let query: Vec<Letter> = (0..113)
+            .map(|i| ((i * 17 + 3) % 25) as Letter | if i % 7 == 0 { i8::MIN } else { 0 })
+            .collect();
+        let subject_data: Vec<Vec<Letter>> = (0..16)
+            .map(|lane| {
+                (0..113)
+                    .map(|i| {
+                        ((i * 11 + lane * 7 + 5) % 25) as Letter
+                            | if (i + lane) % 9 == 0 { i8::MIN } else { 0 }
+                    })
+                    .collect()
+            })
+            .collect();
+        for count in 1..=16 {
+            let subjects: Vec<&[Letter]> =
+                subject_data[..count].iter().map(Vec::as_slice).collect();
+            let expected: Vec<_> = subjects
+                .iter()
+                .map(|subject| saturating_window_score(&query, subject, 113, &score_matrix))
+                .collect();
+            let mut actual = vec![0; count];
+            unsafe {
+                window_ungapped_neon(&query, &subjects, 113, &score_matrix, &mut actual);
+            }
+            assert_eq!(actual, expected, "batch size {count}");
+        }
     }
 
     #[test]

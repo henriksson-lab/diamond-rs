@@ -3,6 +3,8 @@
 //! Direct Rust counterpart of `diamond/src/dp/score_profile.h` for scalar
 //! profile construction.
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use crate::basic::value::LETTER_MASK;
 use crate::basic::value::{letter_mask, Letter, AMINO_ACID_COUNT, TRUE_AA};
 use crate::stats::cbs::TargetMatrix;
 use crate::stats::score_matrix::ScoreMatrix;
@@ -103,6 +105,18 @@ where
     make_profile_for_dispatch(seq, cbs, padding, matrix, avx2_specialization)
 }
 
+fn initialized_profile<Score>(seq_len: usize, padding: usize) -> LongScoreProfile<Score>
+where
+    Score: Copy + Default + From<i8>,
+{
+    let mut profile = LongScoreProfile::new(padding);
+    let len = seq_len + 2 * profile.padding;
+    for row in &mut profile.data {
+        row.resize(len, Score::from(-1));
+    }
+    profile
+}
+
 fn make_profile_for_dispatch<Score>(
     seq: &[Letter],
     cbs: Option<&[i8]>,
@@ -120,11 +134,7 @@ where
         );
     }
 
-    let mut profile = LongScoreProfile::new(padding);
-    let len = seq.len() + 2 * profile.padding;
-    for row in &mut profile.data {
-        row.resize(len, Score::from(-1));
-    }
+    let mut profile = initialized_profile(seq.len(), padding);
 
     for letter in 0..AMINO_ACID_COUNT {
         let scores = &matrix.matrix8()[letter << 5..(letter + 1) << 5];
@@ -151,6 +161,18 @@ pub fn make_profile8(
     padding: usize,
     matrix: &ScoreMatrix,
 ) -> LongScoreProfile<i8> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if matches!(crate::util::simd::arch(), Arch::Avx2 | Arch::Avx512) {
+            // SAFETY: runtime dispatch established AVX2 support. The kernel
+            // handles the final partial vector through a padded local block.
+            return unsafe { make_profile8_avx2(seq, cbs, padding, matrix) };
+        }
+        if matches!(crate::util::simd::arch(), Arch::Sse4_1) {
+            // SAFETY: the Sse4_1 dispatch tier necessarily includes SSSE3.
+            return unsafe { make_profile8_ssse3(seq, cbs, padding, matrix) };
+        }
+    }
     make_profile(seq, cbs, padding, matrix)
 }
 
@@ -160,8 +182,197 @@ pub fn make_profile16(
     padding: usize,
     matrix: &ScoreMatrix,
 ) -> LongScoreProfile<i16> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if matches!(crate::util::simd::arch(), Arch::Avx2 | Arch::Avx512) {
+            // SAFETY: runtime dispatch established AVX2 support.
+            return unsafe { make_profile16_avx2(seq, cbs, padding, matrix) };
+        }
+        if matches!(crate::util::simd::arch(), Arch::Sse4_1) {
+            // SAFETY: the Sse4_1 dispatch tier necessarily includes SSSE3.
+            return unsafe { make_profile16_ssse3(seq, cbs, padding, matrix) };
+        }
+    }
     make_profile(seq, cbs, padding, matrix)
 }
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod x86_profile {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    use super::*;
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn lookup_avx2(subjects: __m256i, low: *const i8, high: *const i8) -> __m256i {
+        let subjects = _mm256_and_si256(subjects, _mm256_set1_epi8(LETTER_MASK as i8));
+        let bit4 = _mm256_and_si256(subjects, _mm256_set1_epi8(0x10));
+        let high_mask = _mm256_slli_epi16(bit4, 3);
+        let low_index = _mm256_or_si256(subjects, high_mask);
+        let high_index = _mm256_or_si256(
+            subjects,
+            _mm256_xor_si256(high_mask, _mm256_set1_epi8(i8::MIN)),
+        );
+        let low_table = _mm256_loadu_si256(low.cast());
+        let high_table = _mm256_loadu_si256(high.cast());
+        _mm256_or_si256(
+            _mm256_shuffle_epi8(low_table, low_index),
+            _mm256_shuffle_epi8(high_table, high_index),
+        )
+    }
+
+    #[target_feature(enable = "ssse3")]
+    unsafe fn lookup_ssse3(subjects: __m128i, row: *const i8) -> __m128i {
+        let subjects = _mm_and_si128(subjects, _mm_set1_epi8(LETTER_MASK as i8));
+        let bit4 = _mm_and_si128(subjects, _mm_set1_epi8(0x10));
+        let high_mask = _mm_slli_epi16(bit4, 3);
+        let low_index = _mm_or_si128(subjects, high_mask);
+        let high_index = _mm_or_si128(subjects, _mm_xor_si128(high_mask, _mm_set1_epi8(i8::MIN)));
+        _mm_or_si128(
+            _mm_shuffle_epi8(_mm_loadu_si128(row.cast()), low_index),
+            _mm_shuffle_epi8(_mm_loadu_si128(row.add(16).cast()), high_index),
+        )
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn make8(
+        seq: &[Letter],
+        cbs: Option<&[i8]>,
+        padding: usize,
+        matrix: &ScoreMatrix,
+    ) -> LongScoreProfile<i8> {
+        if let Some(cbs) = cbs {
+            assert!(
+                cbs.len() >= seq.len(),
+                "CBS vector must cover the complete sequence"
+            );
+        }
+        let mut profile: LongScoreProfile<i8> = initialized_profile(seq.len(), padding);
+        for letter in 0..AMINO_ACID_COUNT {
+            let low = matrix.matrix8_low().as_ptr().add(letter << 5);
+            let high = matrix.matrix8_high().as_ptr().add(letter << 5);
+            let dst = profile.data[letter].as_mut_ptr().add(profile.padding);
+            let mut i = 0;
+            while i + 32 <= seq.len() {
+                let subjects = _mm256_loadu_si256(seq.as_ptr().add(i).cast());
+                let mut scores = lookup_avx2(subjects, low, high);
+                if let Some(cbs) = cbs.filter(|_| letter < TRUE_AA as usize) {
+                    scores =
+                        _mm256_adds_epi8(scores, _mm256_loadu_si256(cbs.as_ptr().add(i).cast()));
+                }
+                _mm256_storeu_si256(dst.add(i).cast(), scores);
+                i += 32;
+            }
+            if i < seq.len() {
+                let mut subjects = [0i8; 32];
+                subjects[..seq.len() - i].copy_from_slice(&seq[i..]);
+                let mut scores =
+                    lookup_avx2(_mm256_loadu_si256(subjects.as_ptr().cast()), low, high);
+                if let Some(cbs) = cbs.filter(|_| letter < TRUE_AA as usize) {
+                    let mut bias = [0i8; 32];
+                    bias[..seq.len() - i].copy_from_slice(&cbs[i..seq.len()]);
+                    scores = _mm256_adds_epi8(scores, _mm256_loadu_si256(bias.as_ptr().cast()));
+                }
+                let mut block = [0i8; 32];
+                _mm256_storeu_si256(block.as_mut_ptr().cast(), scores);
+                std::ptr::copy_nonoverlapping(block.as_ptr(), dst.add(i), seq.len() - i);
+            }
+        }
+        profile
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn make16(
+        seq: &[Letter],
+        cbs: Option<&[i8]>,
+        padding: usize,
+        matrix: &ScoreMatrix,
+    ) -> LongScoreProfile<i16> {
+        let bytes = make8(seq, cbs, padding, matrix);
+        let mut profile: LongScoreProfile<i16> = initialized_profile(seq.len(), padding);
+        for letter in 0..AMINO_ACID_COUNT {
+            let src = bytes.data[letter].as_ptr().add(bytes.padding);
+            let dst = profile.data[letter].as_mut_ptr().add(profile.padding);
+            let mut i = 0;
+            while i + 32 <= seq.len() {
+                let values = _mm256_loadu_si256(src.add(i).cast());
+                let lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(values));
+                let hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(values, 1));
+                _mm256_storeu_si256(dst.add(i).cast(), lo);
+                _mm256_storeu_si256(dst.add(i + 16).cast(), hi);
+                i += 32;
+            }
+            for j in i..seq.len() {
+                *dst.add(j) = *src.add(j) as i16;
+            }
+        }
+        profile
+    }
+
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn make8_ssse3(
+        seq: &[Letter],
+        cbs: Option<&[i8]>,
+        padding: usize,
+        matrix: &ScoreMatrix,
+    ) -> LongScoreProfile<i8> {
+        if let Some(cbs) = cbs {
+            assert!(
+                cbs.len() >= seq.len(),
+                "CBS vector must cover the complete sequence"
+            );
+        }
+        let mut profile: LongScoreProfile<i8> = initialized_profile(seq.len(), padding);
+        for letter in 0..AMINO_ACID_COUNT {
+            let row = matrix.matrix8().as_ptr().add(letter << 5);
+            let dst = profile.data[letter].as_mut_ptr().add(profile.padding);
+            let mut i = 0;
+            while i + 16 <= seq.len() {
+                let mut scores = lookup_ssse3(_mm_loadu_si128(seq.as_ptr().add(i).cast()), row);
+                if let Some(cbs) = cbs {
+                    scores = _mm_add_epi8(scores, _mm_loadu_si128(cbs.as_ptr().add(i).cast()));
+                }
+                _mm_storeu_si128(dst.add(i).cast(), scores);
+                i += 16;
+            }
+            for j in i..seq.len() {
+                let mut score = *row.add(letter_mask(seq[j]) as usize);
+                if let Some(cbs) = cbs {
+                    score = score.wrapping_add(cbs[j]);
+                }
+                *dst.add(j) = score;
+            }
+        }
+        profile
+    }
+
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn make16_ssse3(
+        seq: &[Letter],
+        cbs: Option<&[i8]>,
+        padding: usize,
+        matrix: &ScoreMatrix,
+    ) -> LongScoreProfile<i16> {
+        let bytes = make8_ssse3(seq, cbs, padding, matrix);
+        let mut profile: LongScoreProfile<i16> = initialized_profile(seq.len(), padding);
+        for letter in 0..AMINO_ACID_COUNT {
+            let src = bytes.data[letter].as_ptr().add(bytes.padding);
+            let dst = profile.data[letter].as_mut_ptr().add(profile.padding);
+            for i in 0..seq.len() {
+                *dst.add(i) = *src.add(i) as i16;
+            }
+        }
+        profile
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use x86_profile::{
+    make16 as make_profile16_avx2, make16_ssse3 as make_profile16_ssse3,
+    make8 as make_profile8_avx2, make8_ssse3 as make_profile8_ssse3,
+};
 
 /// Compatibility name retained for existing Rust callers.
 pub fn make_profile16_target_matrix(
@@ -309,5 +520,45 @@ mod tests {
             masked_profile.get(0, 0)[0],
             matrix.scores[seq[0] as usize] as i16
         );
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn randomized_x86_profiles_match_scalar_dispatch_semantics() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let mut state = 0x8d26_15a9_d3c4_b7e1u64;
+        for len in [0, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 97, 257] {
+            let mut seq = Vec::with_capacity(len);
+            let mut cbs = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                seq.push(
+                    (((state >> 32) % AMINO_ACID_COUNT as u64) as i8)
+                        | if state & 1 == 0 { 0 } else { SEED_MASK },
+                );
+                cbs.push((state >> 40) as i8);
+            }
+
+            if std::is_x86_feature_detected!("avx2") {
+                let expected8 = make_profile_for_dispatch::<i8>(&seq, Some(&cbs), 3, &sm, true);
+                let expected16 = make_profile_for_dispatch::<i16>(&seq, Some(&cbs), 3, &sm, true);
+                // SAFETY: guarded by runtime feature detection.
+                let actual8 = unsafe { super::x86_profile::make8(&seq, Some(&cbs), 3, &sm) };
+                let actual16 = unsafe { super::x86_profile::make16(&seq, Some(&cbs), 3, &sm) };
+                assert_eq!(actual8, expected8, "AVX2 i8 length {len}");
+                assert_eq!(actual16, expected16, "AVX2 i16 length {len}");
+            }
+
+            if std::is_x86_feature_detected!("ssse3") {
+                let expected8 = make_profile_for_dispatch::<i8>(&seq, Some(&cbs), 3, &sm, false);
+                let expected16 = make_profile_for_dispatch::<i16>(&seq, Some(&cbs), 3, &sm, false);
+                // SAFETY: guarded by runtime feature detection.
+                let actual8 = unsafe { super::x86_profile::make8_ssse3(&seq, Some(&cbs), 3, &sm) };
+                let actual16 =
+                    unsafe { super::x86_profile::make16_ssse3(&seq, Some(&cbs), 3, &sm) };
+                assert_eq!(actual8, expected8, "SSSE3 i8 length {len}");
+                assert_eq!(actual16, expected16, "SSSE3 i16 length {len}");
+            }
+        }
     }
 }

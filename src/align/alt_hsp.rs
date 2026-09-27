@@ -30,7 +30,7 @@ impl ActiveTarget {
         for hsp in &target_match.hsps {
             let bit = 1u32 << hsp.frame;
             if reserved & bit == 0 && (hsp.frame as usize) < query_contexts {
-                masked_seq[hsp.frame as usize] = Some(target_match.seq.clone());
+                masked_seq[hsp.frame as usize] = Some(target_match.seq.to_vec());
                 reserved |= bit;
             }
         }

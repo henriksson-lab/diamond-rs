@@ -281,6 +281,7 @@ pub fn fastq2fasta<B: ToolsBackend, W: Write>(
 }
 
 pub fn architecture_flags() -> Vec<&'static str> {
+    #[allow(unused_mut)]
     let mut flags = Vec::new();
     #[cfg(target_feature = "sse2")]
     flags.push("sse2");

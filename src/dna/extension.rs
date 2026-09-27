@@ -9,6 +9,7 @@ use crate::dna::dna_index::Index;
 use crate::dna::extension_seed_matches::merge_and_extend_seeds;
 use crate::dna::seed_set_dna::SeedMatch;
 use crate::util::interval::Interval;
+use std::sync::Arc;
 
 pub const KSW2_END_BONUS: i32 = 5;
 pub const KSW2_BAND: i32 = 40;
@@ -274,7 +275,7 @@ pub fn cigar_to_hsp_seed_match(
     out.query_range.end = pattern_pos;
     out.subject_range.end = text_pos;
     out.transcript.push_terminator();
-    out.target_seq = target.to_vec();
+    out.target_seq = Arc::from(target);
     out.query_source_range = out.query_range;
     out.subject_source_range = if reverse {
         Interval::new(out.subject_range.end, out.subject_range.begin)
@@ -324,7 +325,7 @@ pub fn cigar_to_hsp(
     out.query_range.end = pattern_pos;
     out.subject_range.end = text_pos;
     out.transcript.push_terminator();
-    out.target_seq = target.to_vec();
+    out.target_seq = Arc::from(target);
     out.query_source_range = out.query_range;
     out.subject_source_range = if reverse {
         Interval::new(out.subject_range.end, out.subject_range.begin)

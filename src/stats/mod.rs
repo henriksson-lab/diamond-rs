@@ -34,6 +34,8 @@ pub mod sls_alp_sim;
 pub mod sls_basic;
 pub mod standard_matrix;
 pub mod target_freq;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod target_freq_simd;
 
 pub use hauser_correction::HauserCorrection;
 

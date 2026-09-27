@@ -1,4 +1,6 @@
 pub const KSW2_ZDROP_EXTENSION: i32 = 40;
+use std::sync::Arc;
+
 pub const KSW2_ZDROP_BETWEEN_ANCHORS: i32 = 100;
 pub const KSW2_BAND_EXTENSION: i32 = 40;
 pub const KSW2_BAND_GLOBAL: i32 = 30;
@@ -453,7 +455,7 @@ pub fn build_hsp_from_cigar(
     align_hsp.query_range.end = query_pos;
     align_hsp.subject_range.end = target_pos;
     align_hsp.transcript.push_terminator();
-    align_hsp.target_seq = target.to_vec();
+    align_hsp.target_seq = Arc::from(target);
     align_hsp.query_source_range = align_hsp.query_range;
     align_hsp.subject_source_range = if is_reverse {
         Interval::new(align_hsp.subject_range.end, align_hsp.subject_range.begin)

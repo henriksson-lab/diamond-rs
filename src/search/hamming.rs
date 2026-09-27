@@ -133,6 +133,10 @@ impl FingerPrint {
     }
 
     pub fn load(q: &[Letter], center: usize, dst: &mut [Letter; 48]) {
+        if center >= 16 && center + 32 <= q.len() {
+            fingerprint_load_masked(&q[center - 16..center + 32], dst);
+            return;
+        }
         for (i, out) in dst.iter_mut().enumerate() {
             let pos = center as isize + i as isize - 16;
             *out = if pos < 0 || pos as usize >= q.len() {
@@ -148,14 +152,151 @@ impl FingerPrint {
     }
 
     pub fn match_count(&self, rhs: &FingerPrint) -> u32 {
-        let mut n = 0;
-        for i in 0..48 {
-            if self.r[i] == rhs.r[i] {
-                n += 1;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: AVX2 was detected and both arrays contain 48 bytes.
+                return unsafe { fingerprint_match_count_avx2(&self.r, &rhs.r) };
+            }
+            if std::arch::is_x86_feature_detected!("sse2") {
+                // SAFETY: SSE2 was detected and both arrays contain 48 bytes.
+                return unsafe { fingerprint_match_count_sse2(&self.r, &rhs.r) };
             }
         }
-        n
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: Advanced SIMD is mandatory on AArch64 and both arrays
+            // contain the three complete vectors loaded by the kernel.
+            return unsafe { fingerprint_match_count_neon(&self.r, &rhs.r) };
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        self.r
+            .iter()
+            .zip(&rhs.r)
+            .map(|(a, b)| u32::from(a == b))
+            .sum()
     }
+}
+
+#[inline]
+fn fingerprint_load_masked(src: &[Letter], dst: &mut [Letter; 48]) {
+    debug_assert!(src.len() >= 48);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 was detected and both slices contain 48 bytes.
+            unsafe { fingerprint_load_masked_avx2(src, dst) };
+            return;
+        }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            // SAFETY: SSE2 was detected and both slices contain 48 bytes.
+            unsafe { fingerprint_load_masked_sse2(src, dst) };
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: Advanced SIMD is mandatory on AArch64 and both slices
+        // contain the three complete vectors loaded and stored below.
+        unsafe { fingerprint_load_masked_neon(src, dst) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for (out, &letter) in dst.iter_mut().zip(src) {
+        *out = letter_mask(letter) & LETTER_MASK;
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn fingerprint_load_masked_avx2(src: &[Letter], dst: &mut [Letter; 48]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let mask256 = _mm256_set1_epi8(LETTER_MASK);
+    let first = _mm256_and_si256(_mm256_loadu_si256(src.as_ptr().cast()), mask256);
+    _mm256_storeu_si256(dst.as_mut_ptr().cast(), first);
+    let mask128 = _mm_set1_epi8(LETTER_MASK);
+    let last = _mm_and_si128(_mm_loadu_si128(src.as_ptr().add(32).cast()), mask128);
+    _mm_storeu_si128(dst.as_mut_ptr().add(32).cast(), last);
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn fingerprint_load_masked_sse2(src: &[Letter], dst: &mut [Letter; 48]) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let mask = _mm_set1_epi8(LETTER_MASK);
+    for offset in [0, 16, 32] {
+        let block = _mm_and_si128(_mm_loadu_si128(src.as_ptr().add(offset).cast()), mask);
+        _mm_storeu_si128(dst.as_mut_ptr().add(offset).cast(), block);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fingerprint_load_masked_neon(src: &[Letter], dst: &mut [Letter; 48]) {
+    use std::arch::aarch64::*;
+
+    let mask = vdupq_n_s8(LETTER_MASK);
+    for offset in [0, 16, 32] {
+        let block = vandq_s8(vld1q_s8(src.as_ptr().add(offset)), mask);
+        vst1q_s8(dst.as_mut_ptr().add(offset), block);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn fingerprint_match_count_avx2(a: &[Letter; 48], b: &[Letter; 48]) -> u32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let a0 = _mm256_loadu_si256(a.as_ptr().cast());
+    let b0 = _mm256_loadu_si256(b.as_ptr().cast());
+    let a1 = _mm_loadu_si128(a.as_ptr().add(32).cast());
+    let b1 = _mm_loadu_si128(b.as_ptr().add(32).cast());
+    (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a0, b0)) as u32).count_ones()
+        + (_mm_movemask_epi8(_mm_cmpeq_epi8(a1, b1)) as u32).count_ones()
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+unsafe fn fingerprint_match_count_sse2(a: &[Letter; 48], b: &[Letter; 48]) -> u32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let mut count = 0;
+    for offset in [0, 16, 32] {
+        let av = _mm_loadu_si128(a.as_ptr().add(offset).cast());
+        let bv = _mm_loadu_si128(b.as_ptr().add(offset).cast());
+        count += (_mm_movemask_epi8(_mm_cmpeq_epi8(av, bv)) as u32).count_ones();
+    }
+    count
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn fingerprint_match_count_neon(a: &[Letter; 48], b: &[Letter; 48]) -> u32 {
+    use std::arch::aarch64::*;
+
+    let ones = vdupq_n_u8(1);
+    let mut count = 0;
+    for offset in [0, 16, 32] {
+        let av = vld1q_s8(a.as_ptr().add(offset));
+        let bv = vld1q_s8(b.as_ptr().add(offset));
+        count += u32::from(vaddvq_u8(vandq_u8(vceqq_s8(av, bv), ones)));
+    }
+    count
 }
 
 pub fn all_vs_all(
@@ -755,6 +896,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_simd_match_count_matches_scalar_for_all_byte_patterns() {
+        for shift in 0..64u8 {
+            let a = std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(shift) as i8);
+            let mut b = std::array::from_fn(|i| {
+                (i as u8)
+                    .wrapping_mul(37)
+                    .wrapping_add(shift.wrapping_add((i % 7 == 0) as u8)) as i8
+            });
+            b[47] = a[47];
+            let expected = a.iter().zip(&b).filter(|(x, y)| x == y).count() as u32;
+            assert_eq!(
+                FingerPrint::from_array(&a).match_count(&FingerPrint::from_array(&b)),
+                expected
+            );
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe {
+                if std::arch::is_x86_feature_detected!("sse2") {
+                    assert_eq!(fingerprint_match_count_sse2(&a, &b), expected);
+                    let mut loaded = [0; 48];
+                    fingerprint_load_masked_sse2(&a, &mut loaded);
+                    assert_eq!(loaded, a.map(|letter| letter_mask(letter) & LETTER_MASK));
+                }
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    assert_eq!(fingerprint_match_count_avx2(&a, &b), expected);
+                    let mut loaded = [0; 48];
+                    fingerprint_load_masked_avx2(&a, &mut loaded);
+                    assert_eq!(loaded, a.map(|letter| letter_mask(letter) & LETTER_MASK));
+                }
+            }
+        }
+    }
 
     fn seqset(lengths: &[usize]) -> SequenceSet {
         let mut seqs = SequenceSet::new();

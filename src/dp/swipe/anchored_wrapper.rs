@@ -9,7 +9,7 @@ use crate::align::hsp::Hsp;
 use crate::basic::statistics::{StatValue, Statistics};
 use crate::basic::value::Letter;
 use crate::config::Sensitivity;
-use crate::dp::anchored::{smith_waterman, Stats, Target};
+use crate::dp::anchored::{smith_waterman_simd, Stats, Target};
 use crate::dp::score_profile::{make_profile16, LongScoreProfile};
 use crate::dp::swipe::{self, DpTarget, Params, Targets};
 use crate::stats::cbs::{
@@ -277,7 +277,7 @@ pub fn swipe_threads(
     }
     let mut out = Stats::default();
     for (begin, end) in ranges.iter().copied() {
-        let stats = smith_waterman(query, &mut targets[begin..end], cfg.score_matrix);
+        let stats = smith_waterman_simd(query, &mut targets[begin..end], cfg.score_matrix);
         out.gross_cells += stats.gross_cells;
         out.net_cells += stats.net_cells;
     }
@@ -480,6 +480,7 @@ pub fn anchored_swipe(targets: &mut Targets, cfg: &AnchoredSwipeConfig<'_>) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dp::anchored::smith_waterman;
     use crate::dp::swipe::Anchor;
 
     fn matrix() -> ScoreMatrix {
@@ -538,7 +539,7 @@ mod tests {
     fn add_target_preserves_target_matrix() {
         let adjusted = Arc::new(TargetMatrix::new(vec![1; 26 * 32], 1, 1));
         let target = DpTarget {
-            seq: vec![0; 10],
+            seq: vec![0; 10].into(),
             d_begin: -1,
             d_end: 2,
             cols: 10,

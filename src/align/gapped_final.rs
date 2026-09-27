@@ -173,7 +173,7 @@ pub fn align_targets_final(
             let matrix = target.matrix.take();
             matches.push(Match::from_target_hsps(
                 target.block_id,
-                &target.seq,
+                target.seq.clone(),
                 matrix,
                 &mut target.hsp,
                 target.ungapped_score,
@@ -245,9 +245,9 @@ pub fn align_targets_final(
                 cfg,
             );
             let matrix = target.matrix.take();
-            matches.push(Match::new_extension(
+            matches.push(Match::new_extension_shared(
                 target.block_id,
-                &target.seq,
+                target.seq.clone(),
                 matrix,
                 target.ungapped_score,
                 0,

@@ -186,6 +186,74 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
     freq_sd: f64,
     min_query_len: usize,
 ) -> Vec<SeedMatch> {
+    find_seed_matches_partitioned_filtered_min_query_len_impl(
+        query_seqs,
+        ref_seqs,
+        shape,
+        reduction,
+        complexity_cut,
+        freq_sd,
+        min_query_len,
+        |matches| matches,
+    )
+}
+
+/// Join and apply the stage-1 Hamming filter inside each partition worker.
+/// Returns filtered matches plus the number of raw joined pairs examined.
+/// Keeping raw cross-products partition-local bounds their lifetime and avoids
+/// materializing a shape-wide raw `Vec<SeedMatch>`.
+pub fn find_seed_matches_partitioned_filtered_hamming_min_query_len(
+    query_seqs: &[&[Letter]],
+    query_restores: &[Vec<(usize, Letter)>],
+    ref_seqs: &[&[Letter]],
+    ref_restores: &[Vec<(usize, Letter)>],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    freq_sd: f64,
+    min_query_len: usize,
+    hamming_filter_id: u32,
+) -> (Vec<SeedMatch>, usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let raw_count = AtomicUsize::new(0);
+    let matches = find_seed_matches_partitioned_filtered_min_query_len_impl(
+        query_seqs,
+        ref_seqs,
+        shape,
+        reduction,
+        complexity_cut,
+        freq_sd,
+        min_query_len,
+        |mut matches| {
+            raw_count.fetch_add(matches.len(), Ordering::Relaxed);
+            crate::search::hamming_filter::retain_hamming_filter_sequence_set(
+                &mut matches,
+                query_seqs,
+                query_restores,
+                ref_seqs,
+                ref_restores,
+                hamming_filter_id,
+            );
+            matches
+        },
+    );
+    (matches, raw_count.into_inner())
+}
+
+fn find_seed_matches_partitioned_filtered_min_query_len_impl<F>(
+    query_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    freq_sd: f64,
+    min_query_len: usize,
+    process_partition: F,
+) -> Vec<SeedMatch>
+where
+    F: Fn(Vec<SeedMatch>) -> Vec<SeedMatch> + Sync,
+{
     let seedp_bits = DEFAULT_SEEDP_BITS;
     let single_thread = rayon::current_num_threads() == 1;
 
@@ -243,7 +311,7 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
             for p in partition_begin..partition_end {
                 let q_part = query_sa.partition_mut(p as u32);
                 let r_part = ref_sa.partition_mut(p as u32);
-                let mut part = if complexity_cut > 0.0 {
+                let part = if complexity_cut > 0.0 {
                     sort_merge_seed_matches_with_complexity(
                         q_part,
                         r_part,
@@ -273,6 +341,7 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
                         seedp_bits,
                     )
                 };
+                let mut part = process_partition(part);
                 matches.append(&mut part);
             }
             query_data = query_sa.into_data();
@@ -364,23 +433,19 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
             for (p, (q_part, r_part)) in
                 query_parts.iter_mut().zip(ref_parts.iter_mut()).enumerate()
             {
-                let mut part = emit_part(p, q_part, r_part);
+                let mut part = process_partition(emit_part(p, q_part, r_part));
                 matches.append(&mut part);
             }
             matches
         } else {
-            let partition_results: Vec<Vec<SeedMatch>> = query_parts
+            query_parts
                 .par_iter_mut()
                 .zip(ref_parts.par_iter_mut())
                 .enumerate()
-                .map(|(p, (q_part, r_part))| emit_part(p, q_part, r_part))
-                .collect();
-            let total: usize = partition_results.iter().map(Vec::len).sum();
-            let mut matches = Vec::with_capacity(total);
-            for mut part in partition_results {
-                matches.append(&mut part);
-            }
-            matches
+                .flat_map_iter(|(p, (q_part, r_part))| {
+                    process_partition(emit_part(p, q_part, r_part)).into_iter()
+                })
+                .collect()
         };
     }
     let blocks_per_part: Vec<super::seed_array::PartitionBlocks> = if single_thread {
@@ -446,7 +511,8 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
 
     // Phase 2: emit (q_loc, r_loc) cross product per block, filtering blocks
     // whose counts exceed the frequent-seed threshold.
-    let emit_part = |blocks: &super::seed_array::PartitionBlocks,
+    let emit_part = |p: usize,
+                     blocks: &super::seed_array::PartitionBlocks,
                      q_part: &&mut [super::seed_array::SeedEntry],
                      r_part: &&mut [super::seed_array::SeedEntry]| {
         // q_part / r_part are &&mut [SeedEntry] from the zip; the inner
@@ -488,6 +554,8 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
                 &blocks,
                 q_max,
                 r_max,
+                p as u32,
+                seedp_bits,
             )
         } else {
             emit_seed_matches_filtered(
@@ -498,32 +566,34 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
                 blocks,
                 q_max,
                 r_max,
+                p as u32,
+                seedp_bits,
             )
         }
     };
-    let matches = if single_thread {
+    if single_thread {
         let mut matches = Vec::new();
-        for ((blocks, q_part), r_part) in blocks_per_part.iter().zip(&query_parts).zip(&ref_parts) {
-            let mut part = emit_part(blocks, q_part, r_part);
+        for (p, ((blocks, q_part), r_part)) in blocks_per_part
+            .iter()
+            .zip(&query_parts)
+            .zip(&ref_parts)
+            .enumerate()
+        {
+            let mut part = process_partition(emit_part(p, blocks, q_part, r_part));
             matches.append(&mut part);
         }
         matches
     } else {
-        let partition_results: Vec<Vec<SeedMatch>> = blocks_per_part
+        blocks_per_part
             .par_iter()
             .zip(query_parts.par_iter())
             .zip(ref_parts.par_iter())
-            .map(|((blocks, q_part), r_part)| emit_part(blocks, q_part, r_part))
-            .collect();
-
-        let total: usize = partition_results.iter().map(Vec::len).sum();
-        let mut matches = Vec::with_capacity(total);
-        for mut part in partition_results {
-            matches.append(&mut part);
-        }
-        matches
-    };
-    matches
+            .enumerate()
+            .flat_map_iter(|(p, ((blocks, q_part), r_part))| {
+                process_partition(emit_part(p, blocks, q_part, r_part)).into_iter()
+            })
+            .collect()
+    }
 }
 
 /// Find seed matches in parallel across multiple queries (legacy HashMap path).
@@ -659,5 +729,105 @@ mod tests {
         );
         assert!(!filtered.iter().any(|m| m.query_id == 0));
         assert!(filtered.iter().any(|m| m.query_id == 1));
+    }
+
+    #[test]
+    fn parallel_partition_flatten_preserves_serial_emission_order() {
+        let reduction = Reduction::default_reduction();
+        let shape = Shape::from_code("1111", &reduction);
+        let query_data: Vec<Vec<Letter>> = (0..8)
+            .map(|shift| (0..96).map(|i| ((i + shift) % 20) as Letter).collect())
+            .collect();
+        let ref_data: Vec<Vec<Letter>> = (0..9)
+            .map(|shift| (0..104).map(|i| ((i + shift) % 20) as Letter).collect())
+            .collect();
+        let query_seqs: Vec<&[Letter]> = query_data.iter().map(Vec::as_slice).collect();
+        let ref_seqs: Vec<&[Letter]> = ref_data.iter().map(Vec::as_slice).collect();
+        let run = || {
+            find_seed_matches_partitioned_filtered_min_query_len(
+                &query_seqs,
+                &ref_seqs,
+                &shape,
+                &reduction,
+                0.0,
+                0.0,
+                0,
+            )
+        };
+
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(run);
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(run);
+
+        let signature = |matches: &[SeedMatch]| {
+            matches
+                .iter()
+                .map(|m| (m.query_id, m.query_pos, m.ref_id, m.ref_pos, m.seed))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(&parallel), signature(&serial));
+    }
+
+    #[test]
+    fn partition_local_hamming_matches_post_join_filter_exactly() {
+        let reduction = Reduction::default_reduction();
+        let shape = Shape::from_code("1111", &reduction);
+        let query_data: Vec<Vec<Letter>> = (0..5)
+            .map(|shift| (0..72).map(|i| ((i + shift) % 20) as Letter).collect())
+            .collect();
+        let ref_data: Vec<Vec<Letter>> = (0..6)
+            .map(|shift| (0..80).map(|i| ((i + shift) % 20) as Letter).collect())
+            .collect();
+        let query_seqs: Vec<&[Letter]> = query_data.iter().map(Vec::as_slice).collect();
+        let ref_seqs: Vec<&[Letter]> = ref_data.iter().map(Vec::as_slice).collect();
+
+        let raw = find_seed_matches_partitioned_filtered_min_query_len(
+            &query_seqs,
+            &ref_seqs,
+            &shape,
+            &reduction,
+            0.0,
+            0.0,
+            0,
+        );
+        let query_restores = vec![Vec::new(); query_seqs.len()];
+        let ref_restores = vec![Vec::new(); ref_seqs.len()];
+        let mut expected = raw.clone();
+        crate::search::hamming_filter::retain_hamming_filter_sequence_set(
+            &mut expected,
+            &query_seqs,
+            &query_restores,
+            &ref_seqs,
+            &ref_restores,
+            40,
+        );
+        let (fused, raw_count) = find_seed_matches_partitioned_filtered_hamming_min_query_len(
+            &query_seqs,
+            &query_restores,
+            &ref_seqs,
+            &ref_restores,
+            &shape,
+            &reduction,
+            0.0,
+            0.0,
+            0,
+            40,
+        );
+
+        let signature = |matches: &[SeedMatch]| {
+            matches
+                .iter()
+                .map(|m| (m.query_id, m.query_pos, m.ref_id, m.ref_pos, m.seed))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(raw_count, raw.len());
+        assert_eq!(signature(&fused), signature(&expected));
     }
 }

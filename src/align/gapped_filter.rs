@@ -251,16 +251,18 @@ pub fn gapped_filter_hit(
     let d = (hit.diag() - band / 2).max(-(slen - 1));
     let j0 = (hit.j - window).max(0);
     let j1 = (hit.j + window).min(slen);
-    let mut scores = vec![0i32; band as usize];
+    debug_assert!(band == 64 || band == 128);
+    let mut scores = [0i32; 128];
+    let scores = &mut scores[..band as usize];
     f(
         &query_profile[hit.frame as usize],
         target,
         d,
         j0,
         j1,
-        &mut scores,
+        scores,
     );
-    diag_alignment(&scores, gap_open, gap_extend, gapped_filter_diag_score)
+    diag_alignment(scores, gap_open, gap_extend, gapped_filter_diag_score)
 }
 
 /// Matches C++ `Extension::gapped_filter(begin, end, ...)`.

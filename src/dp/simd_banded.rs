@@ -1,4 +1,6 @@
-use crate::basic::value::{Letter, LETTER_MASK};
+use crate::basic::value::Letter;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use crate::basic::value::LETTER_MASK;
 use crate::stats::score_matrix::ScoreMatrix;
 
 /// Result of a SIMD banded alignment.

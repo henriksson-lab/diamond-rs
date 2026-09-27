@@ -163,6 +163,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     }
     eprintln!("Queries: {} sequences", query_records.len());
 
+    use crate::basic::value::{MASK_LETTER, SEED_MASK};
     use rayon::iter::IntoParallelRefMutIterator;
     match config.masking {
         MaskingMode::None => {}
@@ -204,7 +205,6 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // applying the -1 BLOSUM penalty — for a self-self of a heavily-masked
     // protein (Q8QZQ8: 120+ masked residues), that's 120+ extra score relative
     // to C++ and shifts which targets fit inside `-k 25`.
-    use crate::basic::value::{MASK_LETTER, SEED_MASK};
     let hard_mask = |seq: &mut [Letter]| {
         for l in seq.iter_mut() {
             if *l & SEED_MASK != 0 {
@@ -255,6 +255,19 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     } else {
         vec![Vec::new(); query_records.len()]
     };
+    let hamming_restores = |motifs: &[Vec<crate::masking::motifs::MotifMaskEntry>]| {
+        motifs
+            .iter()
+            .map(|saved| {
+                saved
+                    .iter()
+                    .map(|entry| (entry.pos, entry.original))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let db_hamming_restores = hamming_restores(&db_motif_saves);
+    let query_hamming_restores = hamming_restores(&query_motif_saves);
 
     // Set up seed extraction using sensitivity-appropriate shapes
     let reduction = Reduction::default_reduction();
@@ -309,36 +322,33 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // small real query blocks; collecting in shape order preserves the previous
     // output order.
     let mut all_seed_matches = Vec::new();
+    let mut raw_seed_matches = 0usize;
     for (shape_id, shape) in shapes.iter().enumerate() {
         let complexity_cut = traits.seed_cut * std::f64::consts::LN_2 * shape.weight as f64;
-        let mut matches = parallel::find_seed_matches_partitioned_filtered_min_query_len(
-            &query_seqs,
-            &db_seqs,
-            shape,
-            &reduction,
-            complexity_cut,
-            0.0,
-            config.min_query_len,
-        );
+        let (mut matches, shape_raw_seed_matches) =
+            parallel::find_seed_matches_partitioned_filtered_hamming_min_query_len(
+                &query_seqs,
+                &query_hamming_restores,
+                &db_seqs,
+                &db_hamming_restores,
+                shape,
+                &reduction,
+                complexity_cut,
+                0.0,
+                config.min_query_len,
+                traits.min_identities,
+            );
+        raw_seed_matches += shape_raw_seed_matches;
         for m in &mut matches {
             m.shape_id = shape_id as u32;
         }
         all_seed_matches.append(&mut matches);
     }
-    let raw_seed_matches = all_seed_matches.len();
     // C++ stage0/stage2 preserves shape + seed-partition join emission order
     // inside a query. Only group by query so range building is cheap without
     // imposing a Rust-only target/position tie-breaker on ranking boundaries.
     all_seed_matches.sort_by_key(|m| m.query_id);
 
-    // Stage-1 hamming filter: drop seed hits whose 48-letter window matches
-    // fewer than `min_identities` letters. Ports C++ search/hamming/kernel.h.
-    all_seed_matches = crate::search::hamming_filter::apply_hamming_filter(
-        all_seed_matches,
-        &query_seqs,
-        &db_seqs,
-        traits.min_identities,
-    );
     eprintln!(
         "Seed matches: {} (raw) -> {} (hamming)",
         raw_seed_matches,
@@ -370,7 +380,12 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     }
 
     let mut db_block = Block::new();
-    for (idx, record) in db_records.iter().enumerate() {
+    // `Block` owns the compact sequence/title representation used by every
+    // remaining stage. Consume the input records here so their individual
+    // sequence and title allocations are released as soon as each record has
+    // been copied into the block, rather than retaining a duplicate database
+    // throughout alignment and output.
+    for (idx, record) in db_records.into_iter().enumerate() {
         db_block
             .push_back(
                 &record.sequence,
@@ -383,6 +398,10 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             )
             .map_err(io::Error::other)?;
     }
+    drop(db_motif_saves);
+    drop(query_motif_saves);
+    trim_freed_heap_pages();
+    let db_ids = db_block.ids().map_err(io::Error::other)?;
 
     // Parse output format. Only tabular is implemented in the native pipeline.
     // For PAF/SAM/XML/pairwise/DAA the user must use --legacy.
@@ -564,25 +583,23 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 while chunk_begin < group_end {
                     let chunk_end = (chunk_begin + 32).min(group_end);
                     let chunk = &query_seed_matches[chunk_begin..chunk_end];
-                    let subjects = chunk
-                        .iter()
-                        .map(|hit| {
-                            db_block
-                                .seqs()
-                                .position(hit.ref_id as usize, hit.ref_pos as usize)
-                                as isize
-                                - window_left as isize
-                        })
-                        .collect::<Vec<_>>();
+                    let mut subjects = [0isize; 32];
+                    for (subject_start, hit) in subjects.iter_mut().zip(chunk) {
+                        *subject_start = db_block
+                            .seqs()
+                            .position(hit.ref_id as usize, hit.ref_pos as usize)
+                            as isize
+                            - window_left as isize;
+                    }
 
                     let subject_storage;
-                    let subject_windows = if subjects.iter().all(|&start| start >= 0) {
-                        subjects
-                            .iter()
-                            .map(|&start| &ref_seq_data[start as usize..])
-                            .collect::<Vec<_>>()
+                    let mut subject_windows = [&[][..]; 32];
+                    if subjects[..chunk.len()].iter().all(|&start| start >= 0) {
+                        for (window, &start) in subject_windows.iter_mut().zip(&subjects) {
+                            *window = &ref_seq_data[start as usize..];
+                        }
                     } else {
-                        subject_storage = subjects
+                        subject_storage = subjects[..chunk.len()]
                             .iter()
                             .map(|&start| {
                                 (0..window_clipped)
@@ -600,21 +617,20 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                                     .collect::<Vec<_>>()
                             })
                             .collect::<Vec<_>>();
-                        subject_storage
-                            .iter()
-                            .map(Vec::as_slice)
-                            .collect::<Vec<_>>()
-                    };
-                    let scores = if ungapped_cutoff == 0 {
-                        vec![i32::MAX; chunk.len()]
-                    } else {
-                        crate::dp::simd_ungapped::window_ungapped_best(
+                        for (window, storage) in subject_windows.iter_mut().zip(&subject_storage) {
+                            *window = storage;
+                        }
+                    }
+                    let mut scores = [i32::MAX; 32];
+                    if ungapped_cutoff != 0 {
+                        crate::dp::simd_ungapped::window_ungapped_best_into(
                             query_window,
-                            &subject_windows,
+                            &subject_windows[..chunk.len()],
                             window_clipped,
                             &score_matrix,
-                        )
-                    };
+                            &mut scores[..chunk.len()],
+                        );
+                    }
 
                     for (chunk_idx, hit) in chunk.iter().enumerate() {
                         let score = scores[chunk_idx];
@@ -737,17 +753,19 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 GAPPED_FILTER_WINDOW,
                 Option::<fn(u32, &crate::align::gapped_filter::SeedHitList) -> Vec<Match>>::None,
             );
-            let mut target_results: Vec<(u32, f64, OutputHsp)> = Vec::new();
+            // Format each completed match directly into its query buffer. The
+            // match list is already in output order, so retaining a second
+            // vector of copied HSP summaries only adds allocation and traffic.
+            let mut buf: Vec<u8> = Vec::new();
             for m in matches {
                 let Some(best_hsp) = m.hsps.first() else {
                     continue;
                 };
-                let target_id = m.target_block_id;
-                let evalue = best_hsp.evalue;
+                let target_id = m.target_block_id as usize;
 
                 let hsp = OutputHsp {
                     score: best_hsp.score,
-                    evalue,
+                    evalue: best_hsp.evalue,
                     bit_score: best_hsp.bit_score,
                     query_range: (best_hsp.query_range.begin, best_hsp.query_range.end),
                     subject_range: (best_hsp.subject_range.begin, best_hsp.subject_range.end),
@@ -764,45 +782,49 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                     gap_openings: best_hsp.gap_openings,
                     gaps: best_hsp.gaps,
                 };
-
-                target_results.push((target_id, evalue, hsp));
-            }
-
-            // Output results into a per-query buffer.
-            let mut buf: Vec<u8> = Vec::new();
-            for (target_id, _, hsp) in &target_results {
+                let target_title = std::str::from_utf8(db_ids.get(target_id)).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid UTF-8 database title: {error}"),
+                    )
+                })?;
                 format::write_tabular_row(
                     &mut buf,
                     &query_rec.id,
-                    &db_records[*target_id as usize].id,
-                    hsp,
+                    target_title,
+                    &hsp,
                     &fields,
                     query.len() as i32,
-                    db_records[*target_id as usize].sequence.len() as i32,
+                    db_block.seqs().length(target_id) as i32,
                 )?;
             }
             Ok(buf)
         };
-    let per_query_output: Vec<Vec<u8>> = if rayon::current_num_threads() == 1 {
-        query_records
-            .iter()
-            .enumerate()
-            .map(process_query)
-            .collect::<io::Result<Vec<_>>>()?
-    } else {
-        query_records
-            .par_iter()
-            .enumerate()
-            .map(process_query)
-            .collect::<io::Result<Vec<_>>>()?
-    };
-
     let mut total_alignments = 0u64;
-    for buf in &per_query_output {
-        // Each line in buf corresponds to one alignment; count newlines.
-        let buf: &Vec<u8> = buf;
-        total_alignments += buf.iter().filter(|&&b: &&u8| b == b'\n').count() as u64;
-        writer.write_all(buf)?;
+    // Preserve input order without retaining every query's formatted output.
+    // A small batch gives Rayon enough work to balance threads while bounding
+    // buffered output to O(thread-count), even for high-cardinality searches.
+    let output_batch_size = rayon::current_num_threads().max(1) * 2;
+    for (batch_idx, query_batch) in query_records.chunks(output_batch_size).enumerate() {
+        let query_begin = batch_idx * output_batch_size;
+        let batch_output: Vec<Vec<u8>> = if rayon::current_num_threads() == 1 {
+            query_batch
+                .iter()
+                .enumerate()
+                .map(|(offset, record)| process_query((query_begin + offset, record)))
+                .collect::<io::Result<Vec<_>>>()?
+        } else {
+            query_batch
+                .par_iter()
+                .enumerate()
+                .map(|(offset, record)| process_query((query_begin + offset, record)))
+                .collect::<io::Result<Vec<_>>>()?
+        };
+        for buf in batch_output {
+            // Each line in buf corresponds to one alignment; count newlines.
+            total_alignments += buf.iter().filter(|&&b| b == b'\n').count() as u64;
+            writer.write_all(&buf)?;
+        }
     }
     writer.flush()?;
 
