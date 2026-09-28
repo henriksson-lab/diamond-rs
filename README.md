@@ -41,9 +41,9 @@ This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 - **CLI**: `blastp` and `blastx` run natively in Rust by default; C++ FFI fallback is only built for non-Windows conformance testing with `--features ffi`
 - **Native Rust commands**: `blastp`, `blastx`, `makedb`, `dbinfo`, `getseq`, `version`, `help`
 - **Parallel**: Seed search uses rayon for multi-threaded processing
-- **SIMD**: SSE4.1/AVX2 vectorized ungapped scoring
+- **SIMD**: SSE4.1/AVX2 dynamic-programming kernels and runtime-selected AVX-512 search workers on supported x86-64 hosts
 - **Library API**: Core types, scoring matrices, DP kernels, FASTA parsing, and seed search
-- **Tests**: 206 tests including all 20 C++ regression tests + native-vs-FFI equivalence
+- **Tests**: More than 1,600 passing library tests plus CLI and integration suites, including the C++ regression inventory and native-vs-FFI equivalence
 - **Not yet translated**: SQLite-backed taxonomy lookup for NCBI BLAST databases (`taxonomy4blast.sqlite3`), used by taxonomy-aware output fields such as `slineages`, `sskingdoms`, `skingdoms`, and `sphylums`
 
 ## Building
@@ -287,6 +287,105 @@ nonzero and retains a unified diff when parity fails. Quick smoke runs can use
 `CPP_BIN` can be overridden for later scaling experiments. Set
 `RUST_MEMORY_LIMIT=0G` for the upstream-compatible forced-disk comparison.
 
+The broader matrix exercises both the 16 GB adaptive default and immediate
+disk mode, a 64 MB mid-run spill threshold, gzip input, sensitivity presets,
+masking and composition-based statistics, a non-default score matrix,
+representative identity/coverage/top-score filters, an extended tabular output
+schema, and native `blastx`. It runs every mode at one and four threads,
+alternates C++/Rust execution order, checks output bytes, and writes one TSV
+row per comparison with time, RSS, and both ratios:
+
+```bash
+REFERENCE_FASTA=/path/to/real-reference.faa \
+PROTEIN_QUERY_FASTA=/path/to/disjoint-real-query.faa \
+NUCLEOTIDE_QUERY_FASTA=/path/to/real-genomic-region.fna \
+BENCH_CPUSET_1=4 BENCH_CPUSET_4=4-7 \
+  scripts/compare_mode_matrix.sh
+```
+
+`MATRIX_MODES`, `MATRIX_THREADS`, `REPETITIONS`, and `RESULT_DIR` can narrow a
+diagnostic run. The default is five repetitions; use at least that many for a
+published comparison, particularly on a shared host. `SEARCH_ARGS`,
+`OUTFMT_FIELDS`, and `COMMAND=blastp|blastx` expose the same controls in the
+single-comparison driver. The nucleotide input should be a natural sequence
+set or contiguous genomic region—repeating a small fixture makes timing longer
+without adding realistic seeds, alignments, or failure modes.
+
+### Search-mode parity matrix
+
+The following is the five-run matrix on the bundled 389-record protein corpus
+(97,484 residues on each side), pinned to CPU 10 or CPUs 10–13. This compact
+fixture is intended to exercise modes and exact output, not to represent
+large-dataset throughput. `Speed` is C++ time / Rust time and `RSS` is Rust /
+C++; higher speed and lower RSS are better. Every row is byte-identical.
+
+| Mode | Threads | C++ time | Rust time | Speed | C++ RSS | Rust RSS | RSS ratio | Parity |
+|---|---:|---:|---:|---:|---:|---:|---:|:---:|
+| Default 16G | 1 | 0.33 s | 0.45 s | 0.733x | 23,352 KiB | 12,484 KiB | 0.535x | PASS |
+| Default 16G | 4 | 0.36 s | 0.35 s | 1.029x | 28,940 KiB | 19,412 KiB | 0.671x | PASS |
+| 64M ceiling | 1 | 0.31 s | 0.42 s | 0.738x | 23,292 KiB | 12,484 KiB | 0.536x | PASS |
+| 64M ceiling | 4 | 0.25 s | 0.16 s | 1.563x | 28,816 KiB | 16,768 KiB | 0.582x | PASS |
+| Forced disk, 0G | 1 | 0.34 s | 0.45 s | 0.756x | 23,348 KiB | 12,524 KiB | 0.536x | PASS |
+| Forced disk, 0G | 4 | 0.44 s | 0.21 s | 2.095x | 28,620 KiB | 18,392 KiB | 0.643x | PASS |
+| gzip input | 1 | 0.33 s | 0.44 s | 0.750x | 23,420 KiB | 12,524 KiB | 0.535x | PASS |
+| gzip input | 4 | 0.31 s | 0.18 s | 1.722x | 28,884 KiB | 16,156 KiB | 0.559x | PASS |
+| `--faster` | 1 | 0.22 s | 0.22 s | 1.000x | 18,868 KiB | 8,000 KiB | 0.424x | PASS |
+| `--faster` | 4 | 0.28 s | 0.10 s | 2.800x | 28,936 KiB | 8,616 KiB | 0.298x | PASS |
+| `--more-sensitive` | 1 | 1.61 s | 2.17 s | 0.742x | 29,484 KiB | 16,592 KiB | 0.563x | PASS |
+| `--more-sensitive` | 4 | 0.94 s | 0.82 s | 1.146x | 37,540 KiB | 20,656 KiB | 0.550x | PASS |
+| `--ultra-sensitive` | 1 | 3.30 s | 5.40 s | 0.611x | 32,976 KiB | 19,400 KiB | 0.588x | PASS |
+| `--ultra-sensitive` | 4 | 1.70 s | 2.30 s | 0.739x | 51,860 KiB | 31,020 KiB | 0.598x | PASS |
+| CBS disabled | 1 | 0.27 s | 0.38 s | 0.711x | 21,768 KiB | 12,364 KiB | 0.568x | PASS |
+| CBS disabled | 4 | 0.19 s | 0.15 s | 1.267x | 28,940 KiB | 15,716 KiB | 0.543x | PASS |
+| Masking disabled | 1 | 0.27 s | 0.37 s | 0.730x | 23,004 KiB | 12,140 KiB | 0.528x | PASS |
+| Masking disabled | 4 | 0.21 s | 0.14 s | 1.500x | 27,312 KiB | 14,292 KiB | 0.523x | PASS |
+| BLOSUM45 | 1 | 0.28 s | 0.38 s | 0.737x | 22,392 KiB | 12,696 KiB | 0.567x | PASS |
+| BLOSUM45 | 4 | 0.22 s | 0.16 s | 1.375x | 28,688 KiB | 15,308 KiB | 0.534x | PASS |
+| Identity 70% | 1 | 0.28 s | 0.40 s | 0.700x | 22,328 KiB | 12,524 KiB | 0.561x | PASS |
+| Identity 70% | 4 | 0.21 s | 0.16 s | 1.313x | 28,620 KiB | 15,744 KiB | 0.550x | PASS |
+| Query/subject cover 50% | 1 | 0.27 s | 0.38 s | 0.711x | 21,972 KiB | 12,064 KiB | 0.549x | PASS |
+| Query/subject cover 50% | 4 | 0.21 s | 0.16 s | 1.313x | 29,608 KiB | 13,444 KiB | 0.454x | PASS |
+| Top 10% | 1 | 0.27 s | 0.36 s | 0.750x | 18,488 KiB | 7,364 KiB | 0.398x | PASS |
+| Top 10% | 4 | 0.19 s | 0.14 s | 1.357x | 28,936 KiB | 8,252 KiB | 0.285x | PASS |
+| Extended tabular fields | 1 | 0.28 s | 0.38 s | 0.737x | 23,012 KiB | 12,844 KiB | 0.558x | PASS |
+| Extended tabular fields | 4 | 0.21 s | 0.16 s | 1.313x | 28,940 KiB | 17,688 KiB | 0.611x | PASS |
+
+The 64 MB setting does not spill on that compact input. A separate three-run
+AMRFinderPlus stress comparison (4,000 reference and 2,000 query proteins;
+1,357,780 and 679,382 residues) crosses the limit during stage 1. Each run
+logged migration of existing in-memory hits, retained all later hits on disk,
+and read 21.9 MiB of compressed spill data. All 40,297 output rows remained
+byte-identical (SHA-256 `6ea16d64c71f833970aa8f045adbf0cd22a35c2706c69cebbc883f0643911653`).
+
+| Adaptive mid-run spill | Threads | Runs | C++ time | Rust time | Speed | C++ RSS | Rust RSS | RSS ratio | Parity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| `--memory-limit 64M` | 1 | 3 | 20.10 s | 19.19 s | 1.047x | 54,024 KiB | 62,592 KiB | 1.159x | PASS |
+| `--memory-limit 64M` | 4 | 3 | 5.12 s | 5.85 s | 0.875x | 65,824 KiB | 66,996 KiB | 1.018x | PASS |
+
+### Native blastx comparison
+
+The translated-search comparison uses one natural contiguous 250,000 nt
+region from *E. coli* K-12 MG1655 against the independent 4,000-protein AMR
+reference above, with `--sensitive`. It is not made longer by repeating reads.
+These are medians of five alternating runs pinned to the same CPUs. All four
+cases emit the same 25 rows with SHA-256
+`05b35eb5a1a6f89425ae58fe120c12eff0dbe19c3ff9c3d1944bc7e339124bb6`.
+
+| Rust memory mode | Threads | Runs | C++ time | Rust time | Speed | C++ RSS | Rust RSS | RSS ratio | Parity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| Default 16G | 1 | 5 | 3.32 s | 5.06 s | 0.656x | 80,124 KiB | 125,764 KiB | 1.570x | PASS |
+| Default 16G | 4 | 5 | 1.43 s | 2.25 s | 0.636x | 80,332 KiB | 210,996 KiB | 2.627x | PASS |
+| Forced disk, 0G | 1 | 5 | 3.38 s | 5.33 s | 0.634x | 80,124 KiB | 142,536 KiB | 1.779x | PASS |
+| Forced disk, 0G | 4 | 5 | 1.43 s | 2.55 s | 0.561x | 82,416 KiB | 174,272 KiB | 2.115x | PASS |
+
+The blastx adapter now culls targets across all six frames of each original
+DNA query, rather than applying `-k` independently to every frame. Long-frame
+extension batches are bounded to one wave per worker, which reduced default
+four-thread RSS from about 271 MiB to 212 MiB. The remaining RSS and speed gap
+is real: forced-disk profiling places it inside long translated-context
+extension scratch, not the retained-hit store. This is therefore a known
+optimization gap rather than a claim of parity.
+
 For optimization work, use the larger real-sequence harness rather than
 duplicating the bundled records:
 
@@ -325,9 +424,10 @@ src/
 
 ### SIMD Support
 
-The DP kernels use `std::arch` intrinsics with runtime detection:
+The DP kernels and search workers use `std::arch` intrinsics with runtime detection:
 - **SSE4.1**: 16-way parallel ungapped scoring
 - **AVX2**: 32-way parallel ungapped scoring
+- **AVX-512BW**: Specialized seed-search workers when the host supports them
 - **Scalar fallback**: Works on all platforms
 
 ## Citation

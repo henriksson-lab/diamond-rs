@@ -25,6 +25,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # Several translation-audit tests compare generated Rust tables and
+      # inventories directly with the corresponding upstream source files via
+      # include_str!/include_bytes!. The local checkout lives at ./diamond but
+      # is intentionally not copied into this repository, so reproduce that
+      # layout in CI at the exact revision used for the translation baseline.
+      - name: Checkout upstream DIAMOND translation baseline
+        uses: actions/checkout@v5
+        with:
+          repository: bbuchfink/diamond
+          ref: 1d162b4fefb5e6b4d868c24e6ad551cad2dcf246
+          path: diamond
+
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
 

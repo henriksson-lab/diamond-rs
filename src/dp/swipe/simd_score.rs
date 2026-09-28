@@ -35,11 +35,7 @@ pub struct SimdScoreScratch {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     prev_h: Vec<ArchVector>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    curr_h: Vec<ArchVector>,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     prev_e: Vec<ArchVector>,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    curr_e: Vec<ArchVector>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     query_biases: Vec<ArchVector>,
 }
@@ -182,9 +178,7 @@ unsafe fn score_full_batch_avx2_impl(
     let zero = arch::_mm256_setzero_si256();
     let neg = arch::_mm256_set1_epi16(NEG);
     scratch.prev_h.resize(rows, zero);
-    scratch.curr_h.resize(rows, zero);
     scratch.prev_e.resize(rows, neg);
-    scratch.curr_e.resize(rows, neg);
     scratch.prev_h.fill(zero);
     scratch.prev_e.fill(neg);
     let go = arch::_mm256_set1_epi16(gap_open);
@@ -196,10 +190,14 @@ unsafe fn score_full_batch_avx2_impl(
     let max_subject_len = targets.iter().map(|target| target.len()).max().unwrap_or(0);
 
     for j in 0..max_subject_len {
-        scratch.curr_h[0] = zero;
-        scratch.curr_e[0] = neg;
+        // Match upstream's two-row Matrix: update score/hgap in place and
+        // retain the overwritten score as the next cell's diagonal input.
+        let mut diagonal = scratch.prev_h[0];
+        scratch.prev_h[0] = zero;
+        scratch.prev_e[0] = neg;
         let mut vertical = neg;
         for (qpos, &ql) in query.iter().enumerate() {
+            let next_diagonal = scratch.prev_h[qpos + 1];
             let mut subst = [0i16; 16];
             let mut valid = [0i16; 16];
             for lane in 0..targets.len() {
@@ -228,7 +226,7 @@ unsafe fn score_full_batch_avx2_impl(
             }
             let mask = arch::_mm256_loadu_si256(valid.as_ptr().cast());
             let substitution = arch::_mm256_loadu_si256(subst.as_ptr().cast());
-            let diag = arch::_mm256_adds_epi16(scratch.prev_h[qpos], substitution);
+            let diag = arch::_mm256_adds_epi16(diagonal, substitution);
             let horizontal = scratch.prev_e[qpos + 1];
             let mut score = arch::_mm256_max_epi16(diag, horizontal);
             score = arch::_mm256_max_epi16(score, vertical);
@@ -239,8 +237,8 @@ unsafe fn score_full_batch_avx2_impl(
             let next_horizontal =
                 arch::_mm256_max_epi16(arch::_mm256_subs_epi16(horizontal, ge), open);
             vertical = arch::_mm256_max_epi16(arch::_mm256_subs_epi16(vertical, ge), open);
-            scratch.curr_h[qpos + 1] = score;
-            scratch.curr_e[qpos + 1] = arch::_mm256_or_si256(
+            scratch.prev_h[qpos + 1] = score;
+            scratch.prev_e[qpos + 1] = arch::_mm256_or_si256(
                 arch::_mm256_and_si256(mask, next_horizontal),
                 arch::_mm256_andnot_si256(mask, neg),
             );
@@ -249,9 +247,8 @@ unsafe fn score_full_batch_avx2_impl(
                 arch::_mm256_andnot_si256(mask, neg),
             );
             best = arch::_mm256_max_epi16(best, score);
+            diagonal = next_diagonal;
         }
-        std::mem::swap(&mut scratch.prev_h, &mut scratch.curr_h);
-        std::mem::swap(&mut scratch.prev_e, &mut scratch.curr_e);
     }
 
     let mut raw_scores = [0i16; 16];

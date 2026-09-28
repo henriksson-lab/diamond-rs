@@ -74,22 +74,47 @@ impl AlgoInt for usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatternMatcher {
     min_len: u32,
-    patterns: Vec<u32>,
+    suffix_mask: u32,
+    table: Vec<u8>,
 }
 
 impl PatternMatcher {
     pub const SIZE: usize = 1usize << MAX_SHAPE_LEN;
 
     pub fn new(patterns: &[u32]) -> Self {
-        let mut min_len = 32u32;
+        let mut matcher = Self {
+            min_len: 32,
+            suffix_mask: 0,
+            table: vec![0],
+        };
         for &pattern in patterns {
-            assert!(pattern != 0);
-            let len = 32 - pattern.leading_zeros();
-            min_len = min_len.min(len);
+            matcher.add_pattern(pattern);
         }
-        Self {
-            min_len,
-            patterns: patterns.to_vec(),
+        matcher
+    }
+
+    /// Add a shape to this matcher while preserving the lookup table for the
+    /// existing prefix. DIAMOND's left-most filter accumulates shape patterns,
+    /// so this avoids rebuilding every earlier prefix from scratch.
+    pub fn add_pattern(&mut self, pattern: u32) {
+        assert!(pattern != 0);
+        let len = u32::BITS - pattern.leading_zeros();
+        assert!(len as usize <= MAX_SHAPE_LEN);
+        self.min_len = self.min_len.min(len);
+
+        let table_len = (1usize << len).max(self.table.len());
+        let old_len = self.table.len();
+        if table_len > old_len {
+            self.table.resize(table_len, 0);
+            for suffix in old_len..table_len {
+                self.table[suffix] = self.table[suffix % old_len];
+            }
+            self.suffix_mask = (table_len - 1) as u32;
+        }
+        for suffix in 0..table_len {
+            if (suffix as u32 & pattern) == pattern {
+                self.table[suffix] = 1;
+            }
         }
     }
 
@@ -99,26 +124,19 @@ impl PatternMatcher {
             return 0;
         }
 
-        // Bit i in the result denotes a pattern match starting at bit i of h.
-        // For every required position k, `h >> k` has a one at precisely the
-        // valid starts for that position. Intersecting those masks evaluates a
-        // sparse pattern without the cache-dependent 2^MAX_SHAPE_LEN table.
+        // This mirrors upstream PatternMatcher: one suffix-table lookup for
+        // every possible start, independent of the number of accumulated
+        // shapes. Bit i denotes a match starting at bit i of h.
         let mut r = 0u32;
-        let starts = len - self.min_len + 1;
-        let start_mask = if starts == u32::BITS {
-            u32::MAX
-        } else {
-            (1u32 << starts) - 1
-        };
-        for &pattern in &self.patterns {
-            let mut required = pattern;
-            let mut matches = u32::MAX;
-            while required != 0 {
-                let bit = required.trailing_zeros();
-                matches &= h >> bit;
-                required &= required - 1;
-            }
-            r |= matches & start_mask;
+        let end = len - self.min_len + 1;
+        let mut suffix = h;
+        for i in 0..end {
+            let index = (suffix & self.suffix_mask) as usize;
+            // SAFETY: `table` always has a power-of-two length and the private
+            // `suffix_mask` invariant is exactly `table.len() - 1`.
+            let matched = unsafe { *self.table.get_unchecked(index) };
+            r |= u32::from(matched) << i;
+            suffix >>= 1;
         }
         r
     }
@@ -1585,6 +1603,32 @@ mod tests {
                     state ^= state >> 17;
                     state ^= state << 5;
                     assert_eq!(matcher.hit(state, len), reference(patterns, state, len));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_pattern_matcher_incremental_prefixes_match_rebuilt_matchers() {
+        let patterns = [
+            0b11,
+            0b10101,
+            0b111101011,
+            0b1101101011,
+            0b100000000000000001,
+            0b101010101010101,
+        ];
+        let mut incremental = PatternMatcher::new(&[]);
+        let mut state = 0x243f_6a88u32;
+        for end in 1..=patterns.len() {
+            incremental.add_pattern(patterns[end - 1]);
+            let rebuilt = PatternMatcher::new(&patterns[..end]);
+            for len in 0..=32 {
+                for _ in 0..32 {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    assert_eq!(incremental.hit(state, len), rebuilt.hit(state, len));
                 }
             }
         }

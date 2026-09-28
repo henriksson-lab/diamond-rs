@@ -26,11 +26,7 @@ pub struct Scratch8 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     prev_h: Vec<V>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    curr_h: Vec<V>,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     prev_e: Vec<V>,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    curr_e: Vec<V>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     query_biases: Vec<V>,
 }
@@ -147,9 +143,7 @@ unsafe fn score_full_impl(
     let neg = arch::_mm256_set1_epi8(i8::MIN);
     let rows = query.len() + 1;
     scratch.prev_h.resize(rows, zero);
-    scratch.curr_h.resize(rows, zero);
     scratch.prev_e.resize(rows, neg);
-    scratch.curr_e.resize(rows, neg);
     scratch.prev_h.fill(zero);
     scratch.prev_e.fill(neg);
     scratch
@@ -171,10 +165,15 @@ unsafe fn score_full_impl(
     for j in 0..max_len {
         let (subject, valid, seeded) = pack_full_column(targets, j);
         let profile = build_profile(matrix, subject, seeded);
-        scratch.curr_h[0] = zero;
-        scratch.curr_e[0] = neg;
+        // Upstream SWIPE retains one score row and one horizontal-gap row,
+        // updating them in place while carrying the overwritten diagonal in
+        // a register. Two additional AVX2 rows are costly for long reads.
+        let mut diagonal = scratch.prev_h[0];
+        scratch.prev_h[0] = zero;
+        scratch.prev_e[0] = neg;
         let mut vertical = neg;
         for (q, &ql) in query.iter().enumerate() {
+            let next_diagonal = scratch.prev_h[q + 1];
             let mask = valid;
             let cbs_v = scratch.query_biases[q];
             let base = profile[(ql & LETTER_MASK) as usize];
@@ -183,7 +182,7 @@ unsafe fn score_full_impl(
                 arch::_mm256_and_si256(mask, add_overflow(base, cbs_v)),
             );
             let subst = arch::_mm256_adds_epi8(base, cbs_v);
-            let diag = arch::_mm256_adds_epi8(scratch.prev_h[q], subst);
+            let diag = arch::_mm256_adds_epi8(diagonal, subst);
             let horizontal = scratch.prev_e[q + 1];
             let mut h = arch::_mm256_max_epi8(diag, horizontal);
             h = arch::_mm256_max_epi8(h, vertical);
@@ -196,8 +195,8 @@ unsafe fn score_full_impl(
             let open = arch::_mm256_subs_epi8(h, go_v);
             let e = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(horizontal, ge_v), open);
             vertical = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(vertical, ge_v), open);
-            scratch.curr_h[q + 1] = h;
-            scratch.curr_e[q + 1] = arch::_mm256_or_si256(
+            scratch.prev_h[q + 1] = h;
+            scratch.prev_e[q + 1] = arch::_mm256_or_si256(
                 arch::_mm256_and_si256(mask, e),
                 arch::_mm256_andnot_si256(mask, neg),
             );
@@ -206,9 +205,8 @@ unsafe fn score_full_impl(
                 arch::_mm256_andnot_si256(mask, neg),
             );
             best = arch::_mm256_max_epi8(best, h);
+            diagonal = next_diagonal;
         }
-        std::mem::swap(&mut scratch.prev_h, &mut scratch.curr_h);
-        std::mem::swap(&mut scratch.prev_e, &mut scratch.curr_e);
     }
     finish(best, overflow, targets.len(), delta)
 }

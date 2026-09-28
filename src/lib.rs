@@ -53,8 +53,12 @@ pub mod run;
 pub mod search;
 pub mod stats;
 pub mod tools;
+// Translation-audit fixtures read the pinned upstream C/C++ sources. Keep
+// them out of normal library builds so a published crate remains buildable
+// without a sibling `diamond/` checkout; CI checks them in unit-test builds.
+#[cfg(test)]
 #[path = "test/mod.rs"]
-pub mod upstream_test;
+mod upstream_test;
 pub mod util;
 
 /// Convenient re-exports for common types.

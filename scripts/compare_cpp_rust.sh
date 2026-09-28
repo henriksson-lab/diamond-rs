@@ -9,9 +9,31 @@ query=${QUERY_FASTA:-"$repo_dir/diamond/src/test/5.faa"}
 repetitions=${REPETITIONS:-3}
 threads=${THREADS:-1}
 keep_work=${KEEP_WORK:-0}
+benchmark_label=${BENCH_LABEL:-custom}
+summary_file=${SUMMARY_FILE:-}
+search_command=${COMMAND:-blastp}
+search_args_text=${SEARCH_ARGS:-}
+outfmt_text=${OUTFMT_FIELDS:-"qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore"}
 rust_memory_limit=${RUST_MEMORY_LIMIT:-}
 benchmark_cpuset=${BENCH_CPUSET:-}
 benchmark_prefix=()
+search_args=()
+outfmt=()
+
+if [[ "$search_command" != blastp && "$search_command" != blastx ]]; then
+    echo "error: COMMAND must be blastp or blastx" >&2
+    exit 2
+fi
+if [[ -n "$search_args_text" ]]; then
+    # Benchmark flags and values do not contain whitespace. Keeping this as a
+    # plain word list avoids eval and makes the exact invocation visible.
+    read -r -a search_args <<< "$search_args_text"
+fi
+read -r -a outfmt <<< "$outfmt_text"
+if ((${#outfmt[@]} == 0)); then
+    echo "error: OUTFMT_FIELDS must contain at least one tabular field" >&2
+    exit 2
+fi
 
 if [[ -n "$benchmark_cpuset" ]]; then
     if ! command -v taskset >/dev/null 2>&1; then
@@ -77,11 +99,18 @@ cleanup() {
 trap cleanup EXIT
 
 fasta_stats() {
-    awk '
+    local fasta=$1
+    local magic
+    magic=$(od -An -tx1 -N2 -- "$fasta" | tr -d ' \n')
+    local reader=(cat -- "$fasta")
+    if [[ "$magic" == 1f8b ]]; then
+        reader=(gzip -cd -- "$fasta")
+    fi
+    "${reader[@]}" | awk '
         /^>/ { ++records; next }
         { gsub(/[[:space:]]/, ""); residues += length }
         END { printf "%d\t%d\n", records + 0, residues + 0 }
-    ' "$1"
+    '
 }
 
 IFS=$'\t' read -r reference_records reference_residues < <(fasta_stats "$reference")
@@ -89,6 +118,14 @@ IFS=$'\t' read -r query_records query_residues < <(fasta_stats "$query")
 printf 'Workload: reference=%s records/%s residues; query=%s records/%s residues; threads=%s; runs=%s\n' \
     "$reference_records" "$reference_residues" "$query_records" "$query_residues" \
     "$threads" "$repetitions"
+printf 'Search mode: %s' "$search_command"
+if ((${#search_args[@]})); then
+    printf ' %q' "${search_args[@]}"
+fi
+printf '\n'
+printf 'Output fields:'
+printf ' %q' "${outfmt[@]}"
+printf '\n'
 if [[ -n "$benchmark_cpuset" ]]; then
     printf 'CPU affinity: %s (applied identically to C++ and Rust)\n' "$benchmark_cpuset"
 fi
@@ -112,9 +149,16 @@ measure() {
     local run=$3
     shift 3
     local measurement="$work_dir/time.txt"
-    /usr/bin/time -f '%e\t%M' -o "$measurement" "${benchmark_prefix[@]}" "$@" \
-        >"$work_dir/${implementation}-${operation}-${run}.stdout" \
-        2>"$work_dir/${implementation}-${operation}-${run}.stderr"
+    local stdout="$work_dir/${implementation}-${operation}-${run}.stdout"
+    local stderr="$work_dir/${implementation}-${operation}-${run}.stderr"
+    if ! /usr/bin/time -f '%e\t%M' -o "$measurement" "${benchmark_prefix[@]}" "$@" \
+        >"$stdout" 2>"$stderr"; then
+        keep_work=1
+        printf 'error: %s %s run %s failed; stderr follows:\n' \
+            "$implementation" "$operation" "$run" >&2
+        sed -n '1,160p' "$stderr" >&2
+        return 1
+    fi
     local seconds rss
     IFS=$'\t' read -r seconds rss < "$measurement"
     printf '%s\t%s\t%s\t%s\t%s\n' \
@@ -125,10 +169,10 @@ cpp_db="$work_dir/cpp-db"
 rust_db="$work_dir/rust-db"
 cpp_output="$work_dir/cpp.tsv"
 rust_output="$work_dir/rust.tsv"
-outfmt=(6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore)
-rust_blastp_extra=()
+outfmt=(6 "${outfmt[@]}")
+rust_search_extra=()
 if [[ -n "$rust_memory_limit" ]]; then
-    rust_blastp_extra+=(--memory-limit "$rust_memory_limit" --tmpdir "$work_dir")
+    rust_search_extra+=(--memory-limit "$rust_memory_limit" --tmpdir "$work_dir")
 fi
 
 for run in $(seq 1 "$repetitions"); do
@@ -153,12 +197,13 @@ for run in $(seq 1 "$repetitions"); do
     fi
     for implementation in "${implementations[@]}"; do
         if [[ "$implementation" == cpp ]]; then
-            measure cpp blastp "$run" "$cpp_bin" blastp -q "$query" -d "$cpp_db" \
-                -o "$cpp_output" --threads "$threads" --outfmt "${outfmt[@]}"
+            measure cpp "$search_command" "$run" "$cpp_bin" "$search_command" \
+                -q "$query" -d "$cpp_db" -o "$cpp_output" --threads "$threads" \
+                "${search_args[@]}" --outfmt "${outfmt[@]}"
         else
-            measure rust blastp "$run" "$rust_bin" blastp -q "$query" -d "$rust_db" \
-                -o "$rust_output" --threads "$threads" "${rust_blastp_extra[@]}" \
-                --outfmt "${outfmt[@]}"
+            measure rust "$search_command" "$run" "$rust_bin" "$search_command" \
+                -q "$query" -d "$rust_db" -o "$rust_output" --threads "$threads" \
+                "${rust_search_extra[@]}" "${search_args[@]}" --outfmt "${outfmt[@]}"
         fi
     done
 done
@@ -201,7 +246,7 @@ spread() {
 }
 
 printf '\n%-8s %-8s %12s %14s\n' implementation operation seconds peak_rss_kib
-for operation in makedb blastp; do
+for operation in makedb "$search_command"; do
     for implementation in cpp rust; do
         printf '%-8s %-8s %12s %14s\n' \
             "$implementation" "$operation" \
@@ -210,21 +255,34 @@ for operation in makedb blastp; do
     done
 done
 
-cpp_seconds=$(median cpp blastp 4)
-rust_seconds=$(median rust blastp 4)
-cpp_rss=$(median cpp blastp 5)
-rust_rss=$(median rust blastp 5)
+cpp_seconds=$(median cpp "$search_command" 4)
+rust_seconds=$(median rust "$search_command" 4)
+cpp_rss=$(median cpp "$search_command" 5)
+rust_rss=$(median rust "$search_command" 5)
 awk -v cpp="$cpp_seconds" -v rust="$rust_seconds" \
-    'BEGIN { printf "\nblastp speedup (C++/Rust): %.3fx\n", cpp / rust }'
+    -v command="$search_command" \
+    'BEGIN { printf "\n%s speedup (C++/Rust): %.3fx\n", command, cpp / rust }'
 awk -v cpp="$cpp_rss" -v rust="$rust_rss" \
-    'BEGIN { printf "blastp RSS ratio (Rust/C++): %.3fx\n", rust / cpp }'
-printf 'C++ blastp timing: %s\n' "$(spread cpp blastp)"
-printf 'Rust blastp timing: %s\n' "$(spread rust blastp)"
-printf 'blastp byte parity: %s\n' "$parity"
+    -v command="$search_command" \
+    'BEGIN { printf "%s RSS ratio (Rust/C++): %.3fx\n", command, rust / cpp }'
+printf 'C++ %s timing: %s\n' "$search_command" "$(spread cpp "$search_command")"
+printf 'Rust %s timing: %s\n' "$search_command" "$(spread rust "$search_command")"
+printf '%s byte parity: %s\n' "$search_command" "$parity"
 printf 'C++ SHA-256: '
 sha256sum "$cpp_output" | awk '{print $1}'
 printf 'Rust SHA-256: '
 sha256sum "$rust_output" | awk '{print $1}'
+if [[ -n "$summary_file" ]]; then
+    speed_ratio=$(awk -v cpp="$cpp_seconds" -v rust="$rust_seconds" \
+        'BEGIN { printf "%.6f", cpp / rust }')
+    rss_ratio=$(awk -v cpp="$cpp_rss" -v rust="$rust_rss" \
+        'BEGIN { printf "%.6f", rust / cpp }')
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$benchmark_label" "$search_command" "$threads" "$repetitions" \
+        "${rust_memory_limit:-16G-default}" "$search_args_text" \
+        "$cpp_seconds" "$rust_seconds" "$speed_ratio" "$cpp_rss" "$rust_rss" \
+        "$rss_ratio" "$parity" >> "$summary_file"
+fi
 if [[ "$keep_work" == 1 || "$parity" != PASS ]]; then
     printf 'Raw metrics: %s\n' "$metrics"
 else

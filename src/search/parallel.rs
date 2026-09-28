@@ -199,6 +199,35 @@ pub fn find_seed_matches_partitioned_filtered_min_query_len(
     )
 }
 
+fn build_search_seed_array(
+    seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    seedp_bits: i32,
+    min_query_len: usize,
+    sketch_size: usize,
+) -> SeedArray {
+    if sketch_size > 0 {
+        SeedArray::build_sketch_with_min_query_len(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            sketch_size,
+            min_query_len,
+        )
+    } else {
+        SeedArray::build_with_complexity_cut_and_min_query_len(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            0.0,
+            min_query_len,
+        )
+    }
+}
+
 /// Collect the low-complexity query positions produced by the joined seed
 /// groups without retaining the cross product.  Blastp uses this as a masking
 /// prepass so its partition consumer can run the left-most filter immediately.
@@ -209,21 +238,22 @@ pub fn collect_low_complexity_positions_partitioned_min_query_len(
     reduction: &Reduction,
     complexity_cut: f64,
     min_query_len: usize,
+    sketch_size: usize,
 ) -> Vec<(u32, u32)> {
     if complexity_cut <= 0.0 {
         return Vec::new();
     }
     let seedp_bits = DEFAULT_SEEDP_BITS;
-    let mut query_sa = SeedArray::build_with_complexity_cut_and_min_query_len(
+    let mut query_sa = build_search_seed_array(
         query_seqs,
         shape,
         reduction,
         seedp_bits,
-        0.0,
         min_query_len,
+        sketch_size,
     );
     let mut ref_sa =
-        SeedArray::build_with_complexity_cut(ref_seqs, shape, reduction, seedp_bits, 0.0);
+        build_search_seed_array(ref_seqs, shape, reduction, seedp_bits, 0, sketch_size);
     let num_partitions = query_sa.num_partitions();
     let query_offsets = query_sa.seq_offsets().to_vec();
 
@@ -427,6 +457,7 @@ pub fn map_seed_matches_partitioned_streaming_hamming_min_query_len<T, F>(
     complexity_cut: f64,
     min_query_len: usize,
     hamming_filter_id: u32,
+    sketch_size: usize,
     map_batch: F,
 ) -> (Vec<Vec<T>>, usize)
 where
@@ -444,6 +475,7 @@ where
         complexity_cut,
         min_query_len,
         hamming_filter_id,
+        sketch_size,
         usize::MAX,
         map_batch,
         |partitions| output.extend(partitions),
@@ -467,6 +499,7 @@ pub fn visit_seed_matches_partitioned_streaming_hamming_min_query_len<T, F, C>(
     complexity_cut: f64,
     min_query_len: usize,
     hamming_filter_id: u32,
+    sketch_size: usize,
     partition_batch_size: usize,
     map_batch: F,
     consume: C,
@@ -493,6 +526,7 @@ where
                 complexity_cut,
                 min_query_len,
                 hamming_filter_id,
+                sketch_size,
                 partition_batch_size,
                 map_batch,
                 consume,
@@ -534,6 +568,7 @@ fn visit_seed_matches_partitioned_streaming_hamming_min_query_len_for<
     complexity_cut: f64,
     min_query_len: usize,
     hamming_filter_id: u32,
+    sketch_size: usize,
     partition_batch_size: usize,
     map_batch: F,
     mut consume: C,
@@ -546,16 +581,16 @@ where
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let seedp_bits = DEFAULT_SEEDP_BITS;
-    let mut query_sa = SeedArray::build_with_complexity_cut_and_min_query_len(
+    let mut query_sa = build_search_seed_array(
         query_seqs,
         shape,
         reduction,
         seedp_bits,
-        0.0,
         min_query_len,
+        sketch_size,
     );
     let mut ref_sa =
-        SeedArray::build_with_complexity_cut(ref_seqs, shape, reduction, seedp_bits, 0.0);
+        build_search_seed_array(ref_seqs, shape, reduction, seedp_bits, 0, sketch_size);
     let num_partitions = query_sa.num_partitions();
     let query_offsets = query_sa.seq_offsets().to_vec();
     let ref_offsets = ref_sa.seq_offsets().to_vec();
@@ -749,7 +784,6 @@ where
                 };
                 active -= 1;
                 completed.insert(partition, output);
-
                 let mut ready = Vec::new();
                 while let Some(output) = completed.remove(&next_partition) {
                     ready.push(output);

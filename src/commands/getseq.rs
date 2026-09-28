@@ -1,14 +1,29 @@
 use std::io::{self, Write};
+use std::path::Path;
 
 use crate::basic::value::AMINO_ACID_ALPHABET;
 use crate::data::dmnd_reader;
 
 /// Run the getseq command — retrieve sequences from a DIAMOND database.
 pub fn run(database: &str, seq_ids: Option<&str>) -> io::Result<()> {
+    run_with_output(database, seq_ids, None)
+}
+
+/// Retrieve sequences and optionally write them to `-o/--out`. Keeping stdout
+/// as the `None` case preserves the library API while matching the CLI's
+/// upstream output-file behavior.
+pub fn run_with_output(
+    database: &str,
+    seq_ids: Option<&str>,
+    output: Option<&Path>,
+) -> io::Result<()> {
     let (_header, records) = dmnd_reader::read_dmnd_auto(database)?;
 
-    let stdout = io::stdout();
-    let mut writer = io::BufWriter::new(stdout.lock());
+    let mut writer: Box<dyn Write> = if let Some(path) = output {
+        Box::new(io::BufWriter::new(std::fs::File::create(path)?))
+    } else {
+        Box::new(io::BufWriter::new(io::stdout()))
+    };
 
     if let Some(ids_str) = seq_ids {
         // Output specific sequences. Match against the BLAST seqid (truncated
@@ -62,5 +77,19 @@ mod tests {
         // Should succeed without error
         let result = run(db, Some("d1ivsa4"));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn getseq_writes_requested_output_file() {
+        let db = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
+        let output = std::env::temp_dir().join(format!(
+            "diamond-getseq-output-test-{}.faa",
+            std::process::id()
+        ));
+        run_with_output(db, Some("d1ivsa4"), Some(&output)).unwrap();
+        let fasta = std::fs::read_to_string(&output).unwrap();
+        assert!(fasta.starts_with(">d1ivsa4"));
+        assert!(fasta.lines().count() > 1);
+        std::fs::remove_file(output).unwrap();
     }
 }

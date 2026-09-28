@@ -15,8 +15,19 @@ use crate::util::sequence::find_orfs;
 /// Translation info for one protein frame query.
 struct FrameInfo {
     original_id: String,
+    original_index: usize,
     frame: Frame,
     dna_len: i32,
+}
+
+#[derive(Debug)]
+struct BlastxRow {
+    text: String,
+    query_index: usize,
+    subject_id: String,
+    evalue: f64,
+    bitscore: f64,
+    ordinal: usize,
 }
 
 /// Configuration for a blastx run.
@@ -79,7 +90,7 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
     let use_forward = config.strand != "minus";
     let use_reverse = config.strand != "plus";
 
-    for dna_rec in &dna_records {
+    for (dna_index, dna_rec) in dna_records.iter().enumerate() {
         let dna_bytes: Vec<u8> = dna_rec.sequence.iter().map(|&l| l as u8).collect();
         let dna_len = dna_bytes.len() as i32;
         let frames =
@@ -113,7 +124,15 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
                 .next()
                 .unwrap_or("")
                 .to_string();
-            let frame_id = format!("{}_frame{}", dna_short, frame.signed_frame());
+            // Include the input ordinal in the private frame id. Two input
+            // records are allowed to have the same printed FASTA id, but they
+            // must still be culled independently as two source queries.
+            let frame_id = format!(
+                "{}_diamond_query{}_frame{}",
+                dna_short,
+                dna_index,
+                frame.signed_frame()
+            );
             let mut sequence: Vec<Letter> = frame_seq.iter().map(|&b| b as Letter).collect();
             let min_orf = min_orf_len(config.min_orf.unwrap_or(0), sequence.len());
             find_orfs(&mut sequence, min_orf as i32);
@@ -121,6 +140,7 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
                 frame_id.clone(),
                 FrameInfo {
                     original_id: dna_short,
+                    original_index: dna_index,
                     frame,
                     dna_len,
                 },
@@ -223,23 +243,25 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
         Some(path) => Box::new(BufWriter::new(std::fs::File::create(path)?)),
         None => Box::new(BufWriter::new(io::stdout())),
     };
-    for line in bp_in.lines() {
+    let mut rows = Vec::new();
+    let mut passthrough = Vec::new();
+    for (ordinal, line) in bp_in.lines().enumerate() {
         let line = line?;
         if line.is_empty() {
-            writeln!(writer)?;
+            passthrough.push(line);
             continue;
         }
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() < 12 {
             // Unknown format — emit as-is.
-            writeln!(writer, "{}", line)?;
+            passthrough.push(line);
             continue;
         }
         let info = match frame_info.get(cols[0]) {
             Some(f) => f,
             None => {
                 // No frame metadata (shouldn't happen) — emit unchanged.
-                writeln!(writer, "{}", line)?;
+                passthrough.push(line);
                 continue;
             }
         };
@@ -254,11 +276,98 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
         out_cols[0] = info.original_id.clone();
         out_cols[6] = q_start_dna.to_string();
         out_cols[7] = q_end_dna.to_string();
-        writeln!(writer, "{}", out_cols.join("\t"))?;
+        rows.push(BlastxRow {
+            text: out_cols.join("\t"),
+            query_index: info.original_index,
+            subject_id: cols[1].to_string(),
+            evalue: cols[10].parse().unwrap_or(f64::INFINITY),
+            bitscore: cols[11].parse().unwrap_or(f64::NEG_INFINITY),
+            ordinal,
+        });
+    }
+
+    // blastp sees each translated frame as a separate query, so its `-k`
+    // limit is necessarily frame-local. DIAMOND blastx instead ranks targets
+    // across every translated context of the original nucleotide query. A
+    // global top-k target cannot rank below k in the frame that produced its
+    // best HSP, so retaining k per frame above is sufficient; merge duplicate
+    // subjects, rank once here, and apply the user-visible limit globally.
+    for line in cull_blastx_rows(
+        rows,
+        dna_records.len(),
+        config.max_target_seqs,
+        config.toppercent,
+    ) {
+        writeln!(writer, "{}", line)?;
+    }
+    for line in passthrough {
+        writeln!(writer, "{}", line)?;
     }
     writer.flush()?;
     let _ = std::fs::remove_file(&tmp_bp_out);
     Ok(())
+}
+
+fn cull_blastx_rows(
+    rows: Vec<BlastxRow>,
+    query_count: usize,
+    max_target_seqs: i64,
+    toppercent: Option<f64>,
+) -> Vec<String> {
+    let mut by_query: Vec<HashMap<String, BlastxRow>> =
+        (0..query_count).map(|_| HashMap::new()).collect();
+
+    for row in rows {
+        let Some(targets) = by_query.get_mut(row.query_index) else {
+            continue;
+        };
+        match targets.entry(row.subject_id.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(row);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                if row.evalue < current.evalue
+                    || (row.evalue == current.evalue && row.bitscore > current.bitscore)
+                    || (row.evalue == current.evalue
+                        && row.bitscore == current.bitscore
+                        && row.ordinal < current.ordinal)
+                {
+                    entry.insert(row);
+                }
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    for targets in by_query {
+        let mut targets: Vec<BlastxRow> = targets.into_values().collect();
+        if toppercent.is_some() {
+            targets.sort_by(|a, b| {
+                b.bitscore
+                    .total_cmp(&a.bitscore)
+                    .then_with(|| a.evalue.total_cmp(&b.evalue))
+                    .then_with(|| a.ordinal.cmp(&b.ordinal))
+            });
+        } else {
+            targets.sort_by(|a, b| {
+                a.evalue
+                    .total_cmp(&b.evalue)
+                    .then_with(|| b.bitscore.total_cmp(&a.bitscore))
+                    .then_with(|| a.ordinal.cmp(&b.ordinal))
+            });
+        }
+
+        if let Some(percent) = toppercent {
+            if let Some(top) = targets.first().map(|row| row.bitscore) {
+                targets.retain(|row| (1.0 - row.bitscore / top) * 100.0 <= percent);
+            }
+        } else if max_target_seqs > 0 {
+            targets.truncate(max_target_seqs as usize);
+        }
+        output.extend(targets.into_iter().map(|row| row.text));
+    }
+    output
 }
 
 fn min_orf_len(run_len: u32, length: usize) -> u32 {
@@ -309,6 +418,23 @@ fn protein_to_dna_coords(
 mod tests {
     use super::*;
 
+    fn row(
+        query_index: usize,
+        subject: &str,
+        evalue: f64,
+        bitscore: f64,
+        ordinal: usize,
+    ) -> BlastxRow {
+        BlastxRow {
+            text: format!("q{query_index}\t{subject}\t{evalue}\t{bitscore}"),
+            query_index,
+            subject_id: subject.to_string(),
+            evalue,
+            bitscore,
+            ordinal,
+        }
+    }
+
     #[test]
     fn test_blastx_translation() {
         // Test that DNA translation produces valid protein frames
@@ -349,5 +475,43 @@ mod tests {
                 3
             ]
         );
+    }
+
+    #[test]
+    fn blastx_target_limit_is_global_across_frames() {
+        // Model three translated frames, each with its own local top three.
+        // The nucleotide query must still emit only the global top three
+        // unique subjects, and duplicate target A keeps its best-frame HSP.
+        let rows = vec![
+            row(0, "A", 1e-20, 100.0, 0),
+            row(0, "B", 1e-10, 80.0, 1),
+            row(0, "C", 1e-5, 50.0, 2),
+            row(0, "D", 1e-30, 120.0, 3),
+            row(0, "A", 1e-40, 130.0, 4),
+            row(0, "E", 1e-15, 90.0, 5),
+            row(0, "F", 1e-25, 110.0, 6),
+        ];
+        let output = cull_blastx_rows(rows, 1, 3, None);
+        assert_eq!(output.len(), 3);
+        let subjects: Vec<&str> = output
+            .iter()
+            .map(|line| line.split('\t').nth(1).unwrap())
+            .collect();
+        assert_eq!(subjects, ["A", "D", "F"]);
+        assert!(output[0].ends_with("\t130"));
+    }
+
+    #[test]
+    fn blastx_target_limit_is_per_original_query() {
+        let rows = vec![
+            row(0, "A", 1e-20, 100.0, 0),
+            row(0, "B", 1e-10, 80.0, 1),
+            row(1, "C", 1e-30, 120.0, 2),
+            row(1, "D", 1e-5, 50.0, 3),
+        ];
+        let output = cull_blastx_rows(rows, 2, 1, None);
+        assert_eq!(output.len(), 2);
+        assert!(output[0].starts_with("q0\tA\t"));
+        assert!(output[1].starts_with("q1\tC\t"));
     }
 }

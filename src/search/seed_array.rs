@@ -7,6 +7,7 @@
 
 use crate::basic::reduction::Reduction;
 use crate::basic::seed::{self, PackedSeed, SeedPartition};
+use crate::basic::seed_iterator::SketchIterator;
 use crate::basic::shape::Shape;
 use crate::basic::value::Letter;
 use crate::search::seed_match::SeedMatch;
@@ -119,6 +120,77 @@ impl SeedArray {
             0,
             seed::seedp_count(seedp_bits) as usize,
         )
+    }
+
+    /// Build the per-sequence bottom-hash sketch used by `--faster`.
+    /// Upstream reduces each complete sequence first, selects at most
+    /// `sketch_size` seeds by Murmur hash, and only then partitions them.
+    pub fn build_sketch_with_min_query_len(
+        seqs: &[&[Letter]],
+        shape: &Shape,
+        reduction: &Reduction,
+        seedp_bits: i32,
+        sketch_size: usize,
+        min_query_len: usize,
+    ) -> Self {
+        use rayon::prelude::*;
+
+        let num_partitions = seed::seedp_count(seedp_bits) as usize;
+        let mask = seed::seedp_mask(seedp_bits);
+        let seq_offsets = Self::sequence_offsets(seqs);
+        let buckets = seqs
+            .par_iter()
+            .enumerate()
+            .fold(
+                || (0..num_partitions).map(|_| Vec::new()).collect::<Vec<_>>(),
+                |mut buckets, (seq_id, seq)| {
+                    if seq.len() < min_query_len || seq.len() < shape.length as usize {
+                        return buckets;
+                    }
+                    let reduced = reduction.reduce_seq(seq);
+                    let mut iterator = SketchIterator::new(
+                        &reduced,
+                        shape,
+                        sketch_size.min(i32::MAX as usize) as i32,
+                        reduction,
+                    );
+                    while iterator.good() {
+                        let packed = iterator.get();
+                        let partition = seed::seed_partition(packed, mask) as usize;
+                        buckets[partition].push(SeedEntry {
+                            key: seed::seed_partition_offset(packed, seedp_bits as u64) as u32,
+                            loc: seq_offsets[seq_id] + iterator.pos() as u32,
+                        });
+                        iterator.increment();
+                    }
+                    buckets
+                },
+            )
+            .reduce(
+                || (0..num_partitions).map(|_| Vec::new()).collect::<Vec<_>>(),
+                |mut left, right| {
+                    for (left, right) in left.iter_mut().zip(right) {
+                        left.extend(right);
+                    }
+                    left
+                },
+            );
+
+        let mut offsets = Vec::with_capacity(num_partitions + 1);
+        offsets.push(0);
+        for bucket in &buckets {
+            offsets.push(offsets.last().copied().unwrap() + bucket.len());
+        }
+        let mut data = Vec::with_capacity(*offsets.last().unwrap());
+        for bucket in buckets {
+            data.extend(bucket);
+        }
+        Self {
+            data,
+            offsets,
+            seq_offsets,
+            seedp_bits,
+        }
     }
 
     pub fn build_with_complexity_cut_and_min_query_len_partition_range(
@@ -1003,6 +1075,55 @@ mod tests {
         actual.sort_unstable();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn sketch_build_matches_per_sequence_bottom_hash_selection() {
+        let reduction = Reduction::default_reduction();
+        let shape = Shape::from_code("1111", &reduction);
+        let seedp_bits = 4;
+        let mask = seed::seedp_mask(seedp_bits);
+        let seqs_owned: Vec<Vec<Letter>> = vec![
+            (0..28).map(|i| ((i * 3 + 1) % 20) as Letter).collect(),
+            (0..31).map(|i| ((i * 7 + 2) % 20) as Letter).collect(),
+            // This sequence is deliberately shorter than min_query_len.
+            (0..9).map(|i| ((i * 11 + 4) % 20) as Letter).collect(),
+        ];
+        let seqs: Vec<&[Letter]> = seqs_owned.iter().map(Vec::as_slice).collect();
+
+        let actual = SeedArray::build_sketch_with_min_query_len(
+            &seqs, &shape, &reduction, seedp_bits, 5, 10,
+        );
+
+        let mut expected = Vec::new();
+        for (seq_id, seq) in seqs.iter().take(2).enumerate() {
+            let reduced = reduction.reduce_seq(seq);
+            let mut iterator = SketchIterator::new(&reduced, &shape, 5, &reduction);
+            while iterator.good() {
+                let packed = iterator.get();
+                expected.push((
+                    seed::seed_partition(packed, mask) as usize,
+                    seed::seed_partition_offset(packed, seedp_bits as u64) as u32,
+                    seq_id as u32,
+                    iterator.pos() as u32,
+                ));
+                iterator.increment();
+            }
+        }
+        expected.sort_unstable();
+
+        let mut observed = Vec::new();
+        for partition in 0..actual.num_partitions() {
+            for entry in actual.partition(partition as SeedPartition) {
+                let (seq_id, pos) = actual.seq_pos(*entry);
+                observed.push((partition, entry.key, seq_id, pos));
+            }
+        }
+        observed.sort_unstable();
+
+        assert_eq!(observed, expected);
+        assert_eq!(observed.len(), 10);
+        assert!(observed.iter().all(|entry| entry.2 < 2));
     }
 
     #[test]

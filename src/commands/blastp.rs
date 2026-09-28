@@ -126,12 +126,14 @@ struct AdaptiveHitStore {
     memory_limit: Option<usize>,
     tmpdir: PathBuf,
     query_count: usize,
+    query_bins: usize,
     max_subject: u64,
 }
 
 impl AdaptiveHitStore {
     fn new(
         query_count: usize,
+        query_bins: usize,
         max_subject: u64,
         memory_limit: Option<usize>,
         tmpdir: PathBuf,
@@ -142,6 +144,7 @@ impl AdaptiveHitStore {
             memory_limit,
             tmpdir,
             query_count,
+            query_bins,
             max_subject,
         }
     }
@@ -187,7 +190,11 @@ impl AdaptiveHitStore {
             return Ok(());
         }
         let query_end = self.query_count.max(1).min(u32::MAX as usize) as u32;
-        let num_bins = self.query_count.clamp(1, 16);
+        // Match upstream's sensitivity-specific query-bin count (16 for most
+        // modes, 64 for ultra-sensitive). Each bin is decoded as a unit during
+        // alignment, so retaining the default-mode count in ultra-sensitive
+        // searches multiplies the live decoded-hit footprint by about four.
+        let num_bins = self.query_count.clamp(1, self.query_bins.max(1));
         let mut key_partition = Vec::with_capacity(num_bins);
         for bin in 1..=num_bins {
             let end = ((bin * self.query_count + num_bins - 1) / num_bins)
@@ -613,6 +620,31 @@ fn trim_freed_heap_pages() {
     }
 }
 
+// Upstream Tantan starts treating 50k residues as an oversized sequence (its
+// reusable buffers have a 50k-residue floor).  Queries beyond that size also
+// make the final SWIPE pass allocate unusually large temporary profiles and
+// traceback matrices.  Keeping 64 waves of those temporaries in the allocator
+// before returning to the writer can make freed pages dominate RSS, especially
+// for blastx where the six translated contexts are all long.  Bound only this
+// unusual case to one wave of queries per worker; ordinary protein workloads
+// retain the wider batch used for load balancing.
+const LONG_QUERY_RESIDUES: usize = 50_000;
+
+fn output_query_batch_size(records: &[fasta::FastaRecord], threads: usize) -> (usize, bool) {
+    let threads = threads.max(1);
+    let has_long_query = records
+        .iter()
+        .any(|record| record.sequence.len() > LONG_QUERY_RESIDUES);
+    (
+        if has_long_query {
+            threads
+        } else {
+            threads * 64
+        },
+        has_long_query,
+    )
+}
+
 /// Configuration for a blastp run.
 #[derive(Clone)]
 pub struct BlastpConfig {
@@ -743,10 +775,40 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     }
     eprintln!("Queries: {} sequences", query_records.len());
 
+    // Upstream derives a minimum length ratio when the two coverage cutoffs
+    // are equal and at least 50%, then length-sorts both sides before search
+    // (`run/config.cpp` and `run/double_indexed.cpp`).  Besides improving the
+    // stage-1 schedule, this determines the observable query order in tabular
+    // output.  Retain the original ordinal as the tie breaker: C++ sorts
+    // `pair<length, BlockId>` with `greater`, so equal-length records appear
+    // in descending input order as well.
+    if config.query_cover >= 50.0 && config.query_cover == config.subject_cover {
+        let sort_by_cpp_length_order = |records: &mut Vec<fasta::FastaRecord>| {
+            let mut indexed: Vec<_> = records.drain(..).enumerate().collect();
+            indexed.sort_unstable_by(|(left_id, left), (right_id, right)| {
+                right
+                    .sequence
+                    .len()
+                    .cmp(&left.sequence.len())
+                    .then_with(|| right_id.cmp(left_id))
+            });
+            records.extend(indexed.into_iter().map(|(_, record)| record));
+        };
+        sort_by_cpp_length_order(&mut query_records);
+        sort_by_cpp_length_order(&mut db_records);
+    }
+
     use crate::basic::value::{MASK_LETTER, SEED_MASK};
     use rayon::iter::IntoParallelRefMutIterator;
     match config.masking {
-        MaskingMode::None => {}
+        MaskingMode::None => {
+            // Protein databases retain makedb's tantan soft-mask bit.  Search
+            // mode 0 disables masking, so expose the stored residues exactly
+            // as upstream does instead of letting DP treat them as masked.
+            db_records
+                .par_iter_mut()
+                .for_each(|r| crate::masking::remove_bit_mask(&mut r.sequence));
+        }
         MaskingMode::Tantan => {
             // C++ constructs the tantan masker from the active ScoreMatrix and
             // applies it at search time to both targets and queries
@@ -865,23 +927,6 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         .iter()
         .map(|code| Shape::from_code(code, &reduction))
         .collect();
-    let shape_patterns: Vec<u32> = shapes.iter().map(|shape| shape.mask).collect();
-    let left_most_contexts: Vec<LeftMostContext<'_>> = (0..shapes.len())
-        .map(|sid| {
-            let previous = if sid == 0 {
-                &shape_patterns[0..0]
-            } else {
-                &shape_patterns[0..sid]
-            };
-            LeftMostContext {
-                previous_matcher: PatternMatcher::new(previous),
-                current_matcher: PatternMatcher::new(&shape_patterns[0..=sid]),
-                short_query_ungapped_cutoff: score_matrix.rawscore_int(25.0),
-                seedp_mask: seedp_mask(10),
-                reduction: &reduction,
-            }
-        })
-        .collect();
     eprintln!(
         "Sensitivity: {:?}, shapes: {} (weights: {})",
         config.sensitivity,
@@ -944,6 +989,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 &reduction,
                 complexity_cut,
                 config.min_query_len,
+                traits.sketch_size.max(0) as usize,
             ),
         );
     }
@@ -980,7 +1026,11 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     let use_left_most_range = chunked
         && (config.ext_chunk_size == 0 || config.ext_chunk_size <= 128)
         && config.max_target_seqs <= 25;
-    let skip_left_most = config.sensitivity >= Sensitivity::VerySensitive;
+    // Upstream stage2 skips this filter only for minimizer/sketch and linear
+    // search modes; sensitivity itself is not a bypass. Keeping all hits for
+    // very/ultra-sensitive searches inflated the spill file by two orders of
+    // magnitude (and subsequently decoded those unnecessary hits into RAM).
+    let skip_left_most = traits.minimizer_window > 0 || traits.sketch_size > 0;
     // Select the stage-2 kernel once. A tiny const-generic trampoline keeps
     // CPU-feature branches out of the batch loop without cloning the much
     // larger partition worker for every ISA.
@@ -1018,6 +1068,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     let partition_filter: PartitionFilter = filter_partition_to_hits_baseline;
     let mut hit_store = AdaptiveHitStore::new(
         stage2_queries.len(),
+        traits.query_bins as usize,
         db_block.seqs().data().len() as u64,
         config.memory_limit,
         config.tmpdir.clone(),
@@ -1029,7 +1080,17 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     }
     let mut retained_hit_count = 0usize;
     let mut raw_seed_matches = 0usize;
+    let mut current_left_most_matcher = PatternMatcher::new(&[]);
     for (shape_id, shape) in shapes.iter().enumerate() {
+        let previous_left_most_matcher = current_left_most_matcher.clone();
+        current_left_most_matcher.add_pattern(shape.mask);
+        let left_most_context = LeftMostContext {
+            previous_matcher: previous_left_most_matcher,
+            current_matcher: current_left_most_matcher.clone(),
+            short_query_ungapped_cutoff: score_matrix.rawscore_int(25.0),
+            seedp_mask: seedp_mask(10),
+            reduction: &reduction,
+        };
         let complexity_cut = traits.seed_cut * std::f64::consts::LN_2 * shape.weight as f64;
         let map_matches = |matches: &[SeedMatch], out: &mut Vec<StoredHit>| {
             // SAFETY: the AVX-512 function item is installed only after the
@@ -1044,7 +1105,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                     &ungapped_cutoffs,
                     &score_matrix,
                     shape,
-                    &left_most_contexts[shape_id],
+                    &left_most_context,
                     shape_id == 0,
                     chunked,
                     use_left_most_range,
@@ -1069,6 +1130,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                     complexity_cut,
                     config.min_query_len,
                     traits.min_identities,
+                    traits.sketch_size.max(0) as usize,
                     map_matches,
                 );
             retained_hit_count += hit_store.ingest_partitions(partitions)?;
@@ -1085,6 +1147,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 complexity_cut,
                 config.min_query_len,
                 traits.min_identities,
+                traits.sketch_size.max(0) as usize,
                 // Keep enough independent partitions in flight that skewed
                 // seed groups do not leave workers idle at every disk-writer
                 // handoff. This remains bounded (and far below a complete
@@ -1345,11 +1408,12 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // Preserve input order without retaining every query's formatted output.
     // A moderately sized batch gives Rayon enough work to balance variable
     // protein lengths while keeping buffered output proportional to threads.
-    let output_batch_size = rayon::current_num_threads().max(1) * 64;
     let mut write_query_range = |range_begin: usize,
                                  records: &[fasta::FastaRecord],
                                  hits_by_query: &[Vec<CompactHit>]|
      -> io::Result<()> {
+        let (output_batch_size, trim_between_batches) =
+            output_query_batch_size(records, rayon::current_num_threads());
         for (batch_idx, query_batch) in records.chunks(output_batch_size).enumerate() {
             let local_begin = batch_idx * output_batch_size;
             let query_begin = range_begin + local_begin;
@@ -1376,6 +1440,10 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             for buf in batch_output {
                 total_alignments += buf.iter().filter(|&&b| b == b'\n').count() as u64;
                 writer.write_all(&buf)?;
+            }
+            if trim_between_batches && local_begin.saturating_add(query_batch.len()) < records.len()
+            {
+                trim_freed_heap_pages();
             }
         }
         Ok(())
@@ -1430,10 +1498,148 @@ mod tests {
     use super::*;
 
     #[test]
+    fn long_query_output_batches_are_bounded_by_workers() {
+        let record = |len| fasta::FastaRecord {
+            id: "query".to_owned(),
+            sequence: vec![0; len],
+        };
+        let ordinary = vec![record(LONG_QUERY_RESIDUES); 5];
+        let translated_contigs = vec![record(LONG_QUERY_RESIDUES + 1); 6];
+
+        assert_eq!(output_query_batch_size(&ordinary, 4), (256, false));
+        assert_eq!(output_query_batch_size(&translated_contigs, 4), (4, true));
+        assert_eq!(output_query_batch_size(&translated_contigs, 1), (1, true));
+        assert_eq!(output_query_batch_size(&translated_contigs, 0), (1, true));
+    }
+
+    #[test]
+    fn adaptive_hit_store_migrates_existing_hits_and_keeps_writing_to_disk() {
+        let tmpdir = std::env::temp_dir().join(format!(
+            "diamond-adaptive-spill-test-{}",
+            std::process::id()
+        ));
+        let mut store = AdaptiveHitStore::new(2, 16, 100, None, tmpdir.clone());
+        store
+            .ingest_partitions(vec![vec![StoredHit {
+                query_id: 0,
+                subject: 10,
+                seed_offset: 2,
+                score: 30,
+            }]])
+            .unwrap();
+        assert_eq!(store.memory.as_ref().unwrap()[0].len(), 1);
+        assert!(store.disk.is_none());
+
+        // Cross the ceiling only after a hit already resides in memory. The
+        // first hit must migrate and the incoming hit must use the persistent
+        // disk writer rather than recreating an in-memory buffer.
+        store.memory_limit = Some(0);
+        store
+            .ingest_partitions(vec![vec![StoredHit {
+                query_id: 1,
+                subject: 20,
+                seed_offset: 3,
+                score: 40,
+            }]])
+            .unwrap();
+        assert!(store.memory.is_none());
+        assert_eq!(store.disk.as_ref().unwrap().total_hits(), 2);
+
+        store
+            .ingest_partitions(vec![vec![StoredHit {
+                query_id: 0,
+                subject: 30,
+                seed_offset: 4,
+                score: 50,
+            }]])
+            .unwrap();
+        assert!(store.memory.is_none());
+        assert_eq!(store.disk.as_ref().unwrap().total_hits(), 3);
+        drop(store);
+        let _ = std::fs::remove_dir(tmpdir);
+    }
+
+    #[test]
     fn stage2_window_keeps_anchor_relative_right_edge_when_left_clipped() {
         assert_eq!(stage2_query_bounds(232, 3), (0, 51));
         assert_eq!(stage2_query_bounds(232, 100), (52, 148));
         assert_eq!(stage2_query_bounds(120, 100), (52, 120));
+    }
+
+    #[test]
+    fn masking_disabled_clears_makedb_soft_masks_before_alignment() {
+        const QUERY: &str = ">BAF52360.1\nMINSINSFFSSIPRSISSVTRNSSFTASQHKSTPNTVKTSSPLSPSNSPASATTIFKVKNSYTESGLQRSTSYTQSSIEKNALHRPLPDVAQRLVQHLAEHGIQPARNMAEHIPPAPNWPAPTPPVQNEQSRPLPDVAQRLVQHLAEHGIQPARNMAEHIPPAPNWPAPTPPVQNEQSRPLPDVAQRLVQHLAEHGIQPARNMAEHIPPAPNWPAPTPPVQNEQSRPLPDVAQRLMQHLAEHGIQPARNMAEHIPPAPNWPAPTPPVQNEQSRPLPDVAQRLMQHLAEHGINTSKRS*\n";
+        const TARGET: &str = ">BAF52367.1\nMINSINSFFSSIPRSISSVMRNSSFTASQHKSTPNTVKTSSPLSPSNSPASATTIFKVKNSYTESGLQRSTSYTQSSIEKNALHRPLPDVAKRLVQHLAEHGIQPARNMAEHIPPAPNWPAPPPPVQNEQSRPLPDVAQRLMQHLAEHGIQPARNMAEHIPPAPNWPAPPPPVQNEQSRPLPDVAQRLMQHLAEHGIQPARNMAEHIPPAPNWPAPPPPVQNEQSRPLPDVAQRLVQHLAEHGIQPARNMAEHIPPAPNWPAPPPPVQNEQSRPLPDVAQRLMQHLAEHGIQPARNMAEHIPPAPNWPAPTPPVQNEQSRPLPDVAQRLMQHLAEHGIQPARNMAEHIPPAPNWPAPTPPVQNEQSRPLPDVAQRLMQHLAEHGINTSKRS*\n";
+
+        let tmpdir = std::env::temp_dir().join(format!(
+            "diamond-mask0-soft-mask-regression-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir(&tmpdir).unwrap();
+        let query_path = tmpdir.join("query.faa");
+        let target_path = tmpdir.join("target.faa");
+        let db_path = tmpdir.join("target.dmnd");
+        let output_path = tmpdir.join("output.tsv");
+        std::fs::write(&query_path, QUERY).unwrap();
+        std::fs::write(&target_path, TARGET).unwrap();
+        crate::data::db_builder::build_db(
+            &[target_path.to_str().unwrap()],
+            db_path.to_str().unwrap(),
+            crate::basic::value::SequenceType::AminoAcid,
+        )
+        .unwrap();
+
+        run(&BlastpConfig {
+            query_files: vec![query_path.to_string_lossy().into_owned()],
+            database: db_path.to_string_lossy().into_owned(),
+            output: Some(output_path.to_string_lossy().into_owned()),
+            matrix: "blosum62".to_owned(),
+            gap_open: 11,
+            gap_extend: 1,
+            max_evalue: 0.001,
+            max_target_seqs: 25,
+            ext_chunk_size: 0,
+            toppercent: None,
+            global_ranking_targets: 0,
+            min_id: 0.0,
+            threads: 1,
+            outfmt: vec![
+                "6".to_owned(),
+                "qseqid".to_owned(),
+                "sseqid".to_owned(),
+                "pident".to_owned(),
+                "length".to_owned(),
+                "mismatch".to_owned(),
+                "gapopen".to_owned(),
+                "qstart".to_owned(),
+                "qend".to_owned(),
+                "sstart".to_owned(),
+                "send".to_owned(),
+                "evalue".to_owned(),
+                "bitscore".to_owned(),
+            ],
+            sensitivity: Sensitivity::Default,
+            masking: MaskingMode::None,
+            motif_masking: String::new(),
+            min_query_len: 0,
+            query_cover: 0.0,
+            subject_cover: 0.0,
+            comp_based_stats: CbsMode::Disabled,
+            no_self_hits: false,
+            ungapped_xdrop_bits: 12.3,
+            memory_limit: None,
+            tmpdir: tmpdir.clone(),
+        })
+        .unwrap();
+
+        // Exact upstream 2.1.24 result for this real TccP2 pair. Before the
+        // fix, stored tantan bits truncated the alignment to 131 residues.
+        assert_eq!(
+            std::fs::read_to_string(&output_path).unwrap(),
+            "BAF52360.1\tBAF52367.1\t95.6\t295\t13\t0\t1\t295\t1\t295\t3.24e-218\t587\n"
+        );
+        let _ = std::fs::remove_dir_all(tmpdir);
     }
 
     #[test]

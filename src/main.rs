@@ -6,6 +6,7 @@ use diamond::commands::blastx::BlastxConfig;
 use diamond::commands::cluster_cmd::ClusterConfig;
 use diamond::commands::view::ViewConfig;
 use diamond::config::Sensitivity;
+use diamond::output::format::FieldId;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -50,7 +51,12 @@ fn main() {
         "getseq" => {
             if let Some(db) = get_arg(&args, &["-d", "--db"]) {
                 let seq_ids = get_arg(&args, &["--seq"]);
-                run_or_exit(diamond::commands::getseq::run(&db, seq_ids.as_deref()));
+                let output = get_arg(&args, &["-o", "--out"]).map(PathBuf::from);
+                run_or_exit(diamond::commands::getseq::run_with_output(
+                    &db,
+                    seq_ids.as_deref(),
+                    output.as_deref(),
+                ));
             } else {
                 eprintln!("Error: -d/--db argument required");
                 std::process::exit(1);
@@ -71,6 +77,9 @@ fn main() {
                 eprintln!("Error: -d/--db argument required");
                 std::process::exit(1);
             }
+        }
+        "blastp" | "blastx" if has_flag(&args, "--help") || has_flag(&args, "-h") => {
+            print_usage();
         }
         "blastp" if !has_flag(&args, "--legacy") && !route_blastp_to_legacy(&args) => {
             // Native Rust blastp pipeline
@@ -533,15 +542,38 @@ fn get_all_args(args: &[String], flags: &[&str]) -> Vec<String> {
     let mut values = Vec::new();
     let mut i = 0;
     while i < args.len() {
+        let mut joined = None;
         if flags.contains(&args[i].as_str()) {
             i += 1;
-            while i < args.len() && !args[i].starts_with('-') {
-                values.push(args[i].clone());
-                i += 1;
+        } else {
+            for flag in flags {
+                if flag.starts_with("--") {
+                    joined = args[i]
+                        .strip_prefix(&format!("{flag}="))
+                        .map(ToOwned::to_owned);
+                } else if flag.starts_with('-') && flag.len() == 2 {
+                    joined = args[i]
+                        .strip_prefix(flag)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned);
+                }
+                if joined.is_some() {
+                    break;
+                }
             }
-            continue;
+            if joined.is_none() {
+                i += 1;
+                continue;
+            }
+            i += 1;
         }
-        i += 1;
+        if let Some(value) = joined {
+            values.push(value);
+        }
+        while i < args.len() && !args[i].starts_with('-') {
+            values.push(args[i].clone());
+            i += 1;
+        }
     }
     values
 }
@@ -550,20 +582,199 @@ fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
-fn route_blastp_to_legacy(args: &[String]) -> bool {
-    get_all_args(args, &["-f", "--outfmt"])
+/// Whether an option occurs in separated (`--foo value`), long joined
+/// (`--foo=value`), or short joined (`-b2`) form. This deliberately checks
+/// presence rather than successfully parsing a value: an option unsupported by
+/// the native pipeline must never be silently ignored just because it is
+/// malformed.
+fn has_option(args: &[String], flags: &[&str]) -> bool {
+    args.iter().any(|arg| {
+        flags.iter().any(|flag| {
+            arg == flag
+                || (flag.starts_with("--")
+                    && arg
+                        .strip_prefix(flag)
+                        .is_some_and(|suffix| suffix.starts_with('=')))
+                || (flag.starts_with('-')
+                    && flag.len() == 2
+                    && arg
+                        .strip_prefix(flag)
+                        .is_some_and(|suffix| !suffix.is_empty()))
+        })
+    })
+}
+
+/// Manual native-search parsing must not turn an unrecognised option into a
+/// no-op. Unknown switches are sent to the compatibility parser, which either
+/// handles them through the optional C++ backend or rejects them explicitly.
+fn has_unknown_search_option(args: &[String], blastx: bool) -> bool {
+    const COMMON: &[&str] = &[
+        "--query",
+        "--db",
+        "--out",
+        "--matrix",
+        "--gapopen",
+        "--gapextend",
+        "--evalue",
+        "--max-target-seqs",
+        "--ext-chunk-size",
+        "--top",
+        "--global-ranking",
+        "--id",
+        "--threads",
+        "--outfmt",
+        "--faster",
+        "--fast",
+        "--mid-sensitive",
+        "--sensitive",
+        "--more-sensitive",
+        "--very-sensitive",
+        "--ultra-sensitive",
+        "--masking",
+        "--motif-masking",
+        "--min-query-len",
+        "--query-cover",
+        "--subject-cover",
+        "--comp-based-stats",
+        "--no-self-hits",
+        "--xdrop",
+        "--memory-limit",
+        "--tmpdir",
+        "--legacy",
+        "--help",
+        // Recognised incompatibilities are included here because the explicit
+        // routing checks below decide whether a value is natively supported.
+        "--max-hsps",
+        "--block-size",
+        "--index-chunks",
+        "--algo",
+        "--soft-masking",
+        "--approx-id",
+        "--file-buffer-size",
+        "--query-parallel-limit",
+        "--min-score",
+        "--header",
+        "--compress",
+        "--iterate",
+    ];
+    const BLASTX: &[&str] = &[
+        "--query-gencode",
+        "--strand",
+        "--min-orf",
+        "--frameshift",
+        "--swipe",
+    ];
+    const SHORT_COMMON: &[&str] = &[
+        "-q", "-d", "-o", "-e", "-k", "-p", "-f", "-x", "-t", "-b", "-c", "-h",
+    ];
+
+    args.iter().skip(2).any(|arg| {
+        if let Some(long) = arg.strip_prefix("--") {
+            let name = &arg[..2 + long.find('=').unwrap_or(long.len())];
+            !COMMON.contains(&name) && !(blastx && BLASTX.contains(&name))
+        } else if arg.starts_with('-') && arg.as_bytes().get(1).is_some_and(u8::is_ascii_alphabetic)
+        {
+            let name = &arg[..2];
+            (name == "-h" && arg.len() != 2)
+                || (!SHORT_COMMON.contains(&name) && !(blastx && name == "-F"))
+        } else {
+            false
+        }
+    })
+}
+
+fn route_common_search_to_legacy(args: &[String]) -> bool {
+    let requested_output = get_all_args(args, &["-f", "--outfmt"]);
+    let unsupported_output = requested_output
         .first()
-        .is_some_and(|f| f == "100" || f == "daa")
+        .is_some_and(|format| format != "6" && format != "tab")
+        || requested_output.iter().skip(1).any(|name| {
+            !matches!(
+                FieldId::from_name(name),
+                Some(
+                    FieldId::QSeqId
+                        | FieldId::QAcc
+                        | FieldId::QAccVer
+                        | FieldId::SSeqId
+                        | FieldId::SAcc
+                        | FieldId::SAccVer
+                        | FieldId::PIdent
+                        | FieldId::Length
+                        | FieldId::Mismatch
+                        | FieldId::GapOpen
+                        | FieldId::QStart
+                        | FieldId::QEnd
+                        | FieldId::SStart
+                        | FieldId::SEnd
+                        | FieldId::EValue
+                        | FieldId::BitScore
+                        | FieldId::Score
+                        | FieldId::NIdent
+                        | FieldId::Positive
+                        | FieldId::Gaps
+                        | FieldId::PPos
+                        | FieldId::QLen
+                        | FieldId::SLen
+                        | FieldId::QFrame
+                        | FieldId::QCovHsp
+                        | FieldId::SCovHsp
+                )
+            )
+        });
+
+    unsupported_output
         || get_arg(args, &["--masking"]).is_some_and(|m| m.eq_ignore_ascii_case("seg"))
         || get_arg(args, &["--max-hsps"]).is_some_and(|m| m != "1")
         || get_arg(args, &["--comp-based-stats"]).is_some_and(|m| m != "0" && m != "1")
         || get_arg(args, &["--global-ranking"]).is_some_and(|m| m != "0")
+        || has_option(
+            args,
+            &[
+                "-b",
+                "--block-size",
+                "-c",
+                "--index-chunks",
+                "--algo",
+                "--soft-masking",
+                "--approx-id",
+                "--file-buffer-size",
+                "--query-parallel-limit",
+                "--min-score",
+                "--header",
+                "--compress",
+                "--iterate",
+            ],
+        )
+}
+
+fn route_blastp_to_legacy(args: &[String]) -> bool {
+    has_unknown_search_option(args, false) || route_common_search_to_legacy(args)
+}
+
+fn blastx_output_layout_supported(args: &[String]) -> bool {
+    let requested = get_all_args(args, &["-f", "--outfmt"]);
+    if requested.is_empty() {
+        return true;
+    }
+    if requested[0] != "6" && requested[0] != "tab" {
+        return false;
+    }
+    let fields = &requested[1..];
+    fields.is_empty()
+        || fields
+            == [
+                "qseqid", "sseqid", "pident", "length", "mismatch", "gapopen", "qstart", "qend",
+                "sstart", "send", "evalue", "bitscore",
+            ]
 }
 
 fn route_blastx_to_legacy(args: &[String]) -> bool {
-    route_blastp_to_legacy(args)
+    has_unknown_search_option(args, true)
+        || route_common_search_to_legacy(args)
+        || !blastx_output_layout_supported(args)
         || get_arg(args, &["-F", "--frameshift"]).is_some_and(|f| f != "0")
         || has_flag(args, "--swipe")
+        || has_option(args, &["--min-query-len"])
 }
 
 fn parse_arg_or<T: std::str::FromStr>(args: &[String], flags: &[&str], default: T) -> T {
@@ -638,6 +849,24 @@ mod tests {
     }
 
     #[test]
+    fn test_get_all_args_accepts_joined_first_value() {
+        assert_eq!(
+            get_all_args(
+                &args(&["diamond", "blastp", "--outfmt=6", "qseqid", "sseqid"]),
+                &["-f", "--outfmt"]
+            ),
+            ["6", "qseqid", "sseqid"]
+        );
+        assert_eq!(
+            get_all_args(
+                &args(&["diamond", "blastp", "-f6", "qseqid"]),
+                &["-f", "--outfmt"]
+            ),
+            ["6", "qseqid"]
+        );
+    }
+
+    #[test]
     fn parse_memory_sizes() {
         assert_eq!(parse_byte_size("512M"), Ok(512_000_000));
         assert_eq!(parse_byte_size("1.5G"), Ok(1_500_000_000));
@@ -653,5 +882,105 @@ mod tests {
             "0G".to_string(),
         ];
         assert_eq!(parse_memory_limit_arg(&args), Some(0));
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn native_route_never_silently_ignores_unsupported_options() {
+        for option in [
+            ["--block-size", "1"].as_slice(),
+            ["--block-size=1"].as_slice(),
+            ["-b1"].as_slice(),
+            ["--index-chunks", "1"].as_slice(),
+            ["-c1"].as_slice(),
+            ["--algo", "0"].as_slice(),
+            ["--soft-masking", "0"].as_slice(),
+            ["--approx-id", "80"].as_slice(),
+            ["--file-buffer-size", "1024"].as_slice(),
+            ["--query-parallel-limit", "2"].as_slice(),
+            ["--min-score", "50"].as_slice(),
+            ["--header", "1"].as_slice(),
+            ["--compress", "1"].as_slice(),
+            ["--iterate"].as_slice(),
+        ] {
+            let mut command = args(&["diamond", "blastp"]);
+            command.extend(option.iter().map(|value| (*value).to_string()));
+            assert!(route_blastp_to_legacy(&command), "did not route {option:?}");
+        }
+
+        assert!(route_blastp_to_legacy(&args(&[
+            "diamond", "blastp", "--outfmt", "0"
+        ])));
+        assert!(route_blastp_to_legacy(&args(&[
+            "diamond", "blastp", "--outfmt", "101"
+        ])));
+        assert!(!route_blastp_to_legacy(&args(&[
+            "diamond", "blastp", "--outfmt", "6", "qseqid", "sseqid"
+        ])));
+        assert!(!route_blastp_to_legacy(&args(&[
+            "diamond",
+            "blastp",
+            "--outfmt=6",
+            "qlen",
+            "nident",
+            "score"
+        ])));
+        assert!(route_blastp_to_legacy(&args(&[
+            "diamond", "blastp", "--outfmt", "6", "qseq"
+        ])));
+        assert!(route_blastp_to_legacy(&args(&[
+            "diamond",
+            "blastp",
+            "--outfmt",
+            "6",
+            "not_a_field"
+        ])));
+        assert!(route_blastp_to_legacy(&args(&[
+            "diamond",
+            "blastp",
+            "--definitely-not-a-diamond-option"
+        ])));
+        assert!(!route_blastp_to_legacy(&args(&[
+            "diamond",
+            "blastp",
+            "-qquery.faa"
+        ])));
+    }
+
+    #[test]
+    fn blastx_specific_unsupported_modes_route_to_legacy() {
+        assert!(route_blastx_to_legacy(&args(&[
+            "diamond",
+            "blastx",
+            "--frameshift",
+            "15"
+        ])));
+        assert!(route_blastx_to_legacy(&args(&[
+            "diamond", "blastx", "--swipe"
+        ])));
+        assert!(route_blastx_to_legacy(&args(&[
+            "diamond",
+            "blastx",
+            "--min-query-len",
+            "30"
+        ])));
+        assert!(!route_blastx_to_legacy(&args(&[
+            "diamond",
+            "blastx",
+            "--query-gencode",
+            "2",
+            "--strand",
+            "plus",
+            "--frameshift",
+            "0",
+            "--outfmt",
+            "6"
+        ])));
+        assert!(route_blastx_to_legacy(&args(&[
+            "diamond", "blastx", "--outfmt", "6", "qseqid", "qlen", "sseqid"
+        ])));
     }
 }
