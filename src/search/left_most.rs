@@ -1,9 +1,11 @@
 use crate::basic::reduction::Reduction;
-use crate::basic::seed::{seed_partition, PackedSeed};
+#[cfg(test)]
+use crate::basic::seed::seed_partition;
+use crate::basic::seed::PackedSeed;
 use crate::basic::shape::Shape;
 use crate::basic::value::Letter;
 use crate::data::seed_histogram::{SeedPartitionRange, CURRENT_RANGE};
-use crate::search::hamming::FingerPrint;
+use crate::search::hamming::match_centers;
 use crate::search::sse_dist::{reduced_match, seed_mask};
 use crate::util::algo::PatternMatcher;
 use crate::util::sequence;
@@ -47,6 +49,7 @@ pub fn verify_hit(
     )
 }
 
+#[inline(always)]
 pub fn verify_hit_with_range(
     q: &[Letter],
     s: &[Letter],
@@ -65,10 +68,12 @@ pub fn verify_hit_with_range(
         if center + shape.length as usize > s.len() {
             return false;
         }
-        let Some(seed) = shape.set_seed(&s[center..], reduction) else {
+        // SAFETY: the preceding fit check covers every position in the shape.
+        let Some(p) =
+            (unsafe { shape.seed_partition_unchecked(&s[center..], reduction, seedp_mask) })
+        else {
             return false;
         };
-        let p = seed_partition(seed, seedp_mask);
         if let Some(current_range) = current_range {
             if left && !current_range.lower_or_equal(p) {
                 return false;
@@ -89,9 +94,7 @@ pub fn verify_hit_with_range(
     // C++ `FingerPrint::load(p)` reads `[p - 16, p + 32)`. `center` is the
     // candidate seed pointer relative to these slices, so it is the actual
     // fingerprint centre; adding 16 shifts the comparison window right.
-    let fq = FingerPrint::from_seq_center(q, center);
-    let fs = FingerPrint::from_seq_center(s, center);
-    fq.match_count(&fs) >= hamming_filter_id
+    match_centers(q, s, center) >= hamming_filter_id
 }
 
 /// Matches C++ `verify_hits(...)`.
@@ -126,6 +129,7 @@ pub fn verify_hits(
     )
 }
 
+#[inline(always)]
 pub fn verify_hits_with_range(
     mut mask: u32,
     q: &[Letter],
@@ -195,6 +199,7 @@ pub fn left_most_filter(
     )
 }
 
+#[inline(always)]
 pub fn left_most_filter_with_range(
     query: &[Letter],
     subject: &[Letter],
@@ -241,12 +246,16 @@ pub fn left_most_filter_with_range(
     let left_hit = context.current_matcher.hit(match_mask_left, len_left) & query_mask_left;
 
     if first_shape && !chunked {
+        if left_hit == 0 {
+            return true;
+        }
+        let (q_padded, s_padded) = padded_fingerprint_windows(q, s);
         return left_hit == 0
             || !verify_hits_with_range(
                 left_hit,
-                q,
-                s,
-                0,
+                &q_padded,
+                &s_padded,
+                16,
                 score_cutoff,
                 true,
                 match_mask_left,
@@ -269,12 +278,16 @@ pub fn left_most_filter_with_range(
         &context.previous_matcher
     };
     let right_hit = right_matcher.hit(match_mask_right, len_right) & query_mask_right;
+    if left_hit == 0 && right_hit == 0 {
+        return true;
+    }
+    let (q_padded, s_padded) = padded_fingerprint_windows(q, s);
     (left_hit == 0
         || !verify_hits_with_range(
             left_hit,
-            q,
-            s,
-            0,
+            &q_padded,
+            &s_padded,
+            16,
             score_cutoff,
             true,
             match_mask_left,
@@ -288,9 +301,9 @@ pub fn left_most_filter_with_range(
         && (right_hit == 0
             || !verify_hits_with_range(
                 right_hit,
-                q,
-                s,
-                window_left + 1,
+                &q_padded,
+                &s_padded,
+                16 + window_left + 1,
                 score_cutoff,
                 false,
                 match_mask_right,
@@ -301,6 +314,19 @@ pub fn left_most_filter_with_range(
                 context.reduction,
                 current_range,
             ))
+}
+
+/// Recreate the delimiter padding visible to C++'s pointer-based fingerprint
+/// loads once per left-most check, rather than rebuilding two 48-byte arrays
+/// for every candidate seed. Production windows are at most 96 residues.
+#[inline(always)]
+fn padded_fingerprint_windows(q: &[Letter], s: &[Letter]) -> ([Letter; 144], [Letter; 144]) {
+    debug_assert!(q.len() <= 96 && s.len() <= 96);
+    let mut q_padded = [crate::basic::value::DELIMITER_LETTER; 144];
+    let mut s_padded = [crate::basic::value::DELIMITER_LETTER; 144];
+    q_padded[16..16 + q.len()].copy_from_slice(q);
+    s_padded[16..16 + s.len()].copy_from_slice(s);
+    (q_padded, s_padded)
 }
 
 #[cfg(test)]

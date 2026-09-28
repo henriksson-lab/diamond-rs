@@ -42,6 +42,10 @@ pub struct Reduction {
     bit_size: i32,
     bit_size_exact: f64,
     freq: [f64; TRUE_AA as usize],
+    /// Two Murphy-10 letters packed as one base-10 pair. The 32x32 table is
+    /// small enough for L1 and lets the chunked left-most verifier replace ten
+    /// independent reduction lookups with five paired lookups.
+    pair10: [u16; 32 * 32],
 }
 
 impl Reduction {
@@ -98,6 +102,18 @@ impl Reduction {
         map8b[STOP_LETTER as u8 as usize] = (size + 1) as Letter;
         map8b[DELIMITER_LETTER as u8 as usize] = (size + 1) as Letter;
 
+        let mut pair10 = [u16::MAX; 32 * 32];
+        if size == 10 {
+            for a in 0..32usize {
+                for b in 0..32usize {
+                    if super::value::is_amino_acid(a as Letter)
+                        && super::value::is_amino_acid(b as Letter)
+                    {
+                        pair10[(a << 5) | b] = (map[a] * 10 + map[b]) as u16;
+                    }
+                }
+            }
+        }
         Reduction {
             map,
             map8,
@@ -106,6 +122,7 @@ impl Reduction {
             bit_size,
             bit_size_exact,
             freq,
+            pair10,
         }
     }
 
@@ -130,6 +147,12 @@ impl Reduction {
     #[inline]
     pub fn reduce(&self, a: Letter) -> u32 {
         self.map[a as u8 as usize]
+    }
+
+    #[inline(always)]
+    pub(crate) fn reduce_pair10(&self, a: Letter, b: Letter) -> u16 {
+        // Callers strip masking bits first, so both values are in 0..32.
+        unsafe { *self.pair10.get_unchecked(((a as usize) << 5) | b as usize) }
     }
 
     /// Get the map8 lookup table (for SIMD use).

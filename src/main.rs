@@ -1,4 +1,5 @@
 use std::env;
+use std::path::PathBuf;
 
 use diamond::commands::blastp::BlastpConfig;
 use diamond::commands::blastx::BlastxConfig;
@@ -109,6 +110,10 @@ fn main() {
                 ),
                 no_self_hits: has_flag(&args, "--no-self-hits"),
                 ungapped_xdrop_bits: parse_arg_or(&args, &["-x", "--xdrop"], 12.3),
+                memory_limit: parse_memory_limit_arg(&args),
+                tmpdir: get_arg(&args, &["-t", "--tmpdir"])
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
             };
             run_or_exit(diamond::commands::blastp::run(&config));
         }
@@ -152,6 +157,10 @@ fn main() {
                 ),
                 no_self_hits: has_flag(&args, "--no-self-hits"),
                 ungapped_xdrop_bits: parse_arg_or(&args, &["-x", "--xdrop"], 12.3),
+                memory_limit: parse_memory_limit_arg(&args),
+                tmpdir: get_arg(&args, &["-t", "--tmpdir"])
+                    .map(PathBuf::from)
+                    .unwrap_or_default(),
             };
             run_or_exit(diamond::commands::blastx::run(&config));
         }
@@ -467,6 +476,9 @@ fn print_usage() {
     println!("  test       Run regression tests");
     println!();
     println!("Use 'diamond COMMAND --help' for command-specific options.");
+    println!(
+        "Native blastp/blastx: --memory-limit 16G is the default soft RSS ceiling; 0G forces disk mode."
+    );
     #[cfg(all(feature = "ffi", not(windows)))]
     println!("Add --legacy to blastp/blastx to use C++ FFI backend.");
     #[cfg(not(all(feature = "ffi", not(windows))))]
@@ -560,6 +572,25 @@ fn parse_arg_or<T: std::str::FromStr>(args: &[String], flags: &[&str], default: 
         .unwrap_or(default)
 }
 
+const DEFAULT_NATIVE_MEMORY_LIMIT: usize = 16_000_000_000;
+
+fn parse_memory_limit_arg(args: &[String]) -> Option<usize> {
+    Some(
+        get_arg(args, &["--memory-limit"]).map_or(DEFAULT_NATIVE_MEMORY_LIMIT, |value| {
+            parse_byte_size(&value).unwrap_or_else(|error| {
+                eprintln!("Error: invalid --memory-limit '{value}': {error}");
+                std::process::exit(1);
+            })
+        }),
+    )
+}
+
+fn parse_byte_size(value: &str) -> Result<usize, &'static str> {
+    let bytes = diamond::util::string::interpret_number(value)
+        .map_err(|_| "use K, M, G, or T (for example 4G)")?;
+    usize::try_from(bytes).map_err(|_| "value is out of range")
+}
+
 fn parse_sensitivity(args: &[String]) -> Sensitivity {
     if has_flag(args, "--ultra-sensitive") {
         Sensitivity::UltraSensitive
@@ -604,5 +635,23 @@ mod tests {
             get_all_args(&args, &["-f", "--outfmt"]),
             ["6", "qseqid", "sseqid", "104", "score"]
         );
+    }
+
+    #[test]
+    fn parse_memory_sizes() {
+        assert_eq!(parse_byte_size("512M"), Ok(512_000_000));
+        assert_eq!(parse_byte_size("1.5G"), Ok(1_500_000_000));
+        assert!(parse_byte_size("lots").is_err());
+        assert!(parse_byte_size("512").is_err());
+
+        let args = vec!["diamond".to_string(), "blastp".to_string()];
+        assert_eq!(parse_memory_limit_arg(&args), Some(16_000_000_000));
+        let args = vec![
+            "diamond".to_string(),
+            "blastp".to_string(),
+            "--memory-limit".to_string(),
+            "0G".to_string(),
+        ];
+        assert_eq!(parse_memory_limit_arg(&args), Some(0));
     }
 }

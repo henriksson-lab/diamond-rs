@@ -1,5 +1,5 @@
 use super::reduction::Reduction;
-use super::seed::{PackedSeed, MAX_SEED_WEIGHT};
+use super::seed::{PackedSeed, SeedPartition, MAX_SEED_WEIGHT};
 
 /// `ln(n!)` for small n. The Hauser/SEG-style entropy formula uses this in a
 /// tight loop. Keep this as a literal table instead of a lazily initialized
@@ -119,6 +119,94 @@ impl Shape {
             s += r as u64;
         }
         Some(s)
+    }
+
+    /// Extract a seed after the caller has proved that the complete shape fits.
+    ///
+    /// # Safety
+    /// `seq.len()` must be at least `self.length`, and `self` must retain the
+    /// position/weight invariants established by [`Shape::from_code`].
+    #[inline(always)]
+    pub unsafe fn set_seed_unchecked(
+        &self,
+        seq: &[Letter],
+        reduction: &Reduction,
+    ) -> Option<PackedSeed> {
+        debug_assert!(seq.len() >= self.length as usize);
+        debug_assert!((self.weight as usize) <= MAX_SEED_WEIGHT);
+        let mut seed: PackedSeed = 0;
+        let size = reduction.size() as u64;
+        for i in 0..self.weight as usize {
+            // SAFETY: both unchecked indices are covered by this method's
+            // contract and Shape's constructor invariants.
+            let position = unsafe { *self.positions.get_unchecked(i) as usize };
+            let raw = unsafe { *seq.get_unchecked(position) };
+            // This path mirrors C++ `Shape::set_seed` under `SEQ_MASK`: soft
+            // masking is stripped before the amino-acid validity check. Seed
+            // enumeration uses the checked method above, which deliberately
+            // rejects soft-masked positions.
+            let letter = raw & LETTER_MASK;
+            if !is_amino_acid(letter) {
+                return None;
+            }
+            seed = seed * size + reduction.reduce(letter) as u64;
+        }
+        Some(seed)
+    }
+
+    /// Compute only the partition bits needed by chunked left-most checking.
+    ///
+    /// The production protein shapes have weight 10 with the Murphy-10
+    /// reduction. Spell that case at its fixed width so the compiler can
+    /// schedule the independent constant-weight terms instead of retaining a
+    /// ten-step multiply dependency chain. The result is algebraically
+    /// identical to `set_seed_unchecked(...) & partition_mask`.
+    ///
+    /// # Safety
+    /// The requirements are identical to [`Shape::set_seed_unchecked`].
+    #[inline(always)]
+    pub unsafe fn seed_partition_unchecked(
+        &self,
+        seq: &[Letter],
+        reduction: &Reduction,
+        partition_mask: PackedSeed,
+    ) -> Option<SeedPartition> {
+        if self.weight != 10 || reduction.size() != 10 {
+            return self
+                .set_seed_unchecked(seq, reduction)
+                .map(|seed| (seed & partition_mask) as SeedPartition);
+        }
+        debug_assert!(seq.len() >= self.length as usize);
+        macro_rules! letter {
+            ($index:expr) => {{
+                let position = *self.positions.get_unchecked($index) as usize;
+                *seq.get_unchecked(position) & LETTER_MASK
+            }};
+        }
+        let l0 = letter!(0);
+        let l1 = letter!(1);
+        let l2 = letter!(2);
+        let l3 = letter!(3);
+        let l4 = letter!(4);
+        let l5 = letter!(5);
+        let l6 = letter!(6);
+        let l7 = letter!(7);
+        let l8 = letter!(8);
+        let l9 = letter!(9);
+        let p0 = reduction.reduce_pair10(l0, l1);
+        let p1 = reduction.reduce_pair10(l2, l3);
+        let p2 = reduction.reduce_pair10(l4, l5);
+        let p3 = reduction.reduce_pair10(l6, l7);
+        let p4 = reduction.reduce_pair10(l8, l9);
+        if p0 == u16::MAX || p1 == u16::MAX || p2 == u16::MAX || p3 == u16::MAX || p4 == u16::MAX {
+            return None;
+        }
+        let seed = p0 as u64 * 100_000_000
+            + p1 as u64 * 1_000_000
+            + p2 as u64 * 10_000
+            + p3 as u64 * 100
+            + p4 as u64;
+        Some((seed & partition_mask) as SeedPartition)
     }
 
     /// Fused seed extraction + complexity check. Returns the seed value if
@@ -287,5 +375,33 @@ mod tests {
         let seq = vec![0i8, MASK_LETTER, 2];
         let seed = s.set_seed(&seq, &r);
         assert!(seed.is_none());
+    }
+
+    #[test]
+    fn specialized_weight10_partition_matches_full_seed() {
+        let reduction = Reduction::default_reduction();
+        let shape = Shape::from_code("111101110111", &reduction);
+        assert_eq!(shape.weight, 10);
+        let mut state = 0x5eed_10u64;
+        for _ in 0..512 {
+            let sequence: Vec<Letter> = (0..shape.length)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let letter = ((state >> 32) & 31) as Letter;
+                    if state & 7 == 0 {
+                        letter | crate::basic::value::SEED_MASK
+                    } else {
+                        letter
+                    }
+                })
+                .collect();
+            let full = unsafe { shape.set_seed_unchecked(&sequence, &reduction) };
+            for bits in [4, 8, 10, 16] {
+                let mask = (1u64 << bits) - 1;
+                let expected = full.map(|seed| (seed & mask) as SeedPartition);
+                let actual = unsafe { shape.seed_partition_unchecked(&sequence, &reduction, mask) };
+                assert_eq!(actual, expected);
+            }
+        }
     }
 }

@@ -6,8 +6,9 @@
 //! ceiling are reported in `overflow_mask` and must be recomputed with the
 //! scalar `i32` kernel.
 
-use crate::basic::value::Letter;
+use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
+use std::mem::MaybeUninit;
 
 /// One target lane for [`score_batch_avx2`].
 #[derive(Clone, Copy, Debug)]
@@ -39,6 +40,8 @@ pub struct SimdScoreScratch {
     prev_e: Vec<ArchVector>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     curr_e: Vec<ArchVector>,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    query_biases: Vec<ArchVector>,
 }
 
 #[cfg(target_arch = "x86")]
@@ -68,6 +71,10 @@ pub fn score_batch_avx2(
     {
         return None;
     }
+    let query_letters = query.iter().try_fold(0u32, |mask, &letter| {
+        let letter = (letter & LETTER_MASK) as usize;
+        (letter < AMINO_ACID_COUNT).then_some(mask | (1 << letter))
+    })?;
     let gap_open = score_matrix
         .gap_open()
         .checked_add(score_matrix.gap_extend())?;
@@ -89,10 +96,13 @@ pub fn score_batch_avx2(
             score_batch_avx2_impl(
                 query,
                 targets,
-                score_matrix.matrix16(),
+                score_matrix.matrix8u_low(),
+                score_matrix.matrix8u_high(),
+                score_matrix.bias(),
                 query_cbs,
                 gap_open as i16,
                 gap_extend as i16,
+                query_letters,
                 scratch,
             )
         });
@@ -179,6 +189,7 @@ unsafe fn score_full_batch_avx2_impl(
     scratch.prev_e.fill(neg);
     let go = arch::_mm256_set1_epi16(gap_open);
     let ge = arch::_mm256_set1_epi16(gap_extend);
+
     let max_i16 = arch::_mm256_set1_epi16(i16::MAX);
     let mut best = zero;
     let mut overflow = zero;
@@ -267,14 +278,26 @@ unsafe fn score_full_batch_avx2_impl(
 unsafe fn score_batch_avx2_impl(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
-    matrix: &[i16; 32 * 32],
+    matrix_low: &[i8; 32 * 32],
+    matrix_high: &[i8; 32 * 32],
+    matrix_bias: i8,
     query_cbs: &[i8],
     gap_open: i16,
     gap_extend: i16,
+    query_letters: u32,
     scratch: &mut SimdScoreScratch,
 ) -> BatchScores {
     score_batch_avx2_upstream_impl(
-        query, targets, matrix, query_cbs, gap_open, gap_extend, scratch,
+        query,
+        targets,
+        matrix_low,
+        matrix_high,
+        matrix_bias,
+        query_cbs,
+        gap_open,
+        gap_extend,
+        query_letters,
+        scratch,
     )
 }
 
@@ -286,10 +309,13 @@ unsafe fn score_batch_avx2_impl(
 unsafe fn score_batch_avx2_upstream_impl(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
-    matrix: &[i16; 32 * 32],
+    matrix_low: &[i8; 32 * 32],
+    matrix_high: &[i8; 32 * 32],
+    matrix_bias: i8,
     query_cbs: &[i8],
     gap_open: i16,
     gap_extend: i16,
+    _query_letters: u32,
     scratch: &mut SimdScoreScratch,
 ) -> BatchScores {
     const LANES: usize = 16;
@@ -314,7 +340,8 @@ unsafe fn score_batch_avx2_upstream_impl(
     let mut subject_start = [0i32; LANES];
     let mut band_offset = [0usize; LANES];
     let mut columns = 0usize;
-    for (lane, target) in targets.iter().enumerate() {
+    for lane in 0..targets.len() {
+        let target = &targets[lane];
         let expanded_begin = target.d_end - band as i32;
         subject_start[lane] = i1 - (target.d_end - 1);
         band_offset[lane] = (target.d_begin - expanded_begin).max(0) as usize;
@@ -325,79 +352,160 @@ unsafe fn score_batch_avx2_upstream_impl(
     }
 
     let zero = arch::_mm256_setzero_si256();
-    scratch.prev_h.resize(band, zero);
-    scratch.prev_e.resize(band + 1, zero);
-    scratch.prev_h.fill(zero);
-    scratch.prev_e.fill(zero);
+    let dp_zero = arch::_mm256_set1_epi16(i16::MIN);
+    scratch.prev_h.resize(band, dp_zero);
+    scratch.prev_e.resize(band + 1, dp_zero);
+    scratch.prev_h.fill(dp_zero);
+    scratch.prev_e.fill(dp_zero);
+    scratch.query_biases.resize(query.len(), zero);
+    if query_cbs.is_empty() {
+        scratch.query_biases.fill(zero);
+    } else {
+        for (slot, &bias) in scratch.query_biases.iter_mut().zip(query_cbs) {
+            *slot = arch::_mm256_set1_epi16(bias as i16);
+        }
+    }
     let go = arch::_mm256_set1_epi16(gap_open);
     let ge = arch::_mm256_set1_epi16(gap_extend);
-    let max_score = arch::_mm256_set1_epi16(i16::MAX);
-    let row_masks: Vec<ArchVector> = (0..band)
-        .map(|row| {
-            let mut lanes = [0i16; LANES];
-            for lane in 0..targets.len() {
-                if row >= band_offset[lane] {
-                    lanes[lane] = -1;
-                }
-            }
-            arch::_mm256_loadu_si256(lanes.as_ptr().cast())
-        })
-        .collect();
-    let mut best = zero;
-    let mut overflow = zero;
+
+    // A query normally contains only the 20 canonical residue codes.  The
+    // substitution profile is rebuilt for every target column, so avoiding
+    // ambiguity-code rows which this query cannot select is worthwhile.  Do
+    // this once per batch, outside the column loop.
+    // Direct port of RangePartition: each segment has a constant lane mask,
+    // with 0 for lanes whose strict band has begun and i16::MIN otherwise.
+    let mut ordered_offsets = [(0usize, 0usize); LANES];
+    for lane in 0..targets.len() {
+        ordered_offsets[lane] = (band_offset[lane], lane);
+    }
+    ordered_offsets[..targets.len()].sort_unstable();
+    let mut segment_begin = [0usize; LANES];
+    let mut segment_end = [0usize; LANES];
+    let mut segment_masks = [dp_zero; LANES];
+    let mut segment_count = 0usize;
+    let mut lanes = [i16::MIN; LANES];
+    let mut cursor = 0usize;
+    while cursor < targets.len() {
+        let begin = ordered_offsets[cursor].0;
+        while cursor < targets.len() && ordered_offsets[cursor].0 == begin {
+            lanes[ordered_offsets[cursor].1] = 0;
+            cursor += 1;
+        }
+        segment_begin[segment_count] = begin;
+        segment_masks[segment_count] = arch::_mm256_loadu_si256(lanes.as_ptr().cast());
+        segment_count += 1;
+    }
+    for segment in 0..segment_count {
+        segment_end[segment] = if segment + 1 < segment_count {
+            segment_begin[segment + 1]
+        } else {
+            band
+        };
+    }
+    let mut best = dp_zero;
 
     for column in 0..columns {
-        let mut subject = [0usize; LANES];
-        let mut active_lanes = [0i16; LANES];
-        let mut seeded = [false; LANES];
+        let mut subject = [0i16; LANES];
+        let mut inactive_lanes = [i16::MIN; LANES];
+        let mut seeded = [0i16; LANES];
         for lane in 0..targets.len() {
             let pos = subject_start[lane] + column as i32;
             if pos >= 0 && pos < targets[lane].subject.len() as i32 {
                 let letter = targets[lane].subject[pos as usize];
-                subject[lane] = (letter & crate::basic::value::LETTER_MASK) as usize;
-                active_lanes[lane] = -1;
-                seeded[lane] = letter & crate::basic::value::SEED_MASK != 0;
+                subject[lane] = (letter & crate::basic::value::LETTER_MASK) as i16;
+                inactive_lanes[lane] = 0;
+                seeded[lane] = if letter & crate::basic::value::SEED_MASK != 0 {
+                    -1
+                } else {
+                    0
+                };
             }
         }
-        let active = arch::_mm256_loadu_si256(active_lanes.as_ptr().cast());
-        let mut profile = [zero; 32];
-        for (query_letter, slot) in profile.iter_mut().enumerate() {
-            let mut scores = [0i16; LANES];
-            for lane in 0..targets.len() {
-                if active_lanes[lane] != 0 && !seeded[lane] {
-                    scores[lane] = matrix[query_letter * 32 + subject[lane]];
-                }
-            }
-            *slot = arch::_mm256_loadu_si256(scores.as_ptr().cast());
+        let subject = arch::_mm256_loadu_si256(subject.as_ptr().cast());
+        let inactive = arch::_mm256_loadu_si256(inactive_lanes.as_ptr().cast());
+        let seeded = arch::_mm256_loadu_si256(seeded.as_ptr().cast());
+        let mut profile: [MaybeUninit<ArchVector>; AMINO_ACID_COUNT] =
+            [const { MaybeUninit::uninit() }; AMINO_ACID_COUNT];
+        // Direct port of AVX2 ScoreVector<int16_t>(letter, subject-vector):
+        // select the low/high 16-residue table with byte shuffles, expand the
+        // biased u8 scores to i16, then remove the matrix bias. This replaces
+        // 512 scalar indexed loads per target column.
+        let high_mask = arch::_mm256_slli_epi16(
+            arch::_mm256_and_si256(subject, arch::_mm256_set1_epi8(0x10)),
+            3,
+        );
+        let seq_low = arch::_mm256_or_si256(subject, high_mask);
+        let seq_high = arch::_mm256_or_si256(
+            subject,
+            arch::_mm256_xor_si256(high_mask, arch::_mm256_set1_epi8(i8::MIN)),
+        );
+        let byte_mask = arch::_mm256_set1_epi16(255);
+        let bias = arch::_mm256_set1_epi16(matrix_bias as i16);
+        // Match upstream's fixed 26-row profile loop. Iterating a sparse query
+        // mask looked attractive, but tzcnt/blsr and loop-control overhead
+        // retired about 0.2% more instructions end-to-end.
+        for query_letter in 0..AMINO_ACID_COUNT {
+            let row = query_letter * 32;
+            // ScoreMatrix mirrors C++ `alignas(32)` and each row is exactly
+            // 32 bytes, so these are aligned loads just like upstream.
+            let low = arch::_mm256_load_si256(matrix_low.as_ptr().add(row).cast());
+            let high = arch::_mm256_load_si256(matrix_high.as_ptr().add(row).cast());
+            let lo_score = arch::_mm256_shuffle_epi8(low, seq_low);
+            let hi_score = arch::_mm256_shuffle_epi8(high, seq_high);
+            let expanded =
+                arch::_mm256_and_si256(arch::_mm256_or_si256(lo_score, hi_score), byte_mask);
+            profile
+                .get_unchecked_mut(query_letter)
+                .write(arch::_mm256_andnot_si256(
+                    seeded,
+                    arch::_mm256_subs_epi16(expanded, bias),
+                ));
         }
 
         let moving_i0 = i0 + column as i32;
         let query_begin = moving_i0.max(0);
         let query_end = (i1 + column as i32).min(query.len() as i32 - 1) + 1;
-        let mut vertical = zero;
-        let mut col_best = zero;
-        for q in query_begin..query_end {
-            let row = (q - moving_i0) as usize;
-            let cell_mask = arch::_mm256_and_si256(active, row_masks[row]);
-            let base = profile[(query[q as usize] & crate::basic::value::LETTER_MASK) as usize];
-            let bias =
-                arch::_mm256_set1_epi16(query_cbs.get(q as usize).copied().unwrap_or(0) as i16);
-            let substitution = arch::_mm256_adds_epi16(base, bias);
-            let diagonal = arch::_mm256_adds_epi16(scratch.prev_h[row], substitution);
-            let horizontal = scratch.prev_e[row + 1];
-            let mut score = arch::_mm256_max_epi16(diagonal, horizontal);
-            score = arch::_mm256_max_epi16(score, vertical);
-            score = arch::_mm256_max_epi16(score, zero);
-            score = arch::_mm256_and_si256(score, cell_mask);
-            overflow = arch::_mm256_or_si256(overflow, arch::_mm256_cmpeq_epi16(score, max_score));
-            let open = arch::_mm256_subs_epi16(score, go);
-            let next_horizontal =
-                arch::_mm256_max_epi16(arch::_mm256_subs_epi16(horizontal, ge), open);
-            vertical = arch::_mm256_max_epi16(arch::_mm256_subs_epi16(vertical, ge), open);
-            scratch.prev_h[row] = score;
-            scratch.prev_e[row] = arch::_mm256_and_si256(next_horizontal, cell_mask);
-            vertical = arch::_mm256_and_si256(vertical, cell_mask);
-            col_best = arch::_mm256_max_epi16(col_best, score);
+        let query_row_begin = (query_begin - moving_i0) as usize;
+        let query_row_end = (query_end - moving_i0) as usize;
+        let mut vertical = dp_zero;
+        let mut col_best = dp_zero;
+        for segment in 0..segment_count {
+            let row_begin = segment_begin[segment].max(query_row_begin);
+            let row_end = segment_end[segment].min(query_row_end);
+            if row_begin >= row_end {
+                continue;
+            }
+            let target_mask = arch::_mm256_or_si256(segment_masks[segment], inactive);
+            vertical = arch::_mm256_adds_epi16(vertical, target_mask);
+            for row in row_begin..row_end {
+                let q = (moving_i0 + row as i32) as usize;
+                // `query_begin/query_end` clamp q to the query, every segment
+                // is clamped to the allocated band, and the letter mask is
+                // 0..31. Express those already-established invariants here:
+                // otherwise LLVM leaves four panic bounds checks in every DP
+                // cell, unlike the pointer-based upstream kernel.
+                let query_letter = *query.get_unchecked(q) & crate::basic::value::LETTER_MASK;
+                let base = *profile
+                    .get_unchecked(query_letter as usize)
+                    .assume_init_ref();
+                let substitution = arch::_mm256_adds_epi16(
+                    arch::_mm256_adds_epi16(base, *scratch.query_biases.get_unchecked(q)),
+                    target_mask,
+                );
+                let diagonal =
+                    arch::_mm256_adds_epi16(*scratch.prev_h.get_unchecked(row), substitution);
+                let horizontal =
+                    arch::_mm256_adds_epi16(*scratch.prev_e.get_unchecked(row + 1), target_mask);
+                let mut score = arch::_mm256_max_epi16(diagonal, horizontal);
+                score = arch::_mm256_max_epi16(score, vertical);
+                let open = arch::_mm256_subs_epi16(score, go);
+                let next_horizontal =
+                    arch::_mm256_max_epi16(arch::_mm256_subs_epi16(horizontal, ge), open);
+                vertical = arch::_mm256_max_epi16(arch::_mm256_subs_epi16(vertical, ge), open);
+                *scratch.prev_h.get_unchecked_mut(row) = score;
+                *scratch.prev_e.get_unchecked_mut(row) = next_horizontal;
+                col_best = arch::_mm256_max_epi16(col_best, score);
+            }
         }
         best = arch::_mm256_max_epi16(best, col_best);
     }
@@ -405,11 +513,12 @@ unsafe fn score_batch_avx2_upstream_impl(
     let mut raw_scores = [0i16; LANES];
     let mut raw_overflow = [0i16; LANES];
     arch::_mm256_storeu_si256(raw_scores.as_mut_ptr().cast(), best);
+    let overflow = arch::_mm256_cmpeq_epi16(best, arch::_mm256_set1_epi16(i16::MAX));
     arch::_mm256_storeu_si256(raw_overflow.as_mut_ptr().cast(), overflow);
     let mut scores = [0i32; LANES];
     let mut overflow_mask = 0u16;
     for lane in 0..targets.len() {
-        scores[lane] = raw_scores[lane] as i32;
+        scores[lane] = raw_scores[lane] as i32 - i16::MIN as i32;
         if raw_overflow[lane] != 0 {
             overflow_mask |= 1 << lane;
         }
@@ -521,9 +630,10 @@ mod tests {
             return;
         }
         let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
-        // W/W scores 11 in BLOSUM62, so this lane exceeds i16::MAX.
-        let query = vec![17; 4_000];
-        let long = vec![17; 4_000];
+        // The banded kernel uses DIAMOND's SHRT_MIN-biased representation,
+        // so W/W scores of 11 can accumulate through 65,535 before overflow.
+        let query = vec![17; 7_000];
+        let long = vec![17; 7_000];
         let short = vec![17; 20];
         let targets = [
             ScoreTarget {
@@ -547,6 +657,28 @@ mod tests {
         .unwrap();
         assert_eq!(got.overflow_mask, 1);
         assert_eq!(got.scores[1], 220);
+    }
+
+    #[test]
+    fn rejects_query_codes_outside_the_amino_acid_profile() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let subject = [0];
+        let target = [ScoreTarget {
+            subject: &subject,
+            d_begin: 0,
+            d_end: 1,
+        }];
+        assert!(score_batch_avx2(
+            &[AMINO_ACID_COUNT as Letter],
+            &target,
+            &matrix,
+            &[],
+            &mut SimdScoreScratch::default(),
+        )
+        .is_none());
     }
 
     #[test]

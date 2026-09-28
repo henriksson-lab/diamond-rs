@@ -1,5 +1,5 @@
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
@@ -20,7 +20,9 @@ use crate::dp::swipe::{Flags, HspValues};
 use crate::masking::{MaskingAlgo, MaskingMode};
 use crate::output::format::{self, FieldId, Hsp as OutputHsp};
 use crate::search::hit::Hit;
+use crate::search::hit_buffer::{CompactHit, HitBuffer, HitBufferMode};
 use crate::search::left_most::{left_most_filter_with_range, Context as LeftMostContext};
+use crate::search::left_most_unclipped::left_most_filter_with_range_unclipped;
 use crate::search::seed_match::SeedMatch;
 use crate::search::{parallel, sensitivity};
 use crate::stats::cbs::CbsMode;
@@ -44,19 +46,225 @@ struct StoredHit {
     score: u16,
 }
 
-#[derive(Clone, Copy)]
-struct CompactHit {
-    subject: u64,
-    seed_offset: u32,
-    score: u16,
+type UngappedKernel = fn(&[Letter], &[&[Letter]], usize, &ScoreMatrix, &mut [i32]);
+
+type PartitionFilter = for<'a> unsafe fn(
+    &[SeedMatch],
+    &mut Vec<StoredHit>,
+    &[Vec<Letter>],
+    &Block,
+    &[i32],
+    &ScoreMatrix,
+    &Shape,
+    &LeftMostContext<'a>,
+    bool,
+    bool,
+    bool,
+    bool,
+    usize,
+    u32,
+    usize,
+    UngappedKernel,
+) -> usize;
+
+const UNGAPPED_PORTABLE: u8 = 0;
+const UNGAPPED_AVX2: u8 = 1;
+const UNGAPPED_SSE41: u8 = 2;
+
+#[inline]
+fn run_ungapped_kernel<const KERNEL: u8>(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+    out: &mut [i32],
+) {
+    if KERNEL == UNGAPPED_AVX2 {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        // SAFETY: this function item is selected only after the one-time AVX2
+        // check at the blastp run boundary.
+        unsafe {
+            crate::dp::simd_ungapped::window_ungapped_best_into_avx2(
+                query,
+                subjects,
+                window,
+                score_matrix,
+                out,
+            );
+            return;
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        unreachable!("AVX2 specialization on a non-x86 target");
+    }
+    if KERNEL == UNGAPPED_SSE41 {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        // SAFETY: this function item is selected only after the one-time
+        // SSSE3/SSE4.1 checks at the blastp run boundary.
+        unsafe {
+            crate::dp::simd_ungapped::window_ungapped_best_into_sse41(
+                query,
+                subjects,
+                window,
+                score_matrix,
+                out,
+            );
+            return;
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        unreachable!("SSE4.1 specialization on a non-x86 target");
+    }
+    crate::dp::simd_ungapped::window_ungapped_best_into(query, subjects, window, score_matrix, out);
+}
+
+/// Hit storage that keeps the fast compact representation while RSS is below
+/// the requested ceiling, then permanently switches to DIAMOND's compressed
+/// temporary-bin format. The ceiling is necessarily soft: loaded input,
+/// indices, allocator bookkeeping, and one active disk bin are irreducible.
+struct AdaptiveHitStore {
+    memory: Option<Vec<Vec<CompactHit>>>,
+    disk: Option<HitBuffer>,
+    memory_limit: Option<usize>,
+    tmpdir: PathBuf,
+    query_count: usize,
+    max_subject: u64,
+}
+
+impl AdaptiveHitStore {
+    fn new(
+        query_count: usize,
+        max_subject: u64,
+        memory_limit: Option<usize>,
+        tmpdir: PathBuf,
+    ) -> Self {
+        Self {
+            memory: Some((0..query_count).map(|_| Vec::new()).collect()),
+            disk: None,
+            memory_limit,
+            tmpdir,
+            query_count,
+            max_subject,
+        }
+    }
+
+    fn ingest_partitions(&mut self, partitions: Vec<Vec<StoredHit>>) -> io::Result<usize> {
+        let incoming = partitions.iter().map(Vec::len).sum::<usize>();
+        if self.disk.is_none()
+            && self.memory_limit.is_some_and(|limit| {
+                crate::util::system::get_current_rss()
+                    .saturating_add(incoming.saturating_mul(std::mem::size_of::<CompactHit>()))
+                    >= limit
+            })
+        {
+            self.spill_to_disk()?;
+        }
+
+        if let Some(memory) = self.memory.as_mut() {
+            for partition in partitions {
+                for hit in partition {
+                    if let Some(query_hits) = memory.get_mut(hit.query_id as usize) {
+                        query_hits.push(CompactHit {
+                            subject: hit.subject,
+                            seed_offset: hit.seed_offset,
+                            score: hit.score,
+                        });
+                    }
+                }
+            }
+            if self
+                .memory_limit
+                .is_some_and(|limit| crate::util::system::get_current_rss() >= limit)
+            {
+                self.spill_to_disk()?;
+            }
+        } else {
+            self.write_partitions(partitions)?;
+        }
+        Ok(incoming)
+    }
+
+    fn spill_to_disk(&mut self) -> io::Result<()> {
+        if self.disk.is_some() {
+            return Ok(());
+        }
+        let query_end = self.query_count.max(1).min(u32::MAX as usize) as u32;
+        let num_bins = self.query_count.clamp(1, 16);
+        let mut key_partition = Vec::with_capacity(num_bins);
+        for bin in 1..=num_bins {
+            let end = ((bin * self.query_count + num_bins - 1) / num_bins)
+                .max(1)
+                .min(query_end as usize) as u32;
+            if key_partition.last().copied() != Some(end) {
+                key_partition.push(end);
+            }
+        }
+        if key_partition.last().copied() != Some(query_end) {
+            key_partition.push(query_end);
+        }
+        let mut disk = HitBuffer::with_limits(
+            key_partition,
+            &self.tmpdir,
+            self.max_subject > u32::MAX as u64,
+            1,
+            query_end,
+            self.max_subject.max(1),
+            HitBufferMode::Disk,
+        )
+        .map_err(io::Error::other)?;
+
+        let memory = self.memory.take().unwrap_or_default();
+        for (query, hits) in memory.into_iter().enumerate() {
+            for hit in hits {
+                disk.append_disk_hit(Hit::with_score(
+                    query as u32,
+                    hit.subject,
+                    hit.seed_offset,
+                    hit.score,
+                ))
+                .map_err(io::Error::other)?;
+            }
+        }
+        disk.take_error().map_err(io::Error::other)?;
+        self.disk = Some(disk);
+        eprintln!(
+            "Hit buffer: RSS reached --memory-limit; spilling retained hits to {}",
+            if self.tmpdir.as_os_str().is_empty() {
+                std::env::temp_dir().display().to_string()
+            } else {
+                self.tmpdir.display().to_string()
+            }
+        );
+        trim_freed_heap_pages();
+        Ok(())
+    }
+
+    fn write_partitions(&mut self, partitions: Vec<Vec<StoredHit>>) -> io::Result<()> {
+        let disk = self
+            .disk
+            .as_mut()
+            .ok_or_else(|| io::Error::other("disk hit buffer not initialized"))?;
+        for partition in partitions {
+            for hit in partition {
+                disk.append_disk_hit(Hit::with_score(
+                    hit.query_id,
+                    hit.subject,
+                    hit.seed_offset,
+                    hit.score,
+                ))
+                .map_err(io::Error::other)?;
+            }
+        }
+        disk.take_error().map_err(io::Error::other)
+    }
 }
 
 /// Consume one stage-1 partition and retain only candidates that pass the
 /// ungapped window filter.  This is deliberately partition-local: retaining
 /// all Hamming survivors was the multi-gigabyte RSS bottleneck on repetitive
 /// real databases.
+#[inline(always)]
 fn filter_partition_to_hits(
     matches: &[SeedMatch],
+    out: &mut Vec<StoredHit>,
     queries: &[Vec<Letter>],
     db_block: &Block,
     cutoffs: &[i32],
@@ -69,9 +277,157 @@ fn filter_partition_to_hits(
     skip_left_most: bool,
     index_chunks: usize,
     min_identities: u32,
-) -> Vec<StoredHit> {
-    let mut out = Vec::new();
+    ungapped_lane_count: usize,
+    ungapped_kernel: UngappedKernel,
+) -> usize {
+    macro_rules! run {
+        ($first:literal, $chunked:literal, $range:literal, $skip:literal) => {
+            filter_partition_to_hits_impl::<$first, $chunked, $range, $skip>(
+                matches,
+                out,
+                queries,
+                db_block,
+                cutoffs,
+                score_matrix,
+                shape,
+                left_most_context,
+                index_chunks,
+                min_identities,
+                ungapped_lane_count,
+                ungapped_kernel,
+            )
+        };
+    }
+    if skip_left_most {
+        return run!(false, false, false, true);
+    }
+    match (first_shape, chunked, use_left_most_range) {
+        (true, true, true) => run!(true, true, true, false),
+        (false, true, true) => run!(false, true, true, false),
+        (true, true, false) => run!(true, true, false, false),
+        (false, true, false) => run!(false, true, false, false),
+        (true, false, false) => run!(true, false, false, false),
+        (false, false, false) => run!(false, false, false, false),
+        (_, false, true) => unreachable!("left-most range without index chunks"),
+    }
+}
+
+#[inline]
+unsafe fn filter_partition_to_hits_baseline(
+    matches: &[SeedMatch],
+    out: &mut Vec<StoredHit>,
+    queries: &[Vec<Letter>],
+    db_block: &Block,
+    cutoffs: &[i32],
+    score_matrix: &ScoreMatrix,
+    shape: &Shape,
+    left_most_context: &LeftMostContext<'_>,
+    first_shape: bool,
+    chunked: bool,
+    use_left_most_range: bool,
+    skip_left_most: bool,
+    index_chunks: usize,
+    min_identities: u32,
+    ungapped_lane_count: usize,
+    ungapped_kernel: UngappedKernel,
+) -> usize {
+    filter_partition_to_hits(
+        matches,
+        out,
+        queries,
+        db_block,
+        cutoffs,
+        score_matrix,
+        shape,
+        left_most_context,
+        first_shape,
+        chunked,
+        use_left_most_range,
+        skip_left_most,
+        index_chunks,
+        min_identities,
+        ungapped_lane_count,
+        ungapped_kernel,
+    )
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl")]
+unsafe fn filter_partition_to_hits_avx512(
+    matches: &[SeedMatch],
+    out: &mut Vec<StoredHit>,
+    queries: &[Vec<Letter>],
+    db_block: &Block,
+    cutoffs: &[i32],
+    score_matrix: &ScoreMatrix,
+    shape: &Shape,
+    left_most_context: &LeftMostContext<'_>,
+    first_shape: bool,
+    chunked: bool,
+    use_left_most_range: bool,
+    skip_left_most: bool,
+    index_chunks: usize,
+    min_identities: u32,
+    ungapped_lane_count: usize,
+    ungapped_kernel: UngappedKernel,
+) -> usize {
+    filter_partition_to_hits(
+        matches,
+        out,
+        queries,
+        db_block,
+        cutoffs,
+        score_matrix,
+        shape,
+        left_most_context,
+        first_shape,
+        chunked,
+        use_left_most_range,
+        skip_left_most,
+        index_chunks,
+        min_identities,
+        ungapped_lane_count,
+        ungapped_kernel,
+    )
+}
+
+#[inline(always)]
+fn filter_partition_to_hits_impl<
+    const FIRST_SHAPE: bool,
+    const CHUNKED: bool,
+    const USE_LEFT_MOST_RANGE: bool,
+    const SKIP_LEFT_MOST: bool,
+>(
+    matches: &[SeedMatch],
+    out: &mut Vec<StoredHit>,
+    queries: &[Vec<Letter>],
+    db_block: &Block,
+    cutoffs: &[i32],
+    score_matrix: &ScoreMatrix,
+    shape: &Shape,
+    left_most_context: &LeftMostContext<'_>,
+    index_chunks: usize,
+    min_identities: u32,
+    ungapped_lane_count: usize,
+    ungapped_kernel: UngappedKernel,
+) -> usize {
     let ref_seq_data = db_block.seqs().data();
+    let mut ungapped_count = 0usize;
+    // Every callback belongs to one seed partition. C++ exposes the enclosing
+    // index-chunk range through `current_range`; deriving it for every passing
+    // hit introduced two integer divisions in the hottest left-most loop.
+    let current_range = if USE_LEFT_MOST_RANGE {
+        matches.first().map(|hit| {
+            let partitions = seedp_count(10) as usize;
+            let chunk_size = partitions.div_ceil(index_chunks);
+            let partition = seed_partition(hit.seed, seedp_mask(10)) as usize;
+            let begin = (partition / chunk_size) * chunk_size;
+            let end = (begin + chunk_size).min(partitions);
+            SeedPartitionRange::with_bounds(begin as u32, end as u32)
+        })
+    } else {
+        None
+    };
     let mut group_begin = 0usize;
     while group_begin < matches.len() {
         let query_id = matches[group_begin].query_id as usize;
@@ -102,14 +458,14 @@ fn filter_partition_to_hits(
         }
         let left_len = q_end - left_q_start;
 
-        for chunk in matches[group_begin..group_end].chunks(32) {
+        for chunk in matches[group_begin..group_end].chunks(ungapped_lane_count) {
             let mut subject_starts = [0isize; 32];
             for (start, hit) in subject_starts.iter_mut().zip(chunk) {
-                *start = db_block
-                    .seqs()
-                    .position(hit.ref_id as usize, hit.ref_pos as usize)
-                    as isize
-                    - window_left as isize;
+                // The streaming join carries upstream's absolute PackedLoc in
+                // the high bits and its seed partition in the low 10 bits.
+                // Avoid a random limits-array lookup for every cross-product
+                // survivor merely to reconstruct the position we just decoded.
+                *start = (hit.seed >> 10) as isize - window_left as isize;
             }
             let subject_storage;
             let mut subject_windows = [&[][..]; 32];
@@ -145,7 +501,7 @@ fn filter_partition_to_hits(
             }
             let mut scores = [i32::MAX; 32];
             if cutoff != 0 {
-                crate::dp::simd_ungapped::window_ungapped_best_into(
+                ungapped_kernel(
                     query_window,
                     &subject_windows[..chunk.len()],
                     window_clipped,
@@ -153,63 +509,80 @@ fn filter_partition_to_hits(
                     &mut scores[..chunk.len()],
                 );
             }
-            for (hit, &score) in chunk.iter().zip(&scores) {
+            for (hit_index, (hit, &score)) in chunk.iter().zip(&scores).enumerate() {
                 if score <= cutoff {
                     continue;
                 }
-                let subject = db_block
-                    .seqs()
-                    .position(hit.ref_id as usize, hit.ref_pos as usize);
+                ungapped_count += 1;
+                // `subject_starts` already contains this absolute location
+                // minus `window_left`. Avoid repeating the offsets lookup for
+                // every survivor in the hottest stage-1 loop.
+                let subject = (subject_starts[hit_index] + window_left as isize) as usize;
                 let left_subject_start =
                     subject as isize - window_left as isize + interval_overhang as isize;
-                let subject_storage;
-                let subject_window = if left_subject_start >= 0
-                    && left_subject_start as usize + left_len <= ref_seq_data.len()
-                {
-                    &ref_seq_data
-                        [left_subject_start as usize..left_subject_start as usize + left_len]
-                } else {
-                    subject_storage = (0..left_len)
-                        .map(|n| {
-                            let pos = left_subject_start + n as isize;
-                            if pos < 0 {
-                                crate::basic::value::DELIMITER_LETTER
-                            } else {
-                                ref_seq_data
-                                    .get(pos as usize)
-                                    .copied()
-                                    .unwrap_or(crate::basic::value::DELIMITER_LETTER)
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    &subject_storage
-                };
-                let current_range = if use_left_most_range {
-                    let partitions = seedp_count(10) as usize;
-                    let chunk_size = partitions.div_ceil(index_chunks);
-                    let partition = seed_partition(hit.seed, seedp_mask(10)) as usize;
-                    let begin = (partition / chunk_size) * chunk_size;
-                    let end = (begin + chunk_size).min(partitions);
-                    Some(SeedPartitionRange::with_bounds(begin as u32, end as u32))
-                } else {
-                    None
-                };
-                if !skip_left_most
-                    && !left_most_filter_with_range(
-                        &query[left_q_start..q_end],
-                        subject_window,
-                        left_seed_offset as i32,
-                        shape.length,
-                        left_most_context,
-                        first_shape,
-                        shape,
-                        cutoff,
-                        chunked,
-                        min_identities,
-                        current_range,
-                    )
-                {
-                    continue;
+                let local_left_subject_start =
+                    hit.ref_pos as isize - window_left as isize + interval_overhang as isize;
+                let subject_unclipped = local_left_subject_start >= 0
+                    && local_left_subject_start as usize + left_len
+                        <= db_block.seqs().length(hit.ref_id as usize) as usize;
+                if !SKIP_LEFT_MOST {
+                    let keep = if subject_unclipped {
+                        left_most_filter_with_range_unclipped(
+                            query,
+                            left_q_start,
+                            left_len,
+                            ref_seq_data,
+                            left_subject_start as usize,
+                            left_seed_offset as i32,
+                            shape.length,
+                            left_most_context,
+                            FIRST_SHAPE,
+                            shape,
+                            cutoff,
+                            CHUNKED,
+                            min_identities,
+                            current_range,
+                        )
+                    } else {
+                        let subject_storage;
+                        let subject_window = if left_subject_start >= 0
+                            && left_subject_start as usize + left_len <= ref_seq_data.len()
+                        {
+                            &ref_seq_data[left_subject_start as usize
+                                ..left_subject_start as usize + left_len]
+                        } else {
+                            subject_storage = (0..left_len)
+                                .map(|n| {
+                                    let pos = left_subject_start + n as isize;
+                                    if pos < 0 {
+                                        crate::basic::value::DELIMITER_LETTER
+                                    } else {
+                                        ref_seq_data
+                                            .get(pos as usize)
+                                            .copied()
+                                            .unwrap_or(crate::basic::value::DELIMITER_LETTER)
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            &subject_storage
+                        };
+                        left_most_filter_with_range(
+                            &query[left_q_start..q_end],
+                            subject_window,
+                            left_seed_offset as i32,
+                            shape.length,
+                            left_most_context,
+                            FIRST_SHAPE,
+                            shape,
+                            cutoff,
+                            CHUNKED,
+                            min_identities,
+                            current_range,
+                        )
+                    };
+                    if !keep {
+                        continue;
+                    }
                 }
                 out.push(StoredHit {
                     subject: subject as u64,
@@ -225,7 +598,7 @@ fn filter_partition_to_hits(
         }
         group_begin = group_end;
     }
-    out
+    ungapped_count
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -241,6 +614,7 @@ fn trim_freed_heap_pages() {
 }
 
 /// Configuration for a blastp run.
+#[derive(Clone)]
 pub struct BlastpConfig {
     pub query_files: Vec<String>,
     pub database: String,
@@ -268,6 +642,11 @@ pub struct BlastpConfig {
     /// C++ default is 12.3 (`diamond/src/basic/config.cpp:427`) and converts
     /// it to a raw score with the active score matrix at startup.
     pub ungapped_xdrop_bits: f64,
+    /// Soft process-RSS ceiling. Once reached, retained seed hits are stored in
+    /// compressed temporary bins. `None` keeps the all-in-memory fast path.
+    pub memory_limit: Option<usize>,
+    /// Directory for spill files; an empty path uses the OS temporary directory.
+    pub tmpdir: PathBuf,
 }
 
 /// Run a simplified blastp search.
@@ -479,20 +858,6 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     } else {
         vec![Vec::new(); query_records.len()]
     };
-    let hamming_restores = |motifs: &[Vec<crate::masking::motifs::MotifMaskEntry>]| {
-        motifs
-            .iter()
-            .map(|saved| {
-                saved
-                    .iter()
-                    .map(|entry| (entry.pos, entry.original))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    };
-    let db_hamming_restores = hamming_restores(&db_motif_saves);
-    let query_hamming_restores = hamming_restores(&query_motif_saves);
-
     // Set up seed extraction using sensitivity-appropriate shapes
     let reduction = Reduction::default_reduction();
     let shape_codes = sensitivity::get_shape_codes(config.sensitivity);
@@ -599,59 +964,148 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // mark on large databases.
     trim_freed_heap_pages();
 
+    // Hamming fingerprints in upstream are loaded after motif masking has
+    // been removed, directly from the original contiguous sequences. Use the
+    // pre-motif stage-2 copies here as well: seed enumeration still consumes
+    // the masked `query_seqs`/`db_seqs`, while fingerprint loading no longer
+    // needs a sparse restoration lookup for every candidate window. Query
+    // SEED_MASK annotations are harmless because the fingerprint loader
+    // strips LETTER_MASK from every byte.
+    let query_fingerprint_seqs: Vec<&[Letter]> = stage2_queries.iter().map(Vec::as_slice).collect();
+    let db_fingerprint_seqs: Vec<&[Letter]> = (0..db_block.seqs().len())
+        .map(|id| db_block.seqs().get(id))
+        .collect();
+
     let chunked = traits.index_chunks > 1;
     let use_left_most_range = chunked
         && (config.ext_chunk_size == 0 || config.ext_chunk_size <= 128)
         && config.max_target_seqs <= 25;
     let skip_left_most = config.sensitivity >= Sensitivity::VerySensitive;
-    let mut hits_by_query: Vec<Vec<CompactHit>> =
-        (0..stage2_queries.len()).map(|_| Vec::new()).collect();
+    // Select the stage-2 kernel once. A tiny const-generic trampoline keeps
+    // CPU-feature branches out of the batch loop without cloning the much
+    // larger partition worker for every ISA.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let use_avx2_ungapped = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let use_sse41_ungapped = std::arch::is_x86_feature_detected!("ssse3")
+        && std::arch::is_x86_feature_detected!("sse4.1");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let use_avx2_ungapped = false;
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let use_sse41_ungapped = false;
+    let (ungapped_lane_count, ungapped_kernel): (usize, UngappedKernel) = if use_avx2_ungapped {
+        (32, run_ungapped_kernel::<UNGAPPED_AVX2>)
+    } else if use_sse41_ungapped {
+        (16, run_ungapped_kernel::<UNGAPPED_SSE41>)
+    } else {
+        (16, run_ungapped_kernel::<UNGAPPED_PORTABLE>)
+    };
+    // Keep the globally conservative build free of AVX-512 in alignment while
+    // permitting the seed-filter worker to recover native-width vectorization.
+    // This dispatch is selected once per run; workers call the chosen function
+    // item directly, with no CPU-feature branch in the partition hot path.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let partition_filter: PartitionFilter = if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512dq")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+    {
+        filter_partition_to_hits_avx512
+    } else {
+        filter_partition_to_hits_baseline
+    };
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let partition_filter: PartitionFilter = filter_partition_to_hits_baseline;
+    let mut hit_store = AdaptiveHitStore::new(
+        stage2_queries.len(),
+        db_block.seqs().data().len() as u64,
+        config.memory_limit,
+        config.tmpdir.clone(),
+    );
+    // A zero ceiling explicitly requests upstream-compatible disk buffering;
+    // enter that mode before stage 1 rather than waiting for the first batch.
+    if config.memory_limit == Some(0) {
+        hit_store.spill_to_disk()?;
+    }
     let mut retained_hit_count = 0usize;
     let mut raw_seed_matches = 0usize;
     for (shape_id, shape) in shapes.iter().enumerate() {
         let complexity_cut = traits.seed_cut * std::f64::consts::LN_2 * shape.weight as f64;
-        let (shape_partitions, shape_raw_seed_matches) =
-            parallel::map_seed_matches_partitioned_streaming_hamming_min_query_len(
+        let map_matches = |matches: &[SeedMatch], out: &mut Vec<StoredHit>| {
+            // SAFETY: the AVX-512 function item is installed only after the
+            // one-time feature checks above; the baseline item has no extra
+            // instruction-set requirements.
+            unsafe {
+                partition_filter(
+                    matches,
+                    out,
+                    &stage2_queries,
+                    &db_block,
+                    &ungapped_cutoffs,
+                    &score_matrix,
+                    shape,
+                    &left_most_contexts[shape_id],
+                    shape_id == 0,
+                    chunked,
+                    use_left_most_range,
+                    skip_left_most,
+                    traits.index_chunks as usize,
+                    traits.min_identities,
+                    ungapped_lane_count,
+                    ungapped_kernel,
+                )
+            }
+        };
+        let shape_raw_seed_matches = if config.memory_limit.is_none() {
+            // Preserve the fastest existing path when no ceiling was requested.
+            let (partitions, raw) =
+                parallel::map_seed_matches_partitioned_streaming_hamming_min_query_len(
+                    &query_seqs,
+                    &query_fingerprint_seqs,
+                    &db_seqs,
+                    &db_fingerprint_seqs,
+                    shape,
+                    &reduction,
+                    complexity_cut,
+                    config.min_query_len,
+                    traits.min_identities,
+                    map_matches,
+                );
+            retained_hit_count += hit_store.ingest_partitions(partitions)?;
+            raw
+        } else {
+            let mut spill_error = None;
+            let raw = parallel::visit_seed_matches_partitioned_streaming_hamming_min_query_len(
                 &query_seqs,
-                &query_hamming_restores,
+                &query_fingerprint_seqs,
                 &db_seqs,
-                &db_hamming_restores,
+                &db_fingerprint_seqs,
                 shape,
                 &reduction,
                 complexity_cut,
                 config.min_query_len,
                 traits.min_identities,
-                |matches| {
-                    filter_partition_to_hits(
-                        matches,
-                        &stage2_queries,
-                        &db_block,
-                        &ungapped_cutoffs,
-                        &score_matrix,
-                        shape,
-                        &left_most_contexts[shape_id],
-                        shape_id == 0,
-                        chunked,
-                        use_left_most_range,
-                        skip_left_most,
-                        traits.index_chunks as usize,
-                        traits.min_identities,
-                    )
+                // Keep enough independent partitions in flight that skewed
+                // seed groups do not leave workers idle at every disk-writer
+                // handoff. This remains bounded (and far below a complete
+                // 1024-partition shape) for forced-disk RSS control.
+                rayon::current_num_threads().max(1) * 15,
+                map_matches,
+                |partitions| {
+                    if spill_error.is_none() {
+                        match hit_store.ingest_partitions(partitions) {
+                            Ok(count) => retained_hit_count += count,
+                            Err(error) => spill_error = Some(error),
+                        }
+                    }
                 },
             );
-        raw_seed_matches += shape_raw_seed_matches;
-        for shape_hits in shape_partitions {
-            retained_hit_count += shape_hits.len();
-            for hit in shape_hits {
-                if let Some(query_hits) = hits_by_query.get_mut(hit.query_id as usize) {
-                    query_hits.push(CompactHit {
-                        subject: hit.subject,
-                        seed_offset: hit.seed_offset,
-                        score: hit.score,
-                    });
-                }
+            if let Some(error) = spill_error {
+                return Err(error);
             }
-        }
+            raw
+        };
+        raw_seed_matches += shape_raw_seed_matches;
     }
     // C++ stage0/stage2 preserves shape + seed-partition join emission order
     // inside a query. Only group by query so range building is cheap without
@@ -752,166 +1206,213 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // Process each query in input order. Native blastp keeps lazy target
     // masking disabled, so the C++-style extension path can read the shared
     // target block without serializing all queries.
-    let process_query =
-        |(query_idx, query_rec): (usize, &fasta::FastaRecord)| -> io::Result<Vec<u8>> {
-            let query = &query_rec.sequence;
+    let process_query = |(query_idx, query_rec, query_hits): (
+        usize,
+        &fasta::FastaRecord,
+        &[CompactHit],
+    )|
+     -> io::Result<Vec<u8>> {
+        let query = &query_rec.sequence;
 
-            // CBS (composition-based statistics) correction per query position.
-            // C++ default is comp-based-stats=1 (Hauser correction, window=40).
-            // `Sequence::operator[]` strips the soft-mask bit while preserving
-            // the residue, so compute Hauser from the query as stored rather
-            // than converting masked positions to X.
-            let query_cbs = if config.comp_based_stats.hauser() {
-                crate::stats::cbs::hauser_correction(query, &score_matrix)
-            } else {
-                Vec::new()
-            };
-            let query_comp = crate::stats::cbs::compute_composition(query);
-            let ungapped_cfg = UngappedStageConfig {
-                comp_based_stats: config.comp_based_stats,
-                xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
-                ..UngappedStageConfig::default()
-            };
-            let ext_mode = sensitivity::default_ext_mode(config.sensitivity);
-            let gapped_cfg = GappedScoreConfig {
-                comp_based_stats_hauser: config.comp_based_stats.hauser(),
-                comp_based_stats_matrix_adjust: config.comp_based_stats.matrix_adjust(),
-                query_cover: config.query_cover,
-                subject_cover: config.subject_cover,
-                no_self_hits: config.no_self_hits,
-                max_evalue: config.max_evalue,
-                min_id: config.min_id,
-                max_target_seqs: config.max_target_seqs,
-                ext_chunk_size: config.ext_chunk_size,
-                toppercent: config.toppercent,
-                global_ranking_targets: config.global_ranking_targets,
-                gapped_filter_evalue,
-                sensitivity: config.sensitivity,
-                ..GappedScoreConfig::default()
-            };
-
-            let query_hits = &hits_by_query[query_idx];
-            let mut hits = Vec::with_capacity(query_hits.len());
-            hits.extend(
-                query_hits
-                    .iter()
-                    .map(|hit| Hit::with_score(0, hit.subject, hit.seed_offset, hit.score)),
-            );
-            let mut stat = Statistics::new();
-            let output_hsp_values = HspValues::COORDS
-                | HspValues::IDENT
-                | HspValues::LENGTH
-                | HspValues::MISMATCHES
-                | HspValues::GAP_OPENINGS;
-            let query_cbs_arg: &[Vec<i8>] = if query_cbs.is_empty() {
-                &[]
-            } else {
-                std::slice::from_ref(&query_cbs)
-            };
-            let matches = extend_targets(
-                query_idx as u32,
-                &mut hits,
-                std::slice::from_ref(query),
-                &query_rec.id,
-                query.len() as i32,
-                query_cbs_arg,
-                &query_comp,
-                &db_block,
-                &mut stat,
-                Flags::NONE,
-                ext_mode,
-                &gapped_cfg,
-                &ungapped_cfg,
-                &score_matrix,
-                output_hsp_values,
-                |query_len, target_len| {
-                    cutoff_gapped1
-                        .as_ref()
-                        .map_or(-1, |table| table.call(query_len, target_len))
-                },
-                |query_len, target_len| {
-                    cutoff_gapped2
-                        .as_ref()
-                        .map_or(-1, |table| table.call(query_len, target_len))
-                },
-                score_matrix.gap_open(),
-                score_matrix.gap_extend(),
-                gapped_filter_diag_score,
-                GAPPED_FILTER_WINDOW,
-                Option::<fn(u32, &crate::align::gapped_filter::SeedHitList) -> Vec<Match>>::None,
-            );
-            // Format each completed match directly into its query buffer. The
-            // match list is already in output order, so retaining a second
-            // vector of copied HSP summaries only adds allocation and traffic.
-            let mut buf: Vec<u8> = Vec::new();
-            for m in matches {
-                let Some(best_hsp) = m.hsps.first() else {
-                    continue;
-                };
-                let target_id = m.target_block_id as usize;
-
-                let hsp = OutputHsp {
-                    score: best_hsp.score,
-                    evalue: best_hsp.evalue,
-                    bit_score: best_hsp.bit_score,
-                    query_range: (best_hsp.query_range.begin, best_hsp.query_range.end),
-                    subject_range: (best_hsp.subject_range.begin, best_hsp.subject_range.end),
-                    query_source_range: (best_hsp.query_range.begin, best_hsp.query_range.end),
-                    subject_source_range: (
-                        best_hsp.subject_range.begin,
-                        best_hsp.subject_range.end,
-                    ),
-                    frame: best_hsp.frame,
-                    length: best_hsp.length,
-                    identities: best_hsp.identities,
-                    mismatches: best_hsp.mismatches,
-                    positives: best_hsp.positives,
-                    gap_openings: best_hsp.gap_openings,
-                    gaps: best_hsp.gaps,
-                };
-                let target_title = std::str::from_utf8(db_ids.get(target_id)).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("invalid UTF-8 database title: {error}"),
-                    )
-                })?;
-                format::write_tabular_row(
-                    &mut buf,
-                    &query_rec.id,
-                    target_title,
-                    &hsp,
-                    &fields,
-                    query.len() as i32,
-                    db_block.seqs().length(target_id) as i32,
-                )?;
-            }
-            Ok(buf)
+        // CBS (composition-based statistics) correction per query position.
+        // C++ default is comp-based-stats=1 (Hauser correction, window=40).
+        // `Sequence::operator[]` strips the soft-mask bit while preserving
+        // the residue, so compute Hauser from the query as stored rather
+        // than converting masked positions to X.
+        let query_cbs = if config.comp_based_stats.hauser() {
+            crate::stats::cbs::hauser_correction(query, &score_matrix)
+        } else {
+            Vec::new()
         };
+        let query_comp = crate::stats::cbs::compute_composition(query);
+        let ungapped_cfg = UngappedStageConfig {
+            comp_based_stats: config.comp_based_stats,
+            xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
+            ..UngappedStageConfig::default()
+        };
+        let ext_mode = sensitivity::default_ext_mode(config.sensitivity);
+        let gapped_cfg = GappedScoreConfig {
+            comp_based_stats_hauser: config.comp_based_stats.hauser(),
+            comp_based_stats_matrix_adjust: config.comp_based_stats.matrix_adjust(),
+            query_cover: config.query_cover,
+            subject_cover: config.subject_cover,
+            no_self_hits: config.no_self_hits,
+            max_evalue: config.max_evalue,
+            min_id: config.min_id,
+            max_target_seqs: config.max_target_seqs,
+            ext_chunk_size: config.ext_chunk_size,
+            toppercent: config.toppercent,
+            global_ranking_targets: config.global_ranking_targets,
+            gapped_filter_evalue,
+            sensitivity: config.sensitivity,
+            ..GappedScoreConfig::default()
+        };
+
+        let mut hits = Vec::with_capacity(query_hits.len());
+        hits.extend(
+            query_hits
+                .iter()
+                .map(|hit| Hit::with_score(0, hit.subject, hit.seed_offset, hit.score)),
+        );
+        let mut stat = Statistics::new();
+        let output_hsp_values = HspValues::COORDS
+            | HspValues::IDENT
+            | HspValues::LENGTH
+            | HspValues::MISMATCHES
+            | HspValues::GAP_OPENINGS;
+        let query_cbs_arg: &[Vec<i8>] = if query_cbs.is_empty() {
+            &[]
+        } else {
+            std::slice::from_ref(&query_cbs)
+        };
+        let matches = extend_targets(
+            query_idx as u32,
+            &mut hits,
+            std::slice::from_ref(query),
+            &query_rec.id,
+            query.len() as i32,
+            query_cbs_arg,
+            &query_comp,
+            &db_block,
+            &mut stat,
+            Flags::NONE,
+            ext_mode,
+            &gapped_cfg,
+            &ungapped_cfg,
+            &score_matrix,
+            output_hsp_values,
+            |query_len, target_len| {
+                cutoff_gapped1
+                    .as_ref()
+                    .map_or(-1, |table| table.call(query_len, target_len))
+            },
+            |query_len, target_len| {
+                cutoff_gapped2
+                    .as_ref()
+                    .map_or(-1, |table| table.call(query_len, target_len))
+            },
+            score_matrix.gap_open(),
+            score_matrix.gap_extend(),
+            gapped_filter_diag_score,
+            GAPPED_FILTER_WINDOW,
+            Option::<fn(u32, &crate::align::gapped_filter::SeedHitList) -> Vec<Match>>::None,
+        );
+        // Format each completed match directly into its query buffer. The
+        // match list is already in output order, so retaining a second
+        // vector of copied HSP summaries only adds allocation and traffic.
+        let mut buf: Vec<u8> = Vec::new();
+        for m in matches {
+            let Some(best_hsp) = m.hsps.first() else {
+                continue;
+            };
+            let target_id = m.target_block_id as usize;
+
+            let hsp = OutputHsp {
+                score: best_hsp.score,
+                evalue: best_hsp.evalue,
+                bit_score: best_hsp.bit_score,
+                query_range: (best_hsp.query_range.begin, best_hsp.query_range.end),
+                subject_range: (best_hsp.subject_range.begin, best_hsp.subject_range.end),
+                query_source_range: (best_hsp.query_range.begin, best_hsp.query_range.end),
+                subject_source_range: (best_hsp.subject_range.begin, best_hsp.subject_range.end),
+                frame: best_hsp.frame,
+                length: best_hsp.length,
+                identities: best_hsp.identities,
+                mismatches: best_hsp.mismatches,
+                positives: best_hsp.positives,
+                gap_openings: best_hsp.gap_openings,
+                gaps: best_hsp.gaps,
+            };
+            let target_title = std::str::from_utf8(db_ids.get(target_id)).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid UTF-8 database title: {error}"),
+                )
+            })?;
+            format::write_tabular_row(
+                &mut buf,
+                &query_rec.id,
+                target_title,
+                &hsp,
+                &fields,
+                query.len() as i32,
+                db_block.seqs().length(target_id) as i32,
+            )?;
+        }
+        Ok(buf)
+    };
     let mut total_alignments = 0u64;
     // Preserve input order without retaining every query's formatted output.
     // A moderately sized batch gives Rayon enough work to balance variable
     // protein lengths while keeping buffered output proportional to threads.
-    let output_batch_size = rayon::current_num_threads().max(1) * 32;
-    for (batch_idx, query_batch) in query_records.chunks(output_batch_size).enumerate() {
-        let query_begin = batch_idx * output_batch_size;
-        let batch_output: Vec<Vec<u8>> = if rayon::current_num_threads() == 1 {
-            query_batch
-                .iter()
-                .enumerate()
-                .map(|(offset, record)| process_query((query_begin + offset, record)))
-                .collect::<io::Result<Vec<_>>>()?
-        } else {
-            query_batch
-                .par_iter()
-                .enumerate()
-                .map(|(offset, record)| process_query((query_begin + offset, record)))
-                .collect::<io::Result<Vec<_>>>()?
-        };
-        for buf in batch_output {
-            // Each line in buf corresponds to one alignment; count newlines.
-            total_alignments += buf.iter().filter(|&&b| b == b'\n').count() as u64;
-            writer.write_all(&buf)?;
+    let output_batch_size = rayon::current_num_threads().max(1) * 64;
+    let mut write_query_range = |range_begin: usize,
+                                 records: &[fasta::FastaRecord],
+                                 hits_by_query: &[Vec<CompactHit>]|
+     -> io::Result<()> {
+        for (batch_idx, query_batch) in records.chunks(output_batch_size).enumerate() {
+            let local_begin = batch_idx * output_batch_size;
+            let query_begin = range_begin + local_begin;
+            let hit_batch = &hits_by_query[local_begin..local_begin + query_batch.len()];
+            let batch_output: Vec<Vec<u8>> = if rayon::current_num_threads() == 1 {
+                query_batch
+                    .iter()
+                    .zip(hit_batch)
+                    .enumerate()
+                    .map(|(offset, (record, hits))| {
+                        process_query((query_begin + offset, record, hits))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?
+            } else {
+                query_batch
+                    .par_iter()
+                    .zip(hit_batch.par_iter())
+                    .enumerate()
+                    .map(|(offset, (record, hits))| {
+                        process_query((query_begin + offset, record, hits))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?
+            };
+            for buf in batch_output {
+                total_alignments += buf.iter().filter(|&&b| b == b'\n').count() as u64;
+                writer.write_all(&buf)?;
+            }
         }
+        Ok(())
+    };
+
+    if let Some(hits_by_query) = hit_store.memory.as_ref() {
+        write_query_range(0, &query_records, hits_by_query)?;
+    } else {
+        let disk = hit_store
+            .disk
+            .as_mut()
+            .ok_or_else(|| io::Error::other("missing hit storage"))?;
+        disk.try_finish_writing().map_err(io::Error::other)?;
+        let mut load_pending = disk.load_grouped();
+        while load_pending {
+            let Some((bin_hits, begin, end)) = disk
+                .try_retrieve_grouped_owned()
+                .map_err(io::Error::other)?
+            else {
+                break;
+            };
+            // Start decoding the next spill bin before alignment of this bin.
+            load_pending = disk.load_grouped();
+            let begin_idx = begin as usize;
+            let end_idx = (end as usize).min(query_records.len());
+            write_query_range(
+                begin_idx,
+                &query_records[begin_idx..end_idx],
+                &bin_hits[..end_idx - begin_idx],
+            )?;
+            disk.recycle_grouped_hits(bin_hits);
+        }
+        disk.free_buffer();
+        eprintln!(
+            "Hit buffer: read {:.1} MiB of compressed spill data",
+            disk.total_disk_size() as f64 / (1024.0 * 1024.0)
+        );
     }
     writer.flush()?;
 
@@ -921,7 +1422,6 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         total_alignments,
         elapsed.as_secs_f64()
     );
-
     Ok(())
 }
 
@@ -966,6 +1466,8 @@ mod tests {
             comp_based_stats: CbsMode::Hauser,
             no_self_hits: false,
             ungapped_xdrop_bits: 12.3,
+            memory_limit: None,
+            tmpdir: PathBuf::new(),
         };
 
         let result = run(&config);
@@ -984,6 +1486,7 @@ mod tests {
     fn test_blastp_self() {
         let fasta_path = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/1.faa");
         let output_path = std::env::temp_dir().join("test_blastp_self.out");
+        let spill_output_path = std::env::temp_dir().join("test_blastp_self_spill.out");
 
         let config = BlastpConfig {
             query_files: vec![fasta_path.to_string()],
@@ -1009,6 +1512,8 @@ mod tests {
             comp_based_stats: CbsMode::Hauser,
             no_self_hits: false,
             ungapped_xdrop_bits: 12.3,
+            memory_limit: None,
+            tmpdir: PathBuf::new(),
         };
 
         let result = run(&config);
@@ -1020,6 +1525,20 @@ mod tests {
         // Self-alignment should find at least one hit
         assert!(output.lines().count() >= 1);
 
+        // A one-byte ceiling deterministically exercises migration to disk.
+        // Its output must preserve the in-memory path's query/hit order.
+        let mut spill_config = config.clone();
+        spill_config.output = Some(spill_output_path.to_string_lossy().to_string());
+        spill_config.memory_limit = Some(0);
+        let spill_result = run(&spill_config);
+        assert!(
+            spill_result.is_ok(),
+            "disk-backed blastp failed: {:?}",
+            spill_result.err()
+        );
+        assert_eq!(output, std::fs::read_to_string(&spill_output_path).unwrap());
+
         let _ = std::fs::remove_file(&output_path);
+        let _ = std::fs::remove_file(&spill_output_path);
     }
 }

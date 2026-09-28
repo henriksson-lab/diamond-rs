@@ -168,50 +168,69 @@ unsafe fn window_ungapped_avx2(
 
     debug_assert!(subjects.len() <= 32);
     let mut subject_block = [0i8; 32 * 32];
-    let mut subject_rows = [&[][..]; 32];
+    let mut tail_block = [[0i8; 32]; 32];
+    let mut subject_ptrs = [std::ptr::null(); 32];
+    for (pointer, subject) in subject_ptrs.iter_mut().zip(subjects) {
+        *pointer = subject.as_ptr();
+    }
     let mut best_bytes = [SCORE_BIAS; 32];
     let mut score = _mm256_set1_epi8(SCORE_BIAS);
     let mut best = score;
-    let low_nibble = _mm256_set1_epi8(0x0f);
-
     let lane_offset = 32 - subjects.len();
     for block_begin in (0..window).step_by(32) {
         let block_len = (window - block_begin).min(32);
         if block_len == 32 {
-            for (row, subject) in subject_rows.iter_mut().zip(subjects) {
-                *row = &subject[block_begin..];
-            }
-            crate::util::simd::transpose_32(
-                &subject_rows[..subjects.len()],
+            crate::util::simd::transpose_32_avx2(
+                &subject_ptrs[..subjects.len()],
                 subjects.len(),
+                block_begin,
                 &mut subject_block,
             );
         } else {
-            subject_block.fill(0);
-            for position in 0..block_len {
-                for (lane, subject) in subjects.iter().enumerate() {
-                    subject_block[position * 32 + lane_offset + lane] =
-                        subject[block_begin + position];
-                }
+            // Upstream can transpose a complete final vector because its
+            // SequenceSet allocation is padded. Rust slices do not permit an
+            // overread, so make the same full-width input explicitly. Copying
+            // one contiguous tail per lane avoids the former position×lane
+            // loop and its two bounds checks per byte.
+            for (lane, subject) in subjects.iter().enumerate() {
+                tail_block[lane].fill(0);
+                std::ptr::copy_nonoverlapping(
+                    subject.as_ptr().add(block_begin),
+                    tail_block[lane].as_mut_ptr(),
+                    block_len,
+                );
             }
+            for lane in 0..subjects.len() {
+                subject_ptrs[lane] = tail_block[lane].as_ptr();
+            }
+            crate::util::simd::transpose_32_avx2(
+                &subject_ptrs[..subjects.len()],
+                subjects.len(),
+                0,
+                &mut subject_block,
+            );
         }
         for position in 0..block_len {
             let letters = _mm256_and_si256(
                 _mm256_loadu_si256(subject_block.as_ptr().add(position * 32).cast()),
                 _mm256_set1_epi8(LETTER_MASK),
             );
-            let indices = _mm256_and_si256(letters, low_nibble);
-
             let query_letter = (query[block_begin + position] & LETTER_MASK) as usize;
-            let row = score_matrix.matrix8().as_ptr().add(query_letter * 32);
-            let row_low = _mm256_broadcastsi128_si256(_mm_loadu_si128(row.cast()));
-            let row_high = _mm256_broadcastsi128_si256(_mm_loadu_si128(row.add(16).cast()));
-            let low_scores = _mm256_shuffle_epi8(row_low, indices);
-            let high_scores = _mm256_shuffle_epi8(row_high, indices);
-            // Bit 4 is set precisely for alphabet codes 16..31. Its byte value is
-            // positive, so turn it into blendv's sign-bit mask with a left shift.
+            let row = query_letter * 32;
+            let row_low = _mm256_loadu_si256(score_matrix.matrix8_low().as_ptr().add(row).cast());
+            let row_high = _mm256_loadu_si256(score_matrix.matrix8_high().as_ptr().add(row).cast());
+            // Direct port of ScoreVector<int8_t>(letter, subject-vector): the
+            // high bit steers each lane to exactly one of the two shuffle
+            // tables, so their results can be ORed without a blend.
             let high_mask = _mm256_slli_epi16(_mm256_and_si256(letters, _mm256_set1_epi8(0x10)), 3);
-            let match_scores = _mm256_blendv_epi8(low_scores, high_scores, high_mask);
+            let seq_low = _mm256_or_si256(letters, high_mask);
+            let seq_high = _mm256_or_si256(
+                letters,
+                _mm256_xor_si256(high_mask, _mm256_set1_epi8(i8::MIN)),
+            );
+            let low_scores = _mm256_shuffle_epi8(row_low, seq_low);
+            let high_scores = _mm256_shuffle_epi8(row_high, seq_high);
+            let match_scores = _mm256_or_si256(low_scores, high_scores);
 
             score = _mm256_adds_epi8(score, match_scores);
             best = _mm256_max_epi8(best, score);
@@ -326,6 +345,66 @@ pub fn window_ungapped_best_into(
         }
     } else {
         window_ungapped_into(query, subjects, window, score_matrix, out);
+    }
+}
+
+/// AVX2-specialized direct output form used after dispatch at a higher level.
+///
+/// # Safety
+///
+/// The caller must establish that AVX2 is available before calling this
+/// function. Keeping that check at the stage boundary avoids repeating CPU
+/// feature detection for every small subject batch.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+pub(crate) unsafe fn window_ungapped_best_into_avx2(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+    out: &mut [i32],
+) {
+    debug_assert!(query.len() >= window);
+    debug_assert!(subjects.iter().all(|subject| subject.len() >= window));
+    debug_assert!(out.len() >= subjects.len());
+    if subjects.len() < 4 {
+        for (score, subject) in out.iter_mut().zip(subjects) {
+            *score = super::ungapped::ungapped_window(query, subject, window, score_matrix);
+        }
+    } else {
+        // SAFETY: inherited from this function's contract; debug builds also
+        // verify the buffer invariants above.
+        unsafe { window_ungapped_avx2(query, subjects, window, score_matrix, out) };
+    }
+}
+
+/// SSE4.1-specialized direct output form used after dispatch at a higher
+/// level.
+///
+/// # Safety
+///
+/// The caller must establish that SSSE3 and SSE4.1 are available before
+/// calling this function.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+pub(crate) unsafe fn window_ungapped_best_into_sse41(
+    query: &[Letter],
+    subjects: &[&[Letter]],
+    window: usize,
+    score_matrix: &ScoreMatrix,
+    out: &mut [i32],
+) {
+    debug_assert!(query.len() >= window);
+    debug_assert!(subjects.iter().all(|subject| subject.len() >= window));
+    debug_assert!(out.len() >= subjects.len());
+    if subjects.len() < 4 {
+        for (score, subject) in out.iter_mut().zip(subjects) {
+            *score = super::ungapped::ungapped_window(query, subject, window, score_matrix);
+        }
+    } else {
+        // SAFETY: inherited from this function's contract; debug builds also
+        // verify the buffer invariants above.
+        unsafe { window_ungapped_sse41(query, subjects, window, score_matrix, out) };
     }
 }
 

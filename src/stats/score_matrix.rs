@@ -161,6 +161,10 @@ fn area_params_from_alp(p: &super::pvalues::ALP_set_of_parameters) -> super::pva
 /// Holds the scoring data in various representations optimized for
 /// different SIMD widths (8-bit, 16-bit, 32-bit), plus statistical
 /// parameters for E-value computation.
+// C++ `Scores<T>::data` is `alignas(32)`.  Keep the tables in declaration
+// order and align the containing object so each 32-wide row has the same
+// alignment; the preceding table sizes are all multiples of 32 bytes.
+#[repr(C, align(32))]
 pub struct ScoreMatrix {
     /// 32x32 score matrix (padded for alignment), 32-bit scores.
     matrix32: [i32; 32 * 32],
@@ -973,6 +977,14 @@ mod tests {
         assert_eq!(sm.joint_probs().unwrap().len(), 400);
         assert_eq!(sm.background_freqs(), &BLOSUM62_BACKGROUND_FREQS);
         assert!((sm.freq_ratios().unwrap()[1][1] - 3.90294070).abs() < 1e-8);
+    }
+
+    #[test]
+    fn simd_score_tables_are_32_byte_aligned() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        assert_eq!(sm.matrix8u_low().as_ptr() as usize % 32, 0);
+        assert_eq!(sm.matrix8u_high().as_ptr() as usize % 32, 0);
+        assert_eq!(sm.matrix16().as_ptr() as usize % 32, 0);
     }
 
     #[test]

@@ -190,8 +190,8 @@ pub fn xdrop_ungapped(
     while q >= 0
         && s >= 0
         && score - st < xdrop
-        && query[q as usize] != DELIMITER_LETTER
-        && subject[s as usize] != DELIMITER_LETTER
+        && unsafe { *query.get_unchecked(q as usize) } != DELIMITER_LETTER
+        && unsafe { *subject.get_unchecked(s as usize) } != DELIMITER_LETTER
     {
         let ql = query[q as usize] & LETTER_MASK;
         let sl = subject[s as usize] & LETTER_MASK;
@@ -213,8 +213,8 @@ pub fn xdrop_ungapped(
     while q < query.len()
         && s < subject.len()
         && score - st < xdrop
-        && query[q] != DELIMITER_LETTER
-        && subject[s] != DELIMITER_LETTER
+        && unsafe { *query.get_unchecked(q) } != DELIMITER_LETTER
+        && unsafe { *subject.get_unchecked(s) } != DELIMITER_LETTER
     {
         let ql = query[q] & LETTER_MASK;
         let sl = subject[s] & LETTER_MASK;
@@ -254,8 +254,8 @@ pub fn xdrop_ungapped_with_identities(
     while q >= 0
         && s >= 0
         && score - st < xdrop
-        && query[q as usize] != DELIMITER_LETTER
-        && subject[s as usize] != DELIMITER_LETTER
+        && unsafe { *query.get_unchecked(q as usize) } != DELIMITER_LETTER
+        && unsafe { *subject.get_unchecked(s as usize) } != DELIMITER_LETTER
     {
         let ql = query[q as usize] & LETTER_MASK;
         let sl = subject[s as usize] & LETTER_MASK;
@@ -283,8 +283,8 @@ pub fn xdrop_ungapped_with_identities(
     while q < query.len()
         && s < subject.len()
         && score - st < xdrop
-        && query[q] != DELIMITER_LETTER
-        && subject[s] != DELIMITER_LETTER
+        && unsafe { *query.get_unchecked(q) } != DELIMITER_LETTER
+        && unsafe { *subject.get_unchecked(s) } != DELIMITER_LETTER
     {
         let ql = query[q] & LETTER_MASK;
         let sl = subject[s] & LETTER_MASK;
@@ -323,6 +323,57 @@ pub fn xdrop_ungapped_with_cbs(
     count_identities: bool,
     score_matrix: &ScoreMatrix,
 ) -> DiagonalSegment {
+    match (query_cbs, count_identities) {
+        (Some(cbs), true) => xdrop_ungapped_cbs_impl::<true, true>(
+            query,
+            Some(cbs),
+            subject,
+            qa,
+            sa,
+            xdrop,
+            score_matrix,
+        ),
+        (Some(cbs), false) => xdrop_ungapped_cbs_impl::<true, false>(
+            query,
+            Some(cbs),
+            subject,
+            qa,
+            sa,
+            xdrop,
+            score_matrix,
+        ),
+        (None, true) => xdrop_ungapped_cbs_impl::<false, true>(
+            query,
+            None,
+            subject,
+            qa,
+            sa,
+            xdrop,
+            score_matrix,
+        ),
+        (None, false) => xdrop_ungapped_cbs_impl::<false, false>(
+            query,
+            None,
+            subject,
+            qa,
+            sa,
+            xdrop,
+            score_matrix,
+        ),
+    }
+}
+
+#[inline]
+fn xdrop_ungapped_cbs_impl<const CBS: bool, const COUNT_IDENTITIES: bool>(
+    query: &[Letter],
+    query_cbs: Option<&[i8]>,
+    subject: &[Letter],
+    qa: usize,
+    sa: usize,
+    xdrop: i32,
+    score_matrix: &ScoreMatrix,
+) -> DiagonalSegment {
+    debug_assert!(!CBS || query_cbs.is_some_and(|cbs| cbs.len() >= query.len()));
     let mut score: i32 = 0;
     let mut st: i32 = 0;
     let mut delta: i32 = 0;
@@ -336,16 +387,19 @@ pub fn xdrop_ungapped_with_cbs(
     while q >= 0
         && s >= 0
         && score - st < xdrop
-        && query[q as usize] != DELIMITER_LETTER
-        && subject[s as usize] != DELIMITER_LETTER
+        && unsafe { *query.get_unchecked(q as usize) } != DELIMITER_LETTER
+        && unsafe { *subject.get_unchecked(s as usize) } != DELIMITER_LETTER
     {
-        let ql = query[q as usize] & LETTER_MASK;
-        let sl = subject[s as usize] & LETTER_MASK;
+        // The loop conditions prove both indices are in range. Raw access
+        // mirrors C++'s pointer loop without paying another two bounds checks.
+        let ql = unsafe { *query.get_unchecked(q as usize) } & LETTER_MASK;
+        let sl = unsafe { *subject.get_unchecked(s as usize) } & LETTER_MASK;
         st += score_matrix.score(ql, sl);
-        if let Some(cbs) = query_cbs {
-            st += cbs[q as usize] as i32;
+        if CBS {
+            let cbs = unsafe { query_cbs.unwrap_unchecked() };
+            st += unsafe { *cbs.get_unchecked(q as usize) } as i32;
         }
-        if count_identities && ql == sl {
+        if COUNT_IDENTITIES && ql == sl {
             pending_ident += 1;
         }
         if st > score {
@@ -367,16 +421,17 @@ pub fn xdrop_ungapped_with_cbs(
     while q < query.len()
         && s < subject.len()
         && score - st < xdrop
-        && query[q] != DELIMITER_LETTER
-        && subject[s] != DELIMITER_LETTER
+        && unsafe { *query.get_unchecked(q) } != DELIMITER_LETTER
+        && unsafe { *subject.get_unchecked(s) } != DELIMITER_LETTER
     {
-        let ql = query[q] & LETTER_MASK;
-        let sl = subject[s] & LETTER_MASK;
+        let ql = unsafe { *query.get_unchecked(q) } & LETTER_MASK;
+        let sl = unsafe { *subject.get_unchecked(s) } & LETTER_MASK;
         st += score_matrix.score(ql, sl);
-        if let Some(cbs) = query_cbs {
-            st += cbs[q] as i32;
+        if CBS {
+            let cbs = unsafe { query_cbs.unwrap_unchecked() };
+            st += unsafe { *cbs.get_unchecked(q) } as i32;
         }
-        if count_identities && ql == sl {
+        if COUNT_IDENTITIES && ql == sl {
             pending_ident += 1;
         }
         if st > score {

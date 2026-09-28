@@ -534,11 +534,12 @@ impl SeedArray {
             offsets[p + 1] = total;
         }
 
-        let mut cursors = offsets[..num_partitions].to_vec();
         data.clear();
         if data.capacity() < total {
             data.reserve_exact(total);
         }
+
+        let mut cursors = offsets[..num_partitions].to_vec();
         let data_ptr = data.as_mut_ptr();
 
         for (seq_id, seq) in seqs.iter().enumerate() {

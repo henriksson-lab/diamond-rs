@@ -83,9 +83,34 @@ impl WorkTarget {
         score_matrix: &ScoreMatrix,
         cfg: &UngappedStageConfig,
     ) -> Self {
+        Self::new_shared(
+            block_id,
+            Arc::from(seq),
+            query,
+            query_len_true_aa,
+            query_comp,
+            _max_target_len,
+            stats,
+            score_matrix,
+            cfg,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_shared(
+        block_id: BlockId,
+        seq: Arc<[Letter]>,
+        query: &[Letter],
+        query_len_true_aa: Loc,
+        query_comp: &[f64; TRUE_AA as usize],
+        _max_target_len: Loc,
+        stats: &mut Statistics,
+        score_matrix: &ScoreMatrix,
+        cfg: &UngappedStageConfig,
+    ) -> Self {
         let mut target = WorkTarget {
             block_id,
-            seq: Arc::from(seq),
+            seq,
             ungapped_score: [0; MAX_CONTEXT as usize],
             hsp: std::array::from_fn(|_| Vec::new()),
             matrix: None,
@@ -154,8 +179,8 @@ pub fn ungapped_stage_target(
     score_matrix: &ScoreMatrix,
 ) -> WorkTarget {
     let ref_seqs = targets.seqs();
-    let target_seq = ref_seqs.get(block_id as usize);
-    let mut target = WorkTarget::new(
+    let target_seq = ref_seqs.shared_get(block_id as usize);
+    let mut target = WorkTarget::new_shared(
         block_id,
         target_seq,
         &query_seq[0],
@@ -298,8 +323,13 @@ pub fn ungapped_stage_seed_hits(
     }
     let max_target_len = 0;
     targets.reserve(n);
+    // C++ sorts each mutable FlatArray range in place.  The Rust call surface
+    // currently borrows the FlatArray, so reuse one staging buffer rather than
+    // allocating and freeing a Vec for every target range.
+    let mut hits = Vec::new();
     for i in 0..n {
-        let mut hits = seed_hits.range(i as u64).to_vec();
+        hits.clear();
+        hits.extend_from_slice(seed_hits.range(i as u64));
         let target = ungapped_stage_target(
             &mut hits,
             query_seq,

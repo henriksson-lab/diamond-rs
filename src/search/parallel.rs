@@ -419,9 +419,9 @@ where
 /// at most 32; no `Vec<SeedMatch>` proportional to q_count*r_count is built.
 pub fn map_seed_matches_partitioned_streaming_hamming_min_query_len<T, F>(
     query_seqs: &[&[Letter]],
-    query_restores: &[Vec<(usize, Letter)>],
+    query_fingerprint_seqs: &[&[Letter]],
     ref_seqs: &[&[Letter]],
-    ref_restores: &[Vec<(usize, Letter)>],
+    ref_fingerprint_seqs: &[&[Letter]],
     shape: &Shape,
     reduction: &Reduction,
     complexity_cut: f64,
@@ -431,7 +431,117 @@ pub fn map_seed_matches_partitioned_streaming_hamming_min_query_len<T, F>(
 ) -> (Vec<Vec<T>>, usize)
 where
     T: Send,
-    F: Fn(&[SeedMatch]) -> Vec<T> + Sync,
+    F: Fn(&[SeedMatch], &mut Vec<T>) -> usize + Sync,
+{
+    let mut output = Vec::new();
+    let raw_count = visit_seed_matches_partitioned_streaming_hamming_min_query_len(
+        query_seqs,
+        query_fingerprint_seqs,
+        ref_seqs,
+        ref_fingerprint_seqs,
+        shape,
+        reduction,
+        complexity_cut,
+        min_query_len,
+        hamming_filter_id,
+        usize::MAX,
+        map_batch,
+        |partitions| output.extend(partitions),
+    );
+    (output, raw_count)
+}
+
+/// Bounded-output variant of
+/// [`map_seed_matches_partitioned_streaming_hamming_min_query_len`]. Seed
+/// partitions are processed in ordered batches and handed to `consume` before
+/// the next batch is built. This lets callers spill retained hits without
+/// first materializing a complete shape's output.
+#[allow(clippy::too_many_arguments)]
+pub fn visit_seed_matches_partitioned_streaming_hamming_min_query_len<T, F, C>(
+    query_seqs: &[&[Letter]],
+    query_fingerprint_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    ref_fingerprint_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: usize,
+    hamming_filter_id: u32,
+    partition_batch_size: usize,
+    map_batch: F,
+    consume: C,
+) -> usize
+where
+    T: Send,
+    F: Fn(&[SeedMatch], &mut Vec<T>) -> usize + Sync,
+    C: FnMut(Vec<Vec<T>>) + Send,
+{
+    macro_rules! dispatch {
+        ($kernel:expr) => {
+            return visit_seed_matches_partitioned_streaming_hamming_min_query_len_for::<
+                { $kernel },
+                T,
+                F,
+                C,
+            >(
+                query_seqs,
+                query_fingerprint_seqs,
+                ref_seqs,
+                ref_fingerprint_seqs,
+                shape,
+                reduction,
+                complexity_cut,
+                min_query_len,
+                hamming_filter_id,
+                partition_batch_size,
+                map_batch,
+                consume,
+            );
+        };
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx512bw") {
+            dispatch!(crate::search::hamming_filter::FP_AVX512BW);
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            dispatch!(crate::search::hamming_filter::FP_AVX2);
+        }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            dispatch!(crate::search::hamming_filter::FP_SSE2);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    dispatch!(crate::search::hamming_filter::FP_NEON);
+    #[cfg(not(target_arch = "aarch64"))]
+    dispatch!(crate::search::hamming_filter::FP_SCALAR);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_seed_matches_partitioned_streaming_hamming_min_query_len_for<
+    const HAMMING_KERNEL: u8,
+    T,
+    F,
+    C,
+>(
+    query_seqs: &[&[Letter]],
+    query_fingerprint_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    ref_fingerprint_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: usize,
+    hamming_filter_id: u32,
+    partition_batch_size: usize,
+    map_batch: F,
+    mut consume: C,
+) -> usize
+where
+    T: Send,
+    F: Fn(&[SeedMatch], &mut Vec<T>) -> usize + Sync,
+    C: FnMut(Vec<Vec<T>>) + Send,
 {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -468,14 +578,28 @@ where
         partitions
     }
 
+    let raw_count = AtomicUsize::new(0);
+    // Aggregate once per partition, rather than once per hit, so exposing the
+    // same stage boundary as upstream's TENTATIVE_MATCHES1 counter has
+    // negligible cost in the hot cross-product loop.
+    let hamming_count = AtomicUsize::new(0);
+    let ungapped_count = AtomicUsize::new(0);
     let mut query_parts = split_into_partitions(&mut query_sa, num_partitions);
     let mut ref_parts = split_into_partitions(&mut ref_sa, num_partitions);
-    let raw_count = AtomicUsize::new(0);
+
     let process = |partition: usize,
                    query_part: &mut [super::seed_array::SeedEntry],
                    ref_part: &mut [super::seed_array::SeedEntry]| {
         let blocks = match_blocks(query_part, ref_part);
         let mut output = Vec::new();
+        let mut partition_hamming_count = 0usize;
+        let mut partition_ungapped_count = 0usize;
+        // C++ keeps the decoded locations in its per-worker WorkSet. Reuse
+        // these two buffers across joined seed groups in the partition rather
+        // than allocating a pair of Vecs for every group.
+        let mut query_locs = Vec::new();
+        let mut target_locs = Vec::new();
+        let mut target_subjects = Vec::new();
         for block in blocks.blocks {
             let first_query = super::seed_array::decode_seq_pos(
                 &query_offsets,
@@ -499,34 +623,47 @@ where
                 block.q_count as usize * block.r_count as usize,
                 Ordering::Relaxed,
             );
-            let query_locs: Vec<(u32, u32)> = (block.q_start..block.q_start + block.q_count)
-                .map(|index| {
-                    super::seed_array::decode_seq_pos(&query_offsets, query_part[index as usize])
-                })
-                .collect();
-            let target_locs: Vec<(u32, u32)> = (block.r_start..block.r_start + block.r_count)
-                .map(|index| {
-                    super::seed_array::decode_seq_pos(&ref_offsets, ref_part[index as usize])
-                })
-                .collect();
-            let key = query_part[block.q_start as usize].key;
-            let seed = ((key as PackedSeed) << seedp_bits) | partition as PackedSeed;
+            query_locs.clear();
+            query_locs.extend((block.q_start..block.q_start + block.q_count).map(|index| {
+                super::seed_array::decode_seq_pos(&query_offsets, query_part[index as usize])
+            }));
+            target_locs.clear();
+            target_subjects.clear();
+            for index in block.r_start..block.r_start + block.r_count {
+                let entry = ref_part[index as usize];
+                let target = super::seed_array::decode_seq_pos(&ref_offsets, entry);
+                // SeedEntry locations omit SequenceSet's perimeter and record
+                // delimiters. Convert once per distinct target, then reuse the
+                // absolute backing position across the whole query cross
+                // product just as upstream's PackedLoc does.
+                let subject = entry.loc as u64
+                    + target.0 as u64
+                    + crate::data::sequence_set::LetterStringSet::PERIMETER_PADDING as u64;
+                target_locs.push(target);
+                target_subjects.push(subject);
+            }
             let mut batch = Vec::with_capacity(32);
             let mut last_query = None;
-            crate::search::hamming_filter::visit_hamming_group(
+            crate::search::hamming_filter::visit_hamming_group_for::<HAMMING_KERNEL, _>(
                 &query_locs,
                 &target_locs,
-                query_seqs,
-                query_restores,
-                ref_seqs,
-                ref_restores,
+                query_fingerprint_seqs,
+                ref_fingerprint_seqs,
                 hamming_filter_id,
-                |query, target| {
+                |query, target, target_index| {
+                    partition_hamming_count += 1;
                     if last_query.is_some() && last_query != Some(query) && !batch.is_empty() {
-                        output.extend(map_batch(&batch));
+                        partition_ungapped_count += map_batch(&batch, &mut output);
                         batch.clear();
                     }
                     last_query = Some(query);
+                    // This streaming-only field packs the absolute subject
+                    // position above the partition bits. The downstream
+                    // left-most filter needs both but never needs the original
+                    // seed key; retaining PackedSeed's layout avoids growing
+                    // the 32-byte transient match record.
+                    let seed =
+                        (target_subjects[target_index] << seedp_bits) | partition as PackedSeed;
                     batch.push(SeedMatch {
                         query_id: query.0,
                         query_pos: query.1,
@@ -536,34 +673,116 @@ where
                         shape_id: 0,
                     });
                     if batch.len() == 32 {
-                        output.extend(map_batch(&batch));
+                        partition_ungapped_count += map_batch(&batch, &mut output);
                         batch.clear();
                     }
                 },
             );
             if !batch.is_empty() {
-                output.extend(map_batch(&batch));
+                partition_ungapped_count += map_batch(&batch, &mut output);
             }
         }
+        hamming_count.fetch_add(partition_hamming_count, Ordering::Relaxed);
+        ungapped_count.fetch_add(partition_ungapped_count, Ordering::Relaxed);
         output
     };
 
-    let output = if rayon::current_num_threads() == 1 {
-        query_parts
-            .iter_mut()
-            .zip(ref_parts.iter_mut())
-            .enumerate()
-            .map(|(partition, (query_part, ref_part))| process(partition, query_part, ref_part))
-            .collect()
+    let batch_size = partition_batch_size.max(1).min(num_partitions.max(1));
+    if rayon::current_num_threads() == 1 {
+        for begin in (0..num_partitions).step_by(batch_size) {
+            let end = (begin + batch_size).min(num_partitions);
+            let output = query_parts[begin..end]
+                .iter_mut()
+                .zip(ref_parts[begin..end].iter_mut())
+                .enumerate()
+                .map(|(offset, (query_part, ref_part))| {
+                    process(begin + offset, query_part, ref_part)
+                })
+                .collect();
+            consume(output);
+        }
     } else {
-        query_parts
-            .par_iter_mut()
-            .zip(ref_parts.par_iter_mut())
-            .enumerate()
-            .map(|(partition, (query_part, ref_part))| process(partition, query_part, ref_part))
-            .collect()
-    };
-    (output, raw_count.into_inner())
+        // Maintain one strictly bounded sliding window across all seed
+        // partitions. Fixed waves leave every worker waiting for each wave's
+        // slowest prefix; here an ordered completed prefix is consumed and
+        // replaced immediately. The coordinator yields into Rayon while it
+        // waits, so all configured workers remain available for partition
+        // jobs. We consume ready outputs before refilling their slots, keeping
+        // active jobs + buffered outputs at or below `batch_size`.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let receiver = std::sync::Mutex::new(receiver);
+        rayon::scope(|scope| {
+            let mut pending = query_parts.iter_mut().zip(ref_parts.iter_mut()).enumerate();
+            let mut active = 0usize;
+            for _ in 0..batch_size {
+                let Some((partition, (query_part, ref_part))) = pending.next() else {
+                    break;
+                };
+                let sender = sender.clone();
+                let process = &process;
+                scope.spawn(move |_| {
+                    let output = process(partition, query_part, ref_part);
+                    sender
+                        .send((partition, output))
+                        .expect("stage-1 result receiver dropped");
+                });
+                active += 1;
+            }
+
+            let mut next_partition = 0usize;
+            let mut completed = std::collections::BTreeMap::new();
+            while active != 0 {
+                let (partition, output) = loop {
+                    let result = receiver
+                        .lock()
+                        .expect("stage-1 result receiver poisoned")
+                        .try_recv();
+                    match result {
+                        Ok(result) => break result,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            rayon::yield_now();
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            panic!("stage-1 partition worker stopped without a result")
+                        }
+                    }
+                };
+                active -= 1;
+                completed.insert(partition, output);
+
+                let mut ready = Vec::new();
+                while let Some(output) = completed.remove(&next_partition) {
+                    ready.push(output);
+                    next_partition += 1;
+                }
+                let refill = ready.len();
+                if refill != 0 {
+                    consume(ready);
+                }
+                for _ in 0..refill {
+                    let Some((partition, (query_part, ref_part))) = pending.next() else {
+                        break;
+                    };
+                    let sender = sender.clone();
+                    let process = &process;
+                    scope.spawn(move |_| {
+                        let output = process(partition, query_part, ref_part);
+                        sender
+                            .send((partition, output))
+                            .expect("stage-1 result receiver dropped");
+                    });
+                    active += 1;
+                }
+            }
+        });
+    }
+    eprintln!(
+        "Stage-1 filters: {} -> {} (Hamming) -> {} (ungapped)",
+        raw_count.load(Ordering::Relaxed),
+        hamming_count.load(Ordering::Relaxed),
+        ungapped_count.load(Ordering::Relaxed),
+    );
+    raw_count.into_inner()
 }
 
 fn find_seed_matches_partitioned_filtered_min_query_len_impl<F, T>(

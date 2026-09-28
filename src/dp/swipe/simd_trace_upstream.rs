@@ -9,6 +9,17 @@ use crate::dp::smith_waterman::SwResult;
 use crate::stats::score_matrix::ScoreMatrix;
 use std::arch::x86_64 as arch;
 
+#[inline]
+fn push_operation_run(operations: &mut Vec<(EditOperation, i32)>, op: EditOperation, count: i32) {
+    if let Some((last_op, last_count)) = operations.last_mut() {
+        if *last_op == op {
+            *last_count += count;
+            return;
+        }
+    }
+    operations.push((op, count));
+}
+
 type V = arch::__m256i;
 
 #[target_feature(enable = "avx2")]
@@ -47,26 +58,32 @@ struct Trace16 {
     open: u32,
 }
 
-enum Trace16Matrix {
-    Packed(Vec<Trace16>),
-    Sparse { data: Vec<u8>, stride: usize },
+struct Trace16Matrix {
+    packed: Vec<Trace16>,
+    sparse: Vec<u8>,
+    stride: usize,
 }
 
 impl Trace16Matrix {
-    fn new(cells: usize, lanes: usize) -> Self {
-        if lanes >= 3 {
-            Self::Packed(vec![Trace16::default(); cells])
-        } else {
+    fn new<const SPARSE: bool>(cells: usize, lanes: usize) -> Self {
+        if SPARSE {
             let stride = lanes.div_ceil(2);
-            Self::Sparse {
-                data: vec![0; cells * stride],
+            Self {
+                packed: Vec::new(),
+                sparse: vec![0; cells * stride],
                 stride,
+            }
+        } else {
+            Self {
+                packed: vec![Trace16::default(); cells],
+                sparse: Vec::new(),
+                stride: 0,
             }
         }
     }
 
     #[inline]
-    fn set(
+    unsafe fn set<const SPARSE: bool>(
         &mut self,
         cell: usize,
         lanes: usize,
@@ -76,73 +93,70 @@ impl Trace16Matrix {
         open_h: u32,
         active: u32,
     ) {
-        match self {
-            Self::Packed(trace) => {
-                const HMASK: u32 = 0x5555_5555;
-                let active_low = active & HMASK;
-                let vertical_low = (gap_v & HMASK) & active_low;
-                let horizontal_low = (gap_h & HMASK) & active_low & !vertical_low;
-                trace[cell] = Trace16 {
-                    gap: (active_low & !vertical_low) | ((vertical_low | horizontal_low) << 1),
-                    open: (open_v & 0xAAAA_AAAA) | (open_h & HMASK),
+        if SPARSE {
+            let base = cell * self.stride;
+            for lane in 0..lanes {
+                let bit = 1u32 << (2 * lane);
+                let is_active = active & bit != 0;
+                let vertical = is_active && gap_v & bit != 0;
+                let horizontal = is_active && !vertical && gap_h & bit != 0;
+                let state = if !is_active {
+                    0
+                } else if vertical {
+                    2
+                } else if horizontal {
+                    3
+                } else {
+                    1
                 };
-            }
-            Self::Sparse { data, stride } => {
-                let base = cell * *stride;
-                for lane in 0..lanes {
-                    let bit = 1u32 << (2 * lane);
-                    let is_active = active & bit != 0;
-                    let vertical = is_active && gap_v & bit != 0;
-                    let horizontal = is_active && !vertical && gap_h & bit != 0;
-                    let state = if !is_active {
-                        0
-                    } else if vertical {
-                        2
-                    } else if horizontal {
-                        3
-                    } else {
-                        1
-                    };
-                    let nibble =
-                        state | u8::from(open_v & bit != 0) << 2 | u8::from(open_h & bit != 0) << 3;
-                    let byte = &mut data[base + lane / 2];
-                    if lane % 2 == 0 {
-                        *byte = (*byte & 0xf0) | nibble;
-                    } else {
-                        *byte = (*byte & 0x0f) | (nibble << 4);
-                    }
+                let nibble =
+                    state | u8::from(open_v & bit != 0) << 2 | u8::from(open_h & bit != 0) << 3;
+                let byte = self.sparse.get_unchecked_mut(base + lane / 2);
+                if lane % 2 == 0 {
+                    *byte = (*byte & 0xf0) | nibble;
+                } else {
+                    *byte = (*byte & 0x0f) | (nibble << 4);
                 }
             }
+        } else {
+            const HMASK: u32 = 0x5555_5555;
+            let active_low = active & HMASK;
+            let vertical_low = (gap_v & HMASK) & active_low;
+            let horizontal_low = (gap_h & HMASK) & active_low & !vertical_low;
+            *self.packed.get_unchecked_mut(cell) = Trace16 {
+                gap: (active_low & !vertical_low) | ((vertical_low | horizontal_low) << 1),
+                open: (open_v & 0xAAAA_AAAA) | (open_h & HMASK),
+            };
         }
     }
 
     #[inline]
-    fn get(&self, cell: usize, lane: usize) -> (u8, bool, bool) {
-        match self {
-            Self::Packed(trace) => {
-                let low = 1u32 << (2 * lane);
-                let high = 2u32 << (2 * lane);
-                let state = match (trace[cell].gap & high != 0, trace[cell].gap & low != 0) {
-                    (false, false) => 0,
-                    (false, true) => 1,
-                    (true, false) => 2,
-                    (true, true) => 3,
-                };
-                (
-                    state,
-                    trace[cell].open & high != 0,
-                    trace[cell].open & low != 0,
-                )
-            }
-            Self::Sparse { data, stride } => {
-                let byte = data[cell * *stride + lane / 2];
-                let nibble = if lane % 2 == 0 {
-                    byte & 0x0f
-                } else {
-                    byte >> 4
-                };
-                (nibble & 3, nibble & 4 != 0, nibble & 8 != 0)
-            }
+    fn get<const SPARSE: bool>(&self, cell: usize, lane: usize) -> (u8, bool, bool) {
+        if SPARSE {
+            let byte = self.sparse[cell * self.stride + lane / 2];
+            let nibble = if lane % 2 == 0 {
+                byte & 0x0f
+            } else {
+                byte >> 4
+            };
+            (nibble & 3, nibble & 4 != 0, nibble & 8 != 0)
+        } else {
+            let low = 1u32 << (2 * lane);
+            let high = 2u32 << (2 * lane);
+            let state = match (
+                self.packed[cell].gap & high != 0,
+                self.packed[cell].gap & low != 0,
+            ) {
+                (false, false) => 0,
+                (false, true) => 1,
+                (true, false) => 2,
+                (true, true) => 3,
+            };
+            (
+                state,
+                self.packed[cell].open & high != 0,
+                self.packed[cell].open & low != 0,
+            )
         }
     }
 }
@@ -154,6 +168,22 @@ pub(super) unsafe fn trace_i8(
     matrix: &ScoreMatrix,
     query_cbs: &[i8],
 ) -> (Vec<SwResult>, u32) {
+    if query_cbs.is_empty() {
+        trace_i8_impl::<false>(query, targets, matrix, query_cbs)
+    } else {
+        trace_i8_impl::<true>(query, targets, matrix, query_cbs)
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn trace_i8_impl<const HAS_CBS: bool>(
+    query: &[Letter],
+    targets: &[TraceTarget<'_>],
+    matrix: &ScoreMatrix,
+    query_cbs: &[i8],
+) -> (Vec<SwResult>, u32) {
+    debug_assert_eq!(HAS_CBS, !query_cbs.is_empty());
+    debug_assert!(!HAS_CBS || query_cbs.len() >= query.len());
     const LANES: usize = 32;
     let band = targets
         .iter()
@@ -172,7 +202,8 @@ pub(super) unsafe fn trace_i8(
     let mut subject_start = [0i32; LANES];
     let mut band_offset = [0usize; LANES];
     let mut columns = 0usize;
-    for (lane, target) in targets.iter().enumerate() {
+    for lane in 0..targets.len() {
+        let target = &targets[lane];
         let expanded_begin = target.d_end - band as i32;
         subject_start[lane] = i1 - (target.d_end - 1);
         band_offset[lane] = (target.d_begin - expanded_begin).max(0) as usize;
@@ -262,10 +293,12 @@ pub(super) unsafe fn trace_i8(
         for q in query_begin..query_end {
             let row = (q - moving_i0) as usize;
             let cell_mask = arch::_mm256_and_si256(active, row_masks[row]);
-            let bias = arch::_mm256_and_si256(
-                arch::_mm256_set1_epi8(query_cbs.get(q as usize).copied().unwrap_or(0)),
-                standard_mask,
-            );
+            let query_bias = if HAS_CBS {
+                *query_cbs.get_unchecked(q as usize)
+            } else {
+                0
+            };
+            let bias = arch::_mm256_and_si256(arch::_mm256_set1_epi8(query_bias), standard_mask);
             let substitution =
                 arch::_mm256_adds_epi8(profile[(query[q as usize] & LETTER_MASK) as usize], bias);
             let diagonal = arch::_mm256_adds_epi8(score_row[row], substitution);
@@ -352,6 +385,23 @@ pub(super) unsafe fn trace_i16(
     matrix: &ScoreMatrix,
     query_cbs: &[i8],
 ) -> (Vec<SwResult>, u32) {
+    match (targets.len() < 3, query_cbs.is_empty()) {
+        (true, true) => trace_i16_impl::<true, false>(query, targets, matrix, query_cbs),
+        (true, false) => trace_i16_impl::<true, true>(query, targets, matrix, query_cbs),
+        (false, true) => trace_i16_impl::<false, false>(query, targets, matrix, query_cbs),
+        (false, false) => trace_i16_impl::<false, true>(query, targets, matrix, query_cbs),
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn trace_i16_impl<const SPARSE_TRACE: bool, const HAS_CBS: bool>(
+    query: &[Letter],
+    targets: &[TraceTarget<'_>],
+    matrix: &ScoreMatrix,
+    query_cbs: &[i8],
+) -> (Vec<SwResult>, u32) {
+    debug_assert_eq!(HAS_CBS, !query_cbs.is_empty());
+    debug_assert!(!HAS_CBS || query_cbs.len() >= query.len());
     const LANES: usize = 16;
     let band = targets
         .iter()
@@ -370,7 +420,8 @@ pub(super) unsafe fn trace_i16(
     let mut subject_start = [0i32; LANES];
     let mut band_offset = [0usize; LANES];
     let mut columns = 0usize;
-    for (lane, target) in targets.iter().enumerate() {
+    for lane in 0..targets.len() {
+        let target = &targets[lane];
         let expanded_begin = target.d_end - band as i32;
         subject_start[lane] = i1 - (target.d_end - 1);
         band_offset[lane] = (target.d_begin - expanded_begin).max(0) as usize;
@@ -380,10 +431,9 @@ pub(super) unsafe fn trace_i16(
         columns = columns.max((end - subject_start[lane]).max(0) as usize);
     }
     let zero = arch::_mm256_set1_epi16(i16::MIN);
-    let max_value = arch::_mm256_set1_epi16(i16::MAX);
     let mut score_row = vec![zero; band];
     let mut hgap_row = vec![zero; band + 1];
-    let mut trace = Trace16Matrix::new((columns + 1) * band, targets.len());
+    let mut trace = Trace16Matrix::new::<SPARSE_TRACE>((columns + 1) * band, targets.len());
     let mut gap_open = [0i16; LANES];
     let mut gap_extend = [0i16; LANES];
     let mut overflow_mask = 0u32;
@@ -406,6 +456,7 @@ pub(super) unsafe fn trace_i16(
         }
     }
     let standard_mask = arch::_mm256_loadu_si256(standard_lanes.as_ptr().cast());
+    let standard_only = targets.iter().all(|target| target.matrix.is_none());
     let row_masks: Vec<V> = (0..band)
         .map(|row| {
             let mut lanes = [0i16; LANES];
@@ -439,7 +490,7 @@ pub(super) unsafe fn trace_i16(
             }
         }
         let active = arch::_mm256_loadu_si256(active_lanes.as_ptr().cast());
-        let profile = if targets.iter().all(|target| target.matrix.is_none()) {
+        let profile = if standard_only {
             standard_profile_i16(matrix.matrix8(), &subject_bytes, &hard_mask_bytes)
         } else {
             let mut profile = [zero; 32];
@@ -468,15 +519,23 @@ pub(super) unsafe fn trace_i16(
         let mut row_max = zero;
         for q in query_begin..query_end {
             let row = (q - moving_i0) as usize;
-            let cell_mask = arch::_mm256_and_si256(active, row_masks[row]);
-            let bias = arch::_mm256_and_si256(
-                arch::_mm256_set1_epi16(query_cbs.get(q as usize).copied().unwrap_or(0) as i16),
-                standard_mask,
-            );
+            // The moving-band clamps q to the query and row to 0..band; the
+            // profile index is masked to 0..31. These are the same pointer
+            // invariants used by upstream's matrix iterator.
+            let cell_mask = arch::_mm256_and_si256(active, *row_masks.get_unchecked(row));
+            let q_index = q as usize;
+            let query_bias = if HAS_CBS {
+                *query_cbs.get_unchecked(q_index)
+            } else {
+                0
+            };
+            let bias =
+                arch::_mm256_and_si256(arch::_mm256_set1_epi16(query_bias as i16), standard_mask);
+            let query_letter = *query.get_unchecked(q_index) & LETTER_MASK;
             let substitution =
-                arch::_mm256_adds_epi16(profile[(query[q as usize] & LETTER_MASK) as usize], bias);
-            let diagonal = arch::_mm256_adds_epi16(score_row[row], substitution);
-            let horizontal = hgap_row[row + 1];
+                arch::_mm256_adds_epi16(*profile.get_unchecked(query_letter as usize), bias);
+            let diagonal = arch::_mm256_adds_epi16(*score_row.get_unchecked(row), substitution);
+            let horizontal = *hgap_row.get_unchecked(row + 1);
             let vertical_before = vertical;
             let mut score = arch::_mm256_max_epi16(diagonal, horizontal);
             score = arch::_mm256_max_epi16(score, vertical_before);
@@ -502,7 +561,7 @@ pub(super) unsafe fn trace_i16(
             let open_h =
                 arch::_mm256_movemask_epi8(arch::_mm256_cmpeq_epi16(next_horizontal, open)) as u32;
             let trace_index = (column + 1) * band + row;
-            trace.set(
+            trace.set::<SPARSE_TRACE>(
                 trace_index,
                 targets.len(),
                 gap_v,
@@ -511,16 +570,10 @@ pub(super) unsafe fn trace_i16(
                 open_h,
                 active_bits,
             );
-            score_row[row] = score;
-            hgap_row[row] = arch::_mm256_blendv_epi8(zero, next_horizontal, cell_mask);
+            *score_row.get_unchecked_mut(row) = score;
+            *hgap_row.get_unchecked_mut(row) =
+                arch::_mm256_blendv_epi8(zero, next_horizontal, cell_mask);
             vertical = arch::_mm256_blendv_epi8(zero, next_vertical, cell_mask);
-            let saturated =
-                arch::_mm256_movemask_epi8(arch::_mm256_cmpeq_epi16(score, max_value)) as u32;
-            for lane in 0..targets.len() {
-                if saturated & (1 << (2 * lane)) != 0 {
-                    overflow_mask |= 1 << lane;
-                }
-            }
         }
         let mut column_scores = [i16::MIN; LANES];
         let mut column_rows = [0i16; LANES];
@@ -534,12 +587,20 @@ pub(super) unsafe fn trace_i16(
             }
         }
     }
+    for lane in 0..targets.len() {
+        // `best` is a monotonic maximum, so a saturated cell remains visible
+        // here.  Upstream likewise tests the final lane maximum instead of
+        // materializing a saturation mask for every DP cell.
+        if best[lane] == i16::MAX {
+            overflow_mask |= 1 << lane;
+        }
+    }
     let scores: Vec<i32> = best[..targets.len()]
         .iter()
         .map(|&score| i32::from(score) - i32::from(i16::MIN))
         .collect();
     (
-        finish_i16(
+        finish_i16::<SPARSE_TRACE>(
             query,
             targets,
             &trace,
@@ -555,7 +616,7 @@ pub(super) unsafe fn trace_i16(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish_i16(
+fn finish_i16<const SPARSE_TRACE: bool>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
     trace: &Trace16Matrix,
@@ -586,7 +647,7 @@ fn finish_i16(
             let mut operations = Vec::new();
             while i > 0 && j > 0 {
                 let trace_index = (column + 1) * band + row;
-                let (state, _, _) = trace.get(trace_index, lane);
+                let (state, _, _) = trace.get::<SPARSE_TRACE>(trace_index, lane);
                 if state == 0 {
                     break;
                 }
@@ -599,11 +660,11 @@ fn finish_i16(
                             break;
                         }
                         row -= 1;
-                        if i == 0 || trace.get((column + 1) * band + row, lane).1 {
+                        if i == 0 || trace.get::<SPARSE_TRACE>((column + 1) * band + row, lane).1 {
                             break;
                         }
                     }
-                    operations.push((EditOperation::Insertion, count));
+                    push_operation_run(&mut operations, EditOperation::Insertion, count);
                     result.gap_openings += 1;
                     result.gaps += count;
                     result.length += count;
@@ -617,11 +678,11 @@ fn finish_i16(
                         }
                         column -= 1;
                         row += 1;
-                        if j == 0 || trace.get((column + 1) * band + row, lane).2 {
+                        if j == 0 || trace.get::<SPARSE_TRACE>((column + 1) * band + row, lane).2 {
                             break;
                         }
                     }
-                    operations.push((EditOperation::Deletion, count));
+                    push_operation_run(&mut operations, EditOperation::Deletion, count);
                     result.gap_openings += 1;
                     result.gaps += count;
                     result.length += count;
@@ -629,10 +690,10 @@ fn finish_i16(
                     if (query[(i - 1) as usize] & LETTER_MASK)
                         == (target.subject[(j - 1) as usize] & LETTER_MASK)
                     {
-                        operations.push((EditOperation::Match, 1));
+                        push_operation_run(&mut operations, EditOperation::Match, 1);
                         result.identities += 1;
                     } else {
-                        operations.push((EditOperation::Substitution, 1));
+                        push_operation_run(&mut operations, EditOperation::Substitution, 1);
                         result.mismatches += 1;
                     }
                     result.length += 1;
@@ -706,7 +767,7 @@ fn finish_i8(
                             break;
                         }
                     }
-                    operations.push((EditOperation::Insertion, count));
+                    push_operation_run(&mut operations, EditOperation::Insertion, count);
                     result.gap_openings += 1;
                     result.gaps += count;
                     result.length += count;
@@ -724,7 +785,7 @@ fn finish_i8(
                             break;
                         }
                     }
-                    operations.push((EditOperation::Deletion, count));
+                    push_operation_run(&mut operations, EditOperation::Deletion, count);
                     result.gap_openings += 1;
                     result.gaps += count;
                     result.length += count;
@@ -732,10 +793,10 @@ fn finish_i8(
                     if (query[(i - 1) as usize] & LETTER_MASK)
                         == (target.subject[(j - 1) as usize] & LETTER_MASK)
                     {
-                        operations.push((EditOperation::Match, 1));
+                        push_operation_run(&mut operations, EditOperation::Match, 1);
                         result.identities += 1;
                     } else {
-                        operations.push((EditOperation::Substitution, 1));
+                        push_operation_run(&mut operations, EditOperation::Substitution, 1);
                         result.mismatches += 1;
                     }
                     result.length += 1;

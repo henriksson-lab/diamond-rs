@@ -26,3 +26,10 @@ ffi = ["dep:cmake"]
 
 [build-dependencies]
 cmake = { version = "0.1", optional = true }
+
+[profile.release]
+# The search hot path crosses generic/SIMD module boundaries. ThinLTO with a
+# single codegen unit consistently removes about 1.5% of retired instructions
+# in the native forced-disk benchmark while retaining reasonable link times.
+lto = "thin"
+codegen-units = 1

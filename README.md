@@ -6,6 +6,7 @@ DIAMOND is a high-performance sequence aligner for protein and translated DNA se
 
 **This crate is under translation. Do not use it. Do not trust any text below**
 
+* 2026-09-28: Ondisk blastp mode, but also faster inmem mode (not in original). Parity on broader datasets
 * 2006-09-27: Closing the gaps in translation, optimization. Some more work left
 * 2026-08-01: CI added. Full translation is blocked until BLAST is translated
 * 2026-07-07: New audit; state to be checked
@@ -63,8 +64,8 @@ sudo apt-get install g++ cmake zlib1g-dev libsqlite3-dev
 ```bash
 cargo build --release
 
-# Reproducible AVX2 benchmark build on x86-64
-RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+# Host-optimized benchmark build (matches upstream's -march=native build)
+RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 # Build the non-Windows C++ FFI backend for conformance testing
 cargo build --features ffi
@@ -144,20 +145,37 @@ println!("E-value: {:.2e}, Bit score: {:.1}", evalue, bitscore);
 
 Original benchmark baseline: vendored upstream DIAMOND from `https://github.com/bbuchfink/diamond.git`, commit `1d162b4fefb5` (`v2.1.24-2-g1d162b4f-dirty`).
 
-### Native `blastp` comparison
+### Default adaptive mode (`--memory-limit 16G`)
 
-These measurements use the reproducible AVX2 build
-`RUSTFLAGS="-C target-cpu=x86-64-v3"`. Times and peak resident set sizes are
-medians from alternating C++/Rust runs. The speed ratio is C++ time divided by
-Rust time, so values above 1 mean Rust is faster. The RSS ratio is Rust divided
-by C++, so values below 1 mean Rust uses less memory.
+Native Rust `blastp` and `blastx` default to a **16 GB soft process-RSS
+ceiling**. Below that ceiling, retained hits stay in memory for speed. When the
+ceiling is reached, all hits retained so far are migrated to DIAMOND's
+compressed temporary-bin format, and every later hit remains disk-backed. In
+other words, the 16 GB default still spills; it is not a requirement to have
+16 GB available. Input data, indices, an active batch, allocator bookkeeping,
+and one active disk bin also consume memory, so this is a spill trigger rather
+than an OS-enforced hard cap and peak RSS can overshoot it.
+
+This default deliberately differs from upstream DIAMOND `blastp`, whose hit
+buffer is always disk-backed. The value follows upstream's 16 GB clustering
+memory default. Use `--memory-limit 0G` to start directly in disk mode for the
+closest memory-policy comparison with upstream, or set another nonzero limit
+to spill earlier or later.
+
+The following table uses the same upstream baseline and pinned CPUs as the
+forced-disk table below. Rust was invoked without `--memory-limit`, exercising
+the actual 16 GB CLI default. Times and peak resident set sizes are medians;
+the speed ratio is C++ time divided by Rust time, while the RSS ratio is Rust
+divided by C++.
 
 | Dataset | Threads | Runs | C++ time | Rust time | Speed ratio | C++ RSS | Rust RSS | RSS ratio | Byte parity |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-| Human Swiss-Prot, 2,000 ref / 1,000 query | 1 | 5 | 1.55 s | 2.11 s | 0.735x | 30,064 KiB | 23,156 KiB | 0.770x | PASS |
-| Human Swiss-Prot, 2,000 ref / 1,000 query | 4 | 5 | 0.80 s | 0.76 s | 1.053x | 36,308 KiB | 30,940 KiB | 0.852x | PASS |
-| NCBI AMRFinderPlus AMR proteins, 1,000 ref / 500 query | 1 | 5 | 2.25 s | 4.81 s | 0.468x | 21,812 KiB | 16,372 KiB | 0.751x | PASS |
-| NCBI AMRFinderPlus AMR proteins, 1,000 ref / 500 query | 4 | 5 | 1.00 s | 2.07 s | 0.483x | 29,404 KiB | 23,760 KiB | 0.808x | PASS |
+| Human proteins, 2,000 ref / 1,000 query | 1 | 5 | 0.88 s | 1.24 s | 0.710x | 33,648 KiB | 22,216 KiB | 0.660x | PASS |
+| Human proteins, 2,000 ref / 1,000 query | 4 | 5 | 0.60 s | 0.46 s | 1.304x | 37,512 KiB | 31,388 KiB | 0.837x | PASS |
+| AMRFinderPlus, 1,000 ref / 500 query | 1 | 5 | 1.60 s | 1.54 s | 1.039x | 24,452 KiB | 15,900 KiB | 0.650x | PASS |
+| AMRFinderPlus, 1,000 ref / 500 query | 4 | 5 | 0.55 s | 0.47 s | 1.170x | 30,440 KiB | 18,876 KiB | 0.620x | PASS |
+| AMRFinderPlus stress, 4,000 ref / 2,000 query | 1 | 5 | 18.50 s | 16.39 s | 1.129x | 54,028 KiB | 105,468 KiB | 1.952x | PASS |
+| AMRFinderPlus stress, 4,000 ref / 2,000 query | 4 | 7 | 4.97 s | 4.62 s | 1.076x | 68,176 KiB | 111,060 KiB | 1.629x | PASS |
 
 The human workload uses 1,120,714 reference and 546,969 query residues. Its
 reference, query, and output SHA-256 hashes are respectively
@@ -174,18 +192,70 @@ Its reference, query, and byte-identical output SHA-256 hashes are respectively
 `fa0c0f05486af5ad5849c8f52ebe455a2c1c6571a8497a930782b4be96c729e9`,
 and `51847a3bde8172949ad6d934af235a3163a040a51c681bbe476f8e92f126eb71`.
 
-The larger 4,000-reference / 2,000-query AMR stress run evaluates 81.7 million
-raw seed pairs without materializing the cross product. A final four-thread
-parity run measured Rust at 15.11 s / 173,948 KiB, down from 32.47 s /
-4,526,948 KiB before streaming (2.15x faster and 96.2% lower peak RSS). The
-corresponding C++ diagnostic was 5.89 s / 66,612 KiB, giving current speed and
-RSS ratios of 0.390x and 2.611x. Both emitted the same 40,297 lines with
-SHA-256 `6ea16d64c71f833970aa8f045adbf0cd22a35c2706c69cebbc883f0643911653`.
+### Upstream-compatible forced-disk mode (`--memory-limit 0G`)
 
-Other jobs were active on the benchmark host. Alternating implementation order
-and medians reduce bias. Final timing ranges were human C++/Rust 1.27–1.71 s /
-2.09–3.45 s at one thread and 0.78–0.83 s / 0.73–0.95 s at four threads;
-AMR ranges were 2.19–2.35 s / 4.66–4.95 s and 0.95–1.07 s / 2.05–2.48 s.
+Upstream DIAMOND's normal `blastp` hit buffer is disk-backed; it does not call
+the external BLASTP program. Upstream v2.1.24 rejects `--memory-limit` for this
+workflow, so the apples-to-apples commands below use normal upstream `blastp`
+and Rust `blastp --memory-limit 0G`. Zero enters disk mode before stage 1.
+
+These are medians of alternating-order runs on independent, non-synthetic
+protein datasets. Both implementations were built for the host CPU. The C++
+build uses `-march=native`; the Rust benchmark build uses
+`-C target-cpu=native` but keeps general code at AVX2 on x86. Rust then
+runtime-selects its explicitly specialized AVX-512 search workers. This keeps
+the long score/trace loops at the same AVX2 tier as upstream instead of letting
+LLVM's extended EVEX register allocation lower their sustained clock. Rust's
+release profile uses ThinLTO with one codegen unit. The same pinned CPUs were
+used for each C++/Rust pair.
+
+| Dataset | Threads | Runs | C++ time | Rust time | Speed ratio | C++ RSS | Rust RSS | RSS ratio | Byte parity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| Human proteins, 2,000 ref / 1,000 query | 1 | 5 | 0.88 s | 1.34 s | 0.657x | 33,648 KiB | 22,212 KiB | 0.660x | PASS |
+| Human proteins, 2,000 ref / 1,000 query | 4 | 5 | 0.60 s | 0.60 s | 1.000x | 37,512 KiB | 30,312 KiB | 0.808x | PASS |
+| AMRFinderPlus, 1,000 ref / 500 query | 1 | 5 | 1.60 s | 1.76 s | 0.909x | 24,452 KiB | 12,356 KiB | 0.505x | PASS |
+| AMRFinderPlus, 1,000 ref / 500 query | 4 | 5 | 0.55 s | 0.56 s | 0.982x | 30,440 KiB | 19,172 KiB | 0.630x | PASS |
+| AMRFinderPlus stress, 4,000 ref / 2,000 query | 1 | 5 | 18.50 s | 18.77 s | 0.986x | 54,028 KiB | 42,836 KiB | 0.793x | PASS |
+| AMRFinderPlus stress, 4,000 ref / 2,000 query | 4 | 7 | 4.97 s | 5.08 s | 0.978x | 68,176 KiB | 53,728 KiB | 0.788x | PASS |
+
+The stress case evaluates 81.7 million raw seed pairs without materializing
+the cross product. Both implementations emit 40,297 lines with SHA-256
+`6ea16d64c71f833970aa8f045adbf0cd22a35c2706c69cebbc883f0643911653`.
+Rust uses less RSS in every row. It reaches wall-time parity on the four-thread
+human fixture and is within 2.2% on both four-thread AMR fixtures. On the
+heavier stress fixture Rust is 1.4% slower at one thread and 2.2% slower at
+four threads, while using 20.7% and 21.2% less RSS respectively. Fixed-cost
+latency is still visible on the smaller one-thread inputs. Direct paired
+hardware-counter runs show that isolating AVX-512 to the search worker reduces
+four-thread task-clock by about 2% versus allowing LLVM to use AVX-512 registers
+throughout; its one-thread cost is about 0.5%. On the final stress build Rust
+executes 2.6% fewer instructions and 1.7% fewer cycles than C++ at one thread.
+Hoisting the Hamming ISA choice into a const-generic worker removes another
+1.55% of Rust's instructions; matching upstream's final-best saturation check
+in the i16 trace kernel removes 0.3% more.
+
+Native `blastp` and `blastx` can cap the fast in-memory retained-hit path and
+spill to DIAMOND's compressed temporary-bin format. Use zero to select disk
+mode immediately:
+
+```bash
+diamond blastp ... --memory-limit 0G --tmpdir /path/to/fast/scratch
+```
+
+Nonzero values provide the adaptive in-memory mode and use DIAMOND's decimal
+`K`, `M`, `G`, or `T` suffixes. This is a soft process-RSS ceiling, not an
+OS-enforced limit: the
+loaded query/database, seed arrays, allocator overhead, and one active query
+bin still have to fit in RAM. Once the measured RSS approaches the ceiling,
+existing hits are migrated to disk and all subsequent hits stay disk-backed.
+Temporary files are removed when the search finishes, including error exits.
+Small hit sets should normally remain in memory unless `0G` was requested.
+
+Other jobs were active on the benchmark host. Alternating implementation order,
+CPU affinity, and medians reduce bias, but do not eliminate it. Stress-workload
+ranges were C++/Rust 17.51–21.78 s / 18.17–22.87 s at one thread and
+4.94–5.03 s / 4.97–5.18 s at four threads. Raw spread should be considered
+alongside the medians, especially where an external job appeared mid-run.
 
 The benchmark driver and full fixture details are in
 `scripts/compare_real_cpp_rust.sh` and
@@ -214,7 +284,8 @@ protein dataset, reports median wall time and peak RSS for `makedb` and
 `blastp`, and compares a stable 12-column blastp output byte-for-byte. It exits
 nonzero and retains a unified diff when parity fails. Quick smoke runs can use
 `REPETITIONS=1`; `REFERENCE_FASTA`, `QUERY_FASTA`, `THREADS`, `RUST_BIN`, and
-`CPP_BIN` can be overridden for later scaling experiments.
+`CPP_BIN` can be overridden for later scaling experiments. Set
+`RUST_MEMORY_LIMIT=0G` for the upstream-compatible forced-disk comparison.
 
 For optimization work, use the larger real-sequence harness rather than
 duplicating the bundled records:

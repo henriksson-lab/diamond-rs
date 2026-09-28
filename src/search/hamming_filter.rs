@@ -10,6 +10,10 @@
 //! ungapped extension and is the primary mechanism that keeps DIAMOND's
 //! default-mode output as selective as it is.
 use crate::basic::value::{Letter, DELIMITER_LETTER, LETTER_MASK};
+use crate::search::hamming::FingerPrint;
+use crate::search::hamming_all_vs_all::{
+    all_vs_all_pass_masks_avx2, all_vs_all_pass_masks_avx512bw, AlignedFingerprint48,
+};
 use crate::search::seed_match::SeedMatch;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::cell::RefCell;
@@ -22,10 +26,26 @@ const FP_LEN: usize = FP_BEFORE + FP_AFTER;
 
 type CachedFingerprint = ((u32, u32), [Letter; FP_LEN]);
 
+/// C++ stores fingerprints as a separate `vector<array<char, 48>>`. Keeping
+/// locations out of this hot array gives the same 48-byte stride (rather than
+/// 56 bytes for `(location, fingerprint)`) and guarantees the alignment used
+/// by its SSE/AVX loads.
+pub(crate) const FP_SCALAR: u8 = 0;
+pub(crate) const FP_SSE2: u8 = 1;
+pub(crate) const FP_AVX2: u8 = 2;
+pub(crate) const FP_AVX512BW: u8 = 3;
+pub(crate) const FP_NEON: u8 = 4;
+
 #[derive(Default)]
 struct FingerprintScratch {
     query: Vec<CachedFingerprint>,
     target: Vec<CachedFingerprint>,
+}
+
+#[derive(Default)]
+struct StreamingFingerprintScratch {
+    query: Vec<AlignedFingerprint48>,
+    target: Vec<AlignedFingerprint48>,
 }
 
 thread_local! {
@@ -33,12 +53,19 @@ thread_local! {
     // many small seed partitions do not allocate two vectors apiece.
     static FINGERPRINT_SCRATCH: RefCell<FingerprintScratch> =
         RefCell::new(FingerprintScratch::default());
+    static STREAMING_FINGERPRINT_SCRATCH: RefCell<StreamingFingerprintScratch> =
+        RefCell::new(StreamingFingerprintScratch::default());
 }
 
 #[inline]
 fn fingerprint_equal_count(query: &[Letter; FP_LEN], target: &[Letter; FP_LEN]) -> u32 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        if std::arch::is_x86_feature_detected!("avx512bw") {
+            // SAFETY: AVX-512BW was detected; the masked loads touch exactly
+            // the 48 initialized bytes in each fingerprint.
+            return unsafe { fingerprint_equal_count_avx512(query, target) };
+        }
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 was detected and both fixed arrays contain all 48
             // bytes loaded by the kernel.
@@ -64,6 +91,83 @@ fn fingerprint_equal_count(query: &[Letter; FP_LEN], target: &[Letter; FP_LEN]) 
             .map(|(&q, &t)| u32::from(q == t))
             .sum()
     }
+}
+
+/// Compile-time-selected fingerprint comparator. Runtime CPU dispatch happens
+/// at the seed-group boundary so the all-vs-all inner loop contains no feature
+/// test. Keeping this specialization local avoids cloning the much larger
+/// stage-1 pipeline for every supported ISA.
+#[inline(always)]
+fn fingerprint_equal_count_for<const KERNEL: u8>(
+    query: &[Letter; FP_LEN],
+    target: &[Letter; FP_LEN],
+) -> u32 {
+    match KERNEL {
+        FP_AVX512BW => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: this instantiation is selected only after AVX-512BW
+            // detection at the group boundary.
+            unsafe {
+                return fingerprint_equal_count_avx512(query, target);
+            }
+        }
+        FP_AVX2 => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: this instantiation is selected only after AVX2
+            // detection at the group boundary.
+            unsafe {
+                return fingerprint_equal_count_avx2(query, target);
+            }
+        }
+        FP_SSE2 => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: this instantiation is selected only after SSE2
+            // detection at the group boundary.
+            unsafe {
+                return fingerprint_equal_count_sse2(query, target);
+            }
+        }
+        FP_NEON => {
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON is mandatory on AArch64.
+            unsafe {
+                return fingerprint_equal_count_neon(query, target);
+            }
+        }
+        _ => {}
+    }
+    query
+        .iter()
+        .zip(target)
+        .map(|(&q, &t)| u32::from(q == t))
+        .sum()
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+unsafe fn fingerprint_equal_count_avx512(
+    query: &[Letter; FP_LEN],
+    target: &[Letter; FP_LEN],
+) -> u32 {
+    let valid = (1u64 << FP_LEN) - 1;
+    let bits: u64;
+    std::arch::asm!(
+        "kmovq k1, {valid}",
+        "vmovdqu8 zmm0 {{k1}}{{z}}, [{query}]",
+        "vmovdqu8 zmm1 {{k1}}{{z}}, [{target}]",
+        "vpcmpeqb k2 {{k1}}, zmm0, zmm1",
+        "kmovq {bits}, k2",
+        valid = in(reg) valid,
+        query = in(reg) query.as_ptr(),
+        target = in(reg) target.as_ptr(),
+        bits = lateout(reg) bits,
+        out("zmm0") _,
+        out("zmm1") _,
+        out("k1") _,
+        out("k2") _,
+        options(readonly, nostack, preserves_flags),
+    );
+    bits.count_ones()
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -181,7 +285,52 @@ pub fn apply_hamming_filter(
 }
 
 #[inline]
-fn sequence_set_letter(
+fn sequence_set_letter(seqs: &[&[Letter]], mut seq_id: usize, mut pos: isize) -> Letter {
+    loop {
+        let len = seqs[seq_id].len() as isize;
+        if pos < 0 {
+            if pos == -1 || seq_id == 0 {
+                return DELIMITER_LETTER;
+            }
+            seq_id -= 1;
+            pos += seqs[seq_id].len() as isize + 1;
+        } else if pos >= len {
+            if pos == len || seq_id + 1 == seqs.len() {
+                return DELIMITER_LETTER;
+            }
+            pos -= len + 1;
+            seq_id += 1;
+        } else {
+            return seqs[seq_id][pos as usize] & LETTER_MASK;
+        }
+    }
+}
+
+#[inline]
+fn load_sequence_set_fingerprint(seqs: &[&[Letter]], seq_id: u32, pos: u32) -> [Letter; FP_LEN] {
+    let seq = seqs[seq_id as usize];
+    let center = pos as usize;
+    if center >= FP_BEFORE && center + FP_AFTER <= seq.len() {
+        // The production caller supplies the original, pre-motif sequence.
+        // Consequently every interior window is contiguous and can follow
+        // C++ `FingerPrint::load` directly without consulting a sparse motif
+        // restoration table.
+        return FingerPrint::from_seq_center(seq, center).r;
+    }
+    std::array::from_fn(|i| {
+        sequence_set_letter(
+            seqs,
+            seq_id as usize,
+            pos as isize + i as isize - FP_BEFORE as isize,
+        )
+    })
+}
+
+// Compatibility path for the materialized stage-1 helpers. Production blastp
+// uses `visit_hamming_group` with original sequence backing and never enters
+// this sparse-restoration path.
+#[inline]
+fn sequence_set_letter_restored(
     seqs: &[&[Letter]],
     restores: &[Vec<(usize, Letter)>],
     mut seq_id: usize,
@@ -213,14 +362,28 @@ fn sequence_set_letter(
 }
 
 #[inline]
-fn load_sequence_set_fingerprint(
+fn load_sequence_set_fingerprint_restored(
     seqs: &[&[Letter]],
     restores: &[Vec<(usize, Letter)>],
     seq_id: u32,
     pos: u32,
 ) -> [Letter; FP_LEN] {
+    let seq = seqs[seq_id as usize];
+    let restore = &restores[seq_id as usize];
+    let center = pos as usize;
+    if center >= FP_BEFORE && center + FP_AFTER <= seq.len() {
+        let begin = center - FP_BEFORE;
+        let end = center + FP_AFTER;
+        let first_restore = restore.partition_point(|&(restore_pos, _)| restore_pos < begin);
+        if restore
+            .get(first_restore)
+            .is_none_or(|&(restore_pos, _)| restore_pos >= end)
+        {
+            return FingerPrint::from_seq_center(seq, center).r;
+        }
+    }
     std::array::from_fn(|i| {
-        sequence_set_letter(
+        sequence_set_letter_restored(
             seqs,
             restores,
             seq_id as usize,
@@ -232,44 +395,156 @@ fn load_sequence_set_fingerprint(
 /// Visit a joined seed group's passing q×r pairs without materializing that
 /// cross product. Fingerprints are loaded once per location and reused, as in
 /// C++ `all_vs_all`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn visit_hamming_group<F>(
     query_locs: &[(u32, u32)],
     target_locs: &[(u32, u32)],
     query_seqs: &[&[Letter]],
-    query_restores: &[Vec<(usize, Letter)>],
     ref_seqs: &[&[Letter]],
-    ref_restores: &[Vec<(usize, Letter)>],
+    hamming_filter_id: u32,
+    visit: F,
+) where
+    F: FnMut((u32, u32), (u32, u32), usize),
+{
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx512bw") {
+            return visit_hamming_group_for::<FP_AVX512BW, F>(
+                query_locs,
+                target_locs,
+                query_seqs,
+                ref_seqs,
+                hamming_filter_id,
+                visit,
+            );
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return visit_hamming_group_for::<FP_AVX2, F>(
+                query_locs,
+                target_locs,
+                query_seqs,
+                ref_seqs,
+                hamming_filter_id,
+                visit,
+            );
+        }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            return visit_hamming_group_for::<FP_SSE2, F>(
+                query_locs,
+                target_locs,
+                query_seqs,
+                ref_seqs,
+                hamming_filter_id,
+                visit,
+            );
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    return visit_hamming_group_for::<FP_NEON, F>(
+        query_locs,
+        target_locs,
+        query_seqs,
+        ref_seqs,
+        hamming_filter_id,
+        visit,
+    );
+    #[cfg(not(target_arch = "aarch64"))]
+    visit_hamming_group_for::<FP_SCALAR, F>(
+        query_locs,
+        target_locs,
+        query_seqs,
+        ref_seqs,
+        hamming_filter_id,
+        visit,
+    )
+}
+
+#[inline]
+pub(crate) fn visit_hamming_group_for<const KERNEL: u8, F>(
+    query_locs: &[(u32, u32)],
+    target_locs: &[(u32, u32)],
+    query_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
     hamming_filter_id: u32,
     mut visit: F,
 ) where
-    F: FnMut((u32, u32), (u32, u32)),
+    F: FnMut((u32, u32), (u32, u32), usize),
 {
     const TILE_SIZE: usize = 64;
-    let mut scratch = FINGERPRINT_SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    let mut scratch =
+        STREAMING_FINGERPRINT_SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
     scratch.query.clear();
     scratch.target.clear();
     scratch.query.extend(query_locs.iter().map(|&(id, pos)| {
-        (
-            (id, pos),
-            load_sequence_set_fingerprint(query_seqs, query_restores, id, pos),
-        )
+        AlignedFingerprint48::new(load_sequence_set_fingerprint(query_seqs, id, pos))
     }));
     scratch.target.extend(target_locs.iter().map(|&(id, pos)| {
-        (
-            (id, pos),
-            load_sequence_set_fingerprint(ref_seqs, ref_restores, id, pos),
-        )
+        AlignedFingerprint48::new(load_sequence_set_fingerprint(ref_seqs, id, pos))
     }));
-    for &(query_loc, ref query_fp) in &scratch.query {
-        for target_tile in scratch.target.chunks(TILE_SIZE) {
-            for &(target_loc, ref target_fp) in target_tile {
-                if fingerprint_equal_count(query_fp, target_fp) >= hamming_filter_id {
-                    visit(query_loc, target_loc);
+    let mut pass_masks = [0u64; TILE_SIZE];
+    for (query_loc_tile, query_fp_tile) in query_locs
+        .chunks(TILE_SIZE)
+        .zip(scratch.query.chunks(TILE_SIZE))
+    {
+        for (target_tile_index, (target_loc_tile, target_fp_tile)) in target_locs
+            .chunks(TILE_SIZE)
+            .zip(scratch.target.chunks(TILE_SIZE))
+            .enumerate()
+        {
+            if KERNEL == FP_AVX512BW {
+                // SAFETY: this specialization is selected only after
+                // AVX-512BW detection at the group boundary. Masked loads
+                // consume exactly the 48 initialized fingerprint bytes.
+                unsafe {
+                    all_vs_all_pass_masks_avx512bw(
+                        query_fp_tile,
+                        target_fp_tile,
+                        hamming_filter_id,
+                        &mut pass_masks[..query_fp_tile.len()],
+                    );
+                }
+            } else if KERNEL == FP_AVX2 {
+                // SAFETY: AVX2 was detected at the group boundary. Inputs
+                // contain complete fingerprints, target tiles have at most 64
+                // rows, and the output covers every query in this tile.
+                unsafe {
+                    all_vs_all_pass_masks_avx2(
+                        query_fp_tile,
+                        target_fp_tile,
+                        hamming_filter_id,
+                        &mut pass_masks[..query_fp_tile.len()],
+                    );
+                }
+            } else {
+                pass_masks[..query_fp_tile.len()].fill(0);
+                for (query_index, query_fp) in query_fp_tile.iter().enumerate() {
+                    for (target_index, target_fp) in target_fp_tile.iter().enumerate() {
+                        if fingerprint_equal_count_for::<KERNEL>(&query_fp.bytes, &target_fp.bytes)
+                            >= hamming_filter_id
+                        {
+                            pass_masks[query_index] |= 1u64 << target_index;
+                        }
+                    }
+                }
+            }
+            // Upstream writes a HitField and consumes it query-major after the
+            // comparison kernel. These masks reproduce that ordering without
+            // allocating a cross-product-sized match vector.
+            for (query_index, &query_loc) in query_loc_tile.iter().enumerate() {
+                let mut targets = pass_masks[query_index];
+                while targets != 0 {
+                    let target_index = targets.trailing_zeros() as usize;
+                    visit(
+                        query_loc,
+                        target_loc_tile[target_index],
+                        target_tile_index * TILE_SIZE + target_index,
+                    );
+                    targets &= targets - 1;
                 }
             }
         }
     }
-    FINGERPRINT_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
+    STREAMING_FINGERPRINT_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
 }
 
 pub(crate) fn retain_hamming_filter_sequence_set(
@@ -308,10 +583,14 @@ pub(crate) fn retain_hamming_filter_sequence_set(
 
         if group_end == group_begin + 1 {
             let m = matches[group_begin];
-            let query_fp =
-                load_sequence_set_fingerprint(query_seqs, query_restores, m.query_id, m.query_pos);
+            let query_fp = load_sequence_set_fingerprint_restored(
+                query_seqs,
+                query_restores,
+                m.query_id,
+                m.query_pos,
+            );
             let target_fp =
-                load_sequence_set_fingerprint(ref_seqs, ref_restores, m.ref_id, m.ref_pos);
+                load_sequence_set_fingerprint_restored(ref_seqs, ref_restores, m.ref_id, m.ref_pos);
             if fingerprint_equal_count(&query_fp, &target_fp) >= hamming_filter_id {
                 matches[write] = m;
                 write += 1;
@@ -332,7 +611,12 @@ pub(crate) fn retain_hamming_filter_sequence_set(
             if last_query != Some(query) {
                 query_fps.push((
                     query,
-                    load_sequence_set_fingerprint(query_seqs, query_restores, query.0, query.1),
+                    load_sequence_set_fingerprint_restored(
+                        query_seqs,
+                        query_restores,
+                        query.0,
+                        query.1,
+                    ),
                 ));
                 last_query = Some(query);
             }
@@ -340,7 +624,12 @@ pub(crate) fn retain_hamming_filter_sequence_set(
                 let target = (m.ref_id, m.ref_pos);
                 target_fps.push((
                     target,
-                    load_sequence_set_fingerprint(ref_seqs, ref_restores, target.0, target.1),
+                    load_sequence_set_fingerprint_restored(
+                        ref_seqs,
+                        ref_restores,
+                        target.0,
+                        target.1,
+                    ),
                 ));
             }
         }
@@ -417,7 +706,6 @@ mod tests {
         let target_b: Vec<Letter> = (0..96).map(|i| ((i + 7) % 20) as Letter).collect();
         let queries: Vec<&[Letter]> = vec![&query_a, &query_b];
         let targets: Vec<&[Letter]> = vec![&target_a, &target_b];
-        let restores = vec![Vec::new(), Vec::new()];
         let query_locs = vec![(0, 32), (1, 40)];
         let target_locs = vec![(0, 32), (1, 40)];
         let mut expected = Vec::new();
@@ -439,11 +727,9 @@ mod tests {
             &query_locs,
             &target_locs,
             &queries,
-            &restores,
             &targets,
-            &restores,
             20,
-            |query, target| actual.push((query, target)),
+            |query, target, _| actual.push((query, target)),
         );
         assert_eq!(actual, expected);
     }
@@ -542,18 +828,19 @@ mod tests {
         let restores = vec![Vec::new(), vec![(1, 5)], Vec::new()];
 
         assert_eq!(
-            sequence_set_letter(&seqs, &restores, 1, -1),
+            sequence_set_letter_restored(&seqs, &restores, 1, -1),
             DELIMITER_LETTER
         );
-        assert_eq!(sequence_set_letter(&seqs, &restores, 1, -2), 3);
-        assert_eq!(sequence_set_letter(&seqs, &restores, 1, 1), 5);
+        assert_eq!(sequence_set_letter_restored(&seqs, &restores, 1, -2), 3);
+        assert_eq!(sequence_set_letter_restored(&seqs, &restores, 1, 1), 5);
+        assert_eq!(sequence_set_letter(&seqs, 1, 1), 23);
         assert_eq!(
-            sequence_set_letter(&seqs, &restores, 1, 3),
+            sequence_set_letter_restored(&seqs, &restores, 1, 3),
             DELIMITER_LETTER
         );
-        assert_eq!(sequence_set_letter(&seqs, &restores, 1, 4), 7);
+        assert_eq!(sequence_set_letter_restored(&seqs, &restores, 1, 4), 7);
         assert_eq!(
-            sequence_set_letter(&seqs, &restores, 0, -2),
+            sequence_set_letter_restored(&seqs, &restores, 0, -2),
             DELIMITER_LETTER
         );
     }

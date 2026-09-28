@@ -126,24 +126,35 @@ impl FingerPrint {
         Self { r: *a }
     }
 
+    #[inline(always)]
     pub fn from_seq_center(q: &[Letter], center: usize) -> Self {
         let mut r = [0; 48];
         Self::load(q, center, &mut r);
         Self { r }
     }
 
+    #[inline(always)]
     pub fn load(q: &[Letter], center: usize, dst: &mut [Letter; 48]) {
         if center >= 16 && center + 32 <= q.len() {
             fingerprint_load_masked(&q[center - 16..center + 32], dst);
             return;
         }
-        for (i, out) in dst.iter_mut().enumerate() {
-            let pos = center as isize + i as isize - 16;
-            *out = if pos < 0 || pos as usize >= q.len() {
-                DELIMITER_LETTER
-            } else {
-                letter_mask(q[pos as usize]) & LETTER_MASK
-            };
+        // Boundary windows are still common in left-most verification. Fill
+        // the padding once and copy the single valid span instead of doing 48
+        // signed bounds checks and branches for every candidate seed.
+        dst.fill(DELIMITER_LETTER);
+        let window_begin = center as isize - 16;
+        let src_begin = window_begin.max(0) as usize;
+        let dst_begin = (-window_begin).max(0) as usize;
+        let len = q
+            .len()
+            .saturating_sub(src_begin)
+            .min(48usize.saturating_sub(dst_begin));
+        for (out, &letter) in dst[dst_begin..dst_begin + len]
+            .iter_mut()
+            .zip(&q[src_begin..src_begin + len])
+        {
+            *out = letter_mask(letter) & LETTER_MASK;
         }
     }
 
@@ -151,6 +162,7 @@ impl FingerPrint {
         Self::load(q, center, dst);
     }
 
+    #[inline(always)]
     pub fn match_count(&self, rhs: &FingerPrint) -> u32 {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -177,6 +189,120 @@ impl FingerPrint {
             .map(|(a, b)| u32::from(a == b))
             .sum()
     }
+}
+
+/// Compare two fingerprint windows without round-tripping the common interior
+/// case through stack arrays. C++ keeps the loaded vectors in `FingerPrint`;
+/// this produces the same AVX2 operations directly from the sequence slices.
+#[inline]
+pub fn match_centers(a: &[Letter], b: &[Letter], center: usize) -> u32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            if center >= 16 && center + 32 <= a.len() && center + 32 <= b.len() {
+                // SAFETY: the bounds above cover all 48 bytes and AVX2 was
+                // detected at runtime.
+                return unsafe { match_centers_avx2(a, b, center) };
+            }
+            if a.len() == b.len() {
+                let begin = center.saturating_sub(16);
+                let end = center.saturating_add(32).min(a.len());
+                let valid = end.saturating_sub(begin);
+                // Missing positions have the delimiter in both padded
+                // fingerprints and therefore compare equal.
+                return (48 - valid) as u32
+                    + unsafe { match_slices_avx2(&a[begin..end], &b[begin..end]) };
+            }
+        }
+    }
+    FingerPrint::from_seq_center(a, center).match_count(&FingerPrint::from_seq_center(b, center))
+}
+
+/// Compare fingerprints centered at independent offsets in the original
+/// backing sequences. This mirrors C++ pointer arithmetic and avoids padding a
+/// smaller stage-2 window into temporary arrays before every verification.
+#[inline]
+pub fn match_positions(a: &[Letter], a_center: usize, b: &[Letter], b_center: usize) -> u32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::arch::is_x86_feature_detected!("avx2")
+        && a_center >= 16
+        && b_center >= 16
+        && a_center + 32 <= a.len()
+        && b_center + 32 <= b.len()
+    {
+        // SAFETY: the bounds cover both 48-byte windows and AVX2 was detected.
+        return unsafe { match_positions_avx2(a, a_center, b, b_center) };
+    }
+    FingerPrint::from_seq_center(a, a_center)
+        .match_count(&FingerPrint::from_seq_center(b, b_center))
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn match_slices_avx2(a: &[Letter], b: &[Letter]) -> u32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    debug_assert_eq!(a.len(), b.len());
+    let mask256 = _mm256_set1_epi8(LETTER_MASK);
+    let mut offset = 0usize;
+    let mut count = 0u32;
+    while offset + 32 <= a.len() {
+        let av = _mm256_loadu_si256(a.as_ptr().add(offset).cast());
+        let bv = _mm256_loadu_si256(b.as_ptr().add(offset).cast());
+        let difference = _mm256_and_si256(_mm256_xor_si256(av, bv), mask256);
+        count += (_mm256_movemask_epi8(_mm256_cmpeq_epi8(difference, _mm256_setzero_si256()))
+            as u32)
+            .count_ones();
+        offset += 32;
+    }
+    if offset + 16 <= a.len() {
+        let av = _mm_loadu_si128(a.as_ptr().add(offset).cast());
+        let bv = _mm_loadu_si128(b.as_ptr().add(offset).cast());
+        let difference = _mm_and_si128(_mm_xor_si128(av, bv), _mm256_castsi256_si128(mask256));
+        count += (_mm_movemask_epi8(_mm_cmpeq_epi8(difference, _mm_setzero_si128())) as u32)
+            .count_ones();
+        offset += 16;
+    }
+    for index in offset..a.len() {
+        count += u32::from(
+            (*a.get_unchecked(index) & LETTER_MASK) == (*b.get_unchecked(index) & LETTER_MASK),
+        );
+    }
+    count
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn match_centers_avx2(a: &[Letter], b: &[Letter], center: usize) -> u32 {
+    match_positions_avx2(a, center, b, center)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn match_positions_avx2(
+    a: &[Letter],
+    a_center: usize,
+    b: &[Letter],
+    b_center: usize,
+) -> u32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let ap = a.as_ptr().add(a_center - 16);
+    let bp = b.as_ptr().add(b_center - 16);
+    let mask256 = _mm256_set1_epi8(LETTER_MASK);
+    let a0 = _mm256_and_si256(_mm256_loadu_si256(ap.cast()), mask256);
+    let b0 = _mm256_and_si256(_mm256_loadu_si256(bp.cast()), mask256);
+    let mask128 = _mm_set1_epi8(LETTER_MASK);
+    let a1 = _mm_and_si128(_mm_loadu_si128(ap.add(32).cast()), mask128);
+    let b1 = _mm_and_si128(_mm_loadu_si128(bp.add(32).cast()), mask128);
+    (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a0, b0)) as u32).count_ones()
+        + (_mm_movemask_epi8(_mm_cmpeq_epi8(a1, b1)) as u32).count_ones()
 }
 
 #[inline]
@@ -896,6 +1022,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn partial_avx2_centers_match_padded_fingerprint_reference() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for len in 1..=96usize {
+            let a: Vec<Letter> = (0..len)
+                .map(|i| ((i * 17 + len * 3) & 0x9f) as u8 as i8)
+                .collect();
+            let b: Vec<Letter> = (0..len)
+                .map(|i| ((i * 11 + len * 5) & 0x9f) as u8 as i8)
+                .collect();
+            for center in 0..len {
+                let expected = FingerPrint::from_seq_center(&a, center)
+                    .match_count(&FingerPrint::from_seq_center(&b, center));
+                assert_eq!(match_centers(&a, &b, center), expected);
+            }
+        }
+    }
 
     #[test]
     fn fingerprint_simd_match_count_matches_scalar_for_all_byte_patterns() {

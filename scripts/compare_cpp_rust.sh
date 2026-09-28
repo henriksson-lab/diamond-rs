@@ -9,6 +9,17 @@ query=${QUERY_FASTA:-"$repo_dir/diamond/src/test/5.faa"}
 repetitions=${REPETITIONS:-3}
 threads=${THREADS:-1}
 keep_work=${KEEP_WORK:-0}
+rust_memory_limit=${RUST_MEMORY_LIMIT:-}
+benchmark_cpuset=${BENCH_CPUSET:-}
+benchmark_prefix=()
+
+if [[ -n "$benchmark_cpuset" ]]; then
+    if ! command -v taskset >/dev/null 2>&1; then
+        echo "error: BENCH_CPUSET requires taskset" >&2
+        exit 2
+    fi
+    benchmark_prefix=(taskset --cpu-list "$benchmark_cpuset")
+fi
 
 if [[ ! -x /usr/bin/time ]]; then
     echo "error: /usr/bin/time is required for peak-RSS measurement" >&2
@@ -27,14 +38,18 @@ if [[ ${SKIP_BUILD:-0} != 1 ]]; then
     echo "Building Rust release binary..." >&2
     benchmark_rustflags=${RUSTFLAGS:-}
     if [[ -z "$benchmark_rustflags" ]]; then
-        benchmark_arch=$(uname -m)
-        if [[ "$benchmark_arch" == x86_64 ]]; then
-            # Keep LLVM from introducing AVX-512 into the explicitly AVX2
-            # kernels on AVX-512 hosts. That code is slower for this workload.
-            benchmark_rustflags='-C target-cpu=x86-64-v3'
-        else
-            benchmark_rustflags='-C target-cpu=native'
-        fi
+        # Upstream's alignment translation unit is AVX2. On AVX-512 x86 CPUs,
+        # letting LLVM use the extended EVEX register file in those long DP
+        # loops lowers their sustained clock. Keep general code at AVX2 while
+        # runtime-selected search kernels explicitly re-enable AVX-512BW.
+        case $(uname -m) in
+            x86_64 | i?86)
+                benchmark_rustflags='-C target-cpu=native -C target-feature=-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl'
+                ;;
+            *)
+                benchmark_rustflags='-C target-cpu=native'
+                ;;
+        esac
     fi
     RUSTFLAGS="$benchmark_rustflags" cargo build \
         --manifest-path "$repo_dir/Cargo.toml" --release --offline
@@ -74,6 +89,15 @@ IFS=$'\t' read -r query_records query_residues < <(fasta_stats "$query")
 printf 'Workload: reference=%s records/%s residues; query=%s records/%s residues; threads=%s; runs=%s\n' \
     "$reference_records" "$reference_residues" "$query_records" "$query_residues" \
     "$threads" "$repetitions"
+if [[ -n "$benchmark_cpuset" ]]; then
+    printf 'CPU affinity: %s (applied identically to C++ and Rust)\n' "$benchmark_cpuset"
+fi
+if [[ -n "$rust_memory_limit" ]]; then
+    printf 'Rust hit-buffer memory limit: %s (upstream blastp is disk-backed)\n' \
+        "$rust_memory_limit"
+else
+    printf 'Rust hit-buffer memory limit: 16G (native default; adaptive spill)\n'
+fi
 printf 'Reference SHA-256: '
 sha256sum "$reference" | awk '{ print $1 }'
 printf 'Query SHA-256: '
@@ -88,7 +112,7 @@ measure() {
     local run=$3
     shift 3
     local measurement="$work_dir/time.txt"
-    /usr/bin/time -f '%e\t%M' -o "$measurement" "$@" \
+    /usr/bin/time -f '%e\t%M' -o "$measurement" "${benchmark_prefix[@]}" "$@" \
         >"$work_dir/${implementation}-${operation}-${run}.stdout" \
         2>"$work_dir/${implementation}-${operation}-${run}.stderr"
     local seconds rss
@@ -102,6 +126,10 @@ rust_db="$work_dir/rust-db"
 cpp_output="$work_dir/cpp.tsv"
 rust_output="$work_dir/rust.tsv"
 outfmt=(6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore)
+rust_blastp_extra=()
+if [[ -n "$rust_memory_limit" ]]; then
+    rust_blastp_extra+=(--memory-limit "$rust_memory_limit" --tmpdir "$work_dir")
+fi
 
 for run in $(seq 1 "$repetitions"); do
     rm -f -- "$cpp_db.dmnd" "$rust_db.dmnd"
@@ -129,7 +157,8 @@ for run in $(seq 1 "$repetitions"); do
                 -o "$cpp_output" --threads "$threads" --outfmt "${outfmt[@]}"
         else
             measure rust blastp "$run" "$rust_bin" blastp -q "$query" -d "$rust_db" \
-                -o "$rust_output" --threads "$threads" --outfmt "${outfmt[@]}"
+                -o "$rust_output" --threads "$threads" "${rust_blastp_extra[@]}" \
+                --outfmt "${outfmt[@]}"
         fi
     done
 done

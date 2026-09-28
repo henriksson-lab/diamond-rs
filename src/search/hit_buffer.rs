@@ -1,17 +1,17 @@
 //! Buffered seed-hit storage translated from `search/hit_buffer.cpp`.
 //!
 //! The C++ implementation overlaps disk I/O with search workers. Rust keeps
-//! the same packet format and load/retrieve state machine, but performs the
-//! I/O synchronously; this preserves observable ordering and validation while
-//! avoiding process-global thread-pool state.
+//! the same packet format and load/retrieve state machine, including loading
+//! the next disk bin on a background thread while the previous bin is used.
 
 use super::hit::Hit;
 use crate::basic::seed::SeedOffset;
 use crate::basic::value::BlockId;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::{self, JoinHandle};
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 const DISK_BUFFER_SIZE: usize = 65_535;
@@ -22,6 +22,15 @@ pub enum HitBufferMode {
     Disk,
     Memory,
     SwipeAll,
+}
+
+/// Query-local hit representation used by the native protein alignment path.
+/// The query id is implicit in the containing bin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompactHit {
+    pub subject: u64,
+    pub seed_offset: SeedOffset,
+    pub score: u16,
 }
 
 /// Rust counterpart of C++ `Search::HitBuffer`.
@@ -37,10 +46,19 @@ pub struct HitBuffer {
     bins_processed: usize,
     input_range_next: (u32, u32),
     pending_hits: Vec<Hit>,
+    spare_hits: Vec<Hit>,
+    load_worker: Option<JoinHandle<Result<(Vec<Hit>, u64), String>>>,
+    pending_grouped_hits: Vec<Vec<CompactHit>>,
+    spare_grouped_hits: Vec<Vec<CompactHit>>,
+    grouped_load_worker: Option<JoinHandle<Result<(Vec<Vec<CompactHit>>, u64), String>>>,
     pending: bool,
     writing_finished: bool,
     total_disk_size: u64,
     temp_files: Vec<PathBuf>,
+    temp_writers: Vec<Option<BufWriter<File>>>,
+    stream_text_buffers: Vec<Vec<u8>>,
+    stream_buf_count: Vec<u32>,
+    stream_last_key: Vec<Option<(u32, SeedOffset)>>,
     error: Option<String>,
     allocated: bool,
 }
@@ -93,6 +111,7 @@ impl HitBuffer {
 
         let n = key_partition.len();
         let mut temp_files = Vec::new();
+        let mut temp_writers = (0..n).map(|_| None).collect::<Vec<_>>();
         if mode == HitBufferMode::Disk {
             let dir = if tmpdir.as_ref().as_os_str().is_empty() {
                 std::env::temp_dir()
@@ -106,8 +125,9 @@ impl HitBuffer {
                     "diamond-rs-hit-buffer-{}-{id}-{bin}.tmp",
                     std::process::id()
                 ));
-                File::create(&path).map_err(|e| e.to_string())?;
+                let file = File::create(&path).map_err(|e| e.to_string())?;
                 temp_files.push(path);
+                temp_writers[bin] = Some(BufWriter::with_capacity(DISK_BUFFER_SIZE, file));
             }
         }
 
@@ -123,10 +143,19 @@ impl HitBuffer {
             bins_processed: 0,
             input_range_next: (0, 0),
             pending_hits: Vec::new(),
+            spare_hits: Vec::new(),
+            load_worker: None,
+            pending_grouped_hits: Vec::new(),
+            spare_grouped_hits: Vec::new(),
+            grouped_load_worker: None,
             pending: false,
             writing_finished: false,
             total_disk_size: 0,
             temp_files,
+            temp_writers,
+            stream_text_buffers: vec![Vec::new(); n],
+            stream_buf_count: vec![0; n],
+            stream_last_key: vec![None; n],
             error: None,
             allocated: false,
         })
@@ -134,6 +163,80 @@ impl HitBuffer {
 
     pub fn writer(&mut self) -> Writer<'_> {
         Writer::new(self)
+    }
+
+    /// Append directly to the persistent disk encoders. Upstream keeps one
+    /// `TextBuffer` per bin for the lifetime of each search worker; retaining
+    /// these buffers across partition batches avoids thousands of short
+    /// packets and repeated allocation in forced-disk mode.
+    pub fn append_disk_hit(&mut self, hit: Hit) -> Result<(), String> {
+        if self.mode != HitBufferMode::Disk {
+            return Err("HitBuffer::append_disk_hit(): disk mode required".to_string());
+        }
+        if hit.score == 0 {
+            return Err("HitBuffer::append_disk_hit(): score must be positive".to_string());
+        }
+        if !self.long_subject_offsets && hit.subject > u32::MAX as u64 {
+            return Err(
+                "HitBuffer::append_disk_hit(): subject offset does not fit u32".to_string(),
+            );
+        }
+        if self.long_subject_offsets && hit.subject >= (1u64 << 40) {
+            return Err(
+                "HitBuffer::append_disk_hit(): subject offset does not fit PackedLoc".to_string(),
+            );
+        }
+
+        let bin = self.bin(hit.query / self.query_contexts)?;
+        let key = (hit.query, hit.seed_offset);
+        let subject_bytes = if self.long_subject_offsets { 5 } else { 4 };
+        if self.stream_last_key[bin] != Some(key) {
+            if self.stream_text_buffers[bin].len() + 10 + 2 + subject_bytes >= DISK_BUFFER_SIZE {
+                self.flush_stream_bin(bin)?;
+            }
+            Self::start_stream_query(&mut self.stream_text_buffers[bin], key);
+            self.stream_last_key[bin] = Some(key);
+        }
+        if self.stream_text_buffers[bin].len() + 2 + subject_bytes >= DISK_BUFFER_SIZE {
+            self.flush_stream_bin(bin)?;
+            Self::start_stream_query(&mut self.stream_text_buffers[bin], key);
+        }
+
+        self.stream_text_buffers[bin].extend_from_slice(&hit.score.to_ne_bytes());
+        if self.long_subject_offsets {
+            self.stream_text_buffers[bin].extend_from_slice(&hit.subject.to_le_bytes()[..5]);
+        } else {
+            self.stream_text_buffers[bin].extend_from_slice(&(hit.subject as u32).to_ne_bytes());
+        }
+        self.stream_buf_count[bin] += 1;
+        self.count[bin] += 1;
+        Ok(())
+    }
+
+    fn start_stream_query(buffer: &mut Vec<u8>, key: (u32, SeedOffset)) {
+        buffer.extend_from_slice(&0u16.to_ne_bytes());
+        buffer.extend_from_slice(&key.0.to_ne_bytes());
+        buffer.extend_from_slice(&key.1.to_ne_bytes());
+    }
+
+    fn flush_stream_bin(&mut self, bin: usize) -> Result<(), String> {
+        if self.stream_text_buffers[bin].is_empty() {
+            return Ok(());
+        }
+        self.stream_text_buffers[bin].extend_from_slice(&0u16.to_ne_bytes());
+        let count = self.stream_buf_count[bin];
+        let payload = &self.stream_text_buffers[bin];
+        let writer = self.temp_writers[bin]
+            .as_mut()
+            .ok_or_else(|| "HitBuffer::append_disk_hit(): writing already finished".to_string())?;
+        writer
+            .write_all(&payload.len().to_ne_bytes())
+            .and_then(|_| writer.write_all(&count.to_ne_bytes()))
+            .and_then(|_| writer.write_all(payload))
+            .map_err(|error| error.to_string())?;
+        self.stream_text_buffers[bin].clear();
+        self.stream_buf_count[bin] = 0;
+        Ok(())
     }
 
     pub fn mode(&self) -> HitBufferMode {
@@ -202,6 +305,18 @@ impl HitBuffer {
 
     /// Synchronous counterpart of joining all C++ writer tasks.
     pub fn finish_writing(&mut self) {
+        for bin in 0..self.num_bins() {
+            if let Err(error) = self.flush_stream_bin(bin) {
+                self.error = Some(error);
+            }
+        }
+        for writer in &mut self.temp_writers {
+            if let Some(mut writer) = writer.take() {
+                if let Err(error) = writer.flush() {
+                    self.error = Some(error.to_string());
+                }
+            }
+        }
         self.writing_finished = true;
     }
 
@@ -223,14 +338,35 @@ impl HitBuffer {
         }
         let bin = self.bins_processed;
         self.input_range_next = (self.begin(bin), self.end(bin));
-        self.pending_hits.clear();
         match self.mode {
             HitBufferMode::Memory => {}
             HitBufferMode::SwipeAll => {}
             HitBufferMode::Disk => {
-                match self.load_bin(bin) {
-                    Ok(hits) => self.pending_hits = hits,
-                    Err(e) => self.error = Some(e),
+                let path = self.temp_files[bin].clone();
+                let expected_count = self.count[bin];
+                let long_subject_offsets = self.long_subject_offsets;
+                let max_query = self.max_query;
+                let max_target = self.max_target;
+                let mut reuse = if self.spare_hits.capacity() >= self.pending_hits.capacity() {
+                    std::mem::take(&mut self.spare_hits)
+                } else {
+                    std::mem::take(&mut self.pending_hits)
+                };
+                reuse.clear();
+                match thread::Builder::new()
+                    .name("diamond-rs-hit-loader".to_string())
+                    .spawn(move || {
+                        Self::load_bin_from(
+                            path,
+                            expected_count,
+                            long_subject_offsets,
+                            max_query,
+                            max_target,
+                            reuse,
+                        )
+                    }) {
+                    Ok(worker) => self.load_worker = Some(worker),
+                    Err(error) => self.error = Some(error.to_string()),
                 }
                 self.bins_processed += 1;
             }
@@ -239,9 +375,62 @@ impl HitBuffer {
         true
     }
 
+    /// Native blastp loader: decode directly into query-local compact hit
+    /// vectors instead of materializing a flat `Hit` array which the caller
+    /// would immediately copy and regroup.
+    pub(crate) fn load_grouped(&mut self) -> bool {
+        if self.pending || self.load_worker.is_some() || self.grouped_load_worker.is_some() {
+            self.error = Some("HitBuffer::load_grouped(): previous load still in progress".into());
+            return false;
+        }
+        if self.mode != HitBufferMode::Disk {
+            self.error = Some("HitBuffer::load_grouped(): disk mode required".into());
+            return false;
+        }
+        if self.query_contexts != 1 {
+            self.error =
+                Some("HitBuffer::load_grouped(): only one query context is supported".into());
+            return false;
+        }
+        if self.bins_processed == self.num_bins() {
+            return false;
+        }
+        let bin = self.bins_processed;
+        let begin = self.begin(bin);
+        let end = self.end(bin);
+        self.input_range_next = (begin, end);
+        let path = self.temp_files[bin].clone();
+        let expected_count = self.count[bin];
+        let long_subject_offsets = self.long_subject_offsets;
+        let max_query = self.max_query;
+        let max_target = self.max_target;
+        let reuse = std::mem::take(&mut self.spare_grouped_hits);
+        match thread::Builder::new()
+            .name("diamond-rs-grouped-hit-loader".to_string())
+            .spawn(move || {
+                Self::load_grouped_bin_from(
+                    path,
+                    expected_count,
+                    long_subject_offsets,
+                    max_query,
+                    max_target,
+                    begin,
+                    end,
+                    reuse,
+                )
+            }) {
+            Ok(worker) => self.grouped_load_worker = Some(worker),
+            Err(error) => self.error = Some(error.to_string()),
+        }
+        self.bins_processed += 1;
+        self.pending = true;
+        true
+    }
+
     /// Fallible form of C++ `retrieve()`, including propagation of an
     /// exception raised by the load worker.
     pub fn try_retrieve(&mut self) -> Result<Option<(&[Hit], u32, u32)>, String> {
+        self.finish_load_worker()?;
         if let Some(error) = self.error.take() {
             self.pending = false;
             return Err(error);
@@ -266,6 +455,66 @@ impl HitBuffer {
             }
             HitBufferMode::Disk => Ok(Some((&self.pending_hits, begin, end))),
         }
+    }
+
+    /// Owned disk retrieval permits the caller to start loading the next bin
+    /// before processing this one, matching upstream's double-buffered path.
+    pub fn try_retrieve_owned(&mut self) -> Result<Option<(Vec<Hit>, u32, u32)>, String> {
+        if self.mode != HitBufferMode::Disk {
+            return Err("HitBuffer::try_retrieve_owned(): disk mode required".to_string());
+        }
+        self.finish_load_worker()?;
+        if let Some(error) = self.error.take() {
+            self.pending = false;
+            return Err(error);
+        }
+        if !self.pending {
+            if self.bins_processed >= self.num_bins() {
+                return Ok(None);
+            }
+            return Err("HitBuffer retrieve w/o load".to_string());
+        }
+        self.pending = false;
+        let (begin, end) = self.input_range_next;
+        Ok(Some((std::mem::take(&mut self.pending_hits), begin, end)))
+    }
+
+    /// Return a consumed owned result buffer for reuse by a later load.
+    pub fn recycle_hits(&mut self, mut hits: Vec<Hit>) {
+        hits.clear();
+        if hits.capacity() > self.spare_hits.capacity() {
+            self.spare_hits = hits;
+        }
+    }
+
+    pub(crate) fn try_retrieve_grouped_owned(
+        &mut self,
+    ) -> Result<Option<(Vec<Vec<CompactHit>>, u32, u32)>, String> {
+        self.finish_grouped_load_worker()?;
+        if let Some(error) = self.error.take() {
+            self.pending = false;
+            return Err(error);
+        }
+        if !self.pending {
+            if self.bins_processed >= self.num_bins() {
+                return Ok(None);
+            }
+            return Err("HitBuffer grouped retrieve w/o load".to_string());
+        }
+        self.pending = false;
+        let (begin, end) = self.input_range_next;
+        Ok(Some((
+            std::mem::take(&mut self.pending_grouped_hits),
+            begin,
+            end,
+        )))
+    }
+
+    pub(crate) fn recycle_grouped_hits(&mut self, mut hits: Vec<Vec<CompactHit>>) {
+        for query_hits in &mut hits {
+            query_hits.clear();
+        }
+        self.spare_grouped_hits = hits;
     }
 
     /// Compatibility wrapper for callers of the earlier in-memory API. New
@@ -296,11 +545,18 @@ impl HitBuffer {
     }
 
     pub fn free_buffer(&mut self) {
+        let _ = self.finish_load_worker();
+        let _ = self.finish_grouped_load_worker();
         self.pending_hits = Vec::new();
+        self.spare_hits = Vec::new();
+        self.pending_grouped_hits = Vec::new();
+        self.spare_grouped_hits = Vec::new();
         self.allocated = false;
     }
 
     pub fn clear(&mut self) {
+        let load_error = self.finish_load_worker().err();
+        let grouped_load_error = self.finish_grouped_load_worker().err();
         for bin in &mut self.bins {
             bin.clear();
         }
@@ -308,15 +564,29 @@ impl HitBuffer {
         self.bins_processed = 0;
         self.input_range_next = (0, 0);
         self.pending_hits.clear();
+        self.spare_hits.clear();
+        self.pending_grouped_hits.clear();
+        self.spare_grouped_hits.clear();
         self.pending = false;
         self.writing_finished = false;
         self.total_disk_size = 0;
-        self.error = None;
+        for buffer in &mut self.stream_text_buffers {
+            buffer.clear();
+        }
+        self.stream_buf_count.fill(0);
+        self.stream_last_key.fill(None);
+        self.error = load_error.or(grouped_load_error);
         if self.mode == HitBufferMode::Disk {
-            for path in &self.temp_files {
-                if let Err(e) = File::create(path) {
-                    self.error = Some(e.to_string());
-                    break;
+            for (bin, path) in self.temp_files.iter().enumerate() {
+                match File::create(path) {
+                    Ok(file) => {
+                        self.temp_writers[bin] =
+                            Some(BufWriter::with_capacity(DISK_BUFFER_SIZE, file));
+                    }
+                    Err(e) => {
+                        self.error = Some(e.to_string());
+                        break;
+                    }
                 }
             }
         }
@@ -331,25 +601,61 @@ impl HitBuffer {
     /// Synchronous equivalent of `HitBuffer::write_worker`: consumes one
     /// queued packet for the selected bin.
     fn write_worker(&mut self, bin: usize, payload: &[u8], count: u32) -> Result<(), String> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&self.temp_files[bin])
-            .map_err(|e| e.to_string())?;
+        let file = self.temp_writers[bin]
+            .as_mut()
+            .ok_or_else(|| "HitBuffer::write_worker(): writing already finished".to_string())?;
         file.write_all(&payload.len().to_ne_bytes())
             .and_then(|_| file.write_all(&count.to_ne_bytes()))
             .and_then(|_| file.write_all(payload))
             .map_err(|e| e.to_string())
     }
 
-    fn load_bin(&mut self, bin: usize) -> Result<Vec<Hit>, String> {
-        let path = &self.temp_files[bin];
-        self.total_disk_size += fs::metadata(path).map_err(|e| e.to_string())?.len();
-        if self.count[bin] == 0 {
-            return Ok(Vec::new());
+    fn finish_load_worker(&mut self) -> Result<(), String> {
+        let Some(worker) = self.load_worker.take() else {
+            return Ok(());
+        };
+        match worker.join() {
+            Ok(Ok((hits, disk_size))) => {
+                self.pending_hits = hits;
+                self.total_disk_size += disk_size;
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("HitBuffer::load_bin(): background loader panicked".to_string()),
         }
+    }
+
+    fn finish_grouped_load_worker(&mut self) -> Result<(), String> {
+        let Some(worker) = self.grouped_load_worker.take() else {
+            return Ok(());
+        };
+        match worker.join() {
+            Ok(Ok((hits, disk_size))) => {
+                self.pending_grouped_hits = hits;
+                self.total_disk_size += disk_size;
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("HitBuffer::load_grouped_bin(): background loader panicked".to_string()),
+        }
+    }
+
+    fn load_bin_from(
+        path: PathBuf,
+        expected_count: usize,
+        long_subject_offsets: bool,
+        max_query: u32,
+        max_target: u64,
+        mut hits: Vec<Hit>,
+    ) -> Result<(Vec<Hit>, u64), String> {
+        let disk_size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        hits.clear();
+        if expected_count == 0 {
+            return Ok((hits, disk_size));
+        }
+        hits.reserve(expected_count.saturating_sub(hits.capacity()));
         let mut file = File::open(path).map_err(|e| e.to_string())?;
         file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        let mut hits = Vec::with_capacity(self.count[bin]);
         loop {
             let mut size_bytes = [0u8; std::mem::size_of::<usize>()];
             let n = file.read(&mut size_bytes).map_err(|e| e.to_string())?;
@@ -366,18 +672,27 @@ impl HitBuffer {
                 "HitBuffer::load_bin(): truncated packet / possibly corrupted temporary file"
                     .to_string()
             })?;
-            self.decode_packet(&payload, expected, &mut hits)?;
+            Self::decode_packet(
+                &payload,
+                expected,
+                long_subject_offsets,
+                max_query,
+                max_target,
+                &mut hits,
+            )?;
         }
-        if hits.len() != self.count[bin] {
+        if hits.len() != expected_count {
             return Err("Mismatching hit count / possibly corrupted temporary file".to_string());
         }
-        Ok(hits)
+        Ok((hits, disk_size))
     }
 
     fn decode_packet(
-        &self,
         payload: &[u8],
         expected: usize,
+        long_subject_offsets: bool,
+        max_query: u32,
+        max_target: u64,
         out: &mut Vec<Hit>,
     ) -> Result<(), String> {
         let mut pos = 0usize;
@@ -388,7 +703,7 @@ impl HitBuffer {
         let before = out.len();
         while pos < payload.len() {
             let query = take_u32(payload, &mut pos)?;
-            if query >= self.max_query {
+            if query >= max_query {
                 return Err(
                     "HitBuffer::load_bin(): invalid query id / possibly corrupted temporary file"
                         .to_string(),
@@ -400,12 +715,12 @@ impl HitBuffer {
                 if score == 0 {
                     break;
                 }
-                let subject = if self.long_subject_offsets {
+                let subject = if long_subject_offsets {
                     take_u40(payload, &mut pos)?
                 } else {
                     take_u32(payload, &mut pos)? as u64
                 };
-                if subject >= self.max_target {
+                if subject >= max_target {
                     return Err("HitBuffer::load_bin(): invalid subject location / possibly corrupted temporary file".to_string());
                 }
                 if out.len() - before >= expected {
@@ -419,10 +734,98 @@ impl HitBuffer {
         }
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_grouped_bin_from(
+        path: PathBuf,
+        expected_count: usize,
+        long_subject_offsets: bool,
+        max_query: u32,
+        max_target: u64,
+        begin: u32,
+        end: u32,
+        mut hits: Vec<Vec<CompactHit>>,
+    ) -> Result<(Vec<Vec<CompactHit>>, u64), String> {
+        let disk_size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        let query_count = end.saturating_sub(begin) as usize;
+        hits.resize_with(query_count, Vec::new);
+        hits.truncate(query_count);
+        for query_hits in &mut hits {
+            query_hits.clear();
+        }
+        if expected_count == 0 {
+            return Ok((hits, disk_size));
+        }
+
+        let mut file = File::open(path).map_err(|e| e.to_string())?;
+        let mut decoded = 0usize;
+        loop {
+            let mut size_bytes = [0u8; std::mem::size_of::<usize>()];
+            let n = file.read(&mut size_bytes).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            if n != size_bytes.len() {
+                return Err("HitBuffer::load_grouped_bin(): truncated packet size".to_string());
+            }
+            let len = usize::from_ne_bytes(size_bytes);
+            let packet_count = read_u32_from(&mut file)? as usize;
+            let mut payload = vec![0; len];
+            file.read_exact(&mut payload).map_err(|_| {
+                "HitBuffer::load_grouped_bin(): truncated packet / possibly corrupted temporary file"
+                    .to_string()
+            })?;
+            let mut pos = 0usize;
+            if take_u16(&payload, &mut pos)? != 0 {
+                return Err("HitBuffer::load_grouped_bin(): invalid packet header".to_string());
+            }
+            let packet_begin = decoded;
+            while pos < payload.len() {
+                let query = take_u32(&payload, &mut pos)?;
+                if query >= max_query || query < begin || query >= end {
+                    return Err("HitBuffer::load_grouped_bin(): invalid query id / possibly corrupted temporary file".to_string());
+                }
+                let seed_offset = take_u32(&payload, &mut pos)?;
+                let query_hits = &mut hits[(query - begin) as usize];
+                loop {
+                    let score = take_u16(&payload, &mut pos)?;
+                    if score == 0 {
+                        break;
+                    }
+                    let subject = if long_subject_offsets {
+                        take_u40(&payload, &mut pos)?
+                    } else {
+                        take_u32(&payload, &mut pos)? as u64
+                    };
+                    if subject >= max_target {
+                        return Err("HitBuffer::load_grouped_bin(): invalid subject location / possibly corrupted temporary file".to_string());
+                    }
+                    if decoded - packet_begin >= packet_count || decoded >= expected_count {
+                        return Err("HitBuffer::load_grouped_bin(): buffer overflow / possibly corrupted temporary file".to_string());
+                    }
+                    query_hits.push(CompactHit {
+                        subject,
+                        seed_offset,
+                        score,
+                    });
+                    decoded += 1;
+                }
+            }
+            if decoded - packet_begin != packet_count {
+                return Err("Mismatching hit count / possibly corrupted temporary file".to_string());
+            }
+        }
+        if decoded != expected_count {
+            return Err("Mismatching hit count / possibly corrupted temporary file".to_string());
+        }
+        Ok((hits, disk_size))
+    }
 }
 
 impl Drop for HitBuffer {
     fn drop(&mut self) {
+        let _ = self.finish_load_worker();
+        let _ = self.finish_grouped_load_worker();
         for path in &self.temp_files {
             let _ = fs::remove_file(path);
         }
@@ -658,6 +1061,107 @@ mod tests {
             assert!(!buffer.load(1));
             buffer.free_buffer();
         }
+    }
+
+    #[test]
+    fn persistent_disk_encoder_roundtrips_flush_boundary_and_overlapped_bins() {
+        let mut buffer = HitBuffer::with_limits(
+            vec![10, 20],
+            temp_dir(),
+            false,
+            1,
+            20,
+            50_000,
+            HitBufferMode::Disk,
+        )
+        .unwrap();
+        for subject in 0..11_000u64 {
+            buffer
+                .append_disk_hit(Hit::with_score(2, subject, 7, 11))
+                .unwrap();
+        }
+        buffer
+            .append_disk_hit(Hit::with_score(12, 42, 9, 13))
+            .unwrap();
+        buffer
+            .append_disk_hit(Hit::with_score(12, 43, 9, 14))
+            .unwrap();
+        buffer.try_finish_writing().unwrap();
+        buffer.alloc_buffer();
+
+        assert!(buffer.load(usize::MAX));
+        let (first, begin, end) = buffer.try_retrieve_owned().unwrap().unwrap();
+        assert_eq!((begin, end), (0, 10));
+        assert!(buffer.load(usize::MAX));
+        assert_eq!(first.len(), 11_000);
+        assert_eq!(first[0], Hit::with_score(2, 0, 7, 11));
+        assert_eq!(first[10_999], Hit::with_score(2, 10_999, 7, 11));
+        buffer.recycle_hits(first);
+
+        let (second, begin, end) = buffer.try_retrieve_owned().unwrap().unwrap();
+        assert_eq!((begin, end), (10, 20));
+        assert_eq!(
+            second,
+            vec![
+                Hit::with_score(12, 42, 9, 13),
+                Hit::with_score(12, 43, 9, 14)
+            ]
+        );
+        assert!(!buffer.load(usize::MAX));
+        assert!(buffer.total_disk_size() > 0);
+    }
+
+    #[test]
+    fn grouped_disk_decoder_preserves_query_order_and_reuses_bins() {
+        let mut buffer = HitBuffer::with_limits(
+            vec![4, 8],
+            temp_dir(),
+            false,
+            1,
+            8,
+            10_000,
+            HitBufferMode::Disk,
+        )
+        .unwrap();
+        for hit in [
+            Hit::with_score(2, 20, 5, 11),
+            Hit::with_score(1, 10, 3, 7),
+            Hit::with_score(2, 21, 6, 12),
+            Hit::with_score(6, 60, 9, 13),
+        ] {
+            buffer.append_disk_hit(hit).unwrap();
+        }
+        buffer.try_finish_writing().unwrap();
+
+        assert!(buffer.load_grouped());
+        let (first, begin, end) = buffer.try_retrieve_grouped_owned().unwrap().unwrap();
+        assert_eq!((begin, end), (0, 4));
+        assert_eq!(
+            first[1],
+            vec![CompactHit {
+                subject: 10,
+                seed_offset: 3,
+                score: 7
+            }]
+        );
+        assert_eq!(
+            first[2].iter().map(|hit| hit.subject).collect::<Vec<_>>(),
+            vec![20, 21]
+        );
+        buffer.recycle_grouped_hits(first);
+
+        assert!(buffer.load_grouped());
+        let (second, begin, end) = buffer.try_retrieve_grouped_owned().unwrap().unwrap();
+        assert_eq!((begin, end), (4, 8));
+        assert_eq!(
+            second[2],
+            vec![CompactHit {
+                subject: 60,
+                seed_offset: 9,
+                score: 13
+            }]
+        );
+        assert!(!buffer.load_grouped());
     }
 
     #[test]

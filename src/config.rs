@@ -212,6 +212,11 @@ pub struct AlignArgs {
     #[arg(short = 't', long = "tmpdir")]
     pub tmpdir: Option<String>,
 
+    /// Soft RSS ceiling before retained search hits spill to temporary files
+    /// (native blastp/blastx default: 16G; 0G starts on disk)
+    #[arg(long = "memory-limit")]
+    pub memory_limit: Option<String>,
+
     /// Query parallel limit
     #[arg(long = "query-parallel-limit")]
     pub query_parallel_limit: Option<u32>,

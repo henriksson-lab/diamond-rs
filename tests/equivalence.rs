@@ -238,6 +238,8 @@ fn test_native_blastp_matches_ffi_scores() {
         comp_based_stats: diamond::stats::cbs::CbsMode::Hauser,
         no_self_hits: false,
         ungapped_xdrop_bits: 12.3,
+        memory_limit: None,
+        tmpdir: std::path::PathBuf::new(),
     };
     run(&config).unwrap();
 
@@ -424,6 +426,8 @@ fn test_native_blastp_repeat_sequence() {
         comp_based_stats: diamond::stats::cbs::CbsMode::Hauser,
         no_self_hits: false,
         ungapped_xdrop_bits: 12.3,
+        memory_limit: None,
+        tmpdir: std::path::PathBuf::new(),
     };
     diamond::commands::blastp::run(&config).unwrap();
 

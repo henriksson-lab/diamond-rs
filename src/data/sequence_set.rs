@@ -2,6 +2,7 @@
 //! `data/sequence_set.h`, and the inherited `data/string_set.h` template.
 
 use std::io::{self, Write};
+use std::sync::{Arc, OnceLock};
 
 use crate::basic::value::{BlockId, Letter, Loc, DELIMITER_LETTER};
 
@@ -238,14 +239,38 @@ pub fn max_id_len(ids: &StringSet) -> usize {
 /// Rust implementation eagerly restores the trailing 256-byte perimeter after
 /// mutating operations, which is equivalent to the C++ finalized state and
 /// keeps direct SIMD consumers safe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct SequenceSet {
     /// Raw data: all sequences concatenated with delimiter separators.
     data: Vec<Letter>,
     /// Offsets into data where each sequence starts.
     /// offsets[i] is the start of sequence i, offsets[i+1]-1 is the end (exclusive of delimiter).
     offsets: Vec<usize>,
+    /// Lazily materialized owned sequence views.  Alignment objects outlive
+    /// individual extension stages, so one Arc per database sequence avoids
+    /// copying the same letters for every query/target candidate.
+    shared: Vec<OnceLock<Arc<[Letter]>>>,
 }
+
+impl Clone for SequenceSet {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            offsets: self.offsets.clone(),
+            shared: std::iter::repeat_with(OnceLock::new)
+                .take(self.len())
+                .collect(),
+        }
+    }
+}
+
+impl PartialEq for SequenceSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data && self.offsets == other.offsets
+    }
+}
+
+impl Eq for SequenceSet {}
 
 /// Explicit replacement for the C++ `align_mode` fields used by this file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +312,7 @@ impl SequenceSet {
         SequenceSet {
             data: vec![DELIMITER_LETTER; Self::PERIMETER_PADDING],
             offsets: vec![Self::PERIMETER_PADDING],
+            shared: Vec::new(),
         }
     }
 
@@ -304,11 +330,13 @@ impl SequenceSet {
     pub fn reserve(&mut self, n: usize) {
         self.truncate_trailing_padding();
         self.offsets.push(self.raw_len() + n + 1);
+        self.shared.push(OnceLock::new());
     }
 
     /// Matches the two-argument C++ `StringSetBase::reserve` overload.
     pub fn reserve_capacity(&mut self, entries: usize, letters: usize) {
         self.offsets.reserve(entries + 1);
+        self.shared.reserve(entries);
         self.data
             .reserve(letters + 2 * Self::PERIMETER_PADDING + entries);
     }
@@ -320,6 +348,7 @@ impl SequenceSet {
         }
         let begin = self.ptr(i);
         let end = begin + seq.len();
+        self.shared[i].take();
         self.data[begin..end].copy_from_slice(seq);
         self.data[end] = DELIMITER_LETTER;
     }
@@ -330,6 +359,7 @@ impl SequenceSet {
         self.data.extend_from_slice(seq);
         self.data.push(DELIMITER_LETTER);
         self.offsets.push(self.data.len());
+        self.shared.push(OnceLock::new());
         self.finish_reserve();
     }
 
@@ -339,6 +369,7 @@ impl SequenceSet {
         self.data.extend(std::iter::repeat_n(value, n));
         self.data.push(DELIMITER_LETTER);
         self.offsets.push(self.data.len());
+        self.shared.push(OnceLock::new());
         self.finish_reserve();
     }
 
@@ -351,11 +382,13 @@ impl SequenceSet {
     pub fn clear(&mut self) {
         self.offsets.clear();
         self.offsets.push(Self::PERIMETER_PADDING);
+        self.shared.clear();
         self.data.resize(Self::PERIMETER_PADDING, DELIMITER_LETTER);
     }
 
     pub fn shrink_to_fit(&mut self) {
         self.offsets.shrink_to_fit();
+        self.shared.shrink_to_fit();
         self.data.shrink_to_fit();
     }
 
@@ -386,6 +419,15 @@ impl SequenceSet {
         let start = self.offsets[i];
         let end = self.offsets[i + 1] - 1; // -1 for delimiter
         &self.data[start..end]
+    }
+
+    /// Return one shared copy of sequence `i`, reused by all later callers.
+    /// Mutating that sequence invalidates the cache for future callers while
+    /// existing owners retain the immutable pre-mutation snapshot.
+    pub fn shared_get(&self, i: usize) -> Arc<[Letter]> {
+        self.shared[i]
+            .get_or_init(|| Arc::from(self.get(i)))
+            .clone()
     }
 
     /// Length of sequence i.
@@ -634,6 +676,9 @@ impl SequenceSet {
 
     /// Matches C++ `StringSetBase::data(p)`.
     pub fn data_mut_at(&mut self, p: u64) -> &mut [Letter] {
+        for cached in &mut self.shared {
+            cached.take();
+        }
         &mut self.data[p as usize..]
     }
 
@@ -641,6 +686,7 @@ impl SequenceSet {
     pub fn get_mut(&mut self, i: usize) -> &mut [Letter] {
         let start = self.offsets[i];
         let end = self.offsets[i + 1] - 1;
+        self.shared[i].take();
         &mut self.data[start..end]
     }
 }
@@ -654,12 +700,13 @@ impl Default for SequenceSet {
 /// C++ exposes a move constructor from the underlying letter string set.
 impl From<LetterStringSet> for SequenceSet {
     fn from(storage: LetterStringSet) -> Self {
+        let LetterStringSet { data, limits } = storage;
+        let sequence_count = limits.len().saturating_sub(1);
         Self {
-            data: storage.data,
-            offsets: storage
-                .limits
-                .into_iter()
-                .map(|offset| offset as usize)
+            data,
+            offsets: limits.into_iter().map(|offset| offset as usize).collect(),
+            shared: std::iter::repeat_with(OnceLock::new)
+                .take(sequence_count)
                 .collect(),
         }
     }
@@ -753,6 +800,47 @@ mod tests {
         ss.push(&[0, 1, 2]);
         ss.get_mut(0)[1] = 10;
         assert_eq!(ss.get(0), &[0, 10, 2]);
+    }
+
+    #[test]
+    fn shared_sequence_is_reused_and_get_mut_invalidates_only_its_entry() {
+        let mut ss = SequenceSet::new();
+        ss.push(&[0, 1, 2]);
+        ss.push(&[3, 4]);
+        let old0 = ss.shared_get(0);
+        let old1 = ss.shared_get(1);
+        assert!(Arc::ptr_eq(&old0, &ss.shared_get(0)));
+        assert!(Arc::ptr_eq(&old1, &ss.shared_get(1)));
+
+        ss.get_mut(0)[1] = 9;
+        let new0 = ss.shared_get(0);
+        assert_eq!(&*old0, &[0, 1, 2]);
+        assert_eq!(&*new0, &[0, 9, 2]);
+        assert!(!Arc::ptr_eq(&old0, &new0));
+        assert!(Arc::ptr_eq(&old1, &ss.shared_get(1)));
+    }
+
+    #[test]
+    fn bulk_mutation_clone_clear_and_reserve_maintain_shared_cache() {
+        let mut ss = SequenceSet::new();
+        ss.reserve(3);
+        ss.finish_reserve();
+        ss.assign(0, &[1, 2, 3]);
+        let old = ss.shared_get(0);
+        ss.data_mut_at(ss.ptr(0) as u64)[0] = 7;
+        let changed = ss.shared_get(0);
+        assert_eq!(&*old, &[1, 2, 3]);
+        assert_eq!(&*changed, &[7, 2, 3]);
+        assert!(!Arc::ptr_eq(&old, &changed));
+
+        let cloned = ss.clone();
+        let cloned_shared = cloned.shared_get(0);
+        assert_eq!(&*cloned_shared, &[7, 2, 3]);
+        assert!(!Arc::ptr_eq(&changed, &cloned_shared));
+
+        ss.clear();
+        ss.push(&[5]);
+        assert_eq!(&*ss.shared_get(0), &[5]);
     }
 
     #[test]

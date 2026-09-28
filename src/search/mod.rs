@@ -1,9 +1,11 @@
 pub mod hamming;
+pub(crate) mod hamming_all_vs_all;
 pub mod hamming_filter;
 pub mod hit;
 pub mod hit_buffer;
 pub mod kmer_ranking;
 pub mod left_most;
+pub mod left_most_unclipped;
 pub mod parallel;
 pub mod seed_array;
 pub mod seed_complexity;

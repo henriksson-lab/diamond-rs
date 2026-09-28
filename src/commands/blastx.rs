@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::basic::translate::{self, Frame, Strand};
@@ -50,6 +51,8 @@ pub struct BlastxConfig {
     pub comp_based_stats: CbsMode,
     pub no_self_hits: bool,
     pub ungapped_xdrop_bits: f64,
+    pub memory_limit: Option<usize>,
+    pub tmpdir: PathBuf,
 }
 
 /// Run blastx — translated DNA search against protein database.
@@ -161,6 +164,8 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
         comp_based_stats: config.comp_based_stats,
         no_self_hits: config.no_self_hits,
         ungapped_xdrop_bits: config.ungapped_xdrop_bits,
+        memory_limit: config.memory_limit,
+        tmpdir: config.tmpdir.clone(),
     };
 
     // Run the blastp pipeline with translated sequences

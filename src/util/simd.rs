@@ -122,11 +122,16 @@ pub fn features() -> String {
 pub fn transpose(data: &[&[i8]], n: usize, out: &mut [i8], width: usize) {
     assert!(width == 16 || width == 32);
     assert!(n <= width);
+    assert!(data.len() >= n);
     assert!(out.len() >= width * width);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
         if width == 32 && std::arch::is_x86_feature_detected!("avx2") {
-            transpose_32_avx2(data, n, out);
+            let mut pointers = [std::ptr::null(); 32];
+            for (pointer, row) in pointers.iter_mut().zip(data.iter().take(n)) {
+                *pointer = row.as_ptr();
+            }
+            transpose_32_avx2(&pointers[..n], n, 0, out);
             return;
         }
         if width == 16 && std::arch::is_x86_feature_detected!("sse2") {
@@ -209,60 +214,163 @@ unsafe fn transpose_16_sse2(data: &[&[i8]], n: usize, out: &mut [i8]) {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn transpose_32_avx2(data: &[&[i8]], n: usize, out: &mut [i8]) {
+pub(crate) unsafe fn transpose_32_avx2(
+    data: &[*const i8],
+    n: usize,
+    offset: usize,
+    out: &mut [i8],
+) {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    let zero = _mm256_setzero_si256();
-    let mut rows = [zero; 32];
+    debug_assert!(n <= 32 && data.len() >= n && out.len() >= 32 * 32);
     let row0 = 32 - n;
-    for (dst, src) in rows[row0..].iter_mut().zip(data.iter().take(n)) {
-        debug_assert!(src.len() >= 32);
-        *dst = _mm256_loadu_si256(src.as_ptr().cast());
-    }
-    for group in (0..32).step_by(2) {
-        let a = rows[group];
-        let b = rows[group + 1];
-        rows[group] = _mm256_unpacklo_epi8(a, b);
-        rows[group + 1] = _mm256_unpackhi_epi8(a, b);
-    }
-    for group in (0..32).step_by(4) {
-        for offset in 0..2 {
-            let a = rows[group + offset];
-            let b = rows[group + offset + 2];
-            rows[group + offset] = _mm256_unpacklo_epi16(a, b);
-            rows[group + offset + 2] = _mm256_unpackhi_epi16(a, b);
+    let mut rows = if n == 32 {
+        macro_rules! load_row {
+            ($i:expr) => {
+                _mm256_loadu_si256(data.get_unchecked($i).add(offset).cast())
+            };
         }
-    }
-    for group in (0..32).step_by(8) {
-        for offset in 0..4 {
-            let a = rows[group + offset];
-            let b = rows[group + offset + 4];
-            rows[group + offset] = _mm256_unpacklo_epi32(a, b);
-            rows[group + offset + 4] = _mm256_unpackhi_epi32(a, b);
+        [
+            load_row!(0),
+            load_row!(1),
+            load_row!(2),
+            load_row!(3),
+            load_row!(4),
+            load_row!(5),
+            load_row!(6),
+            load_row!(7),
+            load_row!(8),
+            load_row!(9),
+            load_row!(10),
+            load_row!(11),
+            load_row!(12),
+            load_row!(13),
+            load_row!(14),
+            load_row!(15),
+            load_row!(16),
+            load_row!(17),
+            load_row!(18),
+            load_row!(19),
+            load_row!(20),
+            load_row!(21),
+            load_row!(22),
+            load_row!(23),
+            load_row!(24),
+            load_row!(25),
+            load_row!(26),
+            load_row!(27),
+            load_row!(28),
+            load_row!(29),
+            load_row!(30),
+            load_row!(31),
+        ]
+    } else {
+        let zero = _mm256_setzero_si256();
+        let mut rows = [zero; 32];
+        for (dst, &src) in rows[row0..].iter_mut().zip(data.iter().take(n)) {
+            *dst = _mm256_loadu_si256(src.add(offset).cast());
         }
+        rows
+    };
+    macro_rules! unpack8 {
+        ($a:expr, $b:expr) => {{
+            let x = rows[$a];
+            let y = rows[$b];
+            rows[$a] = _mm256_unpacklo_epi8(x, y);
+            rows[$b] = _mm256_unpackhi_epi8(x, y);
+        }};
     }
-    for group in (0..32).step_by(16) {
-        for offset in 0..8 {
-            let a = rows[group + offset];
-            let b = rows[group + offset + 8];
-            rows[group + offset] = _mm256_unpacklo_epi64(a, b);
-            rows[group + offset + 8] = _mm256_unpackhi_epi64(a, b);
-        }
+    macro_rules! unpack16 {
+        ($a:expr, $b:expr) => {{
+            let x = rows[$a];
+            let y = rows[$b];
+            rows[$a] = _mm256_unpacklo_epi16(x, y);
+            rows[$b] = _mm256_unpackhi_epi16(x, y);
+        }};
     }
-    for offset in 0..16 {
-        let a = rows[offset];
-        let b = rows[offset + 16];
-        rows[offset] = _mm256_permute2x128_si256(a, b, 0x20);
-        rows[offset + 16] = _mm256_permute2x128_si256(a, b, 0x31);
+    macro_rules! unpack32 {
+        ($a:expr, $b:expr) => {{
+            let x = rows[$a];
+            let y = rows[$b];
+            rows[$a] = _mm256_unpacklo_epi32(x, y);
+            rows[$b] = _mm256_unpackhi_epi32(x, y);
+        }};
     }
-    for column in 0..32 {
-        let register = (column & 16) + bit_reverse(column & 15, 4);
-        _mm256_storeu_si256(out.as_mut_ptr().add(column * 32).cast(), rows[register]);
+    macro_rules! unpack64 {
+        ($a:expr, $b:expr) => {{
+            let x = rows[$a];
+            let y = rows[$b];
+            rows[$a] = _mm256_unpacklo_epi64(x, y);
+            rows[$b] = _mm256_unpackhi_epi64(x, y);
+        }};
     }
+    macro_rules! unpack128 {
+        ($a:expr, $b:expr) => {{
+            let x = rows[$a];
+            let y = rows[$b];
+            rows[$a] = _mm256_permute2x128_si256(x, y, 0x20);
+            rows[$b] = _mm256_permute2x128_si256(x, y, 0x31);
+        }};
+    }
+    macro_rules! pairs {
+        ($op:ident; $(($a:expr, $b:expr)),+ $(,)?) => {
+            $($op!($a, $b);)+
+        };
+    }
+
+    pairs!(unpack8; (0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15),
+        (16, 17), (18, 19), (20, 21), (22, 23), (24, 25), (26, 27), (28, 29), (30, 31));
+    pairs!(unpack16; (0, 2), (1, 3), (4, 6), (5, 7), (8, 10), (9, 11), (12, 14), (13, 15),
+        (16, 18), (17, 19), (20, 22), (21, 23), (24, 26), (25, 27), (28, 30), (29, 31));
+    pairs!(unpack32; (0, 4), (2, 6), (1, 5), (3, 7), (8, 12), (10, 14), (9, 13), (11, 15),
+        (16, 20), (18, 22), (17, 21), (19, 23), (24, 28), (26, 30), (25, 29), (27, 31));
+    pairs!(unpack64; (0, 8), (4, 12), (2, 10), (6, 14), (1, 9), (5, 13), (3, 11), (7, 15),
+        (16, 24), (20, 28), (18, 26), (22, 30), (17, 25), (21, 29), (19, 27), (23, 31));
+    pairs!(unpack128; (0, 16), (8, 24), (4, 20), (12, 28), (2, 18), (10, 26), (6, 22), (14, 30),
+        (1, 17), (9, 25), (5, 21), (13, 29), (3, 19), (11, 27), (7, 23), (15, 31));
+
+    macro_rules! store_row {
+        ($column:expr, $register:expr) => {
+            _mm256_storeu_si256(out.as_mut_ptr().add($column * 32).cast(), rows[$register]);
+        };
+    }
+    store_row!(0, 0);
+    store_row!(1, 8);
+    store_row!(2, 4);
+    store_row!(3, 12);
+    store_row!(4, 2);
+    store_row!(5, 10);
+    store_row!(6, 6);
+    store_row!(7, 14);
+    store_row!(8, 1);
+    store_row!(9, 9);
+    store_row!(10, 5);
+    store_row!(11, 13);
+    store_row!(12, 3);
+    store_row!(13, 11);
+    store_row!(14, 7);
+    store_row!(15, 15);
+    store_row!(16, 16);
+    store_row!(17, 24);
+    store_row!(18, 20);
+    store_row!(19, 28);
+    store_row!(20, 18);
+    store_row!(21, 26);
+    store_row!(22, 22);
+    store_row!(23, 30);
+    store_row!(24, 17);
+    store_row!(25, 25);
+    store_row!(26, 21);
+    store_row!(27, 29);
+    store_row!(28, 19);
+    store_row!(29, 27);
+    store_row!(30, 23);
+    store_row!(31, 31);
 }
 
 #[cfg(target_arch = "aarch64")]

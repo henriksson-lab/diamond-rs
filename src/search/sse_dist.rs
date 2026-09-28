@@ -173,6 +173,7 @@ pub fn reduced_match32(q: &[Letter], s: &[Letter], len: u32, reduction: &Reducti
 }
 
 /// Matches C++ `reduced_match(const Letter*, const Letter*, int, const Reduction&)`.
+#[inline(always)]
 pub fn reduced_match(q: &[Letter], s: &[Letter], len: i32, reduction: &Reduction) -> u64 {
     assert!(len <= 64);
     let len = len as usize;
@@ -203,6 +204,7 @@ pub fn reduced_match(q: &[Letter], s: &[Letter], len: i32, reduction: &Reduction
 }
 
 /// Matches C++ `seed_mask(const Letter*, int)`.
+#[inline(always)]
 pub fn seed_mask(s: &[Letter], len: i32) -> u64 {
     assert!(len <= 64);
     assert!(len >= 0 && s.len() >= len as usize);

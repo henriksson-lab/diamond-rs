@@ -76,14 +76,28 @@ pub fn format(
     Ok(())
 }
 
+unsafe extern "C" {
+    #[link_name = "memchr"]
+    fn c_memchr(ptr: *const std::ffi::c_void, byte: i32, len: usize) -> *mut std::ffi::c_void;
+}
+
+#[inline(always)]
 pub fn clip(seq: &[Letter], anchor: i32) -> &[Letter] {
     let anchor = anchor as usize;
     let mut begin = 0usize;
     loop {
-        match seq[begin..]
-            .iter()
-            .position(|&x| x == crate::basic::value::DELIMITER_LETTER)
-        {
+        let remaining = &seq[begin..];
+        // Upstream calls libc memchr here. Rust's iterator search compiled to
+        // a byte-at-a-time loop in this stage-2 hotspot.
+        let found = unsafe {
+            let ptr = c_memchr(
+                remaining.as_ptr().cast(),
+                crate::basic::value::DELIMITER_LETTER as i32,
+                remaining.len(),
+            );
+            (!ptr.is_null()).then(|| ptr as usize - remaining.as_ptr() as usize)
+        };
+        match found {
             None => return &seq[begin..],
             Some(p) => {
                 let p = begin + p;

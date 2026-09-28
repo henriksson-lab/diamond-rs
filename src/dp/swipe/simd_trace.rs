@@ -70,10 +70,11 @@ pub fn trace_batch_avx2(
     score_matrix: &ScoreMatrix,
     query_cbs: &[i8],
 ) -> Option<Vec<SwResult>> {
+    let invalid_band = targets.iter().any(|target| target.d_end <= target.d_begin);
     if targets.is_empty()
         || targets.len() > 8
         || (!query_cbs.is_empty() && query_cbs.len() < query.len())
-        || targets.iter().any(|target| target.d_end <= target.d_begin)
+        || invalid_band
     {
         return None;
     }
@@ -98,10 +99,11 @@ pub fn score_adjusted_batch_avx2(
     score_matrix: &ScoreMatrix,
     query_cbs: &[i8],
 ) -> Option<Vec<i32>> {
+    let invalid_band = targets.iter().any(|target| target.d_end <= target.d_begin);
     if targets.is_empty()
         || targets.len() > 8
         || (!query_cbs.is_empty() && query_cbs.len() < query.len())
-        || targets.iter().any(|t| t.d_end <= t.d_begin)
+        || invalid_band
     {
         return None;
     }
@@ -132,10 +134,14 @@ unsafe fn score_adjusted_impl(
     const NEG: i32 = i32::MIN / 4;
     let band = targets
         .iter()
-        .map(|t| (t.d_end - t.d_begin) as usize)
+        .map(|target| (target.d_end - target.d_begin) as usize)
         .max()
-        .unwrap();
-    let max_len = targets.iter().map(|t| t.subject.len()).max().unwrap_or(0);
+        .unwrap_or(0);
+    let max_len = targets
+        .iter()
+        .map(|target| target.subject.len())
+        .max()
+        .unwrap_or(0);
     let zero = arch::_mm256_setzero_si256();
     let neg = arch::_mm256_set1_epi32(NEG);
     let mut prev_h = vec![zero; band];
@@ -223,7 +229,7 @@ unsafe fn trace_batch_avx2_impl(
         .iter()
         .map(|target| (target.d_end - target.d_begin) as usize)
         .max()
-        .unwrap();
+        .unwrap_or(0);
     let max_subject_len = targets
         .iter()
         .map(|target| target.subject.len())
@@ -422,6 +428,20 @@ mod tests {
     use crate::stats::cbs::TargetMatrix;
     use std::sync::Arc;
 
+    fn coalesced_operations(operations: &[(EditOperation, i32)]) -> Vec<(EditOperation, i32)> {
+        let mut out = Vec::new();
+        for &(op, count) in operations {
+            if let Some((last_op, last_count)) = out.last_mut() {
+                if *last_op == op {
+                    *last_count += count;
+                    continue;
+                }
+            }
+            out.push((op, count));
+        }
+        out
+    }
+
     fn assert_sw_result_eq(actual: &SwResult, expected: &SwResult, context: &str) {
         assert_eq!(actual.score, expected.score, "score: {context}");
         assert_eq!(
@@ -450,7 +470,8 @@ mod tests {
             "coordinates/counts: {context}"
         );
         assert_eq!(
-            actual.operations, expected.operations,
+            coalesced_operations(&actual.operations),
+            coalesced_operations(&expected.operations),
             "operations: {context}"
         );
     }

@@ -31,6 +31,8 @@ pub struct Scratch8 {
     prev_e: Vec<V>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     curr_e: Vec<V>,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    query_biases: Vec<V>,
 }
 
 pub fn available() -> bool {
@@ -150,6 +152,16 @@ unsafe fn score_full_impl(
     scratch.curr_e.resize(rows, neg);
     scratch.prev_h.fill(zero);
     scratch.prev_e.fill(neg);
+    scratch
+        .query_biases
+        .resize(query.len(), arch::_mm256_setzero_si256());
+    if cbs.is_empty() {
+        scratch.query_biases.fill(arch::_mm256_setzero_si256());
+    } else {
+        for (slot, &bias) in scratch.query_biases.iter_mut().zip(cbs) {
+            *slot = arch::_mm256_set1_epi8(bias);
+        }
+    }
     let go_v = arch::_mm256_set1_epi8(go);
     let ge_v = arch::_mm256_set1_epi8(ge);
     let max_v = arch::_mm256_set1_epi8(i8::MAX);
@@ -164,7 +176,7 @@ unsafe fn score_full_impl(
         let mut vertical = neg;
         for (q, &ql) in query.iter().enumerate() {
             let mask = valid;
-            let cbs_v = arch::_mm256_set1_epi8(cbs.get(q).copied().unwrap_or(0));
+            let cbs_v = scratch.query_biases[q];
             let base = profile[(ql & LETTER_MASK) as usize];
             overflow = arch::_mm256_or_si256(
                 overflow,
@@ -310,7 +322,8 @@ unsafe fn score_impl(
     let mut subject_start = [0i32; 32];
     let mut band_offset = [0usize; 32];
     let mut columns = 0usize;
-    for (lane, target) in targets.iter().enumerate() {
+    for lane in 0..targets.len() {
+        let target = &targets[lane];
         let expanded_begin = target.d_end - band as i32;
         subject_start[lane] = i1 - (target.d_end - 1);
         band_offset[lane] = (target.d_begin - expanded_begin).max(0) as usize;
@@ -323,6 +336,16 @@ unsafe fn score_impl(
     scratch.prev_e.resize(band + 1, zero);
     scratch.prev_h.fill(zero);
     scratch.prev_e.fill(zero);
+    scratch
+        .query_biases
+        .resize(query.len(), arch::_mm256_setzero_si256());
+    if cbs.is_empty() {
+        scratch.query_biases.fill(arch::_mm256_setzero_si256());
+    } else {
+        for (slot, &bias) in scratch.query_biases.iter_mut().zip(cbs) {
+            *slot = arch::_mm256_set1_epi8(bias);
+        }
+    }
     let go_v = arch::_mm256_set1_epi8(go);
     let ge_v = arch::_mm256_set1_epi8(ge);
     let max_v = arch::_mm256_set1_epi8(i8::MAX);
@@ -365,7 +388,7 @@ unsafe fn score_impl(
             let r = (q - moving_i0) as usize;
             let cell_mask = arch::_mm256_and_si256(active, row_masks[r]);
             let base = profile[(query[q as usize] & LETTER_MASK) as usize];
-            let bias = arch::_mm256_set1_epi8(cbs.get(q as usize).copied().unwrap_or(0));
+            let bias = scratch.query_biases[q as usize];
             let subst = arch::_mm256_adds_epi8(base, bias);
             let diag = arch::_mm256_adds_epi8(scratch.prev_h[r], subst);
             let horizontal = scratch.prev_e[r + 1];

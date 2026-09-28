@@ -74,8 +74,7 @@ impl AlgoInt for usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatternMatcher {
     min_len: u32,
-    suffix_mask: u32,
-    table: Vec<u8>,
+    patterns: Vec<u32>,
 }
 
 impl PatternMatcher {
@@ -83,39 +82,43 @@ impl PatternMatcher {
 
     pub fn new(patterns: &[u32]) -> Self {
         let mut min_len = 32u32;
-        let mut max_len = 0u32;
         for &pattern in patterns {
             assert!(pattern != 0);
             let len = 32 - pattern.leading_zeros();
-            max_len = max_len.max(len);
             min_len = min_len.min(len);
-        }
-        let suffix_mask = (1u32 << max_len) - 1;
-        let mut table = vec![0u8; Self::SIZE];
-        for s in 0..=suffix_mask {
-            for &pattern in patterns {
-                if (s & pattern) == pattern {
-                    table[s as usize] = 1;
-                }
-            }
         }
         Self {
             min_len,
-            suffix_mask,
-            table,
+            patterns: patterns.to_vec(),
         }
     }
 
-    pub fn hit(&self, mut h: u32, len: u32) -> u32 {
+    #[inline(always)]
+    pub fn hit(&self, h: u32, len: u32) -> u32 {
         if len < self.min_len {
             return 0;
         }
-        let mask = self.suffix_mask;
-        let end = len - self.min_len + 1;
+
+        // Bit i in the result denotes a pattern match starting at bit i of h.
+        // For every required position k, `h >> k` has a one at precisely the
+        // valid starts for that position. Intersecting those masks evaluates a
+        // sparse pattern without the cache-dependent 2^MAX_SHAPE_LEN table.
         let mut r = 0u32;
-        for i in 0..end {
-            r |= (self.table[(h & mask) as usize] as u32) << i;
-            h >>= 1;
+        let starts = len - self.min_len + 1;
+        let start_mask = if starts == u32::BITS {
+            u32::MAX
+        } else {
+            (1u32 << starts) - 1
+        };
+        for &pattern in &self.patterns {
+            let mut required = pattern;
+            let mut matches = u32::MAX;
+            while required != 0 {
+                let bit = required.trailing_zeros();
+                matches &= h >> bit;
+                required &= required - 1;
+            }
+            r |= matches & start_mask;
         }
         r
     }
@@ -1543,6 +1546,48 @@ mod tests {
         assert_eq!(matcher.hit(0b0011, 4), 0b001);
         assert_eq!(matcher.hit(0b1010, 4), 0b010);
         assert_eq!(matcher.hit(0b0001, 1), 0);
+    }
+
+    #[test]
+    fn test_pattern_matcher_matches_lookup_semantics() {
+        fn reference(patterns: &[u32], mut h: u32, len: u32) -> u32 {
+            let min_len = patterns
+                .iter()
+                .map(|p| u32::BITS - p.leading_zeros())
+                .min()
+                .unwrap_or(32);
+            if len < min_len {
+                return 0;
+            }
+            let mut r = 0;
+            for i in 0..len - min_len + 1 {
+                if patterns.iter().any(|p| (h & p) == *p) {
+                    r |= 1 << i;
+                }
+                h >>= 1;
+            }
+            r
+        }
+
+        let pattern_sets: &[&[u32]] = &[
+            &[],
+            &[0b11],
+            &[0b10101],
+            &[0b111101011, 0b1101101011],
+            &[0b100000000000000001, 0b101010101010101],
+        ];
+        let mut state = 0x9e37_79b9u32;
+        for patterns in pattern_sets {
+            let matcher = PatternMatcher::new(patterns);
+            for len in 0..=32 {
+                for _ in 0..256 {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    assert_eq!(matcher.hit(state, len), reference(patterns, state, len));
+                }
+            }
+        }
     }
 
     #[test]
