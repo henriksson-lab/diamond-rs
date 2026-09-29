@@ -128,6 +128,9 @@ struct AdaptiveHitStore {
     query_count: usize,
     query_bins: usize,
     max_subject: u64,
+    query_group_size: usize,
+    bytes_since_rss_check: usize,
+    rss_checked_once: bool,
 }
 
 impl AdaptiveHitStore {
@@ -135,6 +138,7 @@ impl AdaptiveHitStore {
         query_count: usize,
         query_bins: usize,
         max_subject: u64,
+        query_group_size: usize,
         memory_limit: Option<usize>,
         tmpdir: PathBuf,
     ) -> Self {
@@ -146,19 +150,28 @@ impl AdaptiveHitStore {
             query_count,
             query_bins,
             max_subject,
+            query_group_size: query_group_size.max(1),
+            bytes_since_rss_check: 0,
+            rss_checked_once: false,
         }
     }
 
     fn ingest_partitions(&mut self, partitions: Vec<Vec<StoredHit>>) -> io::Result<usize> {
         let incoming = partitions.iter().map(Vec::len).sum::<usize>();
-        if self.disk.is_none()
-            && self.memory_limit.is_some_and(|limit| {
-                crate::util::system::get_current_rss()
-                    .saturating_add(incoming.saturating_mul(std::mem::size_of::<CompactHit>()))
-                    >= limit
-            })
-        {
-            self.spill_to_disk()?;
+        let incoming_bytes = incoming.saturating_mul(std::mem::size_of::<CompactHit>());
+        self.bytes_since_rss_check = self.bytes_since_rss_check.saturating_add(incoming_bytes);
+        const RSS_CHECK_GRANULARITY: usize = 8 * 1024 * 1024;
+        if self.disk.is_none() && self.memory_limit.is_some() {
+            let should_check =
+                !self.rss_checked_once || self.bytes_since_rss_check >= RSS_CHECK_GRANULARITY;
+            if should_check {
+                self.rss_checked_once = true;
+                self.bytes_since_rss_check = 0;
+                let limit = self.memory_limit.unwrap();
+                if crate::util::system::get_current_rss().saturating_add(incoming_bytes) >= limit {
+                    self.spill_to_disk()?;
+                }
+            }
         }
 
         if let Some(memory) = self.memory.as_mut() {
@@ -172,12 +185,6 @@ impl AdaptiveHitStore {
                         });
                     }
                 }
-            }
-            if self
-                .memory_limit
-                .is_some_and(|limit| crate::util::system::get_current_rss() >= limit)
-            {
-                self.spill_to_disk()?;
             }
         } else {
             self.write_partitions(partitions)?;
@@ -194,10 +201,15 @@ impl AdaptiveHitStore {
         // modes, 64 for ultra-sensitive). Each bin is decoded as a unit during
         // alignment, so retaining the default-mode count in ultra-sensitive
         // searches multiplies the live decoded-hit footprint by about four.
-        let num_bins = self.query_count.clamp(1, self.query_bins.max(1));
+        let group_count = self.query_count.div_ceil(self.query_group_size).max(1);
+        let num_bins = group_count.clamp(1, self.query_bins.max(1));
         let mut key_partition = Vec::with_capacity(num_bins);
         for bin in 1..=num_bins {
-            let end = ((bin * self.query_count + num_bins - 1) / num_bins)
+            // A translated query's six contexts must be decoded together so
+            // extension can rank and cull targets globally, as upstream does.
+            let end_group = (bin * group_count).div_ceil(num_bins);
+            let end = end_group
+                .saturating_mul(self.query_group_size)
                 .max(1)
                 .min(query_end as usize) as u32;
             if key_partition.last().copied() != Some(end) {
@@ -620,6 +632,55 @@ fn trim_freed_heap_pages() {
     }
 }
 
+/// Port of `align.cpp::make_partition` for translated queries. Hit records
+/// are already grouped by context, so count all six contexts of a source and
+/// extend every threshold crossing through that complete source query.
+fn translated_hit_partitions(
+    hits_by_context: &[Vec<CompactHit>],
+    source_count: usize,
+    query_contexts: usize,
+    min_task_trace_points: usize,
+) -> Vec<std::ops::Range<usize>> {
+    assert!(query_contexts > 0 && min_task_trace_points > 0);
+    debug_assert!(hits_by_context.len() >= source_count.saturating_mul(query_contexts));
+    if source_count == 0 {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut task_begin = 0usize;
+    let mut trace_points = 0usize;
+    for source in 0..source_count {
+        let context_begin = source * query_contexts;
+        trace_points = trace_points.saturating_add(
+            hits_by_context[context_begin..context_begin + query_contexts]
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+        );
+        // Upstream probes `p + min_task_trace_pts` (the 1025th record for
+        // the default 1024), then extends through that record's whole query.
+        if trace_points > min_task_trace_points {
+            ranges.push(task_begin..source + 1);
+            task_begin = source + 1;
+            trace_points = 0;
+        }
+    }
+    if task_begin < source_count {
+        if trace_points == 0 {
+            if let Some(last) = ranges.last_mut() {
+                // HitIterator appends trailing no-hit queries while fetching
+                // the final hit partition; they are not a separate task.
+                last.end = source_count;
+            } else {
+                ranges.push(0..source_count);
+            }
+        } else {
+            ranges.push(task_begin..source_count);
+        }
+    }
+    ranges
+}
+
 // Upstream Tantan starts treating 50k residues as an oversized sequence (its
 // reusable buffers have a 50k-residue floor).  Queries beyond that size also
 // make the final SWIPE pass allocate unusually large temporary profiles and
@@ -679,6 +740,26 @@ pub struct BlastpConfig {
     pub memory_limit: Option<usize>,
     /// Directory for spill files; an empty path uses the OS temporary directory.
     pub tmpdir: PathBuf,
+    /// Internal blastx layout. When present, every source query contributes
+    /// six consecutive protein records (one per translated context).
+    pub translated_query_layout: Option<TranslatedQueryLayout>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TranslatedQuerySource {
+    pub id: String,
+    pub dna_len: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct TranslatedQueryLayout {
+    pub sources: Vec<TranslatedQuerySource>,
+}
+
+struct TranslatedExtensionGroup {
+    id: String,
+    dna_len: i32,
+    frames: Vec<Vec<Letter>>,
 }
 
 /// Run a simplified blastp search.
@@ -794,7 +875,11 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             });
             records.extend(indexed.into_iter().map(|(_, record)| record));
         };
-        sort_by_cpp_length_order(&mut query_records);
+        // blastx contexts are deliberately consecutive: the spill bins and
+        // extension stage consume all six as one source query.
+        if config.translated_query_layout.is_none() {
+            sort_by_cpp_length_order(&mut query_records);
+        }
         sort_by_cpp_length_order(&mut db_records);
     }
 
@@ -822,10 +907,22 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 crate::masking::remove_bit_mask(&mut r.sequence);
                 tantan_masker.mask(&mut r.sequence);
             });
-            query_records.par_iter_mut().for_each(|r| {
-                crate::masking::remove_bit_mask(&mut r.sequence);
-                tantan_masker.mask(&mut r.sequence);
-            });
+            let mask_query = |record: &mut fasta::FastaRecord| {
+                crate::masking::remove_bit_mask(&mut record.sequence);
+                tantan_masker.mask(&mut record.sequence);
+            };
+            if query_records
+                .iter()
+                .any(|record| record.sequence.len() > LONG_QUERY_RESIDUES)
+            {
+                // Tantan's DP workspace is roughly proportional to sequence
+                // length. Six long blastx contexts masked concurrently create
+                // one large workspace per Rayon worker, whereas upstream's
+                // query-block masking reuses one workspace here.
+                query_records.iter_mut().for_each(mask_query);
+            } else {
+                query_records.par_iter_mut().for_each(mask_query);
+            }
         }
         MaskingMode::BlastSeg => {
             return Err(io::Error::new(
@@ -975,40 +1072,14 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             )
         })
         .collect();
-    // Left-most filtering consumes SEED_MASK bits.  Gather them first without
-    // retaining joined pairs, then the search pass can discard rejected pairs
-    // inside each partition instead of keeping them until query extension.
+    // Left-most filtering consumes SEED_MASK bits. Restore the pre-motif query
+    // copy now; each shape will add its low-complexity bits after joining and
+    // then search those same prepared arrays, matching upstream stage0.
     let mut low_complexity_query_positions = Vec::new();
-    for shape in &shapes {
-        let complexity_cut = traits.seed_cut * std::f64::consts::LN_2 * shape.weight as f64;
-        low_complexity_query_positions.extend(
-            parallel::collect_low_complexity_positions_partitioned_min_query_len(
-                &query_seqs,
-                &db_seqs,
-                shape,
-                &reduction,
-                complexity_cut,
-                config.min_query_len,
-                traits.sketch_size.max(0) as usize,
-            ),
-        );
-    }
     let template_len = shapes.iter().map(|shape| shape.length).max().unwrap_or(0);
     for (query, saved) in stage2_queries.iter_mut().zip(&query_motif_saves) {
         crate::masking::motifs::restore_motifs(query, saved, template_len);
     }
-    for &(query_id, query_pos) in &low_complexity_query_positions {
-        if let Some(letter) = stage2_queries
-            .get_mut(query_id as usize)
-            .and_then(|query| query.get_mut(query_pos as usize))
-        {
-            *letter |= SEED_MASK;
-        }
-    }
-    // The masking prepass builds and releases full seed arrays. Return those
-    // pages before the search pass so they do not inflate its RSS high-water
-    // mark on large databases.
-    trim_freed_heap_pages();
 
     // Hamming fingerprints in upstream are loaded after motif masking has
     // been removed, directly from the original contiguous sequences. Use the
@@ -1017,7 +1088,6 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     // needs a sparse restoration lookup for every candidate window. Query
     // SEED_MASK annotations are harmless because the fingerprint loader
     // strips LETTER_MASK from every byte.
-    let query_fingerprint_seqs: Vec<&[Letter]> = stage2_queries.iter().map(Vec::as_slice).collect();
     let db_fingerprint_seqs: Vec<&[Letter]> = (0..db_block.seqs().len())
         .map(|id| db_block.seqs().get(id))
         .collect();
@@ -1070,6 +1140,11 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         stage2_queries.len(),
         traits.query_bins as usize,
         db_block.seqs().data().len() as u64,
+        if config.translated_query_layout.is_some() {
+            6
+        } else {
+            1
+        },
         config.memory_limit,
         config.tmpdir.clone(),
     );
@@ -1092,6 +1167,26 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             reduction: &reduction,
         };
         let complexity_cut = traits.seed_cut * std::f64::consts::LN_2 * shape.weight as f64;
+        let prepared = parallel::prepare_seed_join_partitioned_min_query_len(
+            &query_seqs,
+            &db_seqs,
+            shape,
+            &reduction,
+            complexity_cut,
+            config.min_query_len,
+            traits.sketch_size.max(0) as usize,
+        );
+        for &(query_id, query_pos) in prepared.masked_positions() {
+            if let Some(letter) = stage2_queries
+                .get_mut(query_id as usize)
+                .and_then(|query| query.get_mut(query_pos as usize))
+            {
+                *letter |= SEED_MASK;
+            }
+        }
+        low_complexity_query_positions.extend_from_slice(prepared.masked_positions());
+        let query_fingerprint_seqs: Vec<&[Letter]> =
+            stage2_queries.iter().map(Vec::as_slice).collect();
         let map_matches = |matches: &[SeedMatch], out: &mut Vec<StoredHit>| {
             // SAFETY: the AVX-512 function item is installed only after the
             // one-time feature checks above; the baseline item has no extra
@@ -1118,36 +1213,25 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             }
         };
         let shape_raw_seed_matches = if config.memory_limit.is_none() {
-            // Preserve the fastest existing path when no ceiling was requested.
-            let (partitions, raw) =
-                parallel::map_seed_matches_partitioned_streaming_hamming_min_query_len(
-                    &query_seqs,
-                    &query_fingerprint_seqs,
-                    &db_seqs,
-                    &db_fingerprint_seqs,
-                    shape,
-                    &reduction,
-                    complexity_cut,
-                    config.min_query_len,
-                    traits.min_identities,
-                    traits.sketch_size.max(0) as usize,
-                    map_matches,
-                );
+            let mut partitions = Vec::new();
+            let raw = parallel::visit_prepared_seed_matches_streaming_hamming(
+                &query_fingerprint_seqs,
+                &db_fingerprint_seqs,
+                prepared,
+                traits.min_identities,
+                usize::MAX,
+                map_matches,
+                |batch| partitions.extend(batch),
+            );
             retained_hit_count += hit_store.ingest_partitions(partitions)?;
             raw
         } else {
             let mut spill_error = None;
-            let raw = parallel::visit_seed_matches_partitioned_streaming_hamming_min_query_len(
-                &query_seqs,
+            let raw = parallel::visit_prepared_seed_matches_streaming_hamming(
                 &query_fingerprint_seqs,
-                &db_seqs,
                 &db_fingerprint_seqs,
-                shape,
-                &reduction,
-                complexity_cut,
-                config.min_query_len,
+                prepared,
                 traits.min_identities,
-                traits.sketch_size.max(0) as usize,
                 // Keep enough independent partitions in flight that skewed
                 // seed groups do not leave workers idle at every disk-writer
                 // handoff. This remains bounded (and far below a complete
@@ -1222,6 +1306,40 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     drop(query_motif_saves);
     trim_freed_heap_pages();
     let db_ids = db_block.ids().map_err(io::Error::other)?;
+
+    // Once seeding is complete, move (do not clone) the six translated
+    // protein sequences into one source-query object. This is the shape the
+    // extension code expects for translated search and avoids retaining a
+    // second copy of long contigs.
+    let translated_groups = if let Some(layout) = &config.translated_query_layout {
+        let expected = layout.sources.len().saturating_mul(6);
+        if query_records.len() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "blastx internal layout has {} protein records, expected {expected}",
+                    query_records.len()
+                ),
+            ));
+        }
+        let mut records = std::mem::take(&mut query_records).into_iter();
+        let mut groups = Vec::with_capacity(layout.sources.len());
+        for source in &layout.sources {
+            let frames = records
+                .by_ref()
+                .take(6)
+                .map(|record| record.sequence)
+                .collect();
+            groups.push(TranslatedExtensionGroup {
+                id: source.id.clone(),
+                dna_len: source.dna_len,
+                frames,
+            });
+        }
+        Some(groups)
+    } else {
+        None
+    };
 
     // Parse output format. Only tabular is implemented in the native pipeline.
     // For PAF/SAM/XML/pairwise/DAA the user must use --legacy.
@@ -1404,6 +1522,158 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         }
         Ok(buf)
     };
+
+    let process_translated_query = |(query_idx, group, query_hits): (
+        usize,
+        &TranslatedExtensionGroup,
+        &[Vec<CompactHit>],
+    )|
+     -> io::Result<Vec<u8>> {
+        debug_assert_eq!(group.frames.len(), 6);
+        debug_assert_eq!(query_hits.len(), 6);
+        let query_cbs: Vec<Vec<i8>> = if config.comp_based_stats.hauser() {
+            group
+                .frames
+                .iter()
+                .map(|query| crate::stats::cbs::hauser_correction(query, &score_matrix))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let query_comp = crate::stats::cbs::compute_composition(&group.frames[0]);
+        let ungapped_cfg = UngappedStageConfig {
+            query_contexts: 6,
+            query_translated: true,
+            comp_based_stats: config.comp_based_stats,
+            xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
+            ..UngappedStageConfig::default()
+        };
+        let ext_mode = sensitivity::default_ext_mode(config.sensitivity);
+        let gapped_cfg = GappedScoreConfig {
+            query_contexts: 6,
+            query_translated: true,
+            comp_based_stats_hauser: config.comp_based_stats.hauser(),
+            comp_based_stats_matrix_adjust: config.comp_based_stats.matrix_adjust(),
+            query_cover: config.query_cover,
+            subject_cover: config.subject_cover,
+            no_self_hits: config.no_self_hits,
+            max_evalue: config.max_evalue,
+            min_id: config.min_id,
+            max_target_seqs: config.max_target_seqs,
+            ext_chunk_size: config.ext_chunk_size,
+            toppercent: config.toppercent,
+            global_ranking_targets: config.global_ranking_targets,
+            gapped_filter_evalue,
+            sensitivity: config.sensitivity,
+            ..GappedScoreConfig::default()
+        };
+
+        let total_hits = query_hits.iter().map(Vec::len).sum();
+        let mut hits = Vec::with_capacity(total_hits);
+        for (frame, frame_hits) in query_hits.iter().enumerate() {
+            hits.extend(
+                frame_hits.iter().map(|hit| {
+                    Hit::with_score(frame as u32, hit.subject, hit.seed_offset, hit.score)
+                }),
+            );
+        }
+        let mut stat = Statistics::new();
+        let output_hsp_values = HspValues::COORDS
+            | HspValues::IDENT
+            | HspValues::LENGTH
+            | HspValues::MISMATCHES
+            | HspValues::GAP_OPENINGS;
+        let matches = extend_targets(
+            query_idx as u32,
+            &mut hits,
+            &group.frames,
+            &group.id,
+            group.dna_len,
+            &query_cbs,
+            &query_comp,
+            &db_block,
+            &mut stat,
+            Flags::NONE,
+            ext_mode,
+            &gapped_cfg,
+            &ungapped_cfg,
+            &score_matrix,
+            output_hsp_values,
+            |query_len, target_len| {
+                cutoff_gapped1
+                    .as_ref()
+                    .map_or(-1, |table| table.call(query_len, target_len))
+            },
+            |query_len, target_len| {
+                cutoff_gapped2
+                    .as_ref()
+                    .map_or(-1, |table| table.call(query_len, target_len))
+            },
+            score_matrix.gap_open(),
+            score_matrix.gap_extend(),
+            gapped_filter_diag_score,
+            GAPPED_FILTER_WINDOW,
+            Option::<fn(u32, &crate::align::gapped_filter::SeedHitList) -> Vec<Match>>::None,
+        );
+        let mut buf = Vec::new();
+        for m in matches {
+            let Some(best_hsp) = m.hsps.first() else {
+                continue;
+            };
+            let target_id = m.target_block_id as usize;
+            let source_range = if best_hsp.frame >= 3 {
+                // `absolute_interval` is normalized to an ascending half-open
+                // interval. BLAST tabular coordinates are strand-oriented,
+                // so reverse contexts print the high coordinate first.
+                (
+                    best_hsp.query_source_range.end - 1,
+                    best_hsp.query_source_range.begin + 1,
+                )
+            } else {
+                (
+                    best_hsp.query_source_range.begin,
+                    best_hsp.query_source_range.end,
+                )
+            };
+            let hsp = OutputHsp {
+                score: best_hsp.score,
+                evalue: best_hsp.evalue,
+                bit_score: best_hsp.bit_score,
+                // Tabular qcovhsp is defined in source-query coordinates for
+                // translated search, not in amino-acid frame coordinates.
+                query_range: (
+                    best_hsp.query_source_range.begin,
+                    best_hsp.query_source_range.end,
+                ),
+                subject_range: (best_hsp.subject_range.begin, best_hsp.subject_range.end),
+                query_source_range: source_range,
+                subject_source_range: (best_hsp.subject_range.begin, best_hsp.subject_range.end),
+                frame: crate::basic::translate::Frame::from_index(best_hsp.frame).signed_frame(),
+                length: best_hsp.length,
+                identities: best_hsp.identities,
+                mismatches: best_hsp.mismatches,
+                positives: best_hsp.positives,
+                gap_openings: best_hsp.gap_openings,
+                gaps: best_hsp.gaps,
+            };
+            let target_title = std::str::from_utf8(db_ids.get(target_id)).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid UTF-8 database title: {error}"),
+                )
+            })?;
+            format::write_tabular_row(
+                &mut buf,
+                &group.id,
+                target_title,
+                &hsp,
+                &fields,
+                group.dna_len,
+                db_block.seqs().length(target_id) as i32,
+            )?;
+        }
+        Ok(buf)
+    };
     let mut total_alignments = 0u64;
     // Preserve input order without retaining every query's formatted output.
     // A moderately sized batch gives Rayon enough work to balance variable
@@ -1449,7 +1719,143 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         Ok(())
     };
 
-    if let Some(hits_by_query) = hit_store.memory.as_ref() {
+    if let Some(groups) = translated_groups.as_ref() {
+        // Release the normal-query writer closure's borrow before selecting
+        // the six-context path.
+        drop(write_query_range);
+        let mut write_translated_range = |source_begin: usize,
+                                          source_groups: &[TranslatedExtensionGroup],
+                                          hits_by_context: &[Vec<CompactHit>]|
+         -> io::Result<()> {
+            const MIN_TASK_TRACE_POINTS: usize = 1024;
+            let partitions = translated_hit_partitions(
+                hits_by_context,
+                source_groups.len(),
+                6,
+                MIN_TASK_TRACE_POINTS,
+            );
+            let process_partition = |partition: usize| {
+                partitions[partition]
+                    .clone()
+                    .map(|offset| {
+                        let begin = offset * 6;
+                        process_translated_query((
+                            source_begin + offset,
+                            &source_groups[offset],
+                            &hits_by_context[begin..begin + 6],
+                        ))
+                    })
+                    .collect::<io::Result<Vec<Vec<u8>>>>()
+            };
+            let partition_output: Vec<io::Result<Vec<Vec<u8>>>> =
+                if rayon::current_num_threads() == 1 || partitions.len() <= 1 {
+                    (0..partitions.len()).map(process_partition).collect()
+                } else {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    use std::sync::OnceLock;
+
+                    let next = AtomicUsize::new(0);
+                    let output: Vec<OnceLock<io::Result<Vec<Vec<u8>>>>> =
+                        (0..partitions.len()).map(|_| OnceLock::new()).collect();
+                    let worker_count = rayon::current_num_threads().min(partitions.len());
+                    rayon::scope(|scope| {
+                        for _ in 0..worker_count {
+                            let next = &next;
+                            let output = &output;
+                            let process_partition = &process_partition;
+                            scope.spawn(move |_| loop {
+                                let partition = next.fetch_add(1, Ordering::Relaxed);
+                                if partition >= output.len() {
+                                    break;
+                                }
+                                let result = process_partition(partition);
+                                let was_empty = output[partition].set(result).is_ok();
+                                debug_assert!(was_empty);
+                            });
+                        }
+                    });
+                    output
+                        .into_iter()
+                        .map(|slot| {
+                            slot.into_inner()
+                                .expect("translated partition worker left an empty output slot")
+                        })
+                        .collect()
+                };
+            for partition in partition_output {
+                for buf in partition? {
+                    total_alignments += buf.iter().filter(|&&byte| byte == b'\n').count() as u64;
+                    writer.write_all(&buf)?;
+                }
+            }
+            Ok(())
+        };
+
+        if let Some(hits_by_query) = hit_store.memory.as_ref() {
+            write_translated_range(0, groups, hits_by_query)?;
+        } else {
+            let disk = hit_store
+                .disk
+                .as_mut()
+                .ok_or_else(|| io::Error::other("missing hit storage"))?;
+            disk.try_finish_writing().map_err(io::Error::other)?;
+            let mut load_pending = disk.load_grouped();
+            while load_pending {
+                let Some((mut bin_hits, begin, mut end)) = disk
+                    .try_retrieve_grouped_owned()
+                    .map_err(io::Error::other)?
+                else {
+                    break;
+                };
+                load_pending = disk.load_grouped();
+                // Upstream intended `HitBuffer::load(max_size)` to combine
+                // adjacent bins, but its current loop condition makes that
+                // read exactly one bin. A translated bin often contains only
+                // two or three source queries, which strands alignment
+                // workers behind a barrier. Restore the intended read-ahead,
+                // bounded by live decoded-hit storage. Inner vectors are
+                // moved into the window; individual hits are never copied.
+                const MAX_DECODED_HIT_WINDOW: usize = 64 * 1024 * 1024;
+                let mut decoded_bytes = bin_hits
+                    .iter()
+                    .map(|hits| hits.capacity() * std::mem::size_of::<CompactHit>())
+                    .sum::<usize>();
+                while load_pending && decoded_bytes < MAX_DECODED_HIT_WINDOW {
+                    let Some((mut next_hits, next_begin, next_end)) = disk
+                        .try_retrieve_grouped_owned()
+                        .map_err(io::Error::other)?
+                    else {
+                        break;
+                    };
+                    debug_assert_eq!(next_begin, end);
+                    decoded_bytes = decoded_bytes.saturating_add(
+                        next_hits
+                            .iter()
+                            .map(|hits| hits.capacity() * std::mem::size_of::<CompactHit>())
+                            .sum::<usize>(),
+                    );
+                    bin_hits.append(&mut next_hits);
+                    end = next_end;
+                    load_pending = disk.load_grouped();
+                }
+                let begin_idx = begin as usize;
+                let end_idx = (end as usize).min(groups.len() * 6);
+                debug_assert_eq!(begin_idx % 6, 0);
+                debug_assert_eq!(end_idx % 6, 0);
+                write_translated_range(
+                    begin_idx / 6,
+                    &groups[begin_idx / 6..end_idx / 6],
+                    &bin_hits[..end_idx - begin_idx],
+                )?;
+                disk.recycle_grouped_hits(bin_hits);
+            }
+            disk.free_buffer();
+            eprintln!(
+                "Hit buffer: read {:.1} MiB of compressed spill data",
+                disk.total_disk_size() as f64 / (1024.0 * 1024.0)
+            );
+        }
+    } else if let Some(hits_by_query) = hit_store.memory.as_ref() {
         write_query_range(0, &query_records, hits_by_query)?;
     } else {
         let disk = hit_store
@@ -1497,6 +1903,95 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn context_hits(counts: &[usize], contexts: usize) -> Vec<Vec<CompactHit>> {
+        let hit = CompactHit {
+            subject: 0,
+            seed_offset: 0,
+            score: 0,
+        };
+        counts
+            .iter()
+            .flat_map(|&count| {
+                let mut source = vec![Vec::new(); contexts];
+                source[contexts - 1] = vec![hit; count];
+                source
+            })
+            .collect()
+    }
+
+    #[test]
+    fn translated_partitions_cross_threshold_only_at_source_boundaries() {
+        let hits = context_hits(&[0, 700, 400, 1_500, 20], 6);
+        assert_eq!(
+            translated_hit_partitions(&hits, 5, 6, 1_024),
+            vec![0..3, 3..4, 4..5]
+        );
+    }
+
+    #[test]
+    fn translated_partitions_retain_leading_and_trailing_zero_hit_queries() {
+        let hits = context_hits(&[0, 0, 1_024, 0, 0], 6);
+        assert_eq!(translated_hit_partitions(&hits, 5, 6, 1_024), vec![0..5]);
+        let crossed = context_hits(&[1_024, 1, 0], 6);
+        assert_eq!(translated_hit_partitions(&crossed, 3, 6, 1_024), vec![0..3]);
+        let empty = context_hits(&[0, 0, 0], 6);
+        assert_eq!(translated_hit_partitions(&empty, 3, 6, 1_024), vec![0..3]);
+    }
+
+    #[test]
+    fn translated_partitions_match_upstream_hit_index_algorithm() {
+        fn reference(counts: &[usize], threshold: usize) -> Vec<std::ops::Range<usize>> {
+            let flat: Vec<usize> = counts
+                .iter()
+                .enumerate()
+                .flat_map(|(source, &count)| std::iter::repeat_n(source, count))
+                .collect();
+            if flat.is_empty() {
+                return (!counts.is_empty())
+                    .then_some(0..counts.len())
+                    .into_iter()
+                    .collect();
+            }
+            let mut ranges = Vec::new();
+            let mut p = 0usize;
+            let mut source_begin = 0usize;
+            while p < flat.len() {
+                let mut q = (p + threshold).min(flat.len() - 1);
+                let boundary_source = flat[q];
+                while q < flat.len() && flat[q] == boundary_source {
+                    q += 1;
+                }
+                let source_end = if q == flat.len() {
+                    counts.len()
+                } else {
+                    boundary_source + 1
+                };
+                ranges.push(source_begin..source_end);
+                source_begin = source_end;
+                p = q;
+            }
+            ranges
+        }
+
+        for a in 0..6 {
+            for b in 0..6 {
+                for c in 0..6 {
+                    for d in 0..6 {
+                        let counts = [a, b, c, d];
+                        let hits = context_hits(&counts, 6);
+                        for threshold in 1..5 {
+                            assert_eq!(
+                                translated_hit_partitions(&hits, counts.len(), 6, threshold),
+                                reference(&counts, threshold),
+                                "counts={counts:?}, threshold={threshold}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn long_query_output_batches_are_bounded_by_workers() {
         let record = |len| fasta::FastaRecord {
@@ -1518,7 +2013,7 @@ mod tests {
             "diamond-adaptive-spill-test-{}",
             std::process::id()
         ));
-        let mut store = AdaptiveHitStore::new(2, 16, 100, None, tmpdir.clone());
+        let mut store = AdaptiveHitStore::new(2, 16, 100, 1, None, tmpdir.clone());
         store
             .ingest_partitions(vec![vec![StoredHit {
                 query_id: 0,
@@ -1630,6 +2125,7 @@ mod tests {
             ungapped_xdrop_bits: 12.3,
             memory_limit: None,
             tmpdir: tmpdir.clone(),
+            translated_query_layout: None,
         })
         .unwrap();
 
@@ -1674,6 +2170,7 @@ mod tests {
             ungapped_xdrop_bits: 12.3,
             memory_limit: None,
             tmpdir: PathBuf::new(),
+            translated_query_layout: None,
         };
 
         let result = run(&config);
@@ -1720,6 +2217,7 @@ mod tests {
             ungapped_xdrop_bits: 12.3,
             memory_limit: None,
             tmpdir: PathBuf::new(),
+            translated_query_layout: None,
         };
 
         let result = run(&config);

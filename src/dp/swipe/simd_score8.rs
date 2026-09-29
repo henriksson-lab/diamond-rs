@@ -3,7 +3,7 @@
 use super::simd_score::ScoreTarget;
 use crate::basic::value::Letter;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use crate::basic::value::{LETTER_MASK, SEED_MASK};
+use crate::basic::value::{AMINO_ACID_COUNT, LETTER_MASK, SUPER_HARD_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
 
 #[derive(Clone, Copy, Debug)]
@@ -27,8 +27,6 @@ pub struct Scratch8 {
     prev_h: Vec<V>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     prev_e: Vec<V>,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    query_biases: Vec<V>,
 }
 
 pub fn available() -> bool {
@@ -65,16 +63,48 @@ pub fn score_batch_avx2_i8(
         }
         // SAFETY: AVX2 was detected at runtime.
         Some(unsafe {
-            score_impl(
-                query,
-                targets,
-                matrix.matrix8(),
-                cbs,
-                go as i8,
-                ge as i8,
-                semi_global,
-                scratch,
-            )
+            match (semi_global, cbs.is_empty()) {
+                (true, false) => score_impl::<true, true>(
+                    query,
+                    targets,
+                    matrix.matrix8_low(),
+                    matrix.matrix8_high(),
+                    cbs,
+                    go as i8,
+                    ge as i8,
+                    scratch,
+                ),
+                (true, true) => score_impl::<true, false>(
+                    query,
+                    targets,
+                    matrix.matrix8_low(),
+                    matrix.matrix8_high(),
+                    cbs,
+                    go as i8,
+                    ge as i8,
+                    scratch,
+                ),
+                (false, false) => score_impl::<false, true>(
+                    query,
+                    targets,
+                    matrix.matrix8_low(),
+                    matrix.matrix8_high(),
+                    cbs,
+                    go as i8,
+                    ge as i8,
+                    scratch,
+                ),
+                (false, true) => score_impl::<false, false>(
+                    query,
+                    targets,
+                    matrix.matrix8_low(),
+                    matrix.matrix8_high(),
+                    cbs,
+                    go as i8,
+                    ge as i8,
+                    scratch,
+                ),
+            }
         })
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -107,16 +137,48 @@ pub fn score_full_batch_avx2_i8(
         }
         // SAFETY: guarded by runtime AVX2 detection.
         Some(unsafe {
-            score_full_impl(
-                query,
-                targets,
-                matrix.matrix8(),
-                cbs,
-                go as i8,
-                ge as i8,
-                semi_global,
-                scratch,
-            )
+            match (semi_global, cbs.is_empty()) {
+                (true, false) => score_full_impl::<true, true>(
+                    query,
+                    targets,
+                    matrix.matrix8_low(),
+                    matrix.matrix8_high(),
+                    cbs,
+                    go as i8,
+                    ge as i8,
+                    scratch,
+                ),
+                (true, true) => score_full_impl::<true, false>(
+                    query,
+                    targets,
+                    matrix.matrix8_low(),
+                    matrix.matrix8_high(),
+                    cbs,
+                    go as i8,
+                    ge as i8,
+                    scratch,
+                ),
+                (false, false) => score_full_impl::<false, true>(
+                    query,
+                    targets,
+                    matrix.matrix8_low(),
+                    matrix.matrix8_high(),
+                    cbs,
+                    go as i8,
+                    ge as i8,
+                    scratch,
+                ),
+                (false, true) => score_full_impl::<false, false>(
+                    query,
+                    targets,
+                    matrix.matrix8_low(),
+                    matrix.matrix8_high(),
+                    cbs,
+                    go as i8,
+                    ge as i8,
+                    scratch,
+                ),
+            }
         })
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -128,17 +190,17 @@ pub fn score_full_batch_avx2_i8(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn score_full_impl(
+unsafe fn score_full_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
     query: &[Letter],
     targets: &[&[Letter]],
-    matrix: &[i8; 1024],
+    matrix_low: &[i8; 1024],
+    matrix_high: &[i8; 1024],
     cbs: &[i8],
     go: i8,
     ge: i8,
-    semi_global: bool,
     scratch: &mut Scratch8,
 ) -> BatchScores8 {
-    let delta = if semi_global { 0i8 } else { i8::MIN };
+    let delta = if SEMI_GLOBAL { 0i8 } else { i8::MIN };
     let zero = arch::_mm256_set1_epi8(delta);
     let neg = arch::_mm256_set1_epi8(i8::MIN);
     let rows = query.len() + 1;
@@ -146,25 +208,13 @@ unsafe fn score_full_impl(
     scratch.prev_e.resize(rows, neg);
     scratch.prev_h.fill(zero);
     scratch.prev_e.fill(neg);
-    scratch
-        .query_biases
-        .resize(query.len(), arch::_mm256_setzero_si256());
-    if cbs.is_empty() {
-        scratch.query_biases.fill(arch::_mm256_setzero_si256());
-    } else {
-        for (slot, &bias) in scratch.query_biases.iter_mut().zip(cbs) {
-            *slot = arch::_mm256_set1_epi8(bias);
-        }
-    }
     let go_v = arch::_mm256_set1_epi8(go);
     let ge_v = arch::_mm256_set1_epi8(ge);
-    let max_v = arch::_mm256_set1_epi8(i8::MAX);
     let mut best = zero;
-    let mut overflow = arch::_mm256_setzero_si256();
     let max_len = targets.iter().map(|target| target.len()).max().unwrap_or(0);
     for j in 0..max_len {
-        let (subject, valid, seeded) = pack_full_column(targets, j);
-        let profile = build_profile(matrix, subject, seeded);
+        let (subject, valid) = pack_full_column(targets, j);
+        let profile = build_profile(matrix_low, matrix_high, subject);
         // Upstream SWIPE retains one score row and one horizontal-gap row,
         // updating them in place while carrying the overwritten diagonal in
         // a register. Two additional AVX2 rows are costly for long reads.
@@ -172,31 +222,35 @@ unsafe fn score_full_impl(
         scratch.prev_h[0] = zero;
         scratch.prev_e[0] = neg;
         let mut vertical = neg;
-        for (q, &ql) in query.iter().enumerate() {
-            let next_diagonal = scratch.prev_h[q + 1];
+        for q in 0..query.len() {
+            // `prev_*` have query_len + 1 rows and q is bounded by the query.
+            let next_diagonal = *scratch.prev_h.get_unchecked(q + 1);
             let mask = valid;
-            let cbs_v = scratch.query_biases[q];
-            let base = profile[(ql & LETTER_MASK) as usize];
-            overflow = arch::_mm256_or_si256(
-                overflow,
-                arch::_mm256_and_si256(mask, add_overflow(base, cbs_v)),
-            );
+            let cbs_v = if HAS_CBS {
+                // A memory broadcast is cheaper than rebuilding and retaining
+                // a query_len × 32-byte expanded CBS buffer for every batch.
+                arch::_mm256_set1_epi8(*cbs.get_unchecked(q))
+            } else {
+                arch::_mm256_setzero_si256()
+            };
+            let base = *profile.get_unchecked((*query.get_unchecked(q) & LETTER_MASK) as usize);
             let subst = arch::_mm256_adds_epi8(base, cbs_v);
             let diag = arch::_mm256_adds_epi8(diagonal, subst);
-            let horizontal = scratch.prev_e[q + 1];
+            let horizontal = *scratch.prev_e.get_unchecked(q + 1);
             let mut h = arch::_mm256_max_epi8(diag, horizontal);
             h = arch::_mm256_max_epi8(h, vertical);
-            h = arch::_mm256_max_epi8(h, zero);
+            if SEMI_GLOBAL {
+                h = arch::_mm256_max_epi8(h, zero);
+            }
             h = arch::_mm256_or_si256(
                 arch::_mm256_and_si256(mask, h),
                 arch::_mm256_andnot_si256(mask, zero),
             );
-            overflow = arch::_mm256_or_si256(overflow, arch::_mm256_cmpeq_epi8(h, max_v));
             let open = arch::_mm256_subs_epi8(h, go_v);
             let e = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(horizontal, ge_v), open);
             vertical = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(vertical, ge_v), open);
-            scratch.prev_h[q + 1] = h;
-            scratch.prev_e[q + 1] = arch::_mm256_or_si256(
+            *scratch.prev_h.get_unchecked_mut(q + 1) = h;
+            *scratch.prev_e.get_unchecked_mut(q + 1) = arch::_mm256_or_si256(
                 arch::_mm256_and_si256(mask, e),
                 arch::_mm256_andnot_si256(mask, neg),
             );
@@ -208,6 +262,10 @@ unsafe fn score_full_impl(
             diagonal = next_diagonal;
         }
     }
+    // Upstream promotes a byte lane exactly when its retained maximum reaches
+    // SCHAR_MAX.  Since `best` is monotonic, testing it once is equivalent to
+    // OR-ing a comparison into an overflow vector for every DP cell.
+    let overflow = arch::_mm256_cmpeq_epi8(best, arch::_mm256_set1_epi8(i8::MAX));
     finish(best, overflow, targets.len(), delta)
 }
 
@@ -215,56 +273,50 @@ unsafe fn score_full_impl(
 /// Each entry is the score for one query alphabet letter across all lanes.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn pack_full_column(targets: &[&[Letter]], column: usize) -> (V, V, V) {
+unsafe fn pack_full_column(targets: &[&[Letter]], column: usize) -> (V, V) {
     let mut subject = [0i8; 32];
     let mut valid = [0i8; 32];
-    let mut seeded = [0i8; 32];
     for lane in 0..targets.len() {
         if let Some(&letter) = targets[lane].get(column) {
             subject[lane] = (letter & LETTER_MASK) as i8;
             valid[lane] = -1;
-            seeded[lane] = if letter & SEED_MASK != 0 { -1 } else { 0 };
         }
     }
     (
         arch::_mm256_loadu_si256(subject.as_ptr().cast()),
         arch::_mm256_loadu_si256(valid.as_ptr().cast()),
-        arch::_mm256_loadu_si256(seeded.as_ptr().cast()),
     )
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn build_profile(matrix: &[i8; 1024], subject: V, seeded: V) -> [V; 32] {
-    let low_index = arch::_mm256_and_si256(subject, arch::_mm256_set1_epi8(15));
-    let high_mask = arch::_mm256_cmpgt_epi8(subject, arch::_mm256_set1_epi8(15));
+unsafe fn build_profile(matrix_low: &[i8; 1024], matrix_high: &[i8; 1024], subject: V) -> [V; 32] {
+    // This is the AVX2 `ScoreVector<int8_t>` constructor from upstream.  The
+    // preformatted tables let each query letter use two vector loads
+    // and two shuffles, instead of broadcasting four 128-bit halves.  Masked
+    // sequence letters retain their substitution score: SEED_MASK affects
+    // seeding, while `letter_mask` strips it for DP.
+    let subject = arch::_mm256_and_si256(subject, arch::_mm256_set1_epi8(LETTER_MASK));
+    let high_mask = arch::_mm256_slli_epi16(
+        arch::_mm256_and_si256(subject, arch::_mm256_set1_epi8(16)),
+        3,
+    );
+    let low_index = arch::_mm256_or_si256(subject, high_mask);
+    let high_index = arch::_mm256_or_si256(
+        subject,
+        arch::_mm256_xor_si256(high_mask, arch::_mm256_set1_epi8(i8::MIN)),
+    );
     let zero = arch::_mm256_setzero_si256();
     let mut profile = [zero; 32];
-    for (query_letter, slot) in profile.iter_mut().enumerate() {
-        let row = matrix.as_ptr().add(query_letter * 32);
-        let low = arch::_mm_loadu_si128(row.cast());
-        let high = arch::_mm_loadu_si128(row.add(16).cast());
-        let low = arch::_mm256_broadcastsi128_si256(low);
-        let high = arch::_mm256_broadcastsi128_si256(high);
-        let lo_score = arch::_mm256_shuffle_epi8(low, low_index);
-        let hi_score = arch::_mm256_shuffle_epi8(high, low_index);
-        let score = arch::_mm256_blendv_epi8(lo_score, hi_score, high_mask);
-        *slot = arch::_mm256_andnot_si256(seeded, score);
+    for (query_letter, slot) in profile[..AMINO_ACID_COUNT].iter_mut().enumerate() {
+        let low = arch::_mm256_loadu_si256(matrix_low.as_ptr().add(query_letter * 32).cast());
+        let high = arch::_mm256_loadu_si256(matrix_high.as_ptr().add(query_letter * 32).cast());
+        *slot = arch::_mm256_or_si256(
+            arch::_mm256_shuffle_epi8(low, low_index),
+            arch::_mm256_shuffle_epi8(high, high_index),
+        );
     }
     profile
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn add_overflow(a: V, b: V) -> V {
-    // Signed addition overflows iff both inputs have the same sign and the
-    // wrapping result has the opposite sign.
-    let sum = arch::_mm256_add_epi8(a, b);
-    let bits = arch::_mm256_and_si256(
-        arch::_mm256_xor_si256(a, sum),
-        arch::_mm256_xor_si256(b, sum),
-    );
-    arch::_mm256_cmpgt_epi8(arch::_mm256_setzero_si256(), bits)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -285,17 +337,17 @@ unsafe fn finish(best: V, overflow: V, len: usize, delta: i8) -> BatchScores8 {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn score_impl(
+unsafe fn score_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
-    matrix: &[i8; 32 * 32],
+    matrix_low: &[i8; 32 * 32],
+    matrix_high: &[i8; 32 * 32],
     cbs: &[i8],
     go: i8,
     ge: i8,
-    semi_global: bool,
     scratch: &mut Scratch8,
 ) -> BatchScores8 {
-    let delta = if semi_global { 0i8 } else { i8::MIN };
+    let delta = if SEMI_GLOBAL { 0i8 } else { i8::MIN };
     let band = targets
         .iter()
         .map(|target| (target.d_end - target.d_begin).max(0) as usize)
@@ -334,74 +386,100 @@ unsafe fn score_impl(
     scratch.prev_e.resize(band + 1, zero);
     scratch.prev_h.fill(zero);
     scratch.prev_e.fill(zero);
-    scratch
-        .query_biases
-        .resize(query.len(), arch::_mm256_setzero_si256());
-    if cbs.is_empty() {
-        scratch.query_biases.fill(arch::_mm256_setzero_si256());
-    } else {
-        for (slot, &bias) in scratch.query_biases.iter_mut().zip(cbs) {
-            *slot = arch::_mm256_set1_epi8(bias);
-        }
-    }
     let go_v = arch::_mm256_set1_epi8(go);
     let ge_v = arch::_mm256_set1_epi8(ge);
-    let max_v = arch::_mm256_set1_epi8(i8::MAX);
     let mut best = zero;
-    let mut overflow = arch::_mm256_setzero_si256();
-    let row_masks: Vec<V> = (0..band)
-        .map(|row| {
-            let mut lanes = [0i8; 32];
-            for lane in 0..targets.len() {
-                if row >= band_offset[lane] {
-                    lanes[lane] = -1;
-                }
+    // Match upstream STRICT_BAND: partition rows where lanes enter their true
+    // bands and hold one mask in a register throughout each partition.
+    let mut offsets = band_offset;
+    offsets[..targets.len()].sort_unstable();
+    let mut part_bounds = [0usize; 34];
+    let mut part_masks = [arch::_mm256_setzero_si256(); 33];
+    let mut part_count = 0usize;
+    let mut part_begin = 0usize;
+    for &offset in &offsets[..targets.len()] {
+        let offset = offset.min(band);
+        if offset <= part_begin || offset == band {
+            continue;
+        }
+        part_bounds[part_count] = part_begin;
+        let mut lanes = [i8::MIN; 32];
+        for lane in 0..targets.len() {
+            if part_begin >= band_offset[lane] {
+                lanes[lane] = 0;
             }
-            arch::_mm256_loadu_si256(lanes.as_ptr().cast())
-        })
-        .collect();
+        }
+        part_masks[part_count] = arch::_mm256_loadu_si256(lanes.as_ptr().cast());
+        part_count += 1;
+        part_begin = offset;
+    }
+    part_bounds[part_count] = part_begin;
+    let mut lanes = [i8::MIN; 32];
+    for lane in 0..targets.len() {
+        if part_begin >= band_offset[lane] {
+            lanes[lane] = 0;
+        }
+    }
+    part_masks[part_count] = arch::_mm256_loadu_si256(lanes.as_ptr().cast());
+    part_count += 1;
+    part_bounds[part_count] = band;
     for column in 0..columns {
-        let mut subject = [0i8; 32];
-        let mut active = [0i8; 32];
-        let mut seeded = [0i8; 32];
+        let mut subject = [SUPER_HARD_MASK; 32];
         for lane in 0..targets.len() {
             let pos = subject_start[lane] + column as i32;
             if pos >= 0 && pos < targets[lane].subject.len() as i32 {
                 let letter = targets[lane].subject[pos as usize];
                 subject[lane] = (letter & LETTER_MASK) as i8;
-                active[lane] = -1;
-                seeded[lane] = if letter & SEED_MASK != 0 { -1 } else { 0 };
             }
         }
         let subject = arch::_mm256_loadu_si256(subject.as_ptr().cast());
-        let active = arch::_mm256_loadu_si256(active.as_ptr().cast());
-        let seeded = arch::_mm256_loadu_si256(seeded.as_ptr().cast());
-        let profile = build_profile(matrix, subject, seeded);
+        let profile = build_profile(matrix_low, matrix_high, subject);
         let moving_i0 = i0 + column as i32;
         let query_begin = moving_i0.max(0);
         let query_end = (i1 + column as i32).min(query.len() as i32 - 1) + 1;
         let mut vertical = zero;
         let mut col_best = zero;
-        for q in query_begin..query_end {
-            let r = (q - moving_i0) as usize;
-            let cell_mask = arch::_mm256_and_si256(active, row_masks[r]);
-            let base = profile[(query[q as usize] & LETTER_MASK) as usize];
-            let bias = scratch.query_biases[q as usize];
-            let subst = arch::_mm256_adds_epi8(base, bias);
-            let diag = arch::_mm256_adds_epi8(scratch.prev_h[r], subst);
-            let horizontal = scratch.prev_e[r + 1];
-            let mut h = arch::_mm256_max_epi8(diag, horizontal);
-            h = arch::_mm256_max_epi8(h, vertical);
-            h = arch::_mm256_max_epi8(h, zero);
-            h = arch::_mm256_blendv_epi8(zero, h, cell_mask);
-            overflow = arch::_mm256_or_si256(overflow, arch::_mm256_cmpeq_epi8(h, max_v));
-            let open = arch::_mm256_subs_epi8(h, go_v);
-            let e = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(horizontal, ge_v), open);
-            vertical = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(vertical, ge_v), open);
-            scratch.prev_h[r] = h;
-            scratch.prev_e[r] = arch::_mm256_blendv_epi8(zero, e, cell_mask);
-            vertical = arch::_mm256_blendv_epi8(zero, vertical, cell_mask);
-            col_best = arch::_mm256_max_epi8(col_best, h);
+        let active_r_begin = (query_begin - moving_i0) as usize;
+        let active_r_end = (query_end - moving_i0) as usize;
+        for part in 0..part_count {
+            let r_begin = part_bounds[part].max(active_r_begin);
+            let r_end = part_bounds[part + 1].min(active_r_end);
+            if r_begin >= r_end {
+                continue;
+            }
+            let band_mask = *part_masks.get_unchecked(part);
+            for r in r_begin..r_end {
+                // The band and query bounds prove all of these indices. Using
+                // unchecked access removes cold panic branches from each cell.
+                let qi = (moving_i0 + r as i32) as usize;
+                let base = arch::_mm256_adds_epi8(
+                    *profile.get_unchecked((*query.get_unchecked(qi) & LETTER_MASK) as usize),
+                    band_mask,
+                );
+                let bias = if HAS_CBS {
+                    // Keep CBS scalar and broadcast at its use site. The batch
+                    // API would otherwise expand the full query once per 32
+                    // targets, unlike upstream's once-per-query CBS buffer.
+                    arch::_mm256_set1_epi8(*cbs.get_unchecked(qi))
+                } else {
+                    arch::_mm256_setzero_si256()
+                };
+                let subst = arch::_mm256_adds_epi8(base, bias);
+                let diag = arch::_mm256_adds_epi8(*scratch.prev_h.get_unchecked(r), subst);
+                let horizontal =
+                    arch::_mm256_adds_epi8(*scratch.prev_e.get_unchecked(r + 1), band_mask);
+                let mut h = arch::_mm256_max_epi8(diag, horizontal);
+                h = arch::_mm256_max_epi8(h, vertical);
+                if SEMI_GLOBAL {
+                    h = arch::_mm256_max_epi8(h, zero);
+                }
+                let open = arch::_mm256_subs_epi8(h, go_v);
+                let e = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(horizontal, ge_v), open);
+                vertical = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(vertical, ge_v), open);
+                *scratch.prev_h.get_unchecked_mut(r) = h;
+                *scratch.prev_e.get_unchecked_mut(r) = e;
+                col_best = arch::_mm256_max_epi8(col_best, h);
+            }
         }
         best = arch::_mm256_max_epi8(best, col_best);
     }
@@ -413,7 +491,10 @@ unsafe fn score_impl(
     }
     BatchScores8 {
         scores,
-        overflow_mask: arch::_mm256_movemask_epi8(overflow) as u32,
+        overflow_mask: arch::_mm256_movemask_epi8(arch::_mm256_cmpeq_epi8(
+            best,
+            arch::_mm256_set1_epi8(i8::MAX),
+        )) as u32,
         len: targets.len(),
     }
 }
@@ -421,6 +502,7 @@ unsafe fn score_impl(
 #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
 mod tests {
     use super::*;
+    use crate::basic::value::SEED_MASK;
 
     fn scalar(query: &[Letter], target: ScoreTarget<'_>, matrix: &ScoreMatrix, cbs: &[i8]) -> i32 {
         let neg = i32::MIN / 4;
@@ -436,11 +518,8 @@ mod tests {
             for i in 1..=query.len() {
                 let q = i - 1;
                 if q as i32 >= target.d_begin + j as i32 && (q as i32) < target.d_end + j as i32 {
-                    let subst = if sl & SEED_MASK != 0 {
-                        0
-                    } else {
-                        matrix.score(query[q] & LETTER_MASK, sl & LETTER_MASK)
-                    } + cbs.get(q).copied().unwrap_or(0) as i32;
+                    let subst = matrix.score(query[q] & LETTER_MASK, sl & LETTER_MASK)
+                        + cbs.get(q).copied().unwrap_or(0) as i32;
                     let h = (ph[i - 1] + subst).max(pe[i]).max(f).max(0);
                     ch[i] = h;
                     ce[i] = (pe[i] - ge).max(h - go);
@@ -504,10 +583,13 @@ mod tests {
                 .collect();
             let got =
                 score_batch_avx2_i8(&query, &targets, &matrix, &cbs, false, &mut scratch).unwrap();
+            let semi_global =
+                score_batch_avx2_i8(&query, &targets, &matrix, &cbs, true, &mut scratch).unwrap();
             for lane in 0..count {
                 let expected = scalar(&query, targets[lane], &matrix, &cbs);
                 if expected >= u8::MAX as i32 {
                     assert_ne!(got.overflow_mask & (1 << lane), 0);
+                    assert_ne!(semi_global.overflow_mask & (1 << lane), 0);
                 } else {
                     assert_eq!(
                         got.overflow_mask & (1 << lane),
@@ -516,6 +598,7 @@ mod tests {
                         got.scores[lane]
                     );
                     assert_eq!(got.scores[lane], expected);
+                    assert_eq!(semi_global.scores[lane], expected);
                 }
             }
         }
@@ -547,6 +630,9 @@ mod tests {
         let got =
             score_full_batch_avx2_i8(&query, &refs, &matrix, &[], false, &mut Scratch8::default())
                 .unwrap();
+        let semi_global =
+            score_full_batch_avx2_i8(&query, &refs, &matrix, &[], true, &mut Scratch8::default())
+                .unwrap();
         for lane in 0..refs.len() {
             let expected = scalar(
                 &query,
@@ -560,8 +646,37 @@ mod tests {
             );
             if expected >= 255 {
                 assert_ne!(got.overflow_mask & (1 << lane), 0);
+                assert_ne!(semi_global.overflow_mask & (1 << lane), 0);
             } else {
                 assert_eq!(got.scores[lane], expected);
+                assert_eq!(semi_global.scores[lane], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn avx2_profile_matches_matrix_for_every_alphabet_letter() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let mut subject = [SUPER_HARD_MASK; 32];
+        for (lane, letter) in subject[..AMINO_ACID_COUNT].iter_mut().enumerate() {
+            *letter = lane as Letter | if lane % 2 == 0 { SEED_MASK } else { 0 };
+        }
+        unsafe {
+            let packed = arch::_mm256_loadu_si256(subject.as_ptr().cast());
+            let profile = build_profile(matrix.matrix8_low(), matrix.matrix8_high(), packed);
+            for (query_letter, scores) in profile.iter().enumerate().take(AMINO_ACID_COUNT) {
+                let mut lanes = [0i8; 32];
+                arch::_mm256_storeu_si256(lanes.as_mut_ptr().cast(), *scores);
+                for subject_letter in 0..AMINO_ACID_COUNT {
+                    assert_eq!(
+                        lanes[subject_letter],
+                        matrix.score(query_letter as Letter, subject_letter as Letter) as i8,
+                        "query={query_letter} subject={subject_letter}"
+                    );
+                }
             }
         }
     }
@@ -601,8 +716,9 @@ mod tests {
 
         let start = Instant::now();
         for _ in 0..rounds {
-            let (subject, _, seeded) = unsafe { pack_full_column(&refs, 0) };
-            let profile = unsafe { build_profile(matrix.matrix8(), subject, seeded) };
+            let (subject, _) = unsafe { pack_full_column(&refs, 0) };
+            let profile =
+                unsafe { build_profile(matrix.matrix8_low(), matrix.matrix8_high(), subject) };
             for &q in &query {
                 black_box(profile[(q & LETTER_MASK) as usize]);
             }

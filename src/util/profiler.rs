@@ -58,8 +58,13 @@ impl Drop for Profiler {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_profiler_finish_accumulates_once() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         TIMES.lock().unwrap().clear();
         let mut profiler = Profiler::new("x");
         profiler.finish();
@@ -69,6 +74,9 @@ mod tests {
 
     #[test]
     fn test_profiler_drop_and_print() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         TIMES.lock().unwrap().clear();
         {
             let _profiler = Profiler::new("drop");

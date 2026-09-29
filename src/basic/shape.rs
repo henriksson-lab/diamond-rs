@@ -100,6 +100,47 @@ impl Shape {
     /// Returns None if any position contains a non-amino-acid letter.
     #[inline]
     pub fn set_seed(&self, seq: &[Letter], reduction: &Reduction) -> Option<PackedSeed> {
+        // All production protein-search shapes currently have ten selected
+        // positions under the Murphy-10 reduction.  Spell that case at its
+        // fixed width, just as the native compiler does for DIAMOND's hot seed
+        // iterator: this removes the loop-carried base-10 multiply chain and
+        // combines two reduction lookups in one small L1-resident table.
+        // Keep the generic path for custom reductions and test shapes.
+        if self.weight == 10 && reduction.size() == 10 {
+            debug_assert!(seq.len() >= self.length as usize);
+            macro_rules! letter {
+                ($index:expr) => {{
+                    // SAFETY: Shape::from_code records selected positions
+                    // inside `length`, and callers provide a complete window.
+                    let position = unsafe { *self.positions.get_unchecked($index) as usize };
+                    let raw = unsafe { *seq.get_unchecked(position) };
+                    if raw & crate::basic::value::SEED_MASK != 0 {
+                        return None;
+                    }
+                    raw & LETTER_MASK
+                }};
+            }
+            let p0 = reduction.reduce_pair10(letter!(0), letter!(1));
+            let p1 = reduction.reduce_pair10(letter!(2), letter!(3));
+            let p2 = reduction.reduce_pair10(letter!(4), letter!(5));
+            let p3 = reduction.reduce_pair10(letter!(6), letter!(7));
+            let p4 = reduction.reduce_pair10(letter!(8), letter!(9));
+            if p0 == u16::MAX
+                || p1 == u16::MAX
+                || p2 == u16::MAX
+                || p3 == u16::MAX
+                || p4 == u16::MAX
+            {
+                return None;
+            }
+            return Some(
+                p0 as u64 * 100_000_000
+                    + p1 as u64 * 1_000_000
+                    + p2 as u64 * 10_000
+                    + p3 as u64 * 100
+                    + p4 as u64,
+            );
+        }
         let mut s: PackedSeed = 0;
         for i in 0..self.weight as usize {
             let raw = seq[self.positions[i] as usize];
@@ -283,6 +324,44 @@ impl Shape {
     /// Extract a packed seed from a pre-reduced sequence.
     #[inline]
     pub fn set_seed_reduced(&self, seq: &[Letter], reduction: &Reduction) -> Option<PackedSeed> {
+        if reduction.size() == 10 && matches!(self.weight, 7 | 8 | 10) {
+            debug_assert!(seq.len() >= self.length as usize);
+            macro_rules! digit {
+                ($index:expr) => {{
+                    // SAFETY: selected positions are bounded by Shape::length.
+                    let position = unsafe { *self.positions.get_unchecked($index) as usize };
+                    let letter = unsafe { *seq.get_unchecked(position) } & LETTER_MASK;
+                    if letter == MASK_LETTER {
+                        return None;
+                    }
+                    letter as u64
+                }};
+            }
+            return match self.weight {
+                7 => {
+                    let p0 = digit!(0) * 10 + digit!(1);
+                    let p1 = digit!(2) * 10 + digit!(3);
+                    let p2 = digit!(4) * 10 + digit!(5);
+                    Some((p0 * 10_000 + p1 * 100 + p2) * 10 + digit!(6))
+                }
+                8 => {
+                    let p0 = digit!(0) * 10 + digit!(1);
+                    let p1 = digit!(2) * 10 + digit!(3);
+                    let p2 = digit!(4) * 10 + digit!(5);
+                    let p3 = digit!(6) * 10 + digit!(7);
+                    Some(p0 * 1_000_000 + p1 * 10_000 + p2 * 100 + p3)
+                }
+                10 => {
+                    let p0 = digit!(0) * 10 + digit!(1);
+                    let p1 = digit!(2) * 10 + digit!(3);
+                    let p2 = digit!(4) * 10 + digit!(5);
+                    let p3 = digit!(6) * 10 + digit!(7);
+                    let p4 = digit!(8) * 10 + digit!(9);
+                    Some(p0 * 100_000_000 + p1 * 1_000_000 + p2 * 10_000 + p3 * 100 + p4)
+                }
+                _ => unreachable!(),
+            };
+        }
         let mut s: PackedSeed = 0;
         for i in 0..self.weight as usize {
             let l = seq[self.positions[i] as usize] & LETTER_MASK;

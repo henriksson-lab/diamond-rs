@@ -291,7 +291,10 @@ The broader matrix exercises both the 16 GB adaptive default and immediate
 disk mode, a 64 MB mid-run spill threshold, gzip input, sensitivity presets,
 masking and composition-based statistics, a non-default score matrix,
 representative identity/coverage/top-score filters, an extended tabular output
-schema, and native `blastx`. It runs every mode at one and four threads,
+schema, and native `blastx`. The translated-search cases additionally cover
+very/ultra-sensitive search, CBS and masking disabled, each strand separately,
+genetic code 11, a fixed minimum ORF, and translated-query output fields. It
+runs every mode at one and four threads,
 alternates C++/Rust execution order, checks output bytes, and writes one TSV
 row per comparison with time, RSS, and both ratios:
 
@@ -367,24 +370,52 @@ byte-identical (SHA-256 `6ea16d64c71f833970aa8f045adbf0cd22a35c2706c69cebbc883f0
 The translated-search comparison uses one natural contiguous 250,000 nt
 region from *E. coli* K-12 MG1655 against the independent 4,000-protein AMR
 reference above, with `--sensitive`. It is not made longer by repeating reads.
-These are medians of five alternating runs pinned to the same CPUs. All four
+These are medians of three alternating runs pinned to the same CPUs. All four
 cases emit the same 25 rows with SHA-256
 `05b35eb5a1a6f89425ae58fe120c12eff0dbe19c3ff9c3d1944bc7e339124bb6`.
 
 | Rust memory mode | Threads | Runs | C++ time | Rust time | Speed | C++ RSS | Rust RSS | RSS ratio | Parity |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-| Default 16G | 1 | 5 | 3.32 s | 5.06 s | 0.656x | 80,124 KiB | 125,764 KiB | 1.570x | PASS |
-| Default 16G | 4 | 5 | 1.43 s | 2.25 s | 0.636x | 80,332 KiB | 210,996 KiB | 2.627x | PASS |
-| Forced disk, 0G | 1 | 5 | 3.38 s | 5.33 s | 0.634x | 80,124 KiB | 142,536 KiB | 1.779x | PASS |
-| Forced disk, 0G | 4 | 5 | 1.43 s | 2.55 s | 0.561x | 82,416 KiB | 174,272 KiB | 2.115x | PASS |
+| Default 16G | 1 | 3 | 3.09 s | 1.89 s | 1.635x | 80,180 KiB | 77,464 KiB | 0.966x | PASS |
+| Default 16G | 4 | 3 | 1.54 s | 0.95 s | 1.621x | 81,612 KiB | 78,380 KiB | 0.960x | PASS |
+| Forced disk, 0G | 1 | 3 | 2.98 s | 1.84 s | 1.620x | 80,184 KiB | 77,712 KiB | 0.969x | PASS |
+| Forced disk, 0G | 4 | 3 | 1.64 s | 1.00 s | 1.640x | 82,600 KiB | 79,072 KiB | 0.957x | PASS |
 
-The blastx adapter now culls targets across all six frames of each original
-DNA query, rather than applying `-k` independently to every frame. Long-frame
-extension batches are bounded to one wave per worker, which reduced default
-four-thread RSS from about 271 MiB to 212 MiB. The remaining RSS and speed gap
-is real: forced-disk profiling places it inside long translated-context
-extension scratch, not the retained-hit store. This is therefore a known
-optimization gap rather than a claim of parity.
+The blastx path keeps each DNA query's six translated contexts together, then
+culls globally and traces only the retained targets, matching upstream rather
+than applying `-k` independently to every frame. Seed arrays are built,
+sorted, and joined once per shape; their parallel fill uses exact per-worker
+partition ranges instead of one contended atomic increment per seed. For long
+translated queries, Tantan masking reuses one workspace instead of retaining
+one large workspace per Rayon worker. Together these changes make Rust faster
+and lower-RSS in all four measured modes. The `0G` rows exercise the same
+compressed temporary-bin spill path used after the default 16 GB soft limit
+is reached.
+
+As a separate multi-query coverage check, a natural 42-contig bacterial
+assembly (2,476,164 nt; SHA-256
+`b1be888ba95d0d9daaa6844063b8b1c1b3074d8a133e99b5e208e34b3fe061ce`)
+was searched against the same 4,000-protein database with `--very-sensitive`.
+These are three-run alternating medians pinned to CPU 10 or CPUs 10–13.
+
+| Rust memory mode | Threads | Runs | C++ time | Rust time | Speed ratio | C++ RSS | Rust RSS | RSS ratio | Byte parity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| Default 16G | 1 | 3 | 8.77 s | 10.74 s | 0.817x | 344,552 KiB | 161,504 KiB | 0.469x | PASS (531 rows) |
+| Default 16G | 4 | 3 | 6.18 s | 3.83 s | 1.614x | 366,324 KiB | 212,276 KiB | 0.580x | PASS (531 rows) |
+| Forced disk, 0G | 1 | 3 | 8.26 s | 10.14 s | 0.815x | 344,552 KiB | 162,224 KiB | 0.471x | PASS (531 rows) |
+| Forced disk, 0G | 4 | 3 | 6.18 s | 3.89 s | 1.589x | 366,380 KiB | 209,260 KiB | 0.571x | PASS (531 rows) |
+
+The very-sensitive output is byte-identical (SHA-256
+`48b11ee5f4932930510d21d46c1843026fa4e6322a330721fa434c987e9d04f2`).
+The four-thread Rust path is 1.59–1.61x faster and uses 42–43% less RSS on this
+larger workload. The one-thread path uses about 53% less RSS but remains about
+22% slower, which is still an optimization target rather than a hidden
+average. Compact i16 traceback stores four bits per live lane for batches of
+up to eight targets; this removes the former multi-hundred-megabyte traceback
+spike. Forced-disk translated search coalesces adjacent decoded bins into a
+bounded 64 MiB extension window. Hits are still written to and read from the
+compressed spill files; the window restores worker utilization without
+duplicating hit records.
 
 For optimization work, use the larger real-sequence harness rather than
 duplicating the bundled records:

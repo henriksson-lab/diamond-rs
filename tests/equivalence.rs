@@ -240,6 +240,7 @@ fn test_native_blastp_matches_ffi_scores() {
         ungapped_xdrop_bits: 12.3,
         memory_limit: None,
         tmpdir: std::path::PathBuf::new(),
+        translated_query_layout: None,
     };
     run(&config).unwrap();
 
@@ -428,6 +429,7 @@ fn test_native_blastp_repeat_sequence() {
         ungapped_xdrop_bits: 12.3,
         memory_limit: None,
         tmpdir: std::path::PathBuf::new(),
+        translated_query_layout: None,
     };
     diamond::commands::blastp::run(&config).unwrap();
 

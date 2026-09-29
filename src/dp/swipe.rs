@@ -11,7 +11,7 @@ use crate::align::hsp::Hsp;
 use crate::basic::packed_transcript::EditOperation;
 use crate::basic::statistics::{StatValue, Statistics};
 use crate::basic::translate::{Frame, TranslatedPosition};
-use crate::basic::value::{Letter, LETTER_MASK, SEED_MASK};
+use crate::basic::value::{Letter, LETTER_MASK};
 use crate::data::sequence_set::SequenceSet;
 use crate::dp::smith_waterman::SwResult;
 use crate::stats;
@@ -19,6 +19,7 @@ use crate::stats::cbs::TargetMatrix;
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::geo;
 use crate::util::interval::Interval;
+use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 
 #[path = "swipe/banded_3frame_swipe.rs"]
@@ -69,6 +70,7 @@ pub const SCORE_BINS: usize = 3;
 pub const ALGO_BINS: usize = 2;
 pub const BLANK_TARGET: i64 = i64::MAX;
 pub const MIN_LETTERS: i32 = 3;
+const DEFAULT_SWIPE_TASK_SIZE: i64 = 100_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Flags(pub u8);
@@ -674,9 +676,7 @@ fn traceback_hsp(
                 for _ in 0..len {
                     let ql = p.query[qi];
                     let sl = target_seq[sj];
-                    let match_score = if sl & SEED_MASK != 0 {
-                        0
-                    } else if let Some(matrix) = target.matrix.as_deref() {
+                    let match_score = if let Some(matrix) = target.matrix.as_deref() {
                         matrix.scores
                             [(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize]
                             as i32
@@ -1336,10 +1336,81 @@ pub fn swipe_threads(
     begin: &[DpTarget],
     overflow: &mut TargetVec,
     _round: i32,
-    _bin: usize,
+    bin: usize,
     p: &Params<'_>,
 ) -> Vec<Hsp> {
-    dispatch_swipe(begin, overflow, p)
+    if begin.is_empty() {
+        return Vec::new();
+    }
+
+    // C++ queues target ranges of roughly `swipe_task_size` cells into the
+    // same pool which is processing queries. Rayon supports the same nested
+    // work-stealing model: this does not create threads or oversubscribe, and
+    // a worker waiting for its child ranges continues executing pool work.
+    // Keep boundaries aligned to the score-vector width so every dispatched
+    // range retains full SIMD batches.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let avx2 = false;
+    let channels = if avx2 {
+        [32, 16, 8][bin % SCORE_BINS]
+    } else if cfg!(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm"
+    )) {
+        [16, 8, 4][bin % SCORE_BINS]
+    } else {
+        1
+    };
+    let mut ranges = Vec::new();
+    let mut task_begin = 0usize;
+    let mut task_cells = 0i64;
+    let mut i = 0usize;
+    while i < begin.len() {
+        let end = (i + channels).min(begin.len());
+        task_cells = task_cells.saturating_add(
+            begin[i..end]
+                .iter()
+                .map(|target| target.cells(p.flags, p.query.len() as i32))
+                .sum::<i64>(),
+        );
+        i = end;
+        if task_cells >= DEFAULT_SWIPE_TASK_SIZE {
+            ranges.push(task_begin..i);
+            task_begin = i;
+            task_cells = 0;
+        }
+    }
+
+    // Upstream avoids the task pool entirely unless at least one range hit
+    // the threshold. This matters for the many small per-query SWIPE calls.
+    if ranges.is_empty() || rayon::current_num_threads() == 1 {
+        p.inc_stat(StatValue::SwipeTasksTotal, 1);
+        return dispatch_swipe(begin, overflow, p);
+    }
+    if task_begin < begin.len() {
+        ranges.push(task_begin..begin.len());
+    }
+    p.inc_stat(StatValue::SwipeTasksTotal, ranges.len() as i64);
+    p.inc_stat(StatValue::SwipeTasksAsync, ranges.len() as i64);
+
+    let results: Vec<(Vec<Hsp>, TargetVec)> = ranges
+        .into_par_iter()
+        .map(|range| {
+            let mut local_overflow = TargetVec::default();
+            let output = dispatch_swipe(&begin[range], &mut local_overflow, p);
+            (output, local_overflow)
+        })
+        .collect();
+    let mut output = Vec::new();
+    for (mut local_output, local_overflow) in results {
+        output.append(&mut local_output);
+        overflow.push_back_vec(&local_overflow);
+    }
+    output
 }
 
 pub fn swipe_bin(
@@ -1352,7 +1423,6 @@ pub fn swipe_bin(
         return (Vec::new(), TargetVec::default());
     }
     let timer = Instant::now();
-    p.inc_stat(StatValue::SwipeTasksTotal, 1);
     let extension_stat = match bin % SCORE_BINS {
         0 => StatValue::Ext8,
         1 => StatValue::Ext16,
@@ -1683,15 +1753,12 @@ fn banded_sw_cbs_range(
             let spos = j - 1;
             let ql = query[qpos];
             let sl = subject[spos];
-            // C++ `Sequence::operator[]` strips query soft masks before
-            // SWIPE scoring. A masked subject/profile lane still scores as
-            // zero.
-            let match_score = if sl & SEED_MASK != 0 {
-                0
-            } else if let Some(matrix) = target_matrix {
+            // Upstream's SIMD score-vector constructors apply `letter_mask`
+            // to subject lanes: seed masking suppresses seeds, not DP scores.
+            let match_score = if let Some(matrix) = target_matrix {
                 matrix.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize] as i32
             } else {
-                score_matrix.score(ql, sl)
+                score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
             };
             let current_offset = i - lower_i;
             let cbs = if use_cbs { query_cbs[qpos] as i32 } else { 0 };
@@ -1868,12 +1935,10 @@ fn banded_sw_cbs_score(
             let spos = j - 1;
             let ql = query[qpos];
             let sl = subject[spos];
-            let match_score = if sl & SEED_MASK != 0 {
-                0
-            } else if let Some(matrix) = target_matrix {
+            let match_score = if let Some(matrix) = target_matrix {
                 matrix.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize] as i32
             } else {
-                score_matrix.score(ql, sl)
+                score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
             };
             let current_offset = i - lower_i;
             let cbs = if use_cbs { query_cbs[qpos] as i32 } else { 0 };
@@ -2298,10 +2363,10 @@ mod tests {
     }
 
     #[test]
-    fn test_traceback_positives_respect_masked_subject_letter() {
+    fn test_traceback_positives_score_masked_subject_letter() {
         let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
         let query: Vec<Letter> = vec![0, 1, 2];
-        let subject: Vec<Letter> = vec![0, 3 | SEED_MASK, 2];
+        let subject: Vec<Letter> = vec![0, 3 | crate::basic::value::SEED_MASK, 2];
         let mut scores = vec![-20i8; 32 * AMINO_ACID_COUNT];
         for i in 0..AMINO_ACID_COUNT {
             scores[i * 32 + i] = 20;
@@ -2325,7 +2390,7 @@ mod tests {
         let out = dispatch_swipe(&[target], &mut overflow, &params);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].identities, 2);
-        assert_eq!(out[0].positives, 2);
+        assert_eq!(out[0].positives, 3);
     }
 
     #[test]

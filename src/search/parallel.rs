@@ -228,6 +228,144 @@ fn build_search_seed_array(
     }
 }
 
+/// Seed arrays after the partition-local sort/join and low-complexity pass.
+///
+/// Upstream builds each shape's arrays once, masks rejected joined groups,
+/// then searches those same arrays.  Keeping this intermediate prevents the
+/// native pipeline from repeating the dominant build/sort/join work merely to
+/// make `SEED_MASK` visible to the left-most filter.
+pub struct PreparedSeedJoin {
+    query: SeedArray,
+    reference: SeedArray,
+    blocks: Vec<super::seed_array::PartitionBlocks>,
+    masked_positions: Vec<(u32, u32)>,
+}
+
+impl PreparedSeedJoin {
+    pub fn masked_positions(&self) -> &[(u32, u32)] {
+        &self.masked_positions
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_seed_join_partitioned_min_query_len(
+    query_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: usize,
+    sketch_size: usize,
+) -> PreparedSeedJoin {
+    let seedp_bits = DEFAULT_SEEDP_BITS;
+    let mut query = build_search_seed_array(
+        query_seqs,
+        shape,
+        reduction,
+        seedp_bits,
+        min_query_len,
+        sketch_size,
+    );
+    let mut reference =
+        build_search_seed_array(ref_seqs, shape, reduction, seedp_bits, 0, sketch_size);
+    let num_partitions = query.num_partitions();
+
+    fn split_into_partitions(
+        sa: &mut SeedArray,
+        num_partitions: usize,
+    ) -> Vec<&mut [super::seed_array::SeedEntry]> {
+        let offsets: Vec<usize> = (0..=num_partitions)
+            .map(|partition| sa.partition_offset(partition))
+            .collect();
+        let mut remaining = sa.data_mut();
+        let mut partitions = Vec::with_capacity(num_partitions);
+        for partition in 0..num_partitions {
+            let len = offsets[partition + 1] - offsets[partition];
+            let (current, rest) = remaining.split_at_mut(len);
+            partitions.push(current);
+            remaining = rest;
+        }
+        partitions
+    }
+
+    let mut query_parts = split_into_partitions(&mut query, num_partitions);
+    let mut ref_parts = split_into_partitions(&mut reference, num_partitions);
+    let blocks: Vec<_> = if rayon::current_num_threads() == 1 {
+        query_parts
+            .iter_mut()
+            .zip(ref_parts.iter_mut())
+            .map(|(query_part, ref_part)| match_blocks(query_part, ref_part))
+            .collect()
+    } else {
+        query_parts
+            .par_iter_mut()
+            .zip(ref_parts.par_iter_mut())
+            .map(|(query_part, ref_part)| match_blocks(query_part, ref_part))
+            .collect()
+    };
+    drop(query_parts);
+    drop(ref_parts);
+
+    if complexity_cut <= 0.0 {
+        return PreparedSeedJoin {
+            query,
+            reference,
+            blocks,
+            masked_positions: Vec::new(),
+        };
+    }
+
+    // This is Search::mask_seeds from upstream: test one representative of a
+    // joined key, mark every query occurrence when rejected, and erase that
+    // key from the join before stage 1.  Partition order and within-partition
+    // block order remain unchanged.
+    let query_offsets = query.seq_offsets();
+    let evaluated: Vec<_> = blocks
+        .into_par_iter()
+        .enumerate()
+        .map(|(partition, mut blocks)| {
+            let query_part = query.partition(partition as u32);
+            let mut masked = Vec::new();
+            blocks.blocks.retain(|block| {
+                let first = super::seed_array::decode_seq_pos(
+                    query_offsets,
+                    query_part[block.q_start as usize],
+                );
+                let seq = query_seqs[first.0 as usize];
+                let pos = first.1 as usize;
+                if pos >= seq.len()
+                    || !seed_complexity::seed_is_complex(
+                        &seq[pos..],
+                        shape,
+                        complexity_cut,
+                        reduction,
+                    )
+                {
+                    masked.extend((block.q_start..block.q_start + block.q_count).map(|index| {
+                        super::seed_array::decode_seq_pos(query_offsets, query_part[index as usize])
+                    }));
+                    false
+                } else {
+                    true
+                }
+            });
+            (blocks, masked)
+        })
+        .collect();
+    let mut filtered_blocks = Vec::with_capacity(num_partitions);
+    let mut masked_positions = Vec::new();
+    for (blocks, masked) in evaluated {
+        filtered_blocks.push(blocks);
+        masked_positions.extend(masked);
+    }
+    PreparedSeedJoin {
+        query,
+        reference,
+        blocks: filtered_blocks,
+        masked_positions,
+    }
+}
+
 /// Collect the low-complexity query positions produced by the joined seed
 /// groups without retaining the cross product.  Blastp uses this as a masking
 /// prepass so its partition consumer can run the left-most filter immediately.
@@ -509,24 +647,49 @@ where
     F: Fn(&[SeedMatch], &mut Vec<T>) -> usize + Sync,
     C: FnMut(Vec<Vec<T>>) + Send,
 {
+    let prepared = prepare_seed_join_partitioned_min_query_len(
+        query_seqs,
+        ref_seqs,
+        shape,
+        reduction,
+        complexity_cut,
+        min_query_len,
+        sketch_size,
+    );
+    visit_prepared_seed_matches_streaming_hamming(
+        query_fingerprint_seqs,
+        ref_fingerprint_seqs,
+        prepared,
+        hamming_filter_id,
+        partition_batch_size,
+        map_batch,
+        consume,
+    )
+}
+
+/// Search a shape whose seed arrays, join blocks, and low-complexity mask were
+/// already prepared by [`prepare_seed_join_partitioned_min_query_len`].
+pub fn visit_prepared_seed_matches_streaming_hamming<T, F, C>(
+    query_fingerprint_seqs: &[&[Letter]],
+    ref_fingerprint_seqs: &[&[Letter]],
+    prepared: PreparedSeedJoin,
+    hamming_filter_id: u32,
+    partition_batch_size: usize,
+    map_batch: F,
+    consume: C,
+) -> usize
+where
+    T: Send,
+    F: Fn(&[SeedMatch], &mut Vec<T>) -> usize + Sync,
+    C: FnMut(Vec<Vec<T>>) + Send,
+{
     macro_rules! dispatch {
         ($kernel:expr) => {
-            return visit_seed_matches_partitioned_streaming_hamming_min_query_len_for::<
-                { $kernel },
-                T,
-                F,
-                C,
-            >(
-                query_seqs,
+            return visit_prepared_seed_matches_streaming_hamming_for::<{ $kernel }, T, F, C>(
                 query_fingerprint_seqs,
-                ref_seqs,
                 ref_fingerprint_seqs,
-                shape,
-                reduction,
-                complexity_cut,
-                min_query_len,
+                prepared,
                 hamming_filter_id,
-                sketch_size,
                 partition_batch_size,
                 map_batch,
                 consume,
@@ -553,22 +716,11 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn visit_seed_matches_partitioned_streaming_hamming_min_query_len_for<
-    const HAMMING_KERNEL: u8,
-    T,
-    F,
-    C,
->(
-    query_seqs: &[&[Letter]],
+fn visit_prepared_seed_matches_streaming_hamming_for<const HAMMING_KERNEL: u8, T, F, C>(
     query_fingerprint_seqs: &[&[Letter]],
-    ref_seqs: &[&[Letter]],
     ref_fingerprint_seqs: &[&[Letter]],
-    shape: &Shape,
-    reduction: &Reduction,
-    complexity_cut: f64,
-    min_query_len: usize,
+    prepared: PreparedSeedJoin,
     hamming_filter_id: u32,
-    sketch_size: usize,
     partition_batch_size: usize,
     map_batch: F,
     mut consume: C,
@@ -581,37 +733,15 @@ where
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let seedp_bits = DEFAULT_SEEDP_BITS;
-    let mut query_sa = build_search_seed_array(
-        query_seqs,
-        shape,
-        reduction,
-        seedp_bits,
-        min_query_len,
-        sketch_size,
-    );
-    let mut ref_sa =
-        build_search_seed_array(ref_seqs, shape, reduction, seedp_bits, 0, sketch_size);
+    let PreparedSeedJoin {
+        query: query_sa,
+        reference: ref_sa,
+        blocks,
+        masked_positions: _,
+    } = prepared;
     let num_partitions = query_sa.num_partitions();
     let query_offsets = query_sa.seq_offsets().to_vec();
     let ref_offsets = ref_sa.seq_offsets().to_vec();
-
-    fn split_into_partitions(
-        sa: &mut SeedArray,
-        num_partitions: usize,
-    ) -> Vec<&mut [super::seed_array::SeedEntry]> {
-        let offsets: Vec<usize> = (0..=num_partitions)
-            .map(|partition| sa.partition_offset(partition))
-            .collect();
-        let mut remaining = sa.data_mut();
-        let mut partitions = Vec::with_capacity(num_partitions);
-        for partition in 0..num_partitions {
-            let len = offsets[partition + 1] - offsets[partition];
-            let (current, rest) = remaining.split_at_mut(len);
-            partitions.push(current);
-            remaining = rest;
-        }
-        partitions
-    }
 
     let raw_count = AtomicUsize::new(0);
     // Aggregate once per partition, rather than once per hit, so exposing the
@@ -619,13 +749,17 @@ where
     // negligible cost in the hot cross-product loop.
     let hamming_count = AtomicUsize::new(0);
     let ungapped_count = AtomicUsize::new(0);
-    let mut query_parts = split_into_partitions(&mut query_sa, num_partitions);
-    let mut ref_parts = split_into_partitions(&mut ref_sa, num_partitions);
+    let query_parts: Vec<_> = (0..num_partitions)
+        .map(|partition| query_sa.partition(partition as u32))
+        .collect();
+    let ref_parts: Vec<_> = (0..num_partitions)
+        .map(|partition| ref_sa.partition(partition as u32))
+        .collect();
 
     let process = |partition: usize,
-                   query_part: &mut [super::seed_array::SeedEntry],
-                   ref_part: &mut [super::seed_array::SeedEntry]| {
-        let blocks = match_blocks(query_part, ref_part);
+                   query_part: &[super::seed_array::SeedEntry],
+                   ref_part: &[super::seed_array::SeedEntry],
+                   blocks: &super::seed_array::PartitionBlocks| {
         let mut output = Vec::new();
         let mut partition_hamming_count = 0usize;
         let mut partition_ungapped_count = 0usize;
@@ -635,25 +769,7 @@ where
         let mut query_locs = Vec::new();
         let mut target_locs = Vec::new();
         let mut target_subjects = Vec::new();
-        for block in blocks.blocks {
-            let first_query = super::seed_array::decode_seq_pos(
-                &query_offsets,
-                query_part[block.q_start as usize],
-            );
-            if complexity_cut > 0.0 {
-                let query = query_seqs[first_query.0 as usize];
-                let pos = first_query.1 as usize;
-                if pos >= query.len()
-                    || !seed_complexity::seed_is_complex(
-                        &query[pos..],
-                        shape,
-                        complexity_cut,
-                        reduction,
-                    )
-                {
-                    continue;
-                }
-            }
+        for block in &blocks.blocks {
             raw_count.fetch_add(
                 block.q_count as usize * block.r_count as usize,
                 Ordering::Relaxed,
@@ -727,11 +843,12 @@ where
         for begin in (0..num_partitions).step_by(batch_size) {
             let end = (begin + batch_size).min(num_partitions);
             let output = query_parts[begin..end]
-                .iter_mut()
-                .zip(ref_parts[begin..end].iter_mut())
+                .iter()
+                .zip(ref_parts[begin..end].iter())
+                .zip(blocks[begin..end].iter())
                 .enumerate()
-                .map(|(offset, (query_part, ref_part))| {
-                    process(begin + offset, query_part, ref_part)
+                .map(|(offset, ((query_part, ref_part), blocks))| {
+                    process(begin + offset, query_part, ref_part, blocks)
                 })
                 .collect();
             consume(output);
@@ -747,16 +864,20 @@ where
         let (sender, receiver) = std::sync::mpsc::channel();
         let receiver = std::sync::Mutex::new(receiver);
         rayon::scope(|scope| {
-            let mut pending = query_parts.iter_mut().zip(ref_parts.iter_mut()).enumerate();
+            let mut pending = query_parts
+                .iter()
+                .zip(ref_parts.iter())
+                .zip(blocks.iter())
+                .enumerate();
             let mut active = 0usize;
             for _ in 0..batch_size {
-                let Some((partition, (query_part, ref_part))) = pending.next() else {
+                let Some((partition, ((query_part, ref_part), blocks))) = pending.next() else {
                     break;
                 };
                 let sender = sender.clone();
                 let process = &process;
                 scope.spawn(move |_| {
-                    let output = process(partition, query_part, ref_part);
+                    let output = process(partition, query_part, ref_part, blocks);
                     sender
                         .send((partition, output))
                         .expect("stage-1 result receiver dropped");
@@ -794,13 +915,13 @@ where
                     consume(ready);
                 }
                 for _ in 0..refill {
-                    let Some((partition, (query_part, ref_part))) = pending.next() else {
+                    let Some((partition, ((query_part, ref_part), blocks))) = pending.next() else {
                         break;
                     };
                     let sender = sender.clone();
                     let process = &process;
                     scope.spawn(move |_| {
-                        let output = process(partition, query_part, ref_part);
+                        let output = process(partition, query_part, ref_part, blocks);
                         sender
                             .send((partition, output))
                             .expect("stage-1 result receiver dropped");

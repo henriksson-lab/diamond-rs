@@ -1,34 +1,15 @@
-use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::basic::translate::{self, Frame, Strand};
+use crate::basic::translate;
 use crate::basic::value::{Letter, SequenceType};
-use crate::commands::blastp::BlastpConfig;
+use crate::commands::blastp::{BlastpConfig, TranslatedQueryLayout, TranslatedQuerySource};
 use crate::config::Sensitivity;
 use crate::data::fasta::{self, FastaRecord};
 use crate::stats::cbs::CbsMode;
 use crate::util::sequence::find_orfs;
-
-/// Translation info for one protein frame query.
-struct FrameInfo {
-    original_id: String,
-    original_index: usize,
-    frame: Frame,
-    dna_len: i32,
-}
-
-#[derive(Debug)]
-struct BlastxRow {
-    text: String,
-    query_index: usize,
-    subject_id: String,
-    evalue: f64,
-    bitscore: f64,
-    ordinal: usize,
-}
 
 /// Configuration for a blastx run.
 pub struct BlastxConfig {
@@ -68,10 +49,21 @@ pub struct BlastxConfig {
 
 /// Run blastx — translated DNA search against protein database.
 ///
-/// Translates query DNA sequences in all 6 reading frames, then runs
-/// blastp on each translated frame.
+/// Translates each DNA query into six protein contexts, uses the native seed
+/// search, then ranks and extends all contexts as one source query.
 pub fn run(config: &BlastxConfig) -> io::Result<()> {
     let start = Instant::now();
+    let (use_forward, use_reverse) = match config.strand.as_str() {
+        "both" => (true, true),
+        "plus" => (true, false),
+        "minus" => (false, true),
+        value => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid value for --strand: {value}"),
+            ));
+        }
+    };
 
     // Load query DNA sequences
     let mut dna_records = Vec::new();
@@ -81,14 +73,11 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
     }
     eprintln!("Queries: {} DNA sequences", dna_records.len());
 
-    // Translate to protein in all 6 frames. Each frame becomes a synthetic
-    // protein query named `{dna_id}_frame{N}`; we keep a map back to the
-    // original id + frame + DNA length so we can rewrite the blastp output
-    // into C++-equivalent (original id, DNA-space coords).
+    // Translate to protein in all 6 frames. Each frame becomes a private
+    // protein query; the grouped extension path maps results back to the
+    // source DNA query and DNA coordinates before formatting output.
     let mut protein_records = Vec::new();
-    let mut frame_info: HashMap<String, FrameInfo> = HashMap::new();
-    let use_forward = config.strand != "minus";
-    let use_reverse = config.strand != "plus";
+    let mut translated_sources = Vec::with_capacity(dna_records.len());
 
     for (dna_index, dna_rec) in dna_records.iter().enumerate() {
         let dna_bytes: Vec<u8> = dna_rec.sequence.iter().map(|&l| l as u8).collect();
@@ -97,33 +86,19 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
             translate::translate_6_frames_with_genetic_code(&dna_bytes, config.query_gencode)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
+        let dna_short: String = dna_rec
+            .id
+            .split(|c: char| crate::util::sequence::ID_DELIMITERS.contains(c))
+            .next()
+            .unwrap_or("")
+            .to_string();
+        translated_sources.push(TranslatedQuerySource {
+            id: dna_short.clone(),
+            dna_len,
+        });
+
         for (frame_idx, frame_seq) in frames.iter().enumerate() {
-            // Skip frames based on strand setting
-            if frame_idx < 3 && !use_forward {
-                continue;
-            }
-            if frame_idx >= 3 && !use_reverse {
-                continue;
-            }
-
-            // Skip empty frames
-            if frame_seq.is_empty() {
-                continue;
-            }
-
             let frame = translate::Frame::from_index(frame_idx as i32);
-            // Key `frame_info` by the *post-`print_title`* short id, since
-            // the blastp inner pipeline emits column 0 via `print_title`
-            // (`src/output/format.rs:1469`), which truncates at the first
-            // ID delimiter (whitespace, \x01, etc.). If we keyed by the
-            // raw `dna_rec.id`, queries whose header has whitespace would
-            // miss the lookup and emit unchanged protein-space coords.
-            let dna_short: String = dna_rec
-                .id
-                .split(|c: char| crate::util::sequence::ID_DELIMITERS.contains(c))
-                .next()
-                .unwrap_or("")
-                .to_string();
             // Include the input ordinal in the private frame id. Two input
             // records are allowed to have the same printed FASTA id, but they
             // must still be culled independently as two source queries.
@@ -133,30 +108,26 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
                 dna_index,
                 frame.signed_frame()
             );
-            let mut sequence: Vec<Letter> = frame_seq.iter().map(|&b| b as Letter).collect();
-            let min_orf = min_orf_len(config.min_orf.unwrap_or(0), sequence.len());
-            find_orfs(&mut sequence, min_orf as i32);
-            frame_info.insert(
-                frame_id.clone(),
-                FrameInfo {
-                    original_id: dna_short,
-                    original_index: dna_index,
-                    frame,
-                    dna_len,
-                },
-            );
+            let active = (frame_idx < 3 && use_forward) || (frame_idx >= 3 && use_reverse);
+            let mut sequence: Vec<Letter> = if active && !frame_seq.is_empty() {
+                frame_seq.iter().map(|&b| b as Letter).collect()
+            } else {
+                // Keep a six-record layout without giving disabled/empty
+                // contexts any seedable residues.
+                vec![crate::basic::value::MASK_LETTER]
+            };
+            if active {
+                let min_orf = min_orf_len(config.min_orf.unwrap_or(0), sequence.len());
+                find_orfs(&mut sequence, min_orf as i32);
+            }
             protein_records.push(FastaRecord {
                 id: frame_id,
                 sequence,
             });
         }
     }
-    eprintln!(
-        "Translated frames: {} protein sequences",
-        protein_records.len()
-    );
-
-    // Build a blastp config and delegate
+    // Reuse blastp's database loading and seed-search front end. The internal
+    // translated layout makes its extension stage combine all six contexts.
     let blastp_config = BlastpConfig {
         query_files: vec![], // not used directly — we pass translated records
         database: config.database.clone(),
@@ -186,19 +157,14 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
         ungapped_xdrop_bits: config.ungapped_xdrop_bits,
         memory_limit: config.memory_limit,
         tmpdir: config.tmpdir.clone(),
+        translated_query_layout: Some(TranslatedQueryLayout {
+            sources: translated_sources,
+        }),
     };
 
-    // Run the blastp pipeline with translated sequences
-    // For now, delegate to the FFI for full blastx compatibility
-    // (the native blastp pipeline expects FASTA file inputs)
-    eprintln!(
-        "Translated {} DNA queries into {} protein frames in {:.1}s",
-        dna_records.len(),
-        protein_records.len(),
-        start.elapsed().as_secs_f64()
-    );
-
-    // Write translated sequences to temp file and run blastp on them
+    // The native blastp front end currently accepts FASTA paths, so use a
+    // temporary translated-query file for the internal handoff.
+    // Write translated sequences to a temporary handoff file and run blastp.
     let temp_tag = format!(
         "{}_{}",
         std::process::id(),
@@ -207,7 +173,18 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let tmp_query = std::env::temp_dir().join(format!("diamond_blastx_query_{temp_tag}.faa"));
+    let temp_dir = if config.tmpdir.as_os_str().is_empty() {
+        std::env::temp_dir()
+    } else {
+        config.tmpdir.clone()
+    };
+    let tmp_query = temp_dir.join(format!("diamond_blastx_query_{temp_tag}.faa"));
+    let translated_frame_count = protein_records.len();
+    let dna_query_count = dna_records.len();
+    eprintln!(
+        "Translated {dna_query_count} DNA queries into {translated_frame_count} protein frames in {:.1}s",
+        start.elapsed().as_secs_f64()
+    );
     {
         let mut f = BufWriter::new(std::fs::File::create(&tmp_query)?);
         for rec in &protein_records {
@@ -223,151 +200,17 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
             }
         }
     }
+    // The inner blastp reader owns the translated sequences from here. Do not
+    // retain a second in-memory copy throughout seeding and extension.
+    drop(protein_records);
+    drop(dna_records);
 
-    // Run blastp on translated queries, redirecting its output to a temp file
-    // so we can post-process: strip `_frame{N}` suffixes from query IDs and
-    // convert qstart/qend from protein-space back to DNA-space.
-    let final_output = blastp_config.output.clone();
-    let tmp_bp_out = std::env::temp_dir().join(format!("diamond_blastx_bp_{temp_tag}.tsv"));
     let mut bp_config = blastp_config;
     bp_config.query_files = vec![tmp_query.to_string_lossy().to_string()];
-    bp_config.output = Some(tmp_bp_out.to_string_lossy().to_string());
     let result = crate::commands::blastp::run(&bp_config);
 
     let _ = std::fs::remove_file(&tmp_query);
-    result?;
-
-    // Post-process: translate protein coords back to DNA coords.
-    let bp_in = BufReader::new(std::fs::File::open(&tmp_bp_out)?);
-    let mut writer: Box<dyn Write> = match final_output {
-        Some(path) => Box::new(BufWriter::new(std::fs::File::create(path)?)),
-        None => Box::new(BufWriter::new(io::stdout())),
-    };
-    let mut rows = Vec::new();
-    let mut passthrough = Vec::new();
-    for (ordinal, line) in bp_in.lines().enumerate() {
-        let line = line?;
-        if line.is_empty() {
-            passthrough.push(line);
-            continue;
-        }
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 12 {
-            // Unknown format — emit as-is.
-            passthrough.push(line);
-            continue;
-        }
-        let info = match frame_info.get(cols[0]) {
-            Some(f) => f,
-            None => {
-                // No frame metadata (shouldn't happen) — emit unchanged.
-                passthrough.push(line);
-                continue;
-            }
-        };
-        // Default tabular: 0:qseqid 1:sseqid 2:pident 3:length 4:mismatch
-        //                  5:gapopen 6:qstart 7:qend 8:sstart 9:send
-        //                  10:evalue 11:bitscore
-        let q_start_prot: i32 = cols[6].parse().unwrap_or(0);
-        let q_end_prot: i32 = cols[7].parse().unwrap_or(0);
-        let (q_start_dna, q_end_dna) =
-            protein_to_dna_coords(q_start_prot, q_end_prot, info.frame, info.dna_len);
-        let mut out_cols: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
-        out_cols[0] = info.original_id.clone();
-        out_cols[6] = q_start_dna.to_string();
-        out_cols[7] = q_end_dna.to_string();
-        rows.push(BlastxRow {
-            text: out_cols.join("\t"),
-            query_index: info.original_index,
-            subject_id: cols[1].to_string(),
-            evalue: cols[10].parse().unwrap_or(f64::INFINITY),
-            bitscore: cols[11].parse().unwrap_or(f64::NEG_INFINITY),
-            ordinal,
-        });
-    }
-
-    // blastp sees each translated frame as a separate query, so its `-k`
-    // limit is necessarily frame-local. DIAMOND blastx instead ranks targets
-    // across every translated context of the original nucleotide query. A
-    // global top-k target cannot rank below k in the frame that produced its
-    // best HSP, so retaining k per frame above is sufficient; merge duplicate
-    // subjects, rank once here, and apply the user-visible limit globally.
-    for line in cull_blastx_rows(
-        rows,
-        dna_records.len(),
-        config.max_target_seqs,
-        config.toppercent,
-    ) {
-        writeln!(writer, "{}", line)?;
-    }
-    for line in passthrough {
-        writeln!(writer, "{}", line)?;
-    }
-    writer.flush()?;
-    let _ = std::fs::remove_file(&tmp_bp_out);
-    Ok(())
-}
-
-fn cull_blastx_rows(
-    rows: Vec<BlastxRow>,
-    query_count: usize,
-    max_target_seqs: i64,
-    toppercent: Option<f64>,
-) -> Vec<String> {
-    let mut by_query: Vec<HashMap<String, BlastxRow>> =
-        (0..query_count).map(|_| HashMap::new()).collect();
-
-    for row in rows {
-        let Some(targets) = by_query.get_mut(row.query_index) else {
-            continue;
-        };
-        match targets.entry(row.subject_id.clone()) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(row);
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let current = entry.get();
-                if row.evalue < current.evalue
-                    || (row.evalue == current.evalue && row.bitscore > current.bitscore)
-                    || (row.evalue == current.evalue
-                        && row.bitscore == current.bitscore
-                        && row.ordinal < current.ordinal)
-                {
-                    entry.insert(row);
-                }
-            }
-        }
-    }
-
-    let mut output = Vec::new();
-    for targets in by_query {
-        let mut targets: Vec<BlastxRow> = targets.into_values().collect();
-        if toppercent.is_some() {
-            targets.sort_by(|a, b| {
-                b.bitscore
-                    .total_cmp(&a.bitscore)
-                    .then_with(|| a.evalue.total_cmp(&b.evalue))
-                    .then_with(|| a.ordinal.cmp(&b.ordinal))
-            });
-        } else {
-            targets.sort_by(|a, b| {
-                a.evalue
-                    .total_cmp(&b.evalue)
-                    .then_with(|| b.bitscore.total_cmp(&a.bitscore))
-                    .then_with(|| a.ordinal.cmp(&b.ordinal))
-            });
-        }
-
-        if let Some(percent) = toppercent {
-            if let Some(top) = targets.first().map(|row| row.bitscore) {
-                targets.retain(|row| (1.0 - row.bitscore / top) * 100.0 <= percent);
-            }
-        } else if max_target_seqs > 0 {
-            targets.truncate(max_target_seqs as usize);
-        }
-        output.extend(targets.into_iter().map(|row| row.text));
-    }
-    output
+    result
 }
 
 fn min_orf_len(run_len: u32, length: usize) -> u32 {
@@ -383,57 +226,9 @@ fn min_orf_len(run_len: u32, length: usize) -> u32 {
     }
 }
 
-/// Convert protein-space [qstart, qend] (1-based, inclusive) to the equivalent
-/// DNA-space range. For forward frames the DNA range goes ascending; for reverse
-/// frames it descends, matching C++ DIAMOND blastx output which reports the
-/// reverse strand with qstart > qend.
-fn protein_to_dna_coords(
-    q_start_prot: i32,
-    q_end_prot: i32,
-    frame: Frame,
-    dna_len: i32,
-) -> (i32, i32) {
-    // Each protein residue corresponds to 3 DNA bases. For forward frame f
-    // (offset 0..=2), protein position i (1-based) maps to DNA bases at
-    // 1-based positions [f + 3*(i-1) + 1, f + 3*i].
-    match frame.strand {
-        Strand::Forward => {
-            let f = frame.offset;
-            let dna_start = f + 3 * (q_start_prot - 1) + 1;
-            let dna_end = f + 3 * q_end_prot;
-            (dna_start, dna_end)
-        }
-        Strand::Reverse => {
-            // Reverse-complement strand: protein pos i in the reversed sequence
-            // corresponds to original DNA positions [L - f - 3*i + 1, L - f - 3*(i-1)].
-            let f = frame.offset;
-            let dna_start = dna_len - f - 3 * (q_start_prot - 1);
-            let dna_end = dna_len - f - 3 * q_end_prot + 1;
-            (dna_start, dna_end)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn row(
-        query_index: usize,
-        subject: &str,
-        evalue: f64,
-        bitscore: f64,
-        ordinal: usize,
-    ) -> BlastxRow {
-        BlastxRow {
-            text: format!("q{query_index}\t{subject}\t{evalue}\t{bitscore}"),
-            query_index,
-            subject_id: subject.to_string(),
-            evalue,
-            bitscore,
-            ordinal,
-        }
-    }
 
     #[test]
     fn test_blastx_translation() {
@@ -475,43 +270,5 @@ mod tests {
                 3
             ]
         );
-    }
-
-    #[test]
-    fn blastx_target_limit_is_global_across_frames() {
-        // Model three translated frames, each with its own local top three.
-        // The nucleotide query must still emit only the global top three
-        // unique subjects, and duplicate target A keeps its best-frame HSP.
-        let rows = vec![
-            row(0, "A", 1e-20, 100.0, 0),
-            row(0, "B", 1e-10, 80.0, 1),
-            row(0, "C", 1e-5, 50.0, 2),
-            row(0, "D", 1e-30, 120.0, 3),
-            row(0, "A", 1e-40, 130.0, 4),
-            row(0, "E", 1e-15, 90.0, 5),
-            row(0, "F", 1e-25, 110.0, 6),
-        ];
-        let output = cull_blastx_rows(rows, 1, 3, None);
-        assert_eq!(output.len(), 3);
-        let subjects: Vec<&str> = output
-            .iter()
-            .map(|line| line.split('\t').nth(1).unwrap())
-            .collect();
-        assert_eq!(subjects, ["A", "D", "F"]);
-        assert!(output[0].ends_with("\t130"));
-    }
-
-    #[test]
-    fn blastx_target_limit_is_per_original_query() {
-        let rows = vec![
-            row(0, "A", 1e-20, 100.0, 0),
-            row(0, "B", 1e-10, 80.0, 1),
-            row(1, "C", 1e-30, 120.0, 2),
-            row(1, "D", 1e-5, 50.0, 3),
-        ];
-        let output = cull_blastx_rows(rows, 2, 1, None);
-        assert_eq!(output.len(), 2);
-        assert!(output[0].starts_with("q0\tA\t"));
-        assert!(output[1].starts_with("q1\tC\t"));
     }
 }

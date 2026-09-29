@@ -4,7 +4,7 @@
 
 use super::simd_trace::TraceTarget;
 use crate::basic::packed_transcript::EditOperation;
-use crate::basic::value::{Letter, LETTER_MASK, SEED_MASK};
+use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK};
 use crate::dp::smith_waterman::SwResult;
 use crate::stats::score_matrix::ScoreMatrix;
 use std::arch::x86_64 as arch;
@@ -23,25 +23,53 @@ fn push_operation_run(operations: &mut Vec<(EditOperation, i32)>, op: EditOperat
 type V = arch::__m256i;
 
 #[target_feature(enable = "avx2")]
-unsafe fn standard_profile_i16(
-    matrix: &[i8; 1024],
-    subject: &[i8; 16],
-    hard_masked: &[i8; 16],
-) -> [V; 32] {
+unsafe fn standard_profile_i16(matrix: &[i8; 1024], subject: &[i8; 16]) -> [V; 32] {
     let subject = arch::_mm_loadu_si128(subject.as_ptr().cast());
-    let hard_masked = arch::_mm_loadu_si128(hard_masked.as_ptr().cast());
     let indices = arch::_mm_and_si128(subject, arch::_mm_set1_epi8(15));
     let high = arch::_mm_cmpgt_epi8(subject, arch::_mm_set1_epi8(15));
     let mut profile = [arch::_mm256_setzero_si256(); 32];
-    for (query_letter, slot) in profile.iter_mut().enumerate() {
+    for (query_letter, slot) in profile[..AMINO_ACID_COUNT].iter_mut().enumerate() {
         let row = matrix.as_ptr().add(query_letter * 32);
         let low_scores = arch::_mm_loadu_si128(row.cast());
         let high_scores = arch::_mm_loadu_si128(row.add(16).cast());
         let low_scores = arch::_mm_shuffle_epi8(low_scores, indices);
         let high_scores = arch::_mm_shuffle_epi8(high_scores, indices);
         let scores = arch::_mm_blendv_epi8(low_scores, high_scores, high);
-        let scores = arch::_mm_andnot_si128(hard_masked, scores);
         *slot = arch::_mm256_cvtepi8_epi16(scores);
+    }
+    profile
+}
+
+/// Upstream's AVX2 `SwipeProfile<int8_t>::set(SeqVector)`: preformatted
+/// matrix halves and two byte shuffles replace a 32-by-lane scalar gather for
+/// every target column.
+#[target_feature(enable = "avx2")]
+unsafe fn standard_profile_i8(
+    matrix_low: &[i8; 1024],
+    matrix_high: &[i8; 1024],
+    subject: &[i8; 32],
+) -> [V; 32] {
+    let subject = arch::_mm256_and_si256(
+        arch::_mm256_loadu_si256(subject.as_ptr().cast()),
+        arch::_mm256_set1_epi8(LETTER_MASK as i8),
+    );
+    let high_mask = arch::_mm256_slli_epi16(
+        arch::_mm256_and_si256(subject, arch::_mm256_set1_epi8(16)),
+        3,
+    );
+    let low_index = arch::_mm256_or_si256(subject, high_mask);
+    let high_index = arch::_mm256_or_si256(
+        subject,
+        arch::_mm256_xor_si256(high_mask, arch::_mm256_set1_epi8(i8::MIN)),
+    );
+    let mut profile = [arch::_mm256_setzero_si256(); 32];
+    for (query_letter, slot) in profile[..AMINO_ACID_COUNT].iter_mut().enumerate() {
+        let low = arch::_mm256_loadu_si256(matrix_low.as_ptr().add(query_letter * 32).cast());
+        let high = arch::_mm256_loadu_si256(matrix_high.as_ptr().add(query_letter * 32).cast());
+        *slot = arch::_mm256_or_si256(
+            arch::_mm256_shuffle_epi8(low, low_index),
+            arch::_mm256_shuffle_epi8(high, high_index),
+        );
     }
     profile
 }
@@ -83,7 +111,7 @@ impl Trace16Matrix {
     }
 
     #[inline]
-    unsafe fn set<const SPARSE: bool>(
+    unsafe fn set<const SPARSE: bool, const BMI2: bool>(
         &mut self,
         cell: usize,
         lanes: usize,
@@ -95,28 +123,22 @@ impl Trace16Matrix {
     ) {
         if SPARSE {
             let base = cell * self.stride;
-            for lane in 0..lanes {
-                let bit = 1u32 << (2 * lane);
-                let is_active = active & bit != 0;
-                let vertical = is_active && gap_v & bit != 0;
-                let horizontal = is_active && !vertical && gap_h & bit != 0;
-                let state = if !is_active {
-                    0
-                } else if vertical {
-                    2
-                } else if horizontal {
-                    3
-                } else {
-                    1
-                };
-                let nibble =
-                    state | u8::from(open_v & bit != 0) << 2 | u8::from(open_h & bit != 0) << 3;
-                let byte = self.sparse.get_unchecked_mut(base + lane / 2);
-                if lane % 2 == 0 {
-                    *byte = (*byte & 0xf0) | nibble;
-                } else {
-                    *byte = (*byte & 0x0f) | (nibble << 4);
+            debug_assert!(lanes <= 8);
+            let nibbles = if BMI2 {
+                pack_trace_nibbles_bmi2(gap_v, gap_h, open_v, open_h, active)
+            } else {
+                pack_trace_nibbles_portable(gap_v, gap_h, open_v, open_h, active)
+            };
+            let destination = self.sparse.as_mut_ptr().add(base);
+            match self.stride {
+                1 => *destination = nibbles as u8,
+                2 => std::ptr::write_unaligned(destination.cast::<u16>(), nibbles as u16),
+                3 => {
+                    std::ptr::write_unaligned(destination.cast::<u16>(), nibbles as u16);
+                    *destination.add(2) = (nibbles >> 16) as u8;
                 }
+                4 => std::ptr::write_unaligned(destination.cast::<u32>(), nibbles as u32),
+                _ => std::hint::unreachable_unchecked(),
             }
         } else {
             const HMASK: u32 = 0x5555_5555;
@@ -161,6 +183,68 @@ impl Trace16Matrix {
     }
 }
 
+/// Collapse the duplicated two-bit lanes produced by `_mm256_movemask_epi8`
+/// after an i16 comparison into one bit per lane.
+#[inline]
+fn compact_i16_movemask(mut bits: u32) -> u16 {
+    bits &= 0x5555_5555;
+    bits = (bits | bits >> 1) & 0x3333_3333;
+    bits = (bits | bits >> 2) & 0x0f0f_0f0f;
+    bits = (bits | bits >> 4) & 0x00ff_00ff;
+    bits = (bits | bits >> 8) & 0x0000_ffff;
+    bits as u16
+}
+
+/// Place the low eight lane bits at bit 0 of successive four-bit nibbles.
+#[inline]
+fn spread_nibbles(bits: u16) -> u64 {
+    let mut bits = u64::from(bits & 0xff);
+    bits = (bits | bits << 12) & 0x000f_000f;
+    bits = (bits | bits << 6) & 0x0303_0303;
+    (bits | bits << 3) & 0x1111_1111
+}
+
+#[inline]
+fn pack_trace_nibbles_portable(
+    gap_v: u32,
+    gap_h: u32,
+    open_v: u32,
+    open_h: u32,
+    active: u32,
+) -> u64 {
+    let active = compact_i16_movemask(active);
+    let vertical = compact_i16_movemask(gap_v) & active;
+    let horizontal = compact_i16_movemask(gap_h) & active & !vertical;
+    let state_low = active & !vertical;
+    let state_high = active & (vertical | horizontal);
+    spread_nibbles(state_low)
+        | spread_nibbles(state_high) << 1
+        | spread_nibbles(compact_i16_movemask(open_v)) << 2
+        | spread_nibbles(compact_i16_movemask(open_h)) << 3
+}
+
+#[target_feature(enable = "bmi2")]
+unsafe fn pack_trace_nibbles_bmi2(
+    gap_v: u32,
+    gap_h: u32,
+    open_v: u32,
+    open_h: u32,
+    active: u32,
+) -> u64 {
+    const EVEN_BYTES: u32 = 0x5555_5555;
+    const NIBBLE_LOW_BITS: u64 = 0x1111_1111;
+    let extract = |bits| arch::_pext_u32(bits, EVEN_BYTES) as u16;
+    let active = extract(active);
+    let vertical = extract(gap_v) & active;
+    let horizontal = extract(gap_h) & active & !vertical;
+    let state_low = active & !vertical;
+    let state_high = active & (vertical | horizontal);
+    arch::_pdep_u64(u64::from(state_low), NIBBLE_LOW_BITS)
+        | arch::_pdep_u64(u64::from(state_high), NIBBLE_LOW_BITS) << 1
+        | arch::_pdep_u64(u64::from(extract(open_v)), NIBBLE_LOW_BITS) << 2
+        | arch::_pdep_u64(u64::from(extract(open_h)), NIBBLE_LOW_BITS) << 3
+}
+
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn trace_i8(
     query: &[Letter],
@@ -168,15 +252,19 @@ pub(super) unsafe fn trace_i8(
     matrix: &ScoreMatrix,
     query_cbs: &[i8],
 ) -> (Vec<SwResult>, u32) {
-    if query_cbs.is_empty() {
-        trace_i8_impl::<false>(query, targets, matrix, query_cbs)
-    } else {
-        trace_i8_impl::<true>(query, targets, matrix, query_cbs)
+    match (
+        query_cbs.is_empty(),
+        targets.iter().all(|target| target.matrix.is_none()),
+    ) {
+        (true, true) => trace_i8_impl::<false, true>(query, targets, matrix, query_cbs),
+        (false, true) => trace_i8_impl::<true, true>(query, targets, matrix, query_cbs),
+        (true, false) => trace_i8_impl::<false, false>(query, targets, matrix, query_cbs),
+        (false, false) => trace_i8_impl::<true, false>(query, targets, matrix, query_cbs),
     }
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn trace_i8_impl<const HAS_CBS: bool>(
+unsafe fn trace_i8_impl<const HAS_CBS: bool, const STANDARD_ONLY: bool>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
@@ -213,7 +301,6 @@ unsafe fn trace_i8_impl<const HAS_CBS: bool>(
         columns = columns.max((end - subject_start[lane]).max(0) as usize);
     }
     let zero = arch::_mm256_set1_epi8(i8::MIN);
-    let max_value = arch::_mm256_set1_epi8(i8::MAX);
     let mut score_row = vec![zero; band];
     let mut hgap_row = vec![zero; band + 1];
     let mut trace = vec![Trace8::default(); (columns + 1) * band];
@@ -257,32 +344,43 @@ unsafe fn trace_i8_impl<const HAS_CBS: bool>(
     for column in 0..columns {
         let mut subject_letter = [0usize; LANES];
         let mut active_lanes = [0i8; LANES];
-        let mut hard_masked = [false; LANES];
         for lane in 0..targets.len() {
             let pos = subject_start[lane] + column as i32;
             if pos >= 0 && pos < targets[lane].subject.len() as i32 {
                 let letter = targets[lane].subject[pos as usize];
                 subject_letter[lane] = (letter & LETTER_MASK) as usize;
                 active_lanes[lane] = -1;
-                hard_masked[lane] = letter & SEED_MASK != 0;
             }
         }
         let active = arch::_mm256_loadu_si256(active_lanes.as_ptr().cast());
-        let mut profile = [zero; 32];
-        for (query_letter, slot) in profile.iter_mut().enumerate() {
-            let mut scores = [0i8; LANES];
-            for lane in 0..targets.len() {
-                if active_lanes[lane] == 0 || hard_masked[lane] {
-                    continue;
+        let profile = if STANDARD_ONLY {
+            standard_profile_i8(
+                matrix.matrix8_low(),
+                matrix.matrix8_high(),
+                &subject_letter.map(|x| x as i8),
+            )
+        } else {
+            let mut profile = [zero; 32];
+            for (query_letter, slot) in profile[..AMINO_ACID_COUNT].iter_mut().enumerate() {
+                let mut scores = [0i8; LANES];
+                for lane in 0..targets.len() {
+                    if active_lanes[lane] == 0 {
+                        continue;
+                    }
+                    scores[lane] = if let Some(adjusted) = targets[lane].matrix {
+                        *adjusted
+                            .scores
+                            .get_unchecked(subject_letter[lane] * 32 + query_letter)
+                    } else {
+                        *matrix
+                            .matrix8()
+                            .get_unchecked(query_letter * 32 + subject_letter[lane])
+                    };
                 }
-                scores[lane] = if let Some(adjusted) = targets[lane].matrix {
-                    adjusted.scores[subject_letter[lane] * 32 + query_letter]
-                } else {
-                    matrix.matrix8()[query_letter * 32 + subject_letter[lane]]
-                };
+                *slot = arch::_mm256_loadu_si256(scores.as_ptr().cast());
             }
-            *slot = arch::_mm256_loadu_si256(scores.as_ptr().cast());
-        }
+            profile
+        };
         let moving_i0 = i0 + column as i32;
         let query_begin = moving_i0.max(0);
         let query_end = (i1 + column as i32).min(query.len() as i32 - 1) + 1;
@@ -292,17 +390,19 @@ unsafe fn trace_i8_impl<const HAS_CBS: bool>(
         let mut row_max = zero;
         for q in query_begin..query_end {
             let row = (q - moving_i0) as usize;
-            let cell_mask = arch::_mm256_and_si256(active, row_masks[row]);
+            let cell_mask = arch::_mm256_and_si256(active, *row_masks.get_unchecked(row));
             let query_bias = if HAS_CBS {
                 *query_cbs.get_unchecked(q as usize)
             } else {
                 0
             };
             let bias = arch::_mm256_and_si256(arch::_mm256_set1_epi8(query_bias), standard_mask);
-            let substitution =
-                arch::_mm256_adds_epi8(profile[(query[q as usize] & LETTER_MASK) as usize], bias);
-            let diagonal = arch::_mm256_adds_epi8(score_row[row], substitution);
-            let horizontal = hgap_row[row + 1];
+            let substitution = arch::_mm256_adds_epi8(
+                *profile.get_unchecked((*query.get_unchecked(q as usize) & LETTER_MASK) as usize),
+                bias,
+            );
+            let diagonal = arch::_mm256_adds_epi8(*score_row.get_unchecked(row), substitution);
+            let horizontal = *hgap_row.get_unchecked(row + 1);
             let vertical_before = vertical;
             let mut score = arch::_mm256_max_epi8(diagonal, horizontal);
             score = arch::_mm256_max_epi8(score, vertical_before);
@@ -336,15 +436,14 @@ unsafe fn trace_i8_impl<const HAS_CBS: bool>(
             let horizontal_state = gap_h & active_bits & !vertical_state;
             let low = active_bits & !vertical_state;
             let high = vertical_state | horizontal_state;
-            trace[(column + 1) * band + row] = Trace8 {
+            *trace.get_unchecked_mut((column + 1) * band + row) = Trace8 {
                 gap: (u64::from(high) << 32) | u64::from(low),
                 open: (u64::from(open_v) << 32) | u64::from(open_h),
             };
-            score_row[row] = score;
-            hgap_row[row] = arch::_mm256_blendv_epi8(zero, next_horizontal, cell_mask);
+            *score_row.get_unchecked_mut(row) = score;
+            *hgap_row.get_unchecked_mut(row) =
+                arch::_mm256_blendv_epi8(zero, next_horizontal, cell_mask);
             vertical = arch::_mm256_blendv_epi8(zero, next_vertical, cell_mask);
-            overflow_mask |=
-                arch::_mm256_movemask_epi8(arch::_mm256_cmpeq_epi8(score, max_value)) as u32;
         }
         let mut column_scores = [i8::MIN; LANES];
         let mut column_rows = [0i8; LANES];
@@ -356,6 +455,11 @@ unsafe fn trace_i8_impl<const HAS_CBS: bool>(
                 best_col[lane] = column;
                 best_row[lane] = column_rows[lane] as u8 as usize;
             }
+        }
+    }
+    for lane in 0..targets.len() {
+        if best[lane] == i8::MAX {
+            overflow_mask |= 1 << lane;
         }
     }
     let scores: Vec<i32> = best[..targets.len()]
@@ -385,16 +489,50 @@ pub(super) unsafe fn trace_i16(
     matrix: &ScoreMatrix,
     query_cbs: &[i8],
 ) -> (Vec<SwResult>, u32) {
-    match (targets.len() < 3, query_cbs.is_empty()) {
-        (true, true) => trace_i16_impl::<true, false>(query, targets, matrix, query_cbs),
-        (true, false) => trace_i16_impl::<true, true>(query, targets, matrix, query_cbs),
-        (false, true) => trace_i16_impl::<false, false>(query, targets, matrix, query_cbs),
-        (false, false) => trace_i16_impl::<false, true>(query, targets, matrix, query_cbs),
+    if targets.len() <= 8 {
+        if std::arch::is_x86_feature_detected!("bmi2") {
+            trace_i16_dispatch::<true, true>(query, targets, matrix, query_cbs)
+        } else {
+            trace_i16_dispatch::<true, false>(query, targets, matrix, query_cbs)
+        }
+    } else {
+        trace_i16_dispatch::<false, false>(query, targets, matrix, query_cbs)
     }
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn trace_i16_impl<const SPARSE_TRACE: bool, const HAS_CBS: bool>(
+unsafe fn trace_i16_dispatch<const SPARSE_TRACE: bool, const BMI2: bool>(
+    query: &[Letter],
+    targets: &[TraceTarget<'_>],
+    matrix: &ScoreMatrix,
+    query_cbs: &[i8],
+) -> (Vec<SwResult>, u32) {
+    match (
+        query_cbs.is_empty(),
+        targets.iter().all(|target| target.matrix.is_none()),
+    ) {
+        (true, true) => {
+            trace_i16_impl::<SPARSE_TRACE, BMI2, false, true>(query, targets, matrix, query_cbs)
+        }
+        (false, true) => {
+            trace_i16_impl::<SPARSE_TRACE, BMI2, true, true>(query, targets, matrix, query_cbs)
+        }
+        (true, false) => {
+            trace_i16_impl::<SPARSE_TRACE, BMI2, false, false>(query, targets, matrix, query_cbs)
+        }
+        (false, false) => {
+            trace_i16_impl::<SPARSE_TRACE, BMI2, true, false>(query, targets, matrix, query_cbs)
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn trace_i16_impl<
+    const SPARSE_TRACE: bool,
+    const BMI2: bool,
+    const HAS_CBS: bool,
+    const STANDARD_ONLY: bool,
+>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
@@ -456,7 +594,6 @@ unsafe fn trace_i16_impl<const SPARSE_TRACE: bool, const HAS_CBS: bool>(
         }
     }
     let standard_mask = arch::_mm256_loadu_si256(standard_lanes.as_ptr().cast());
-    let standard_only = targets.iter().all(|target| target.matrix.is_none());
     let row_masks: Vec<V> = (0..band)
         .map(|row| {
             let mut lanes = [0i16; LANES];
@@ -476,8 +613,6 @@ unsafe fn trace_i16_impl<const SPARSE_TRACE: bool, const HAS_CBS: bool>(
         let mut subject_letter = [0usize; LANES];
         let mut subject_bytes = [0i8; LANES];
         let mut active_lanes = [0i16; LANES];
-        let mut hard_masked = [false; LANES];
-        let mut hard_mask_bytes = [0i8; LANES];
         for lane in 0..targets.len() {
             let pos = subject_start[lane] + column as i32;
             if pos >= 0 && pos < targets[lane].subject.len() as i32 {
@@ -485,19 +620,17 @@ unsafe fn trace_i16_impl<const SPARSE_TRACE: bool, const HAS_CBS: bool>(
                 subject_letter[lane] = (letter & LETTER_MASK) as usize;
                 subject_bytes[lane] = (letter & LETTER_MASK) as i8;
                 active_lanes[lane] = -1;
-                hard_masked[lane] = letter & SEED_MASK != 0;
-                hard_mask_bytes[lane] = if hard_masked[lane] { -1 } else { 0 };
             }
         }
         let active = arch::_mm256_loadu_si256(active_lanes.as_ptr().cast());
-        let profile = if standard_only {
-            standard_profile_i16(matrix.matrix8(), &subject_bytes, &hard_mask_bytes)
+        let profile = if STANDARD_ONLY {
+            standard_profile_i16(matrix.matrix8(), &subject_bytes)
         } else {
             let mut profile = [zero; 32];
-            for (query_letter, slot) in profile.iter_mut().enumerate() {
+            for (query_letter, slot) in profile[..AMINO_ACID_COUNT].iter_mut().enumerate() {
                 let mut scores = [0i16; LANES];
                 for lane in 0..targets.len() {
-                    if active_lanes[lane] == 0 || hard_masked[lane] {
+                    if active_lanes[lane] == 0 {
                         continue;
                     }
                     scores[lane] = if let Some(adjusted) = targets[lane].matrix {
@@ -561,7 +694,7 @@ unsafe fn trace_i16_impl<const SPARSE_TRACE: bool, const HAS_CBS: bool>(
             let open_h =
                 arch::_mm256_movemask_epi8(arch::_mm256_cmpeq_epi16(next_horizontal, open)) as u32;
             let trace_index = (column + 1) * band + row;
-            trace.set::<SPARSE_TRACE>(
+            trace.set::<SPARSE_TRACE, BMI2>(
                 trace_index,
                 targets.len(),
                 gap_v,
@@ -815,4 +948,34 @@ fn finish_i8(
             result
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bmi2_trace_nibble_packing_matches_portable() {
+        if !std::arch::is_x86_feature_detected!("bmi2") {
+            return;
+        }
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // Model an i16 comparison movemask: both bytes of each lane
+            // always carry the same comparison bit.
+            let lanes = state & 0x5555_5555;
+            lanes | lanes << 1
+        };
+        for _ in 0..10_000 {
+            let gap_v = next();
+            let gap_h = next();
+            let open_v = next();
+            let open_h = next();
+            let active = next();
+            let portable = pack_trace_nibbles_portable(gap_v, gap_h, open_v, open_h, active);
+            let bmi2 = unsafe { pack_trace_nibbles_bmi2(gap_v, gap_h, open_v, open_h, active) };
+            assert_eq!(bmi2, portable);
+        }
+    }
 }

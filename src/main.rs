@@ -123,6 +123,7 @@ fn main() {
                 tmpdir: get_arg(&args, &["-t", "--tmpdir"])
                     .map(PathBuf::from)
                     .unwrap_or_default(),
+                translated_query_layout: None,
             };
             run_or_exit(diamond::commands::blastp::run(&config));
         }
@@ -751,27 +752,9 @@ fn route_blastp_to_legacy(args: &[String]) -> bool {
     has_unknown_search_option(args, false) || route_common_search_to_legacy(args)
 }
 
-fn blastx_output_layout_supported(args: &[String]) -> bool {
-    let requested = get_all_args(args, &["-f", "--outfmt"]);
-    if requested.is_empty() {
-        return true;
-    }
-    if requested[0] != "6" && requested[0] != "tab" {
-        return false;
-    }
-    let fields = &requested[1..];
-    fields.is_empty()
-        || fields
-            == [
-                "qseqid", "sseqid", "pident", "length", "mismatch", "gapopen", "qstart", "qend",
-                "sstart", "send", "evalue", "bitscore",
-            ]
-}
-
 fn route_blastx_to_legacy(args: &[String]) -> bool {
     has_unknown_search_option(args, true)
         || route_common_search_to_legacy(args)
-        || !blastx_output_layout_supported(args)
         || get_arg(args, &["-F", "--frameshift"]).is_some_and(|f| f != "0")
         || has_flag(args, "--swipe")
         || has_option(args, &["--min-query-len"])
@@ -979,7 +962,7 @@ mod tests {
             "--outfmt",
             "6"
         ])));
-        assert!(route_blastx_to_legacy(&args(&[
+        assert!(!route_blastx_to_legacy(&args(&[
             "diamond", "blastx", "--outfmt", "6", "qseqid", "qlen", "sseqid"
         ])));
     }

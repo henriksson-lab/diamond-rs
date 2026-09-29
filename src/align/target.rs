@@ -390,7 +390,10 @@ where
     let gf_target_block_ids;
     let (seed_hits, target_block_ids) = if cfg.gapped_filter_evalue > 0.0
         && cfg.global_ranking_targets == 0
-        && (!cfg.query_translated || query_seq[0].len() as i32 >= GAPPED_FILTER_MIN_QLEN)
+        && (!cfg.query_translated
+            || query_seq
+                .iter()
+                .any(|query| query.len() as i32 >= GAPPED_FILTER_MIN_QLEN))
     {
         let query_refs: Vec<&[Letter]> = query_seq.iter().map(Vec::as_slice).collect();
         let query_cbs_refs: Vec<&[i8]> = query_cbs.iter().map(Vec::as_slice).collect();
@@ -503,7 +506,11 @@ where
     F2: Fn(i32, i32) -> i32 + Copy,
 {
     const UNIFIED_TARGET_LEN: u32 = 50;
-    let query_len = query_seq.first().map_or(0, Vec::len) as u32;
+    let query_len = if cfg.query_translated {
+        query_seq.iter().map(Vec::len).max().unwrap_or(0) as u32
+    } else {
+        query_seq.first().map_or(0, Vec::len) as u32
+    };
     let self_aln_score = if target_block.block().has_self_aln() {
         target_block.block().self_aln_score(query_id as i64)
     } else {
@@ -1155,7 +1162,6 @@ pub fn add_dp_targets(
     mode: ExtensionMode,
     cfg: &GappedScoreConfig,
 ) {
-    let base_band = band(query_seq[0].len() as i32, mode, cfg.padding);
     let slen = target.seq.len() as i32;
     let score_width = matrix
         .as_deref()
@@ -1163,6 +1169,7 @@ pub fn add_dp_targets(
         .unwrap_or(0);
     for frame in 0..cfg.query_contexts {
         let qlen = query_seq[frame].len() as i32;
+        let base_band = band(qlen, mode, cfg.padding);
         if mode == ExtensionMode::Full {
             if target.ungapped_score[frame] == 0 {
                 continue;

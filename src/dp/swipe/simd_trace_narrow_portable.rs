@@ -7,10 +7,7 @@
 use super::simd_trace::TraceTarget;
 use crate::basic::value::Letter;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
-use crate::basic::{
-    packed_transcript::EditOperation,
-    value::{LETTER_MASK, SEED_MASK},
-};
+use crate::basic::{packed_transcript::EditOperation, value::LETTER_MASK};
 use crate::dp::smith_waterman::SwResult;
 use crate::stats::score_matrix::ScoreMatrix;
 
@@ -272,9 +269,7 @@ unsafe fn score_i8_core(
             live[lane] = true;
             let sl = targets[lane].subject[p as usize];
             for ql in 0..32 {
-                profile[ql][lane] = if sl & SEED_MASK != 0 {
-                    0
-                } else if let Some(adjusted) = targets[lane].matrix {
+                profile[ql][lane] = if let Some(adjusted) = targets[lane].matrix {
                     adjusted.scores[(sl & LETTER_MASK) as usize * 32 + ql]
                 } else {
                     matrix.matrix8()[ql * 32 + (sl & LETTER_MASK) as usize]
@@ -385,9 +380,7 @@ unsafe fn score_i16_core(
             live[lane] = true;
             let sl = targets[lane].subject[p as usize];
             for ql in 0..32 {
-                profile[ql][lane] = if sl & SEED_MASK != 0 {
-                    0
-                } else if let Some(adjusted) = targets[lane].matrix {
+                profile[ql][lane] = if let Some(adjusted) = targets[lane].matrix {
                     i16::from(adjusted.scores[(sl & LETTER_MASK) as usize * 32 + ql])
                 } else {
                     i16::from(matrix.matrix8()[ql * 32 + (sl & LETTER_MASK) as usize])
@@ -512,9 +505,7 @@ unsafe fn trace_i8_core(
                 }
                 mask[lane] = -1;
                 let sl = targets[lane].subject[subject_pos[lane]];
-                let raw = if sl & SEED_MASK != 0 {
-                    0
-                } else if let Some(adjusted) = targets[lane].matrix {
+                let raw = if let Some(adjusted) = targets[lane].matrix {
                     adjusted.scores[(sl & LETTER_MASK) as usize * 32 + qletter]
                 } else {
                     matrix.matrix8()[qletter * 32 + (sl & LETTER_MASK) as usize]
@@ -655,9 +646,7 @@ unsafe fn trace_i16_core(
                 }
                 mask[lane] = -1;
                 let sl = targets[lane].subject[subject_pos[lane]];
-                let raw = if sl & SEED_MASK != 0 {
-                    0
-                } else if let Some(adjusted) = targets[lane].matrix {
+                let raw = if let Some(adjusted) = targets[lane].matrix {
                     adjusted.scores[(sl & LETTER_MASK) as usize * 32 + qletter]
                 } else {
                     matrix.matrix8()[qletter * 32 + (sl & LETTER_MASK) as usize]

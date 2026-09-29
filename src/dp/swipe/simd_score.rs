@@ -36,8 +36,6 @@ pub struct SimdScoreScratch {
     prev_h: Vec<ArchVector>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     prev_e: Vec<ArchVector>,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    query_biases: Vec<ArchVector>,
 }
 
 #[cfg(target_arch = "x86")]
@@ -67,10 +65,13 @@ pub fn score_batch_avx2(
     {
         return None;
     }
-    let query_letters = query.iter().try_fold(0u32, |mask, &letter| {
+    let valid_query = query.iter().all(|&letter| {
         let letter = (letter & LETTER_MASK) as usize;
-        (letter < AMINO_ACID_COUNT).then_some(mask | (1 << letter))
-    })?;
+        letter < AMINO_ACID_COUNT
+    });
+    if !valid_query {
+        return None;
+    }
     let gap_open = score_matrix
         .gap_open()
         .checked_add(score_matrix.gap_extend())?;
@@ -89,18 +90,31 @@ pub fn score_batch_avx2(
         // SAFETY: guarded by runtime AVX2 detection; all memory accesses in
         // the implementation are bounds checked or use fixed-size arrays.
         return Some(unsafe {
-            score_batch_avx2_impl(
-                query,
-                targets,
-                score_matrix.matrix8u_low(),
-                score_matrix.matrix8u_high(),
-                score_matrix.bias(),
-                query_cbs,
-                gap_open as i16,
-                gap_extend as i16,
-                query_letters,
-                scratch,
-            )
+            if query_cbs.is_empty() {
+                score_batch_avx2_impl::<false>(
+                    query,
+                    targets,
+                    score_matrix.matrix8u_low(),
+                    score_matrix.matrix8u_high(),
+                    score_matrix.bias(),
+                    query_cbs,
+                    gap_open as i16,
+                    gap_extend as i16,
+                    scratch,
+                )
+            } else {
+                score_batch_avx2_impl::<true>(
+                    query,
+                    targets,
+                    score_matrix.matrix8u_low(),
+                    score_matrix.matrix8u_high(),
+                    score_matrix.bias(),
+                    query_cbs,
+                    gap_open as i16,
+                    gap_extend as i16,
+                    scratch,
+                )
+            }
         });
     }
 
@@ -272,7 +286,7 @@ unsafe fn score_full_batch_avx2_impl(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn score_batch_avx2_impl(
+unsafe fn score_batch_avx2_impl<const HAS_CBS: bool>(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
     matrix_low: &[i8; 32 * 32],
@@ -281,10 +295,9 @@ unsafe fn score_batch_avx2_impl(
     query_cbs: &[i8],
     gap_open: i16,
     gap_extend: i16,
-    query_letters: u32,
     scratch: &mut SimdScoreScratch,
 ) -> BatchScores {
-    score_batch_avx2_upstream_impl(
+    score_batch_avx2_upstream_impl::<HAS_CBS>(
         query,
         targets,
         matrix_low,
@@ -293,7 +306,6 @@ unsafe fn score_batch_avx2_impl(
         query_cbs,
         gap_open,
         gap_extend,
-        query_letters,
         scratch,
     )
 }
@@ -303,7 +315,7 @@ unsafe fn score_batch_avx2_impl(
 /// the query coordinate uniform across lanes and the substitution profile in
 /// vector form throughout the cell loop.
 #[target_feature(enable = "avx2")]
-unsafe fn score_batch_avx2_upstream_impl(
+unsafe fn score_batch_avx2_upstream_impl<const HAS_CBS: bool>(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
     matrix_low: &[i8; 32 * 32],
@@ -312,7 +324,6 @@ unsafe fn score_batch_avx2_upstream_impl(
     query_cbs: &[i8],
     gap_open: i16,
     gap_extend: i16,
-    _query_letters: u32,
     scratch: &mut SimdScoreScratch,
 ) -> BatchScores {
     const LANES: usize = 16;
@@ -354,14 +365,6 @@ unsafe fn score_batch_avx2_upstream_impl(
     scratch.prev_e.resize(band + 1, dp_zero);
     scratch.prev_h.fill(dp_zero);
     scratch.prev_e.fill(dp_zero);
-    scratch.query_biases.resize(query.len(), zero);
-    if query_cbs.is_empty() {
-        scratch.query_biases.fill(zero);
-    } else {
-        for (slot, &bias) in scratch.query_biases.iter_mut().zip(query_cbs) {
-            *slot = arch::_mm256_set1_epi16(bias as i16);
-        }
-    }
     let go = arch::_mm256_set1_epi16(gap_open);
     let ge = arch::_mm256_set1_epi16(gap_extend);
 
@@ -485,10 +488,13 @@ unsafe fn score_batch_avx2_upstream_impl(
                 let base = *profile
                     .get_unchecked(query_letter as usize)
                     .assume_init_ref();
-                let substitution = arch::_mm256_adds_epi16(
-                    arch::_mm256_adds_epi16(base, *scratch.query_biases.get_unchecked(q)),
-                    target_mask,
-                );
+                let query_bias = if HAS_CBS {
+                    arch::_mm256_set1_epi16(*query_cbs.get_unchecked(q) as i16)
+                } else {
+                    zero
+                };
+                let substitution =
+                    arch::_mm256_adds_epi16(arch::_mm256_adds_epi16(base, query_bias), target_mask);
                 let diagonal =
                     arch::_mm256_adds_epi16(*scratch.prev_h.get_unchecked(row), substitution);
                 let horizontal =
@@ -609,12 +615,21 @@ mod tests {
                 })
                 .collect();
             let got = score_batch_avx2(&query, &targets, &matrix, &cbs, &mut scratch).unwrap();
+            let got_without_cbs =
+                score_batch_avx2(&query, &targets, &matrix, &[], &mut scratch).unwrap();
             assert_eq!(got.overflow_mask, 0);
+            assert_eq!(got_without_cbs.overflow_mask, 0);
             for lane in 0..lane_count {
                 assert_eq!(
                     got.scores[lane],
                     scalar(&query, targets[lane], &matrix, &cbs),
                     "lane {lane}, qlen {qlen}, band {:?}",
+                    bands[lane]
+                );
+                assert_eq!(
+                    got_without_cbs.scores[lane],
+                    scalar(&query, targets[lane], &matrix, &[]),
+                    "no-CBS lane {lane}, qlen {qlen}, band {:?}",
                     bands[lane]
                 );
             }

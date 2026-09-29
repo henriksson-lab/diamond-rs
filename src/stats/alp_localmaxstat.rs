@@ -412,7 +412,12 @@ mod tests {
 
     #[test]
     fn test_local_max_stat_computes_small_distribution() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        // The neighboring `should_panic` test deliberately unwinds while it
+        // owns this serialization lock. Test order is unspecified, so recover
+        // the guard rather than making a valid later test fail on poisoning.
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         LocalMaxStat::setTime(0.0);
         let stat = LocalMaxStat::new(2, Some(&[-1, 2]), Some(&[0.8, 0.2]));
         assert!(stat.bool_());
@@ -428,7 +433,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "Error - you have exceeded the calculation time or memory limit.")]
     fn test_local_max_stat_rejects_non_logarithmic_distribution() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let _ = LocalMaxStat::new(2, Some(&[-1, 2]), Some(&[0.2, 0.8]));
     }
 }

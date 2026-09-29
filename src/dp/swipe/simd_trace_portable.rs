@@ -5,7 +5,7 @@ use super::simd_trace::TraceTarget;
 use crate::basic::packed_transcript::EditOperation;
 use crate::basic::value::Letter;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
-use crate::basic::value::{LETTER_MASK, SEED_MASK};
+use crate::basic::value::LETTER_MASK;
 use crate::dp::smith_waterman::SwResult;
 use crate::stats::score_matrix::ScoreMatrix;
 
@@ -143,12 +143,11 @@ unsafe fn trace_impl(
                 indices[lane] = (j0 + 1) * (width + 2) + q + 1 - (lower + 1);
                 let ql = query[q];
                 let sl = t.subject[j0];
-                subst[lane] = if sl & SEED_MASK != 0 {
-                    0
-                } else if let Some(m) = t.matrix {
+                subst[lane] = if let Some(m) = t.matrix {
                     m.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize] as i32
                 } else {
-                    matrix.score(ql, sl) + cbs.get(q).copied().unwrap_or(0) as i32
+                    matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
+                        + cbs.get(q).copied().unwrap_or(0) as i32
                 };
                 let scale = t.matrix_scale.max(1);
                 go[lane] = (matrix.gap_open() + matrix.gap_extend()) * scale;

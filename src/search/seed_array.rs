@@ -9,7 +9,7 @@ use crate::basic::reduction::Reduction;
 use crate::basic::seed::{self, PackedSeed, SeedPartition};
 use crate::basic::seed_iterator::SketchIterator;
 use crate::basic::shape::Shape;
-use crate::basic::value::Letter;
+use crate::basic::value::{is_amino_acid, Letter, LETTER_MASK, MASK_LETTER, SEED_MASK};
 use crate::search::seed_match::SeedMatch;
 
 /// A single entry in the seed array: the seed key (with partition bits stripped)
@@ -35,6 +35,28 @@ pub struct SeedArray {
     seq_offsets: Vec<u32>,
     /// Number of partition bits.
     pub seedp_bits: i32,
+}
+
+/// Match upstream `enum_seeds`: reduce a complete sequence once, then extract
+/// every overlapping shape from the compact reduced bytes.  Seed masking is
+/// preserved as the reduction's sentinel so `set_seed_reduced` rejects exactly
+/// the same windows as the direct extractor.
+#[inline]
+fn reduce_seed_sequence_into(seq: &[Letter], reduction: &Reduction, out: &mut Vec<Letter>) {
+    out.clear();
+    out.reserve(seq.len());
+    out.extend(seq.iter().map(|&raw| {
+        if raw & SEED_MASK != 0 {
+            MASK_LETTER
+        } else {
+            let letter = raw & LETTER_MASK;
+            if is_amino_acid(letter) {
+                reduction.reduce(letter) as Letter
+            } else {
+                MASK_LETTER
+            }
+        }
+    }));
 }
 
 impl SeedArray {
@@ -239,6 +261,7 @@ impl SeedArray {
 
         if rayon::current_num_threads() == 1 {
             let mut counts = vec![0usize; num_partitions];
+            let mut reduced = Vec::new();
             for seq in seqs {
                 let slen = seq.len();
                 if min_query_len > 0 && slen < min_query_len {
@@ -247,13 +270,21 @@ impl SeedArray {
                 if slen < shape_length {
                     continue;
                 }
+                if complexity_cut <= 0.0 {
+                    reduce_seed_sequence_into(seq, reduction, &mut reduced);
+                }
+                let seed_seq = if complexity_cut > 0.0 {
+                    *seq
+                } else {
+                    reduced.as_slice()
+                };
                 let last = slen - shape_length;
                 for pos in 0..=last {
-                    let window = &seq[pos..pos + shape_length];
+                    let window = &seed_seq[pos..pos + shape_length];
                     let seed = if complexity_cut > 0.0 {
                         shape.set_seed_with_complexity(window, reduction, complexity_cut)
                     } else {
-                        shape.set_seed(window, reduction)
+                        shape.set_seed_reduced(window, reduction)
                     };
                     if let Some(s) = seed {
                         let p = seed::seed_partition(s, mask) as usize;
@@ -286,13 +317,21 @@ impl SeedArray {
                 if slen < shape_length {
                     continue;
                 }
+                if complexity_cut <= 0.0 {
+                    reduce_seed_sequence_into(seq, reduction, &mut reduced);
+                }
+                let seed_seq = if complexity_cut > 0.0 {
+                    *seq
+                } else {
+                    reduced.as_slice()
+                };
                 let last = slen - shape_length;
                 for pos in 0..=last {
-                    let window = &seq[pos..pos + shape_length];
+                    let window = &seed_seq[pos..pos + shape_length];
                     let seed = if complexity_cut > 0.0 {
                         shape.set_seed_with_complexity(window, reduction, complexity_cut)
                     } else {
-                        shape.set_seed(window, reduction)
+                        shape.set_seed_reduced(window, reduction)
                     };
                     if let Some(s) = seed {
                         let p = seed::seed_partition(s, mask) as usize;
@@ -336,55 +375,72 @@ impl SeedArray {
 
         // Two-pass build matching C++'s `SeedArray::SeedArray(...with histogram)`:
         //   pass 1: scan all sequences in parallel, count seeds per partition
-        //   pass 2: allocate one contiguous Vec sized to the total, then write
-        //           each seed directly to its partition's slot via atomic cursor
+        //   pass 2: allocate one contiguous Vec sized to the total, then give
+        //           every worker an exact, disjoint slice of each partition
         // This avoids the gigabyte-scale intermediate `Vec<Raw>` and the
-        // sequential bucket-sort copy that the prior implementation needed.
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        // sequential bucket-sort copy that the prior implementation needed,
+        // without a locked atomic increment for every emitted seed.
 
-        // Pass 1: histogram. Each worker keeps a `Vec<usize>` count per
-        // partition; reduce sums them. Keeping counts in `usize` avoids
-        // release-mode wrap before allocation on very large inputs.
-        let counts: Vec<usize> = seqs
+        let worker_count = rayon::current_num_threads().min(seqs.len().max(1));
+        let worker_range = |worker: usize| {
+            let begin = worker * seqs.len() / worker_count;
+            let end = (worker + 1) * seqs.len() / worker_count;
+            begin..end
+        };
+
+        // Keep the small worker-by-partition histogram. Besides giving the
+        // global counts, its prefix sums are the workers' non-overlapping
+        // output ranges in pass 2.
+        let worker_counts: Vec<Vec<usize>> = (0..worker_count)
             .into_par_iter()
-            .fold(
-                || vec![0usize; num_partitions],
-                |mut acc, seq| {
+            .map(|worker| {
+                let mut counts = vec![0usize; num_partitions];
+                let mut reduced = Vec::new();
+                for seq in &seqs[worker_range(worker)] {
                     let slen = seq.len();
                     if min_query_len > 0 && slen < min_query_len {
-                        return acc;
+                        continue;
                     }
                     if slen < shape_length {
-                        return acc;
+                        continue;
                     }
+                    if complexity_cut <= 0.0 {
+                        reduce_seed_sequence_into(seq, reduction, &mut reduced);
+                    }
+                    let seed_seq = if complexity_cut > 0.0 {
+                        *seq
+                    } else {
+                        reduced.as_slice()
+                    };
                     let last = slen - shape_length;
                     for pos in 0..=last {
-                        let window = &seq[pos..pos + shape_length];
+                        let window = &seed_seq[pos..pos + shape_length];
                         let seed = if complexity_cut > 0.0 {
                             shape.set_seed_with_complexity(window, reduction, complexity_cut)
                         } else {
-                            shape.set_seed(window, reduction)
+                            shape.set_seed_reduced(window, reduction)
                         };
                         if let Some(s) = seed {
                             let p = seed::seed_partition(s, mask) as usize;
                             if filter_partitions && (p < partition_begin || p >= partition_end) {
                                 continue;
                             }
-                            acc[p] += 1;
+                            counts[p] += 1;
                         }
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || vec![0usize; num_partitions],
-                |mut a, b| {
-                    for (x, y) in a.iter_mut().zip(b.iter()) {
-                        *x += *y;
-                    }
-                    a
-                },
-            );
+                }
+                counts
+            })
+            .collect();
+
+        let mut counts = vec![0usize; num_partitions];
+        for local in &worker_counts {
+            for (total, &count) in counts.iter_mut().zip(local) {
+                *total = total
+                    .checked_add(count)
+                    .expect("seed array partition size overflow");
+            }
+        }
 
         let mut offsets = vec![0usize; num_partitions + 1];
         for p in 0..num_partitions {
@@ -394,64 +450,80 @@ impl SeedArray {
         }
         let total = offsets[num_partitions];
 
-        // Pass 2: allocate the flat buffer and write each seed directly to its
-        // partition slot via an atomic cursor per partition. Using
-        // `AtomicUsize::fetch_add(1)` gives each push a unique index — fast on
-        // x86 (single LOCK XADD) and avoids serialization through a single
-        // global cursor.
-        let cursors: Vec<AtomicUsize> = offsets[..num_partitions]
-            .iter()
-            .map(|&o| AtomicUsize::new(o))
-            .collect();
+        let mut worker_cursors = Vec::with_capacity(worker_count);
+        let mut next = offsets[..num_partitions].to_vec();
+        for local in &worker_counts {
+            worker_cursors.push(next.clone());
+            for (cursor, &count) in next.iter_mut().zip(local) {
+                *cursor += count;
+            }
+        }
         data.clear();
         if data.capacity() < total {
             data.reserve_exact(total);
         }
         let data_ptr = data.as_mut_ptr() as usize; // smuggle pointer across threads
 
-        seqs.into_par_iter().enumerate().for_each(|(seq_id, seq)| {
-            let slen = seq.len();
-            if min_query_len > 0 && slen < min_query_len {
-                return;
-            }
-            if slen < shape_length {
-                return;
-            }
-            let last = slen - shape_length;
-            for pos in 0..=last {
-                let window = &seq[pos..pos + shape_length];
-                let seed = if complexity_cut > 0.0 {
-                    shape.set_seed_with_complexity(window, reduction, complexity_cut)
-                } else {
-                    shape.set_seed(window, reduction)
-                };
-                if let Some(s) = seed {
-                    let p = seed::seed_partition(s, mask) as usize;
-                    if filter_partitions && (p < partition_begin || p >= partition_end) {
+        let final_cursors: Vec<Vec<usize>> = worker_cursors
+            .into_par_iter()
+            .enumerate()
+            .map(|(worker, mut cursors)| {
+                let mut reduced = Vec::new();
+                for seq_id in worker_range(worker) {
+                    let seq = seqs[seq_id];
+                    let slen = seq.len();
+                    if (min_query_len > 0 && slen < min_query_len) || slen < shape_length {
                         continue;
                     }
-                    let key = seed::seed_partition_offset(s, seedp_bits as u64) as u32;
-                    let idx = cursors[p].fetch_add(1, Ordering::Relaxed);
-                    // SAFETY: `idx` is unique per `cursors[p]` and falls in
-                    // `[offsets[p], offsets[p+1])`. data_ptr is the start of the
-                    // properly-allocated buffer.
-                    unsafe {
-                        let ptr = (data_ptr as *mut SeedEntry).add(idx);
-                        std::ptr::write(
-                            ptr,
-                            SeedEntry {
-                                key,
-                                loc: seq_offsets[seq_id] + pos as u32,
-                            },
-                        );
+                    if complexity_cut <= 0.0 {
+                        reduce_seed_sequence_into(seq, reduction, &mut reduced);
+                    }
+                    let seed_seq = if complexity_cut > 0.0 {
+                        seq
+                    } else {
+                        reduced.as_slice()
+                    };
+                    let last = slen - shape_length;
+                    for pos in 0..=last {
+                        let window = &seed_seq[pos..pos + shape_length];
+                        let seed = if complexity_cut > 0.0 {
+                            shape.set_seed_with_complexity(window, reduction, complexity_cut)
+                        } else {
+                            shape.set_seed_reduced(window, reduction)
+                        };
+                        if let Some(s) = seed {
+                            let p = seed::seed_partition(s, mask) as usize;
+                            if filter_partitions && (p < partition_begin || p >= partition_end) {
+                                continue;
+                            }
+                            let key = seed::seed_partition_offset(s, seedp_bits as u64) as u32;
+                            let idx = cursors[p];
+                            cursors[p] += 1;
+                            // SAFETY: pass 1 assigned this worker an exact
+                            // disjoint subrange of partition `p`; `idx`
+                            // advances only inside that range.
+                            unsafe {
+                                let ptr = (data_ptr as *mut SeedEntry).add(idx);
+                                std::ptr::write(
+                                    ptr,
+                                    SeedEntry {
+                                        key,
+                                        loc: seq_offsets[seq_id] + pos as u32,
+                                    },
+                                );
+                            }
+                        }
                     }
                 }
-            }
-        });
+                cursors
+            })
+            .collect();
 
         for p in 0..num_partitions {
             assert_eq!(
-                cursors[p].load(Ordering::Relaxed),
+                final_cursors
+                    .last()
+                    .map_or(offsets[p], |cursors| cursors[p]),
                 offsets[p + 1],
                 "seed array partition {p} was not fully initialized"
             );
@@ -737,6 +809,52 @@ pub struct MatchBlock {
     pub r_count: u32,
 }
 
+/// Upstream sorts seed partitions with a stable radix sorter. Seed-array
+/// emission is already in increasing global-location order, so a stable sort
+/// by the 32-bit partition key produces the required `(key, loc)` order without
+/// an `O(n log n)` comparison sort. Tiny or externally-constructed partitions
+/// retain the standard sorter, where radix setup would dominate.
+fn sort_seed_partition(entries: &mut [SeedEntry]) {
+    if entries.len() < 96 || !entries.windows(2).all(|pair| pair[0].loc <= pair[1].loc) {
+        entries.sort_unstable_by_key(|entry| ((entry.key as u64) << 32) | entry.loc as u64);
+        return;
+    }
+
+    let max_key = entries.iter().map(|entry| entry.key).max().unwrap_or(0);
+    let passes = if max_key < (1 << 24) { 3 } else { 4 };
+    let mut scratch = vec![entries[0]; entries.len()];
+    for pass in 0..passes {
+        let shift = pass * 8;
+        let mut counts = [0usize; 256];
+        let source: &[SeedEntry] = if pass & 1 == 0 { entries } else { &scratch };
+        for entry in source {
+            counts[((entry.key >> shift) & 0xff) as usize] += 1;
+        }
+        let mut next = [0usize; 256];
+        let mut offset = 0usize;
+        for (slot, count) in next.iter_mut().zip(counts) {
+            *slot = offset;
+            offset += count;
+        }
+        if pass & 1 == 0 {
+            for &entry in entries.iter() {
+                let bucket = ((entry.key >> shift) & 0xff) as usize;
+                scratch[next[bucket]] = entry;
+                next[bucket] += 1;
+            }
+        } else {
+            for &entry in &scratch {
+                let bucket = ((entry.key >> shift) & 0xff) as usize;
+                entries[next[bucket]] = entry;
+                next[bucket] += 1;
+            }
+        }
+    }
+    if passes & 1 != 0 {
+        entries.copy_from_slice(&scratch);
+    }
+}
+
 /// Sort the partitions and find every block of matching keys. Returns the
 /// blocks (one per shared key) suitable for accumulating frequent-seed stats
 /// and then emitting the join with a threshold filter. The partitions are
@@ -749,8 +867,8 @@ pub fn match_blocks(query_part: &mut [SeedEntry], ref_part: &mut [SeedEntry]) ->
     // order. The Rust seed-array builder fills partitions in parallel, so an
     // unstable sort by the full logical order is both deterministic and closer
     // to C++ than preserving atomic insertion order for equal keys.
-    query_part.sort_unstable_by_key(|e| (e.key, e.loc));
-    ref_part.sort_unstable_by_key(|e| (e.key, e.loc));
+    sort_seed_partition(query_part);
+    sort_seed_partition(ref_part);
     let mut blocks = Vec::new();
     let mut qi = 0usize;
     let mut ri = 0usize;
@@ -1020,6 +1138,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stable_radix_seed_sort_matches_logical_order() {
+        let mut entries: Vec<SeedEntry> = (0..4096u32)
+            .map(|loc| SeedEntry {
+                key: loc.wrapping_mul(2_654_435_761) & 0x00ff_ffff,
+                loc,
+            })
+            .collect();
+        let mut expected = entries.clone();
+        expected.sort_unstable_by_key(|entry| ((entry.key as u64) << 32) | entry.loc as u64);
+        sort_seed_partition(&mut entries);
+        assert!(entries
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| actual.key == expected.key && actual.loc == expected.loc));
+    }
+
+    #[test]
     fn test_seed_array_build() {
         let reduction = Reduction::default_reduction();
         let shape = Shape::from_code("111", &reduction);
@@ -1074,6 +1209,51 @@ mod tests {
         }
         actual.sort_unstable();
 
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn production_shape_reduced_build_matches_direct_mask_semantics() {
+        let reduction = Reduction::default_reduction();
+        let shape = Shape::from_code("111101110111", &reduction);
+        let seedp_bits = 10;
+        let mask = seed::seedp_mask(seedp_bits);
+        let mut seqs_owned: Vec<Vec<Letter>> = (0..48)
+            .map(|sid| {
+                (0..73)
+                    .map(|pos| ((sid * 11 + pos * 7) % 20) as Letter)
+                    .collect()
+            })
+            .collect();
+        seqs_owned[3][17] = MASK_LETTER;
+        seqs_owned[11][29] |= SEED_MASK;
+        seqs_owned[31][42] = crate::basic::value::STOP_LETTER;
+        let seqs: Vec<&[Letter]> = seqs_owned.iter().map(Vec::as_slice).collect();
+
+        let array = SeedArray::build(&seqs, &shape, &reduction, seedp_bits);
+        let mut expected = Vec::new();
+        for (seq_id, seq) in seqs.iter().enumerate() {
+            for pos in 0..=seq.len() - shape.length as usize {
+                if let Some(packed) = shape.set_seed(&seq[pos..], &reduction) {
+                    expected.push((
+                        seed::seed_partition(packed, mask) as usize,
+                        seed::seed_partition_offset(packed, seedp_bits as u64) as u32,
+                        seq_id as u32,
+                        pos as u32,
+                    ));
+                }
+            }
+        }
+        expected.sort_unstable();
+
+        let mut actual = Vec::new();
+        for partition in 0..array.num_partitions() {
+            for &entry in array.partition(partition as SeedPartition) {
+                let (seq_id, pos) = array.seq_pos(entry);
+                actual.push((partition, entry.key, seq_id, pos));
+            }
+        }
+        actual.sort_unstable();
         assert_eq!(actual, expected);
     }
 

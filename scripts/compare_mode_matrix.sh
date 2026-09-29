@@ -8,7 +8,7 @@ protein_query=${PROTEIN_QUERY_FASTA:-${QUERY_FASTA:-"$repo_dir/diamond/src/test/
 nucleotide_query=${NUCLEOTIDE_QUERY_FASTA:-}
 repetitions=${REPETITIONS:-5}
 matrix_threads=${MATRIX_THREADS:-"1 4"}
-matrix_modes=${MATRIX_MODES:-"default16 spill64m disk0 gzip-input faster more ultra cbs0 mask0 blosum45 filter-id filter-cover filter-top output-extra blastx-default blastx-disk"}
+matrix_modes=${MATRIX_MODES:-"default16 spill64m disk0 gzip-input faster more ultra cbs0 mask0 blosum45 filter-id filter-cover filter-top output-extra blastx-default blastx-disk blastx-very blastx-ultra blastx-cbs0 blastx-mask0 blastx-strand-plus blastx-strand-minus blastx-gencode11 blastx-min-orf blastx-output-extra"}
 result_dir=${RESULT_DIR:-"$repo_dir/.tmp/benchmark-matrix"}
 summary="$result_dir/summary.tsv"
 
@@ -70,7 +70,10 @@ for mode in $matrix_modes; do
         output-extra)
             outfmt='qseqid qlen sseqid slen pident nident length mismatch gapopen gaps qstart qend sstart send evalue bitscore score'
             ;;
-        blastx-default | blastx-disk)
+        blastx-default | blastx-disk | blastx-very | blastx-ultra | \
+        blastx-cbs0 | blastx-mask0 | blastx-strand-plus | \
+        blastx-strand-minus | blastx-gencode11 | blastx-min-orf | \
+        blastx-output-extra)
             if [[ -z "$nucleotide_query" ]]; then
                 echo "Skipping $mode: set NUCLEOTIDE_QUERY_FASTA to a real DNA FASTA." >&2
                 continue
@@ -82,6 +85,19 @@ for mode in $matrix_modes; do
             # shapes rather than measuring mostly fixed startup cost.
             search_args='--sensitive'
             [[ "$mode" == blastx-default ]] && memory_limit=''
+            case "$mode" in
+                blastx-very) search_args='--very-sensitive' ;;
+                blastx-ultra) search_args='--ultra-sensitive' ;;
+                blastx-cbs0) search_args='--sensitive --comp-based-stats 0' ;;
+                blastx-mask0) search_args='--sensitive --masking 0' ;;
+                blastx-strand-plus) search_args='--sensitive --strand plus' ;;
+                blastx-strand-minus) search_args='--sensitive --strand minus' ;;
+                blastx-gencode11) search_args='--sensitive --query-gencode 11' ;;
+                blastx-min-orf) search_args='--sensitive --min-orf 30' ;;
+                blastx-output-extra)
+                    outfmt='qseqid qlen sseqid slen pident nident length mismatch gapopen gaps qstart qend sstart send qframe evalue bitscore score'
+                    ;;
+            esac
             ;;
         *)
             echo "error: unknown MATRIX_MODES entry: $mode" >&2
