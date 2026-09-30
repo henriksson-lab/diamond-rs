@@ -6,18 +6,13 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-/// Check if AVX2 is available at runtime. Does NOT require FMA — the SIMD
-/// path is deliberately FMA-free to match C++'s AVX2 build (no `-mfma`), so
-/// gating on FMA would needlessly fall back to scalar on AVX2-only CPUs and
-/// (with a different rounding mode) drift parity. See `forward_step_avx2`
-/// for the no-FMA mul+add pattern.
 #[cfg(target_arch = "x86_64")]
-pub fn has_avx2_fma() -> bool {
+pub fn has_avx2() -> bool {
     is_x86_feature_detected!("avx2")
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub fn has_avx2_fma() -> bool {
+pub fn has_avx2() -> bool {
     false
 }
 

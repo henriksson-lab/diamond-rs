@@ -48,90 +48,9 @@ impl HauserCorrection {
     /// C++ `HauserCorrection(const Sequence&)`, with the global score matrix
     /// and `config.cbs_window` passed explicitly.
     pub fn new(seq: &[Letter], score_matrix: &ScoreMatrix, window: usize) -> Self {
-        let len = seq.len();
-        let background_scores = score_matrix.background_scores();
-        let mut values = vec![0.0f32; len];
-        let mut scores = VectorScores::new();
-        let window_half = (window / 2).min(len.wrapping_sub(1));
-        let mut n = 0usize;
-        let mut h = 0usize;
-        let mut m = 0usize;
-        let mut t = 0usize;
-
-        while n < window_half && h < len {
-            n += 1;
-            scores.add(seq[h], score_matrix);
-            h += 1;
-        }
-        while n < window + 1 && h < len {
-            n += 1;
-            scores.add(seq[h], score_matrix);
-            set_correction(
-                &mut values,
-                m,
-                seq[m],
-                &scores,
-                n,
-                background_scores,
-                score_matrix,
-            );
-            h += 1;
-            m += 1;
-        }
-        while h < len {
-            scores.add(seq[h], score_matrix);
-            scores.sub(seq[t], score_matrix);
-            set_correction(
-                &mut values,
-                m,
-                seq[m],
-                &scores,
-                n,
-                background_scores,
-                score_matrix,
-            );
-            h += 1;
-            t += 1;
-            m += 1;
-        }
-        while m < len && n > window_half + 1 {
-            n -= 1;
-            scores.sub(seq[t], score_matrix);
-            set_correction(
-                &mut values,
-                m,
-                seq[m],
-                &scores,
-                n,
-                background_scores,
-                score_matrix,
-            );
-            t += 1;
-            m += 1;
-        }
-        while m < len {
-            set_correction(
-                &mut values,
-                m,
-                seq[m],
-                &scores,
-                n,
-                background_scores,
-                score_matrix,
-            );
-            m += 1;
-        }
-
-        let mut int8 = Vec::with_capacity(len + PADDING);
-        int8.extend(values.iter().map(|&value| {
-            let rounded = if value < 0.0 {
-                value - 0.5
-            } else {
-                value + 0.5
-            };
-            rounded as i8
-        }));
-        int8.resize(len + PADDING, 0);
+        let mut values = Vec::new();
+        let mut int8 = Vec::new();
+        fill_hauser_correction(seq, score_matrix, window, &mut values, &mut int8);
         Self { values, int8 }
     }
 
@@ -178,6 +97,112 @@ impl HauserCorrection {
         );
         values[..len].iter().rev().copied().collect()
     }
+}
+
+fn fill_hauser_correction(
+    seq: &[Letter],
+    score_matrix: &ScoreMatrix,
+    window: usize,
+    values: &mut Vec<f32>,
+    int8: &mut Vec<i8>,
+) {
+    let len = seq.len();
+    let background_scores = score_matrix.background_scores();
+    values.clear();
+    values.resize(len, 0.0);
+    let mut scores = VectorScores::new();
+    let window_half = (window / 2).min(len.wrapping_sub(1));
+    let mut n = 0usize;
+    let mut h = 0usize;
+    let mut m = 0usize;
+    let mut t = 0usize;
+
+    while n < window_half && h < len {
+        n += 1;
+        scores.add(seq[h], score_matrix);
+        h += 1;
+    }
+    while n < window + 1 && h < len {
+        n += 1;
+        scores.add(seq[h], score_matrix);
+        set_correction(
+            values,
+            m,
+            seq[m],
+            &scores,
+            n,
+            background_scores,
+            score_matrix,
+        );
+        h += 1;
+        m += 1;
+    }
+    while h < len {
+        scores.add(seq[h], score_matrix);
+        scores.sub(seq[t], score_matrix);
+        set_correction(
+            values,
+            m,
+            seq[m],
+            &scores,
+            n,
+            background_scores,
+            score_matrix,
+        );
+        h += 1;
+        t += 1;
+        m += 1;
+    }
+    while m < len && n > window_half + 1 {
+        n -= 1;
+        scores.sub(seq[t], score_matrix);
+        set_correction(
+            values,
+            m,
+            seq[m],
+            &scores,
+            n,
+            background_scores,
+            score_matrix,
+        );
+        t += 1;
+        m += 1;
+    }
+    while m < len {
+        set_correction(
+            values,
+            m,
+            seq[m],
+            &scores,
+            n,
+            background_scores,
+            score_matrix,
+        );
+        m += 1;
+    }
+
+    int8.clear();
+    int8.reserve(len + PADDING);
+    int8.extend(values.iter().map(|&value| {
+        let rounded = if value < 0.0 {
+            value - 0.5
+        } else {
+            value + 0.5
+        };
+        rounded as i8
+    }));
+    int8.resize(len + PADDING, 0);
+}
+
+/// Compute only the padded SIMD representation while reusing caller-owned
+/// storage. Alignment workers use this for consecutive query contexts.
+pub(crate) fn hauser_correction_into(
+    seq: &[Letter],
+    score_matrix: &ScoreMatrix,
+    output: &mut Vec<i8>,
+    values_scratch: &mut Vec<f32>,
+) {
+    fill_hauser_correction(seq, score_matrix, 40, values_scratch, output);
 }
 
 impl Deref for HauserCorrection {
@@ -325,6 +350,20 @@ mod tests {
         assert!(correction.values.is_empty());
         assert_eq!(correction.int8, vec![0; PADDING]);
         assert!(HauserCorrection::default().int8.is_empty());
+    }
+
+    #[test]
+    fn reusable_int8_path_matches_owned_constructor_across_lengths() {
+        let score_matrix = matrix();
+        let mut output = Vec::with_capacity(256);
+        let mut values = Vec::with_capacity(256);
+        for len in [73usize, 4, 0, 129] {
+            let seq: Vec<Letter> = (0..len).map(|i| (i % 20) as Letter).collect();
+            let expected = hauser_correction(&seq, &score_matrix);
+            hauser_correction_into(&seq, &score_matrix, &mut output, &mut values);
+            assert_eq!(output, expected);
+            assert_eq!(values.len(), seq.len());
+        }
     }
 
     #[test]

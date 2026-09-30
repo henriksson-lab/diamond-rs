@@ -70,7 +70,8 @@ for mode in $matrix_modes; do
         output-extra)
             outfmt='qseqid qlen sseqid slen pident nident length mismatch gapopen gaps qstart qend sstart send evalue bitscore score'
             ;;
-        blastx-default | blastx-disk | blastx-very | blastx-ultra | \
+        blastx-default | blastx-disk | blastx-very | blastx-very-default | \
+        blastx-very-disk | blastx-ultra | \
         blastx-cbs0 | blastx-mask0 | blastx-strand-plus | \
         blastx-strand-minus | blastx-gencode11 | blastx-min-orf | \
         blastx-output-extra)
@@ -84,9 +85,11 @@ for mode in $matrix_modes; do
             # range at this preset and exercises several translated-search
             # shapes rather than measuring mostly fixed startup cost.
             search_args='--sensitive'
-            [[ "$mode" == blastx-default ]] && memory_limit=''
+            [[ "$mode" == blastx-default || "$mode" == blastx-very-default ]] && memory_limit=''
             case "$mode" in
-                blastx-very) search_args='--very-sensitive' ;;
+                blastx-very | blastx-very-default | blastx-very-disk)
+                    search_args='--very-sensitive'
+                    ;;
                 blastx-ultra) search_args='--ultra-sensitive' ;;
                 blastx-cbs0) search_args='--sensitive --comp-based-stats 0' ;;
                 blastx-mask0) search_args='--sensitive --masking 0' ;;

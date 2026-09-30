@@ -9,7 +9,9 @@ use crate::basic::reduction::Reduction;
 use crate::basic::seed::{self, PackedSeed, SeedPartition};
 use crate::basic::seed_iterator::SketchIterator;
 use crate::basic::shape::Shape;
-use crate::basic::value::{is_amino_acid, Letter, LETTER_MASK, MASK_LETTER, SEED_MASK};
+use crate::basic::value::Letter;
+#[cfg(test)]
+use crate::basic::value::{MASK_LETTER, SEED_MASK};
 use crate::search::seed_match::SeedMatch;
 
 /// A single entry in the seed array: the seed key (with partition bits stripped)
@@ -45,18 +47,7 @@ pub struct SeedArray {
 fn reduce_seed_sequence_into(seq: &[Letter], reduction: &Reduction, out: &mut Vec<Letter>) {
     out.clear();
     out.reserve(seq.len());
-    out.extend(seq.iter().map(|&raw| {
-        if raw & SEED_MASK != 0 {
-            MASK_LETTER
-        } else {
-            let letter = raw & LETTER_MASK;
-            if is_amino_acid(letter) {
-                reduction.reduce(letter) as Letter
-            } else {
-                MASK_LETTER
-            }
-        }
-    }));
+    out.extend(seq.iter().map(|&raw| reduction.reduce_seed_letter(raw)));
 }
 
 impl SeedArray {
@@ -624,6 +615,7 @@ impl SeedArray {
         let mask = seed::seedp_mask(seedp_bits);
         let shape_length = shape.length as usize;
         let mut counts = vec![0usize; num_partitions];
+        let mut reduced = Vec::new();
         for seq in seqs {
             let slen = seq.len();
             if min_query_len > 0 && slen < min_query_len {
@@ -632,16 +624,24 @@ impl SeedArray {
             if slen < shape_length {
                 continue;
             }
+            if complexity_cut <= 0.0 {
+                reduce_seed_sequence_into(seq, reduction, &mut reduced);
+            }
+            let seed_seq = if complexity_cut > 0.0 {
+                *seq
+            } else {
+                reduced.as_slice()
+            };
             let last = slen - shape_length;
             for pos in 0..=last {
-                let window = &seq[pos..pos + shape_length];
+                let window = &seed_seq[pos..pos + shape_length];
                 let seed = if complexity_cut > 0.0 {
                     shape.set_seed_with_complexity(window, reduction, complexity_cut)
                 } else {
-                    shape.set_seed(window, reduction)
+                    shape.set_seed_reduced(window, reduction)
                 };
-                if let Some(s) = seed {
-                    counts[seed::seed_partition(s, mask) as usize] += 1;
+                if let Some(seed) = seed {
+                    counts[seed::seed_partition(seed, mask) as usize] += 1;
                 }
             }
         }
@@ -685,6 +685,7 @@ impl SeedArray {
 
         let mut cursors = offsets[..num_partitions].to_vec();
         let data_ptr = data.as_mut_ptr();
+        let mut reduced = Vec::new();
 
         for (seq_id, seq) in seqs.iter().enumerate() {
             let slen = seq.len();
@@ -694,21 +695,22 @@ impl SeedArray {
             if slen < shape_length {
                 continue;
             }
+            reduce_seed_sequence_into(seq, reduction, &mut reduced);
             let last = slen - shape_length;
             let seq_offset = seq_offsets[seq_id];
             for pos in 0..=last {
-                let window = &seq[pos..pos + shape_length];
-                if let Some(s) = shape.set_seed(window, reduction) {
-                    let p = seed::seed_partition(s, mask) as usize;
-                    if p < partition_begin || p >= partition_end {
+                let window = &reduced[pos..pos + shape_length];
+                if let Some(seed) = shape.set_seed_reduced(window, reduction) {
+                    let partition = seed::seed_partition(seed, mask) as usize;
+                    if partition < partition_begin || partition >= partition_end {
                         continue;
                     }
-                    let key = seed::seed_partition_offset(s, seedp_bits as u64) as u32;
-                    let idx = cursors[p];
-                    cursors[p] += 1;
+                    let key = seed::seed_partition_offset(seed, seedp_bits as u64) as u32;
+                    let index = cursors[partition];
+                    cursors[partition] += 1;
                     unsafe {
                         std::ptr::write(
-                            data_ptr.add(idx),
+                            data_ptr.add(index),
                             SeedEntry {
                                 key,
                                 loc: seq_offset + pos as u32,
@@ -787,6 +789,61 @@ pub fn decode_seq_pos(seq_offsets: &[u32], entry: SeedEntry) -> (u32, u32) {
     (i as u32, loc - seq_offsets[i])
 }
 
+/// Compact accelerator for repeatedly resolving seed-array locations.
+///
+/// `SeedEntry::loc` is a position in the concatenation of all records.  The
+/// straightforward decoder above therefore has to binary-search the record
+/// offsets for every seed occurrence.  Stage 1 does that for both sides of
+/// every joined key before the Hamming filter, while upstream can address its
+/// packed locations directly.  Remembering the record that contains each
+/// 64-letter boundary turns the hot lookup into one indexed load followed by
+/// only the record boundaries crossed inside that small interval.  The table
+/// is four bytes per 64 input letters, rather than a per-letter duplicate of
+/// the sequence metadata.
+pub(crate) struct SeqOffsetLocator<'a> {
+    offsets: &'a [u32],
+    block_seq: Vec<u32>,
+}
+
+impl<'a> SeqOffsetLocator<'a> {
+    const BLOCK_SHIFT: u32 = 6;
+
+    pub(crate) fn new(offsets: &'a [u32]) -> Self {
+        debug_assert!(!offsets.is_empty());
+        debug_assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+        let total = offsets.last().copied().unwrap_or(0) as usize;
+        let block_count = total.div_ceil(1usize << Self::BLOCK_SHIFT);
+        let mut block_seq = Vec::with_capacity(block_count);
+        for block in 0..block_count {
+            let loc = (block << Self::BLOCK_SHIFT) as u32;
+            let seq = offsets.partition_point(|&offset| offset <= loc) - 1;
+            block_seq.push(seq as u32);
+        }
+        Self { offsets, block_seq }
+    }
+
+    #[inline(always)]
+    pub(crate) fn decode(&self, entry: SeedEntry) -> (u32, u32) {
+        let loc = entry.loc;
+        debug_assert!(self.offsets.last().is_some_and(|&total| loc < total));
+        let mut seq = unsafe {
+            *self
+                .block_seq
+                .get_unchecked((loc >> Self::BLOCK_SHIFT) as usize)
+        } as usize;
+        // Empty records and short records can share a 64-letter block.  Move
+        // forward to exactly the last offset not greater than `loc`, matching
+        // `partition_point` (including duplicate offsets) byte-for-byte.
+        while unsafe { *self.offsets.get_unchecked(seq + 1) } <= loc {
+            seq += 1;
+        }
+        (
+            seq as u32,
+            loc - unsafe { *self.offsets.get_unchecked(seq) },
+        )
+    }
+}
+
 /// Result of joining one partition: matched (query_loc, ref_loc) pairs.
 pub struct JoinResult {
     pub query_locs: Vec<(u32, u32)>, // (seq_id, pos)
@@ -821,7 +878,15 @@ fn sort_seed_partition(entries: &mut [SeedEntry]) {
     }
 
     let max_key = entries.iter().map(|entry| entry.key).max().unwrap_or(0);
-    let passes = if max_key < (1 << 24) { 3 } else { 4 };
+    let passes = if max_key < (1 << 8) {
+        1
+    } else if max_key < (1 << 16) {
+        2
+    } else if max_key < (1 << 24) {
+        3
+    } else {
+        4
+    };
     let mut scratch = vec![entries[0]; entries.len()];
     for pass in 0..passes {
         let shift = pass * 8;
@@ -1326,5 +1391,20 @@ mod tests {
         // key=7: no query match
         assert_eq!(result.query_locs.len(), 3);
         assert_eq!(result.ref_locs.len(), 3);
+    }
+
+    #[test]
+    fn coarse_seq_offset_locator_matches_binary_search_with_empty_records() {
+        let lengths = [0u32, 1, 2, 61, 0, 1, 63, 64, 65, 0, 129, 7];
+        let mut offsets = Vec::with_capacity(lengths.len() + 1);
+        offsets.push(0u32);
+        for length in lengths {
+            offsets.push(offsets.last().copied().unwrap() + length);
+        }
+        let locator = SeqOffsetLocator::new(&offsets);
+        for loc in 0..*offsets.last().unwrap() {
+            let entry = SeedEntry { key: 0, loc };
+            assert_eq!(locator.decode(entry), decode_seq_pos(&offsets, entry));
+        }
     }
 }

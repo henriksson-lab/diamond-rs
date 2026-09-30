@@ -322,7 +322,7 @@ impl Shape {
     }
 
     /// Extract a packed seed from a pre-reduced sequence.
-    #[inline]
+    #[inline(always)]
     pub fn set_seed_reduced(&self, seq: &[Letter], reduction: &Reduction) -> Option<PackedSeed> {
         if reduction.size() == 10 && matches!(self.weight, 7 | 8 | 10) {
             debug_assert!(seq.len() >= self.length as usize);

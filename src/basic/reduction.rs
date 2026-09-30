@@ -38,6 +38,7 @@ pub struct Reduction {
     map: [u32; 256],
     map8: [Letter; 256],
     map8b: [Letter; 256],
+    seed_map8: [Letter; 256],
     size: u32,
     bit_size: i32,
     bit_size_exact: f64,
@@ -102,6 +103,20 @@ impl Reduction {
         map8b[STOP_LETTER as u8 as usize] = (size + 1) as Letter;
         map8b[DELIMITER_LETTER as u8 as usize] = (size + 1) as Letter;
 
+        // Seed enumeration treats either a soft-mask bit or any non-amino
+        // residue as the reduced MASK sentinel. Precompute the complete byte
+        // mapping so whole-sequence reduction is one lookup per residue, as
+        // in upstream Reduction::reduce_seq.
+        let mut seed_map8 = [MASK_LETTER; 256];
+        for byte in 0..256usize {
+            if byte & 0x80 == 0 {
+                let letter = byte & super::value::LETTER_MASK as usize;
+                if letter < TRUE_AA as usize {
+                    seed_map8[byte] = map8[letter];
+                }
+            }
+        }
+
         let mut pair10 = [u16::MAX; 32 * 32];
         if size == 10 {
             for a in 0..32usize {
@@ -118,6 +133,7 @@ impl Reduction {
             map,
             map8,
             map8b,
+            seed_map8,
             size,
             bit_size,
             bit_size_exact,
@@ -163,6 +179,11 @@ impl Reduction {
     /// Get the map8b lookup table (for SIMD use).
     pub fn map8b(&self) -> &[Letter; 256] {
         &self.map8b
+    }
+
+    #[inline(always)]
+    pub(crate) fn reduce_seed_letter(&self, letter: Letter) -> Letter {
+        unsafe { *self.seed_map8.get_unchecked(letter as u8 as usize) }
     }
 
     /// Get the frequency for a reduced bucket.
@@ -220,6 +241,25 @@ mod tests {
         assert_eq!(r.reduce(0), 0);
         // K=11, R=1 should be in same group
         assert_eq!(r.reduce(11), r.reduce(1));
+    }
+
+    #[test]
+    fn seed_reduction_table_preserves_masking_semantics() {
+        let reduction = Reduction::default_reduction();
+        for byte in 0u16..=255 {
+            let raw = byte as u8 as Letter;
+            let expected = if byte & 0x80 != 0 {
+                MASK_LETTER
+            } else {
+                let letter = raw & super::super::value::LETTER_MASK;
+                if letter < TRUE_AA as Letter {
+                    reduction.reduce(letter) as Letter
+                } else {
+                    MASK_LETTER
+                }
+            };
+            assert_eq!(reduction.reduce_seed_letter(raw), expected);
+        }
     }
 
     #[test]

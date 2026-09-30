@@ -762,6 +762,15 @@ struct TranslatedExtensionGroup {
     frames: Vec<Vec<Letter>>,
 }
 
+#[derive(Default)]
+struct ExtensionWorkerScratch {
+    /// Flattened six-frame hit list consumed synchronously by extension.
+    /// Capacity is retained by the alignment worker across source queries.
+    hits: Vec<Hit>,
+    query_cbs: [Vec<i8>; 6],
+    hauser_values: Vec<f32>,
+}
+
 /// Run a simplified blastp search.
 ///
 /// This implements the basic pipeline:
@@ -1523,157 +1532,167 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         Ok(buf)
     };
 
-    let process_translated_query = |(query_idx, group, query_hits): (
-        usize,
-        &TranslatedExtensionGroup,
-        &[Vec<CompactHit>],
-    )|
-     -> io::Result<Vec<u8>> {
-        debug_assert_eq!(group.frames.len(), 6);
-        debug_assert_eq!(query_hits.len(), 6);
-        let query_cbs: Vec<Vec<i8>> = if config.comp_based_stats.hauser() {
-            group
-                .frames
-                .iter()
-                .map(|query| crate::stats::cbs::hauser_correction(query, &score_matrix))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let query_comp = crate::stats::cbs::compute_composition(&group.frames[0]);
-        let ungapped_cfg = UngappedStageConfig {
-            query_contexts: 6,
-            query_translated: true,
-            comp_based_stats: config.comp_based_stats,
-            xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
-            ..UngappedStageConfig::default()
-        };
-        let ext_mode = sensitivity::default_ext_mode(config.sensitivity);
-        let gapped_cfg = GappedScoreConfig {
-            query_contexts: 6,
-            query_translated: true,
-            comp_based_stats_hauser: config.comp_based_stats.hauser(),
-            comp_based_stats_matrix_adjust: config.comp_based_stats.matrix_adjust(),
-            query_cover: config.query_cover,
-            subject_cover: config.subject_cover,
-            no_self_hits: config.no_self_hits,
-            max_evalue: config.max_evalue,
-            min_id: config.min_id,
-            max_target_seqs: config.max_target_seqs,
-            ext_chunk_size: config.ext_chunk_size,
-            toppercent: config.toppercent,
-            global_ranking_targets: config.global_ranking_targets,
-            gapped_filter_evalue,
-            sensitivity: config.sensitivity,
-            ..GappedScoreConfig::default()
-        };
-
-        let total_hits = query_hits.iter().map(Vec::len).sum();
-        let mut hits = Vec::with_capacity(total_hits);
-        for (frame, frame_hits) in query_hits.iter().enumerate() {
-            hits.extend(
-                frame_hits.iter().map(|hit| {
-                    Hit::with_score(frame as u32, hit.subject, hit.seed_offset, hit.score)
-                }),
-            );
-        }
-        let mut stat = Statistics::new();
-        let output_hsp_values = HspValues::COORDS
-            | HspValues::IDENT
-            | HspValues::LENGTH
-            | HspValues::MISMATCHES
-            | HspValues::GAP_OPENINGS;
-        let matches = extend_targets(
-            query_idx as u32,
-            &mut hits,
-            &group.frames,
-            &group.id,
-            group.dna_len,
-            &query_cbs,
-            &query_comp,
-            &db_block,
-            &mut stat,
-            Flags::NONE,
-            ext_mode,
-            &gapped_cfg,
-            &ungapped_cfg,
-            &score_matrix,
-            output_hsp_values,
-            |query_len, target_len| {
-                cutoff_gapped1
-                    .as_ref()
-                    .map_or(-1, |table| table.call(query_len, target_len))
-            },
-            |query_len, target_len| {
-                cutoff_gapped2
-                    .as_ref()
-                    .map_or(-1, |table| table.call(query_len, target_len))
-            },
-            score_matrix.gap_open(),
-            score_matrix.gap_extend(),
-            gapped_filter_diag_score,
-            GAPPED_FILTER_WINDOW,
-            Option::<fn(u32, &crate::align::gapped_filter::SeedHitList) -> Vec<Match>>::None,
-        );
-        let mut buf = Vec::new();
-        for m in matches {
-            let Some(best_hsp) = m.hsps.first() else {
-                continue;
-            };
-            let target_id = m.target_block_id as usize;
-            let source_range = if best_hsp.frame >= 3 {
-                // `absolute_interval` is normalized to an ascending half-open
-                // interval. BLAST tabular coordinates are strand-oriented,
-                // so reverse contexts print the high coordinate first.
-                (
-                    best_hsp.query_source_range.end - 1,
-                    best_hsp.query_source_range.begin + 1,
-                )
+    let process_translated_query =
+        |(query_idx, group, query_hits): (usize, &TranslatedExtensionGroup, &[Vec<CompactHit>]),
+         scratch: &mut ExtensionWorkerScratch|
+         -> io::Result<Vec<u8>> {
+            debug_assert_eq!(group.frames.len(), 6);
+            debug_assert_eq!(query_hits.len(), 6);
+            let ExtensionWorkerScratch {
+                hits,
+                query_cbs,
+                hauser_values,
+            } = scratch;
+            let query_cbs: &[Vec<i8>] = if config.comp_based_stats.hauser() {
+                for (query, output) in group.frames.iter().zip(query_cbs.iter_mut()) {
+                    crate::stats::hauser_correction::hauser_correction_into(
+                        query,
+                        &score_matrix,
+                        output,
+                        hauser_values,
+                    );
+                }
+                query_cbs
             } else {
-                (
-                    best_hsp.query_source_range.begin,
-                    best_hsp.query_source_range.end,
-                )
+                &[]
             };
-            let hsp = OutputHsp {
-                score: best_hsp.score,
-                evalue: best_hsp.evalue,
-                bit_score: best_hsp.bit_score,
-                // Tabular qcovhsp is defined in source-query coordinates for
-                // translated search, not in amino-acid frame coordinates.
-                query_range: (
-                    best_hsp.query_source_range.begin,
-                    best_hsp.query_source_range.end,
-                ),
-                subject_range: (best_hsp.subject_range.begin, best_hsp.subject_range.end),
-                query_source_range: source_range,
-                subject_source_range: (best_hsp.subject_range.begin, best_hsp.subject_range.end),
-                frame: crate::basic::translate::Frame::from_index(best_hsp.frame).signed_frame(),
-                length: best_hsp.length,
-                identities: best_hsp.identities,
-                mismatches: best_hsp.mismatches,
-                positives: best_hsp.positives,
-                gap_openings: best_hsp.gap_openings,
-                gaps: best_hsp.gaps,
+            let query_comp = crate::stats::cbs::compute_composition(&group.frames[0]);
+            let ungapped_cfg = UngappedStageConfig {
+                query_contexts: 6,
+                query_translated: true,
+                comp_based_stats: config.comp_based_stats,
+                xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
+                ..UngappedStageConfig::default()
             };
-            let target_title = std::str::from_utf8(db_ids.get(target_id)).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid UTF-8 database title: {error}"),
-                )
-            })?;
-            format::write_tabular_row(
-                &mut buf,
+            let ext_mode = sensitivity::default_ext_mode(config.sensitivity);
+            let gapped_cfg = GappedScoreConfig {
+                query_contexts: 6,
+                query_translated: true,
+                comp_based_stats_hauser: config.comp_based_stats.hauser(),
+                comp_based_stats_matrix_adjust: config.comp_based_stats.matrix_adjust(),
+                query_cover: config.query_cover,
+                subject_cover: config.subject_cover,
+                no_self_hits: config.no_self_hits,
+                max_evalue: config.max_evalue,
+                min_id: config.min_id,
+                max_target_seqs: config.max_target_seqs,
+                ext_chunk_size: config.ext_chunk_size,
+                toppercent: config.toppercent,
+                global_ranking_targets: config.global_ranking_targets,
+                gapped_filter_evalue,
+                sensitivity: config.sensitivity,
+                ..GappedScoreConfig::default()
+            };
+
+            let total_hits = query_hits.iter().map(Vec::len).sum();
+            hits.clear();
+            hits.reserve(total_hits);
+            for (frame, frame_hits) in query_hits.iter().enumerate() {
+                hits.extend(frame_hits.iter().map(|hit| {
+                    Hit::with_score(frame as u32, hit.subject, hit.seed_offset, hit.score)
+                }));
+            }
+            let mut stat = Statistics::new();
+            let output_hsp_values = HspValues::COORDS
+                | HspValues::IDENT
+                | HspValues::LENGTH
+                | HspValues::MISMATCHES
+                | HspValues::GAP_OPENINGS;
+            let matches = extend_targets(
+                query_idx as u32,
+                hits,
+                &group.frames,
                 &group.id,
-                target_title,
-                &hsp,
-                &fields,
                 group.dna_len,
-                db_block.seqs().length(target_id) as i32,
-            )?;
-        }
-        Ok(buf)
-    };
+                query_cbs,
+                &query_comp,
+                &db_block,
+                &mut stat,
+                Flags::NONE,
+                ext_mode,
+                &gapped_cfg,
+                &ungapped_cfg,
+                &score_matrix,
+                output_hsp_values,
+                |query_len, target_len| {
+                    cutoff_gapped1
+                        .as_ref()
+                        .map_or(-1, |table| table.call(query_len, target_len))
+                },
+                |query_len, target_len| {
+                    cutoff_gapped2
+                        .as_ref()
+                        .map_or(-1, |table| table.call(query_len, target_len))
+                },
+                score_matrix.gap_open(),
+                score_matrix.gap_extend(),
+                gapped_filter_diag_score,
+                GAPPED_FILTER_WINDOW,
+                Option::<fn(u32, &crate::align::gapped_filter::SeedHitList) -> Vec<Match>>::None,
+            );
+            let mut buf = Vec::new();
+            for m in matches {
+                let Some(best_hsp) = m.hsps.first() else {
+                    continue;
+                };
+                let target_id = m.target_block_id as usize;
+                let source_range = if best_hsp.frame >= 3 {
+                    // `absolute_interval` is normalized to an ascending half-open
+                    // interval. BLAST tabular coordinates are strand-oriented,
+                    // so reverse contexts print the high coordinate first.
+                    (
+                        best_hsp.query_source_range.end - 1,
+                        best_hsp.query_source_range.begin + 1,
+                    )
+                } else {
+                    (
+                        best_hsp.query_source_range.begin,
+                        best_hsp.query_source_range.end,
+                    )
+                };
+                let hsp = OutputHsp {
+                    score: best_hsp.score,
+                    evalue: best_hsp.evalue,
+                    bit_score: best_hsp.bit_score,
+                    // Tabular qcovhsp is defined in source-query coordinates for
+                    // translated search, not in amino-acid frame coordinates.
+                    query_range: (
+                        best_hsp.query_source_range.begin,
+                        best_hsp.query_source_range.end,
+                    ),
+                    subject_range: (best_hsp.subject_range.begin, best_hsp.subject_range.end),
+                    query_source_range: source_range,
+                    subject_source_range: (
+                        best_hsp.subject_range.begin,
+                        best_hsp.subject_range.end,
+                    ),
+                    frame: crate::basic::translate::Frame::from_index(best_hsp.frame)
+                        .signed_frame(),
+                    length: best_hsp.length,
+                    identities: best_hsp.identities,
+                    mismatches: best_hsp.mismatches,
+                    positives: best_hsp.positives,
+                    gap_openings: best_hsp.gap_openings,
+                    gaps: best_hsp.gaps,
+                };
+                let target_title = std::str::from_utf8(db_ids.get(target_id)).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid UTF-8 database title: {error}"),
+                    )
+                })?;
+                format::write_tabular_row(
+                    &mut buf,
+                    &group.id,
+                    target_title,
+                    &hsp,
+                    &fields,
+                    group.dna_len,
+                    db_block.seqs().length(target_id) as i32,
+                )?;
+            }
+            Ok(buf)
+        };
     let mut total_alignments = 0u64;
     // Preserve input order without retaining every query's formatted output.
     // A moderately sized batch gives Rayon enough work to balance variable
@@ -1734,22 +1753,28 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 6,
                 MIN_TASK_TRACE_POINTS,
             );
-            let process_partition = |partition: usize| {
+            let process_partition = |partition: usize, scratch: &mut ExtensionWorkerScratch| {
                 partitions[partition]
                     .clone()
                     .map(|offset| {
                         let begin = offset * 6;
-                        process_translated_query((
-                            source_begin + offset,
-                            &source_groups[offset],
-                            &hits_by_context[begin..begin + 6],
-                        ))
+                        process_translated_query(
+                            (
+                                source_begin + offset,
+                                &source_groups[offset],
+                                &hits_by_context[begin..begin + 6],
+                            ),
+                            scratch,
+                        )
                     })
                     .collect::<io::Result<Vec<Vec<u8>>>>()
             };
             let partition_output: Vec<io::Result<Vec<Vec<u8>>>> =
                 if rayon::current_num_threads() == 1 || partitions.len() <= 1 {
-                    (0..partitions.len()).map(process_partition).collect()
+                    let mut scratch = ExtensionWorkerScratch::default();
+                    (0..partitions.len())
+                        .map(|partition| process_partition(partition, &mut scratch))
+                        .collect()
                 } else {
                     use std::sync::atomic::{AtomicUsize, Ordering};
                     use std::sync::OnceLock;
@@ -1763,14 +1788,17 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                             let next = &next;
                             let output = &output;
                             let process_partition = &process_partition;
-                            scope.spawn(move |_| loop {
-                                let partition = next.fetch_add(1, Ordering::Relaxed);
-                                if partition >= output.len() {
-                                    break;
+                            scope.spawn(move |_| {
+                                let mut scratch = ExtensionWorkerScratch::default();
+                                loop {
+                                    let partition = next.fetch_add(1, Ordering::Relaxed);
+                                    if partition >= output.len() {
+                                        break;
+                                    }
+                                    let result = process_partition(partition, &mut scratch);
+                                    let was_empty = output[partition].set(result).is_ok();
+                                    debug_assert!(was_empty);
                                 }
-                                let result = process_partition(partition);
-                                let was_empty = output[partition].set(result).is_ok();
-                                debug_assert!(was_empty);
                             });
                         }
                     });

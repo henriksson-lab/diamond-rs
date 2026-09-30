@@ -36,6 +36,8 @@ pub struct SimdScoreScratch {
     prev_h: Vec<ArchVector>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     prev_e: Vec<ArchVector>,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    cbs: Vec<ArchVector>,
 }
 
 #[cfg(target_arch = "x86")]
@@ -365,6 +367,13 @@ unsafe fn score_batch_avx2_upstream_impl<const HAS_CBS: bool>(
     scratch.prev_e.resize(band + 1, dp_zero);
     scratch.prev_h.fill(dp_zero);
     scratch.prev_e.fill(dp_zero);
+    if HAS_CBS {
+        scratch.cbs.clear();
+        scratch.cbs.reserve(query.len());
+        for &bias in query_cbs.get_unchecked(..query.len()) {
+            scratch.cbs.push(arch::_mm256_set1_epi16(bias as i16));
+        }
+    }
     let go = arch::_mm256_set1_epi16(gap_open);
     let ge = arch::_mm256_set1_epi16(gap_extend);
 
@@ -477,38 +486,55 @@ unsafe fn score_batch_avx2_upstream_impl<const HAS_CBS: bool>(
             }
             let target_mask = arch::_mm256_or_si256(segment_masks[segment], inactive);
             vertical = arch::_mm256_adds_epi16(vertical, target_mask);
-            for row in row_begin..row_end {
-                let q = (moving_i0 + row as i32) as usize;
-                // `query_begin/query_end` clamp q to the query, every segment
-                // is clamped to the allocated band, and the letter mask is
-                // 0..31. Express those already-established invariants here:
-                // otherwise LLVM leaves four panic bounds checks in every DP
-                // cell, unlike the pointer-based upstream kernel.
-                let query_letter = *query.get_unchecked(q) & crate::basic::value::LETTER_MASK;
-                let base = *profile
-                    .get_unchecked(query_letter as usize)
-                    .assume_init_ref();
-                let query_bias = if HAS_CBS {
-                    arch::_mm256_set1_epi16(*query_cbs.get_unchecked(q) as i16)
-                } else {
-                    zero
-                };
-                let substitution =
-                    arch::_mm256_adds_epi16(arch::_mm256_adds_epi16(base, query_bias), target_mask);
-                let diagonal =
-                    arch::_mm256_adds_epi16(*scratch.prev_h.get_unchecked(row), substitution);
-                let horizontal =
-                    arch::_mm256_adds_epi16(*scratch.prev_e.get_unchecked(row + 1), target_mask);
-                let mut score = arch::_mm256_max_epi16(diagonal, horizontal);
-                score = arch::_mm256_max_epi16(score, vertical);
-                let open = arch::_mm256_subs_epi16(score, go);
-                let next_horizontal =
-                    arch::_mm256_max_epi16(arch::_mm256_subs_epi16(horizontal, ge), open);
-                vertical = arch::_mm256_max_epi16(arch::_mm256_subs_epi16(vertical, ge), open);
-                *scratch.prev_h.get_unchecked_mut(row) = score;
-                *scratch.prev_e.get_unchecked_mut(row) = next_horizontal;
-                col_best = arch::_mm256_max_epi16(col_best, score);
+            let q_start = (moving_i0 + row_begin as i32) as usize;
+            let mut query_ptr = query.as_ptr().add(q_start);
+            let mut cbs_ptr = if HAS_CBS {
+                scratch.cbs.as_ptr().add(q_start)
+            } else {
+                std::ptr::NonNull::<ArchVector>::dangling().as_ptr()
+            };
+            let mut row = row_begin;
+            macro_rules! update_cell {
+                () => {{
+                    let query_letter = *query_ptr & crate::basic::value::LETTER_MASK;
+                    let base = *profile
+                        .get_unchecked(query_letter as usize)
+                        .assume_init_ref();
+                    let query_bias = if HAS_CBS { *cbs_ptr } else { zero };
+                    let substitution = arch::_mm256_adds_epi16(
+                        arch::_mm256_adds_epi16(base, query_bias),
+                        target_mask,
+                    );
+                    let diagonal =
+                        arch::_mm256_adds_epi16(*scratch.prev_h.get_unchecked(row), substitution);
+                    let horizontal = arch::_mm256_adds_epi16(
+                        *scratch.prev_e.get_unchecked(row + 1),
+                        target_mask,
+                    );
+                    let mut score = arch::_mm256_max_epi16(diagonal, horizontal);
+                    score = arch::_mm256_max_epi16(score, vertical);
+                    let open = arch::_mm256_subs_epi16(score, go);
+                    let next_horizontal =
+                        arch::_mm256_max_epi16(arch::_mm256_subs_epi16(horizontal, ge), open);
+                    vertical = arch::_mm256_max_epi16(arch::_mm256_subs_epi16(vertical, ge), open);
+                    *scratch.prev_h.get_unchecked_mut(row) = score;
+                    *scratch.prev_e.get_unchecked_mut(row) = next_horizontal;
+                    col_best = arch::_mm256_max_epi16(col_best, score);
+                    query_ptr = query_ptr.add(1);
+                    if HAS_CBS {
+                        cbs_ptr = cbs_ptr.add(1);
+                    }
+                    row += 1;
+                }};
             }
+            while row + 1 < row_end {
+                update_cell!();
+                update_cell!();
+            }
+            if row < row_end {
+                update_cell!();
+            }
+            debug_assert_eq!(row, row_end);
         }
         best = arch::_mm256_max_epi16(best, col_best);
     }

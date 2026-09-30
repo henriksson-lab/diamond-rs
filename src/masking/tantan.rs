@@ -7,6 +7,8 @@
 //! Uses a 50-position window HMM with forward-backward algorithm to compute
 //! per-position posterior probability of being in a repeat state.
 
+#[cfg(test)]
+use crate::basic::value::DELIMITER_LETTER;
 use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK, MASK_LETTER, SEED_MASK, TRUE_AA};
 use crate::masking::Ranges;
 use crate::stats::score_matrix::ScoreMatrix;
@@ -20,7 +22,7 @@ const P_REPEAT_END: f32 = 0.05;
 const REPEAT_GROWTH: f32 = 1.0 / 0.9;
 const DEFAULT_MIN_MASK_PROB: f32 = 0.9;
 const WINDOW: usize = 50;
-const EMISSION_ROWS: usize = (LETTER_MASK as usize) + 1;
+const EMISSION_ROWS: usize = AMINO_ACID_COUNT;
 
 #[derive(Default)]
 struct TantanScratch {
@@ -53,7 +55,7 @@ fn x86_backend() -> X86Backend {
     if FORCE_SCALAR.with(Cell::get) {
         return X86Backend::Scalar;
     }
-    if super::tantan_simd::has_avx2_fma() {
+    if super::tantan_simd::has_avx2() {
         X86Backend::Avx2
     } else if super::tantan_simd::has_sse41_ssse3() {
         X86Backend::Sse
@@ -478,11 +480,6 @@ pub fn mask(
         let mut ranges = Ranges::new();
 
         let alphabet_size = AMINO_ACID_COUNT;
-        // letter_mask strips to 5 bits → idx in 0..32. Allocate emission rows for
-        // the full 32-row range so we can index `e[ltr]` safely; rows beyond
-        // AMINO_ACID_COUNT stay zero (matching C++'s typically-zero UB on the
-        // uninitialized tail of likelihoodRatioMatrixf_).
-        let emission_rows = EMISSION_ROWS;
 
         // Tantan HMM parameters
         let b2b = 1.0f32 - p_repeat;
@@ -503,17 +500,56 @@ pub fn mask(
         // letters (B/J/Z/X/*/_, ids 20..25) DO contribute non-zero emissions via the
         // populated 26x26 lr_matrix block. Only DELIMITER (31) and similarly-stripped
         // values read past the 26-column initialized region (C++ UB, typically zero).
-        for aa in 0..emission_rows {
+        // Normal protein records contain only the 26-letter alphabet after
+        // stripping the mask bit. Validate that invariant once, then mirror
+        // upstream's raw-pointer transpose without two bounds checks in each
+        // of the 26 * len cells. Keep a safe zero-filling fallback for the
+        // public low-level API's malformed/custom inputs.
+        let all_letters_valid = seq
+            .iter()
+            .all(|&letter| ((letter & LETTER_MASK) as usize) < alphabet_size);
+        let direct_emissions = likelihood_ratio_matrix.len() >= alphabet_size
+            && likelihood_ratio_matrix[..alphabet_size]
+                .iter()
+                .all(|row| row.len() >= alphabet_size)
+            && all_letters_valid;
+        for aa in 0..alphabet_size {
             let ev = &mut emission[aa];
             ev.resize(len + WINDOW, 0.0);
-            if aa < alphabet_size {
+            if direct_emissions {
+                // SAFETY: the one-time checks above prove every source row and
+                // stripped sequence letter is in bounds; resize established
+                // len + WINDOW initialized destination elements.
+                unsafe {
+                    let source = likelihood_ratio_matrix.get_unchecked(aa).as_ptr();
+                    let destination = ev.as_mut_ptr();
+                    for j in 0..len {
+                        let idx = (*seq.get_unchecked(j) & LETTER_MASK) as usize;
+                        *destination.add(len - 1 - j) = *source.add(idx);
+                    }
+                    std::ptr::write_bytes(destination.add(len), 0, WINDOW);
+                }
+            } else {
                 for j in 0..len {
                     let idx = (seq[j] & LETTER_MASK) as usize;
-                    ev[len - 1 - j] = likelihood_ratio_matrix[aa].get(idx).copied().unwrap_or(0.0);
+                    ev[len - 1 - j] = likelihood_ratio_matrix
+                        .get(aa)
+                        .and_then(|row| row.get(idx))
+                        .copied()
+                        .unwrap_or(0.0);
                 }
                 ev[len..len + WINDOW].fill(0.0);
             }
         }
+        // The public low-level entry point accepts arbitrary encoded bytes.
+        // Upstream reads outside its 26-row pointer table for those values;
+        // define that malformed-input case as a zero-emission row instead.
+        // Normal protein input never allocates this fallback.
+        let invalid_emission = if all_letters_valid {
+            Vec::new()
+        } else {
+            vec![0.0; len + WINDOW]
+        };
 
         let mut f = [0.0f32; WINDOW];
         let mut d_arr = [0.0f32; WINDOW];
@@ -526,7 +562,13 @@ pub fn mask(
         // Forward pass
         for i in 0..len {
             let ltr = (seq[i] & LETTER_MASK) as usize;
-            let e_seg = &emission[ltr][len - i..];
+            let e_row = if ltr < alphabet_size {
+                // SAFETY: the comparison proves the row is in bounds.
+                unsafe { emission.get_unchecked(ltr) }
+            } else {
+                &invalid_emission
+            };
+            let e_seg = &e_row[len - i..];
 
             f_sum = forward_step(&mut f, &d_arr, e_seg, &mut b, f2f, p_repeat_end, b2b, f_sum);
 
@@ -603,7 +645,13 @@ pub fn mask(
             }
 
             let ltr = (seq[i] & LETTER_MASK) as usize;
-            let e_seg = &emission[ltr][len - i..];
+            let e_row = if ltr < alphabet_size {
+                // SAFETY: the comparison proves the row is in bounds.
+                unsafe { emission.get_unchecked(ltr) }
+            } else {
+                &invalid_emission
+            };
+            let e_seg = &e_row[len - i..];
 
             backward_step(&mut f, &d_arr, e_seg, &mut b, f2f, p_repeat_end, b2b);
 
@@ -772,6 +820,22 @@ mod tests {
             2,
         );
         assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn malformed_letters_and_short_matrix_use_zero_emissions() {
+        let mut seq = vec![0, DELIMITER_LETTER, 31, 1, 30, 2];
+        let lr = vec![vec![1.0f32; 2]];
+        let _ = mask(
+            &mut seq,
+            &lr,
+            P_REPEAT,
+            P_REPEAT_END,
+            REPEAT_GROWTH,
+            DEFAULT_MIN_MASK_PROB,
+            0,
+        );
+        assert_eq!(seq, vec![0, DELIMITER_LETTER, 31, 1, 30, 2]);
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub struct Scratch8 {
     prev_h: Vec<V>,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     prev_e: Vec<V>,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    cbs: Vec<V>,
 }
 
 pub fn available() -> bool {
@@ -208,6 +210,13 @@ unsafe fn score_full_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
     scratch.prev_e.resize(rows, neg);
     scratch.prev_h.fill(zero);
     scratch.prev_e.fill(neg);
+    if HAS_CBS {
+        scratch.cbs.clear();
+        scratch.cbs.reserve(query.len());
+        for &bias in cbs.get_unchecked(..query.len()) {
+            scratch.cbs.push(arch::_mm256_set1_epi8(bias));
+        }
+    }
     let go_v = arch::_mm256_set1_epi8(go);
     let ge_v = arch::_mm256_set1_epi8(ge);
     let mut best = zero;
@@ -227,9 +236,7 @@ unsafe fn score_full_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
             let next_diagonal = *scratch.prev_h.get_unchecked(q + 1);
             let mask = valid;
             let cbs_v = if HAS_CBS {
-                // A memory broadcast is cheaper than rebuilding and retaining
-                // a query_len × 32-byte expanded CBS buffer for every batch.
-                arch::_mm256_set1_epi8(*cbs.get_unchecked(q))
+                *scratch.cbs.get_unchecked(q)
             } else {
                 arch::_mm256_setzero_si256()
             };
@@ -386,6 +393,16 @@ unsafe fn score_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
     scratch.prev_e.resize(band + 1, zero);
     scratch.prev_h.fill(zero);
     scratch.prev_e.fill(zero);
+    if HAS_CBS {
+        // Match upstream CBSBuffer: pay one broadcast per query position,
+        // then consume a vector directly in every DP cell. Retaining the
+        // allocation in worker-local scratch avoids a per-batch allocation.
+        scratch.cbs.clear();
+        scratch.cbs.reserve(query.len());
+        for &bias in cbs.get_unchecked(..query.len()) {
+            scratch.cbs.push(arch::_mm256_set1_epi8(bias));
+        }
+    }
     let go_v = arch::_mm256_set1_epi8(go);
     let ge_v = arch::_mm256_set1_epi8(ge);
     let mut best = zero;
@@ -448,38 +465,59 @@ unsafe fn score_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
                 continue;
             }
             let band_mask = *part_masks.get_unchecked(part);
-            for r in r_begin..r_end {
-                // The band and query bounds prove all of these indices. Using
-                // unchecked access removes cold panic branches from each cell.
-                let qi = (moving_i0 + r as i32) as usize;
-                let base = arch::_mm256_adds_epi8(
-                    *profile.get_unchecked((*query.get_unchecked(qi) & LETTER_MASK) as usize),
-                    band_mask,
-                );
-                let bias = if HAS_CBS {
-                    // Keep CBS scalar and broadcast at its use site. The batch
-                    // API would otherwise expand the full query once per 32
-                    // targets, unlike upstream's once-per-query CBS buffer.
-                    arch::_mm256_set1_epi8(*cbs.get_unchecked(qi))
-                } else {
-                    arch::_mm256_setzero_si256()
-                };
-                let subst = arch::_mm256_adds_epi8(base, bias);
-                let diag = arch::_mm256_adds_epi8(*scratch.prev_h.get_unchecked(r), subst);
-                let horizontal =
-                    arch::_mm256_adds_epi8(*scratch.prev_e.get_unchecked(r + 1), band_mask);
-                let mut h = arch::_mm256_max_epi8(diag, horizontal);
-                h = arch::_mm256_max_epi8(h, vertical);
-                if SEMI_GLOBAL {
-                    h = arch::_mm256_max_epi8(h, zero);
-                }
-                let open = arch::_mm256_subs_epi8(h, go_v);
-                let e = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(horizontal, ge_v), open);
-                vertical = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(vertical, ge_v), open);
-                *scratch.prev_h.get_unchecked_mut(r) = h;
-                *scratch.prev_e.get_unchecked_mut(r) = e;
-                col_best = arch::_mm256_max_epi8(col_best, h);
+            let q_start = (moving_i0 + r_begin as i32) as usize;
+            let mut query_ptr = query.as_ptr().add(q_start);
+            let mut cbs_ptr = if HAS_CBS {
+                scratch.cbs.as_ptr().add(q_start)
+            } else {
+                std::ptr::NonNull::<V>::dangling().as_ptr()
+            };
+            let mut r = r_begin;
+            macro_rules! update_cell {
+                () => {{
+                    // The band and query bounds prove all of these indices.
+                    let base = arch::_mm256_adds_epi8(
+                        *profile.get_unchecked((*query_ptr & LETTER_MASK) as usize),
+                        band_mask,
+                    );
+                    let bias = if HAS_CBS {
+                        *cbs_ptr
+                    } else {
+                        arch::_mm256_setzero_si256()
+                    };
+                    let subst = arch::_mm256_adds_epi8(base, bias);
+                    let diag = arch::_mm256_adds_epi8(*scratch.prev_h.get_unchecked(r), subst);
+                    let horizontal =
+                        arch::_mm256_adds_epi8(*scratch.prev_e.get_unchecked(r + 1), band_mask);
+                    let mut h = arch::_mm256_max_epi8(diag, horizontal);
+                    h = arch::_mm256_max_epi8(h, vertical);
+                    if SEMI_GLOBAL {
+                        h = arch::_mm256_max_epi8(h, zero);
+                    }
+                    let open = arch::_mm256_subs_epi8(h, go_v);
+                    let e = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(horizontal, ge_v), open);
+                    vertical = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(vertical, ge_v), open);
+                    *scratch.prev_h.get_unchecked_mut(r) = h;
+                    *scratch.prev_e.get_unchecked_mut(r) = e;
+                    col_best = arch::_mm256_max_epi8(col_best, h);
+                    query_ptr = query_ptr.add(1);
+                    if HAS_CBS {
+                        cbs_ptr = cbs_ptr.add(1);
+                    }
+                    r += 1;
+                }};
             }
+            // Match the native C++ compiler's two-cell unrolling. This keeps
+            // the vertical dependency order exact while halving loop-control
+            // branches in the dominant recurrence.
+            while r + 1 < r_end {
+                update_cell!();
+                update_cell!();
+            }
+            if r < r_end {
+                update_cell!();
+            }
+            debug_assert_eq!(r, r_end);
         }
         best = arch::_mm256_max_epi8(best, col_best);
     }

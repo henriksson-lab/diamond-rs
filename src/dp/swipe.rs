@@ -20,6 +20,7 @@ use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::geo;
 use crate::util::interval::Interval;
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 #[path = "swipe/banded_3frame_swipe.rs"]
@@ -716,15 +717,45 @@ fn traceback_hsp(
     Some(hsp)
 }
 
+#[derive(Default)]
+struct DispatchScratch {
+    score: ScoreScratch,
+    traceback: TracebackScratch,
+    score8: simd_score8::Scratch8,
+    score8_portable: simd_score8_portable::PortableScratch8,
+    score16: simd_score::SimdScoreScratch,
+    score16_portable: simd_score_portable::PortableSimdScoreScratch,
+}
+
+thread_local! {
+    /// C++ gives each alignment worker one monotonic allocation resource.
+    /// Retaining the large DP rows per OS worker provides the same important
+    /// property here: consecutive queries reuse capacity without making the
+    /// result objects allocator-parametric or extending any borrowed data.
+    static DISPATCH_SCRATCH: RefCell<DispatchScratch> = RefCell::new(DispatchScratch::default());
+}
+
 pub fn dispatch_swipe(
     subject_begin: &[DpTarget],
     overflow: &mut TargetVec,
     p: &Params<'_>,
 ) -> Vec<Hsp> {
+    DISPATCH_SCRATCH.with(|scratch| {
+        dispatch_swipe_with_scratch(subject_begin, overflow, p, &mut scratch.borrow_mut())
+    })
+}
+
+fn dispatch_swipe_with_scratch(
+    subject_begin: &[DpTarget],
+    overflow: &mut TargetVec,
+    p: &Params<'_>,
+    scratch: &mut DispatchScratch,
+) -> Vec<Hsp> {
+    if subject_begin.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let bias = p.composition_bias.unwrap_or(&[]);
-    let mut score_scratch = ScoreScratch::default();
-    let mut traceback_scratch = TracebackScratch::default();
 
     // Target-specific composition matrices use per-lane profiles and scaled
     // gap vectors. Keep them in the same byte -> word -> i32 promotion cascade
@@ -746,31 +777,46 @@ pub fn dispatch_swipe(
             _ => 8,
         };
         for chunk in subject_begin.chunks(lane_width) {
-            let lane_targets: Vec<&DpTarget> = chunk
-                .iter()
-                .filter(|target| !target.blank() && !target.seq.is_empty())
-                .collect();
-            let score_targets: Vec<_> = lane_targets
-                .iter()
-                .map(|target| {
-                    let (d_begin, d_end) = if p.flags.any(Flags::FULL_MATRIX) {
-                        (-(target.seq.len() as i32 - 1), p.query.len() as i32)
-                    } else {
-                        (target.d_begin, target.d_end)
-                    };
-                    simd_trace::TraceTarget {
-                        subject: target.seq.as_ref(),
-                        d_begin,
-                        d_end,
-                        matrix: target.matrix.as_deref(),
-                        matrix_scale: target.matrix_scale(),
-                    }
-                })
-                .collect();
+            // Upstream passes a bounded iterator range directly into SWIPE.
+            // Keep the equivalent lane metadata on the stack rather than
+            // allocating two short-lived Vecs for every SIMD batch.
+            let mut lane_targets = [&subject_begin[0]; 32];
+            let mut score_targets = [simd_trace::TraceTarget {
+                subject: &[],
+                d_begin: 0,
+                d_end: 0,
+                matrix: None,
+                matrix_scale: 1,
+            }; 32];
+            let mut lane_count = 0usize;
+            for target in chunk {
+                if target.blank() || target.seq.is_empty() {
+                    continue;
+                }
+                let (d_begin, d_end) = if p.flags.any(Flags::FULL_MATRIX) {
+                    (-(target.seq.len() as i32 - 1), p.query.len() as i32)
+                } else {
+                    (target.d_begin, target.d_end)
+                };
+                lane_targets[lane_count] = target;
+                score_targets[lane_count] = simd_trace::TraceTarget {
+                    subject: target.seq.as_ref(),
+                    d_begin,
+                    d_end,
+                    matrix: target.matrix.as_deref(),
+                    matrix_scale: target.matrix_scale(),
+                };
+                lane_count += 1;
+            }
+            if lane_count == 0 {
+                continue;
+            }
+            let lane_targets = &lane_targets[..lane_count];
+            let score_targets = &score_targets[..lane_count];
             let (scores, overflow_mask) = match score_bin {
                 0 => simd_adjusted_narrow::score_batch_avx2_i8(
                     p.query,
-                    &score_targets,
+                    score_targets,
                     p.score_matrix,
                     bias,
                 )
@@ -778,7 +824,7 @@ pub fn dispatch_swipe(
                 .or_else(|| {
                     simd_trace_narrow_portable::score_batch_i8(
                         p.query,
-                        &score_targets,
+                        score_targets,
                         p.score_matrix,
                         bias,
                     )
@@ -787,7 +833,7 @@ pub fn dispatch_swipe(
                 .unwrap_or((None, 0)),
                 1 => simd_adjusted_narrow::score_batch_avx2_i16(
                     p.query,
-                    &score_targets,
+                    score_targets,
                     p.score_matrix,
                     bias,
                 )
@@ -795,7 +841,7 @@ pub fn dispatch_swipe(
                 .or_else(|| {
                     simd_trace_narrow_portable::score_batch_i16(
                         p.query,
-                        &score_targets,
+                        score_targets,
                         p.score_matrix,
                         bias,
                     )
@@ -805,14 +851,14 @@ pub fn dispatch_swipe(
                 _ => (
                     simd_trace::score_adjusted_batch_avx2(
                         p.query,
-                        &score_targets,
+                        score_targets,
                         p.score_matrix,
                         bias,
                     )
                     .or_else(|| {
                         simd_trace_portable::score_adjusted_batch_portable(
                             p.query,
-                            &score_targets,
+                            score_targets,
                             p.score_matrix,
                             bias,
                         )
@@ -821,7 +867,7 @@ pub fn dispatch_swipe(
                 ),
             };
             for (lane, (&target, score_target)) in
-                lane_targets.iter().zip(&score_targets).enumerate()
+                lane_targets.iter().zip(score_targets).enumerate()
             {
                 if overflow_mask & (1 << lane) != 0 {
                     overflow.push_back(target.clone());
@@ -840,7 +886,7 @@ pub fn dispatch_swipe(
                             bias,
                             target.matrix.as_deref(),
                             target.matrix_scale(),
-                            &mut score_scratch,
+                            &mut scratch.score,
                         )
                     });
                 if let Some(hsp) =
@@ -865,8 +911,6 @@ pub fn dispatch_swipe(
             .iter()
             .all(|target| target.blank() || target.seq.is_empty() || !target.adjusted_matrix())
     {
-        let mut scratch = simd_score8::Scratch8::default();
-        let mut portable_scratch = simd_score8_portable::PortableScratch8::default();
         let lane_width = if simd_score8::available() { 32 } else { 16 };
         for chunk in subject_begin.chunks(lane_width) {
             let mut lanes = [simd_score::ScoreTarget {
@@ -910,7 +954,7 @@ pub fn dispatch_swipe(
                     p.score_matrix,
                     bias,
                     p.flags.any(Flags::SEMI_GLOBAL),
-                    &mut scratch,
+                    &mut scratch.score8,
                 )
                 .or_else(|| {
                     simd_score8_portable::score_full_batch_portable_i8(
@@ -919,7 +963,7 @@ pub fn dispatch_swipe(
                         p.score_matrix,
                         bias,
                         p.flags.any(Flags::SEMI_GLOBAL),
-                        &mut portable_scratch,
+                        &mut scratch.score8_portable,
                     )
                 })
             } else {
@@ -929,7 +973,7 @@ pub fn dispatch_swipe(
                     p.score_matrix,
                     bias,
                     p.flags.any(Flags::SEMI_GLOBAL),
-                    &mut scratch,
+                    &mut scratch.score8,
                 )
                 .or_else(|| {
                     simd_score8_portable::score_batch_portable_i8(
@@ -938,7 +982,7 @@ pub fn dispatch_swipe(
                         p.score_matrix,
                         bias,
                         p.flags.any(Flags::SEMI_GLOBAL),
-                        &mut portable_scratch,
+                        &mut scratch.score8_portable,
                     )
                 })
             };
@@ -958,7 +1002,7 @@ pub fn dispatch_swipe(
                         bias,
                         None,
                         1,
-                        &mut score_scratch,
+                        &mut scratch.score,
                     );
                     if let Some(hsp) = score_only_hsp(target, score, d_begin, d_end, p) {
                         out.push(hsp);
@@ -992,8 +1036,6 @@ pub fn dispatch_swipe(
             .iter()
             .all(|target| target.blank() || target.seq.is_empty() || !target.adjusted_matrix())
     {
-        let mut simd_scratch = simd_score::SimdScoreScratch::default();
-        let mut portable_scratch = simd_score_portable::PortableSimdScoreScratch::default();
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         let lane_width = if std::arch::is_x86_feature_detected!("avx2") {
             16
@@ -1043,7 +1085,7 @@ pub fn dispatch_swipe(
                     &subjects[..lane_count],
                     p.score_matrix,
                     bias,
-                    &mut simd_scratch,
+                    &mut scratch.score16,
                 )
                 .or_else(|| {
                     simd_score_portable::score_full_batch_portable_i16(
@@ -1051,7 +1093,7 @@ pub fn dispatch_swipe(
                         &subjects[..lane_count],
                         p.score_matrix,
                         bias,
-                        &mut portable_scratch,
+                        &mut scratch.score16_portable,
                     )
                 })
             } else {
@@ -1060,7 +1102,7 @@ pub fn dispatch_swipe(
                     &lanes[..lane_count],
                     p.score_matrix,
                     bias,
-                    &mut simd_scratch,
+                    &mut scratch.score16,
                 )
                 .or_else(|| {
                     simd_score_portable::score_batch_portable_i16(
@@ -1068,7 +1110,7 @@ pub fn dispatch_swipe(
                         &lanes[..lane_count],
                         p.score_matrix,
                         bias,
-                        &mut portable_scratch,
+                        &mut scratch.score16_portable,
                     )
                 })
             };
@@ -1088,7 +1130,7 @@ pub fn dispatch_swipe(
                         bias,
                         None,
                         1,
-                        &mut score_scratch,
+                        &mut scratch.score,
                     );
                     if let Some(hsp) = score_only_hsp(target, score, d_begin, d_end, p) {
                         out.push(hsp);
@@ -1120,7 +1162,7 @@ pub fn dispatch_swipe(
                         bias,
                         None,
                         1,
-                        &mut score_scratch,
+                        &mut scratch.score,
                     )
                 } else {
                     batch.scores[lane]
@@ -1152,45 +1194,57 @@ pub fn dispatch_swipe(
         };
         let mut reversed_sequences: [Vec<Letter>; 32] = std::array::from_fn(|_| Vec::new());
         for chunk in subject_begin.chunks(lane_width) {
-            let lane_targets: Vec<&DpTarget> = chunk
-                .iter()
-                .filter(|target| !target.blank() && !target.seq.is_empty())
-                .collect();
-            if lane_targets.is_empty() {
+            // These are fixed-width upstream SIMD lanes. Stack storage avoids
+            // allocator traffic for lane references and TraceTarget metadata
+            // in every final-pass batch.
+            let mut lane_targets = [&subject_begin[0]; 32];
+            let mut lane_count = 0usize;
+            for target in chunk {
+                if !target.blank() && !target.seq.is_empty() {
+                    lane_targets[lane_count] = target;
+                    lane_count += 1;
+                }
+            }
+            if lane_count == 0 {
                 continue;
             }
             if p.reverse_targets {
-                for (lane, target) in lane_targets.iter().enumerate() {
+                for (lane, target) in lane_targets[..lane_count].iter().enumerate() {
                     reversed_sequences[lane].clear();
                     reversed_sequences[lane].extend(target.seq.iter().rev().copied());
                 }
             }
-            let trace_targets: Vec<_> = lane_targets
-                .iter()
-                .enumerate()
-                .map(|(lane, target)| {
-                    let subject = if p.reverse_targets {
-                        reversed_sequences[lane].as_slice()
-                    } else {
-                        target.seq.as_ref()
-                    };
-                    let (d_begin, d_end) = if p.flags.any(Flags::FULL_MATRIX) {
-                        (-(subject.len() as i32 - 1), p.query.len() as i32)
-                    } else {
-                        (target.d_begin, target.d_end)
-                    };
-                    simd_trace::TraceTarget {
-                        subject,
-                        d_begin,
-                        d_end,
-                        matrix: target.matrix.as_deref(),
-                        matrix_scale: target.matrix_scale(),
-                    }
-                })
-                .collect();
+            let mut trace_targets = [simd_trace::TraceTarget {
+                subject: &[],
+                d_begin: 0,
+                d_end: 0,
+                matrix: None,
+                matrix_scale: 1,
+            }; 32];
+            for (lane, target) in lane_targets[..lane_count].iter().enumerate() {
+                let subject = if p.reverse_targets {
+                    reversed_sequences[lane].as_slice()
+                } else {
+                    target.seq.as_ref()
+                };
+                let (d_begin, d_end) = if p.flags.any(Flags::FULL_MATRIX) {
+                    (-(subject.len() as i32 - 1), p.query.len() as i32)
+                } else {
+                    (target.d_begin, target.d_end)
+                };
+                trace_targets[lane] = simd_trace::TraceTarget {
+                    subject,
+                    d_begin,
+                    d_end,
+                    matrix: target.matrix.as_deref(),
+                    matrix_scale: target.matrix_scale(),
+                };
+            }
+            let lane_targets = &lane_targets[..lane_count];
+            let trace_targets = &trace_targets[..lane_count];
             let Some(batch) = simd_trace::trace_batch_tier_avx2(
                 p.query,
-                &trace_targets,
+                trace_targets,
                 p.score_matrix,
                 bias,
                 score_bin,
@@ -1199,13 +1253,13 @@ pub fn dispatch_swipe(
                 let narrow = match score_bin {
                     0 => simd_trace_narrow_portable::trace_batch_i8(
                         p.query,
-                        &trace_targets,
+                        trace_targets,
                         p.score_matrix,
                         bias,
                     ),
                     1 => simd_trace_narrow_portable::trace_batch_i16(
                         p.query,
-                        &trace_targets,
+                        trace_targets,
                         p.score_matrix,
                         bias,
                     ),
@@ -1219,7 +1273,7 @@ pub fn dispatch_swipe(
             .or_else(|| {
                 simd_trace_portable::trace_batch_portable(
                     p.query,
-                    &trace_targets,
+                    trace_targets,
                     p.score_matrix,
                     bias,
                 )
@@ -1230,7 +1284,7 @@ pub fn dispatch_swipe(
             }) else {
                 // Runtime fallback is handled by the scalar loop below. This
                 // only occurs on a non-AVX2 host or unsupported input.
-                for (&target, trace_target) in lane_targets.iter().zip(&trace_targets) {
+                for (&target, trace_target) in lane_targets.iter().zip(trace_targets) {
                     let sw = banded_sw_cbs_range(
                         p.query,
                         trace_target.subject,
@@ -1240,7 +1294,7 @@ pub fn dispatch_swipe(
                         bias,
                         target.matrix.as_deref(),
                         target.matrix_scale(),
-                        &mut traceback_scratch,
+                        &mut scratch.traceback,
                     );
                     if let Some(hsp) = traceback_hsp(
                         target,
@@ -1257,7 +1311,7 @@ pub fn dispatch_swipe(
             };
             for (lane, ((&target, trace_target), sw)) in lane_targets
                 .iter()
-                .zip(&trace_targets)
+                .zip(trace_targets)
                 .zip(batch.results)
                 .enumerate()
             {
@@ -1307,7 +1361,7 @@ pub fn dispatch_swipe(
                 bias,
                 target.matrix.as_deref(),
                 target.matrix_scale(),
-                &mut score_scratch,
+                &mut scratch.score,
             );
             if let Some(hsp) = score_only_hsp(target, sw_score, d_begin, d_end, p) {
                 out.push(hsp);
@@ -1323,7 +1377,7 @@ pub fn dispatch_swipe(
             bias,
             target.matrix.as_deref(),
             target.matrix_scale(),
-            &mut traceback_scratch,
+            &mut scratch.traceback,
         );
         if let Some(hsp) = traceback_hsp(target, target_seq, d_begin, d_end, sw, p) {
             out.push(hsp);

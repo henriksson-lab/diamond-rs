@@ -6,6 +6,7 @@ DIAMOND is a high-performance sequence aligner for protein and translated DNA se
 
 **This crate is under translation. Do not use it. Do not trust any text below**
 
+* 2026-09-30: More optimization
 * 2026-09-28: Ondisk blastp mode, but also faster inmem mode (not in original). Parity on broader datasets
 * 2006-09-27: Closing the gaps in translation, optimization. Some more work left
 * 2026-08-01: CI added. Full translation is blocked until BLAST is translated
@@ -263,8 +264,8 @@ The benchmark driver and full fixture details are in
 
 ### Bundled smoke benchmark
 
-The table below uses bundled test data, measured with the same reproducible
-x86-64-v3 build, one thread, and `/usr/bin/time` (median of 5 runs):
+The table below uses bundled test data, measured with the same native-CPU
+release build, one thread, and `/usr/bin/time` (median of 5 runs):
 
 | Operation | Input | C++ Original | Rust (Native) | Speedup | Peak RSS Ratio (Rust/C++) |
 |-----------|-------|--------------|---------------|---------|---------------------------|
@@ -284,7 +285,9 @@ protein dataset, reports median wall time and peak RSS for `makedb` and
 `blastp`, and compares a stable 12-column blastp output byte-for-byte. It exits
 nonzero and retains a unified diff when parity fails. Quick smoke runs can use
 `REPETITIONS=1`; `REFERENCE_FASTA`, `QUERY_FASTA`, `THREADS`, `RUST_BIN`, and
-`CPP_BIN` can be overridden for later scaling experiments. Set
+`CPP_BIN` can be overridden for later scaling experiments. To benchmark
+existing equivalent databases without rebuilding, set both `CPP_DB` and
+`RUST_DB` to their database paths (with or without `.dmnd`). Set
 `RUST_MEMORY_LIMIT=0G` for the upstream-compatible forced-disk comparison.
 
 The broader matrix exercises both the 16 GB adaptive default and immediate
@@ -370,16 +373,16 @@ byte-identical (SHA-256 `6ea16d64c71f833970aa8f045adbf0cd22a35c2706c69cebbc883f0
 The translated-search comparison uses one natural contiguous 250,000 nt
 region from *E. coli* K-12 MG1655 against the independent 4,000-protein AMR
 reference above, with `--sensitive`. It is not made longer by repeating reads.
-These are medians of three alternating runs pinned to the same CPUs. All four
+These are medians of five alternating runs. All four
 cases emit the same 25 rows with SHA-256
 `05b35eb5a1a6f89425ae58fe120c12eff0dbe19c3ff9c3d1944bc7e339124bb6`.
 
 | Rust memory mode | Threads | Runs | C++ time | Rust time | Speed | C++ RSS | Rust RSS | RSS ratio | Parity |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-| Default 16G | 1 | 3 | 3.09 s | 1.89 s | 1.635x | 80,180 KiB | 77,464 KiB | 0.966x | PASS |
-| Default 16G | 4 | 3 | 1.54 s | 0.95 s | 1.621x | 81,612 KiB | 78,380 KiB | 0.960x | PASS |
-| Forced disk, 0G | 1 | 3 | 2.98 s | 1.84 s | 1.620x | 80,184 KiB | 77,712 KiB | 0.969x | PASS |
-| Forced disk, 0G | 4 | 3 | 1.64 s | 1.00 s | 1.640x | 82,600 KiB | 79,072 KiB | 0.957x | PASS |
+| Default 16G | 1 | 5 | 5.22 s | 2.09 s | 2.498x | 77,192 KiB | 80,204 KiB | 1.039x | PASS |
+| Default 16G | 4 | 5 | 2.51 s | 0.99 s | 2.535x | 80,308 KiB | 81,332 KiB | 1.013x | PASS |
+| Forced disk, 0G | 1 | 5 | 5.17 s | 1.74 s | 2.971x | 77,308 KiB | 80,776 KiB | 1.045x | PASS |
+| Forced disk, 0G | 4 | 5 | 2.61 s | 0.98 s | 2.663x | 80,756 KiB | 81,536 KiB | 1.010x | PASS |
 
 The blastx path keeps each DNA query's six translated contexts together, then
 culls globally and traces only the retained targets, matching upstream rather
@@ -387,8 +390,8 @@ than applying `-k` independently to every frame. Seed arrays are built,
 sorted, and joined once per shape; their parallel fill uses exact per-worker
 partition ranges instead of one contended atomic increment per seed. For long
 translated queries, Tantan masking reuses one workspace instead of retaining
-one large workspace per Rayon worker. Together these changes make Rust faster
-and lower-RSS in all four measured modes. The `0G` rows exercise the same
+one large workspace per Rayon worker. Rust is substantially faster on this
+short fixture; its peak RSS is within 1--5% of C++. The `0G` rows exercise the same
 compressed temporary-bin spill path used after the default 16 GB soft limit
 is reached.
 
@@ -396,26 +399,50 @@ As a separate multi-query coverage check, a natural 42-contig bacterial
 assembly (2,476,164 nt; SHA-256
 `b1be888ba95d0d9daaa6844063b8b1c1b3074d8a133e99b5e208e34b3fe061ce`)
 was searched against the same 4,000-protein database with `--very-sensitive`.
-These are three-run alternating medians pinned to CPU 10 or CPUs 10–13.
+These are three-run alternating medians. The host had other active jobs, so
+the implementations alternate first-run order and the counter check below is
+CPU-pinned.
 
 | Rust memory mode | Threads | Runs | C++ time | Rust time | Speed ratio | C++ RSS | Rust RSS | RSS ratio | Byte parity |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
-| Default 16G | 1 | 3 | 8.77 s | 10.74 s | 0.817x | 344,552 KiB | 161,504 KiB | 0.469x | PASS (531 rows) |
-| Default 16G | 4 | 3 | 6.18 s | 3.83 s | 1.614x | 366,324 KiB | 212,276 KiB | 0.580x | PASS (531 rows) |
-| Forced disk, 0G | 1 | 3 | 8.26 s | 10.14 s | 0.815x | 344,552 KiB | 162,224 KiB | 0.471x | PASS (531 rows) |
-| Forced disk, 0G | 4 | 3 | 6.18 s | 3.89 s | 1.589x | 366,380 KiB | 209,260 KiB | 0.571x | PASS (531 rows) |
+| Default 16G | 1 | 3 | 8.93 s | 8.70 s | 1.026x | 347,680 KiB | 170,532 KiB | 0.490x | PASS (531 rows) |
+| Default 16G | 4 | 3 | 6.63 s | 3.44 s | 1.927x | 359,140 KiB | 226,888 KiB | 0.632x | PASS (531 rows) |
+| Forced disk, 0G | 1 | 3 | 8.95 s | 8.84 s | 1.012x | 347,872 KiB | 170,184 KiB | 0.489x | PASS (531 rows) |
+| Forced disk, 0G | 4 | 3 | 6.67 s | 3.42 s | 1.950x | 363,280 KiB | 236,892 KiB | 0.652x | PASS (531 rows) |
 
 The very-sensitive output is byte-identical (SHA-256
 `48b11ee5f4932930510d21d46c1843026fa4e6322a330721fa434c987e9d04f2`).
-The four-thread Rust path is 1.59–1.61x faster and uses 42–43% less RSS on this
-larger workload. The one-thread path uses about 53% less RSS but remains about
-22% slower, which is still an optimization target rather than a hidden
-average. Compact i16 traceback stores four bits per live lane for batches of
-up to eight targets; this removes the former multi-hundred-megabyte traceback
-spike. Forced-disk translated search coalesces adjacent decoded bins into a
+The four-thread Rust path is 1.93–1.95x faster and uses 35–37% less RSS on this
+larger workload. The one-thread path is 1–3% faster while using about 51% less
+RSS. Compact i16 traceback uses four-bit nibbles for batches of one to six
+targets and four byte-wide bit planes for batches of seven or eight. The
+layout choice is hoisted above the DP loop with const generics; the bit-plane
+case removes BMI2 deposit work only where both layouts occupy the same four
+bytes per cell. Score, horizontal-gap, and row-mask buffers retain capacity per
+alignment worker, matching upstream's thread-local `MemBuffer` lifetime, while
+the much larger traceback allocation remains call-local. Translated workers
+also retain their flattened-hit and six Hauser-CBS buffers across source
+queries. Stage 1 reuses worker-local match batches and compact sequence-offset
+locators, and updates the raw-match atomic only once per partition. The AVX2
+i8 and i16 score recurrences process two cells per loop iteration, reducing
+the hot path's branch count without changing its operation order. Forced-disk
+translated search coalesces adjacent decoded bins into a
 bounded 64 MiB extension window. Hits are still written to and read from the
 compressed spill files; the window restores worker utilization without
-duplicating hit records.
+duplicating retained hit records.
+
+A final pinned one-thread hardware-counter run on this fixture retired 68.68
+billion instructions and 27.18 billion cycles. The comparable upstream run
+retired 72.15 billion instructions and 25.73 billion cycles; the repeated
+alternating wall-clock results above therefore remain the primary end-to-end
+measurement. Repeated validation covered default 16G and forced-disk 0G at one
+and four threads on both natural blastx fixtures; all 32 outputs matched the
+hashes above. Wall-time measurements were repeated because this host was
+shared. An upstream-dense traceback experiment raised Rust RSS to about 352
+MiB without improving time, so the compact hybrid layout was retained.
+One-run post-change parity checks also passed with CBS disabled, masking
+disabled, plus-only and minus-only strands, genetic code 11, and the extended
+translated-query output schema.
 
 For optimization work, use the larger real-sequence harness rather than
 duplicating the bundled records:

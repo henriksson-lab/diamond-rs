@@ -6,6 +6,8 @@ rust_bin=${RUST_BIN:-"$repo_dir/target/release/diamond"}
 cpp_bin=${CPP_BIN:-"$repo_dir/diamond/build/diamond"}
 reference=${REFERENCE_FASTA:-"$repo_dir/diamond/src/test/data.faa"}
 query=${QUERY_FASTA:-"$repo_dir/diamond/src/test/5.faa"}
+cpp_db_override=${CPP_DB:-}
+rust_db_override=${RUST_DB:-}
 repetitions=${REPETITIONS:-3}
 threads=${THREADS:-1}
 keep_work=${KEEP_WORK:-0}
@@ -47,8 +49,26 @@ if [[ ! -x /usr/bin/time ]]; then
     echo "error: /usr/bin/time is required for peak-RSS measurement" >&2
     exit 2
 fi
-if [[ ! -s "$reference" || ! -s "$query" ]]; then
-    echo "error: reference and query FASTA files must be nonempty" >&2
+if [[ -n "$cpp_db_override" && -z "$rust_db_override" ]] || \
+    [[ -z "$cpp_db_override" && -n "$rust_db_override" ]]; then
+    echo "error: CPP_DB and RUST_DB must either both be set or both be unset" >&2
+    exit 2
+fi
+use_prebuilt_db=0
+if [[ -n "$cpp_db_override" ]]; then
+    use_prebuilt_db=1
+    cpp_db_override=${cpp_db_override%.dmnd}
+    rust_db_override=${rust_db_override%.dmnd}
+    if [[ ! -s "$cpp_db_override.dmnd" || ! -s "$rust_db_override.dmnd" ]]; then
+        echo "error: CPP_DB and RUST_DB must name nonempty DIAMOND databases" >&2
+        exit 2
+    fi
+elif [[ ! -s "$reference" ]]; then
+    echo "error: reference FASTA must be nonempty" >&2
+    exit 2
+fi
+if [[ ! -s "$query" ]]; then
+    echo "error: query FASTA must be nonempty" >&2
     exit 2
 fi
 if [[ ! "$repetitions" =~ ^[1-9][0-9]*$ || ! "$threads" =~ ^[1-9][0-9]*$ ]]; then
@@ -60,18 +80,9 @@ if [[ ${SKIP_BUILD:-0} != 1 ]]; then
     echo "Building Rust release binary..." >&2
     benchmark_rustflags=${RUSTFLAGS:-}
     if [[ -z "$benchmark_rustflags" ]]; then
-        # Upstream's alignment translation unit is AVX2. On AVX-512 x86 CPUs,
-        # letting LLVM use the extended EVEX register file in those long DP
-        # loops lowers their sustained clock. Keep general code at AVX2 while
-        # runtime-selected search kernels explicitly re-enable AVX-512BW.
-        case $(uname -m) in
-            x86_64 | i?86)
-                benchmark_rustflags='-C target-cpu=native -C target-feature=-avx512f,-avx512dq,-avx512cd,-avx512bw,-avx512vl'
-                ;;
-            *)
-                benchmark_rustflags='-C target-cpu=native'
-                ;;
-        esac
+        # Match the vendored C++ release build's native-CPU policy. Individual
+        # kernels still perform their own runtime feature dispatch.
+        benchmark_rustflags='-C target-cpu=native'
     fi
     RUSTFLAGS="$benchmark_rustflags" cargo build \
         --manifest-path "$repo_dir/Cargo.toml" --release --offline
@@ -113,11 +124,18 @@ fasta_stats() {
     '
 }
 
-IFS=$'\t' read -r reference_records reference_residues < <(fasta_stats "$reference")
 IFS=$'\t' read -r query_records query_residues < <(fasta_stats "$query")
-printf 'Workload: reference=%s records/%s residues; query=%s records/%s residues; threads=%s; runs=%s\n' \
-    "$reference_records" "$reference_residues" "$query_records" "$query_residues" \
-    "$threads" "$repetitions"
+if ((use_prebuilt_db)); then
+    printf 'Workload: prebuilt databases; query=%s records/%s residues; threads=%s; runs=%s\n' \
+        "$query_records" "$query_residues" "$threads" "$repetitions"
+    printf 'C++ database: %s.dmnd\nRust database: %s.dmnd\n' \
+        "$cpp_db_override" "$rust_db_override"
+else
+    IFS=$'\t' read -r reference_records reference_residues < <(fasta_stats "$reference")
+    printf 'Workload: reference=%s records/%s residues; query=%s records/%s residues; threads=%s; runs=%s\n' \
+        "$reference_records" "$reference_residues" "$query_records" "$query_residues" \
+        "$threads" "$repetitions"
+fi
 printf 'Search mode: %s' "$search_command"
 if ((${#search_args[@]})); then
     printf ' %q' "${search_args[@]}"
@@ -135,8 +153,10 @@ if [[ -n "$rust_memory_limit" ]]; then
 else
     printf 'Rust hit-buffer memory limit: 16G (native default; adaptive spill)\n'
 fi
-printf 'Reference SHA-256: '
-sha256sum "$reference" | awk '{ print $1 }'
+if ((!use_prebuilt_db)); then
+    printf 'Reference SHA-256: '
+    sha256sum "$reference" | awk '{ print $1 }'
+fi
 printf 'Query SHA-256: '
 sha256sum "$query" | awk '{ print $1 }'
 
@@ -165,31 +185,42 @@ measure() {
         "$implementation" "$operation" "$run" "$seconds" "$rss" >> "$metrics"
 }
 
-cpp_db="$work_dir/cpp-db"
-rust_db="$work_dir/rust-db"
-cpp_output="$work_dir/cpp.tsv"
-rust_output="$work_dir/rust.tsv"
+if ((use_prebuilt_db)); then
+    cpp_db=$cpp_db_override
+    rust_db=$rust_db_override
+else
+    cpp_db="$work_dir/cpp-db"
+    rust_db="$work_dir/rust-db"
+fi
+cpp_output=
+rust_output=
 outfmt=(6 "${outfmt[@]}")
 rust_search_extra=()
 if [[ -n "$rust_memory_limit" ]]; then
     rust_search_extra+=(--memory-limit "$rust_memory_limit" --tmpdir "$work_dir")
 fi
 
-for run in $(seq 1 "$repetitions"); do
-    rm -f -- "$cpp_db.dmnd" "$rust_db.dmnd"
-    measure cpp makedb "$run" "$cpp_bin" makedb --in "$reference" --db "$cpp_db" \
-        --threads "$threads"
-    measure rust makedb "$run" "$rust_bin" makedb --in "$reference" --db "$rust_db" \
-        --threads "$threads"
-done
+parity=PASS
+expected_output_sha256=${EXPECTED_OUTPUT_SHA256:-}
+if ((!use_prebuilt_db)); then
+    for run in $(seq 1 "$repetitions"); do
+        rm -f -- "$cpp_db.dmnd" "$rust_db.dmnd"
+        measure cpp makedb "$run" "$cpp_bin" makedb --in "$reference" --db "$cpp_db" \
+            --threads "$threads"
+        measure rust makedb "$run" "$rust_bin" makedb --in "$reference" --db "$rust_db" \
+            --threads "$threads"
+    done
 
-# Build fresh databases outside the blastp measurements.
-"$cpp_bin" makedb --in "$reference" --db "$cpp_db" --threads "$threads" \
-    >"$work_dir/cpp-makedb.stdout" 2>"$work_dir/cpp-makedb.stderr"
-"$rust_bin" makedb --in "$reference" --db "$rust_db" --threads "$threads" \
-    >"$work_dir/rust-makedb.stdout" 2>"$work_dir/rust-makedb.stderr"
+    # Build fresh databases outside the search measurements.
+    "$cpp_bin" makedb --in "$reference" --db "$cpp_db" --threads "$threads" \
+        >"$work_dir/cpp-makedb.stdout" 2>"$work_dir/cpp-makedb.stderr"
+    "$rust_bin" makedb --in "$reference" --db "$rust_db" --threads "$threads" \
+        >"$work_dir/rust-makedb.stdout" 2>"$work_dir/rust-makedb.stderr"
+fi
 
 for run in $(seq 1 "$repetitions"); do
+    cpp_output="$work_dir/cpp-${run}.tsv"
+    rust_output="$work_dir/rust-${run}.tsv"
     if ((run % 2)); then
         implementations=(cpp rust)
     else
@@ -206,14 +237,20 @@ for run in $(seq 1 "$repetitions"); do
                 "${rust_search_extra[@]}" "${search_args[@]}" --outfmt "${outfmt[@]}"
         fi
     done
+    if ! cmp -s -- "$cpp_output" "$rust_output"; then
+        parity=FAIL
+        diff -u -- "$cpp_output" "$rust_output" > "$work_dir/parity-run-${run}.diff" || true
+    fi
+    if [[ -n "$expected_output_sha256" ]]; then
+        cpp_sha=$(sha256sum "$cpp_output" | awk '{print $1}')
+        rust_sha=$(sha256sum "$rust_output" | awk '{print $1}')
+        if [[ "$cpp_sha" != "$expected_output_sha256" || "$rust_sha" != "$expected_output_sha256" ]]; then
+            parity=FAIL
+            printf 'error: run %s output hash differs from EXPECTED_OUTPUT_SHA256=%s (C++=%s, Rust=%s)\n' \
+                "$run" "$expected_output_sha256" "$cpp_sha" "$rust_sha" >&2
+        fi
+    fi
 done
-
-parity=FAIL
-if cmp -s -- "$cpp_output" "$rust_output"; then
-    parity=PASS
-else
-    diff -u -- "$cpp_output" "$rust_output" > "$work_dir/parity.diff" || true
-fi
 
 median() {
     local implementation=$1
@@ -246,7 +283,11 @@ spread() {
 }
 
 printf '\n%-8s %-8s %12s %14s\n' implementation operation seconds peak_rss_kib
-for operation in makedb "$search_command"; do
+operations=("$search_command")
+if ((!use_prebuilt_db)); then
+    operations=(makedb "$search_command")
+fi
+for operation in "${operations[@]}"; do
     for implementation in cpp rust; do
         printf '%-8s %-8s %12s %14s\n' \
             "$implementation" "$operation" \
@@ -267,7 +308,8 @@ awk -v cpp="$cpp_rss" -v rust="$rust_rss" \
     'BEGIN { printf "%s RSS ratio (Rust/C++): %.3fx\n", command, rust / cpp }'
 printf 'C++ %s timing: %s\n' "$search_command" "$(spread cpp "$search_command")"
 printf 'Rust %s timing: %s\n' "$search_command" "$(spread rust "$search_command")"
-printf '%s byte parity: %s\n' "$search_command" "$parity"
+printf '%s byte parity across all %s run pairs: %s\n' \
+    "$search_command" "$repetitions" "$parity"
 printf 'C++ SHA-256: '
 sha256sum "$cpp_output" | awk '{print $1}'
 printf 'Rust SHA-256: '
@@ -290,7 +332,7 @@ else
 fi
 
 if [[ "$parity" != PASS ]]; then
-    echo "parity diff: $work_dir/parity.diff" >&2
+    echo "parity artifacts: $work_dir/parity-run-*.diff" >&2
     keep_work=1
     exit 1
 fi

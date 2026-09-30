@@ -732,6 +732,14 @@ where
 {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[derive(Default)]
+    struct VisitScratch {
+        query_locs: Vec<(u32, u32)>,
+        target_locs: Vec<(u32, u32)>,
+        target_subjects: Vec<u64>,
+        batch: Vec<SeedMatch>,
+    }
+
     let seedp_bits = DEFAULT_SEEDP_BITS;
     let PreparedSeedJoin {
         query: query_sa,
@@ -742,6 +750,8 @@ where
     let num_partitions = query_sa.num_partitions();
     let query_offsets = query_sa.seq_offsets().to_vec();
     let ref_offsets = ref_sa.seq_offsets().to_vec();
+    let query_locator = super::seed_array::SeqOffsetLocator::new(&query_offsets);
+    let ref_locator = super::seed_array::SeqOffsetLocator::new(&ref_offsets);
 
     let raw_count = AtomicUsize::new(0);
     // Aggregate once per partition, rather than once per hit, so exposing the
@@ -759,30 +769,36 @@ where
     let process = |partition: usize,
                    query_part: &[super::seed_array::SeedEntry],
                    ref_part: &[super::seed_array::SeedEntry],
-                   blocks: &super::seed_array::PartitionBlocks| {
+                   blocks: &super::seed_array::PartitionBlocks,
+                   scratch: &mut VisitScratch| {
         let mut output = Vec::new();
+        let mut partition_raw_count = 0usize;
         let mut partition_hamming_count = 0usize;
         let mut partition_ungapped_count = 0usize;
         // C++ keeps the decoded locations in its per-worker WorkSet. Reuse
         // these two buffers across joined seed groups in the partition rather
         // than allocating a pair of Vecs for every group.
-        let mut query_locs = Vec::new();
-        let mut target_locs = Vec::new();
-        let mut target_subjects = Vec::new();
+        let VisitScratch {
+            query_locs,
+            target_locs,
+            target_subjects,
+            batch,
+        } = scratch;
+        if batch.capacity() < 32 {
+            batch.reserve(32 - batch.capacity());
+        }
         for block in &blocks.blocks {
-            raw_count.fetch_add(
-                block.q_count as usize * block.r_count as usize,
-                Ordering::Relaxed,
-            );
+            partition_raw_count += block.q_count as usize * block.r_count as usize;
             query_locs.clear();
-            query_locs.extend((block.q_start..block.q_start + block.q_count).map(|index| {
-                super::seed_array::decode_seq_pos(&query_offsets, query_part[index as usize])
-            }));
+            query_locs.extend(
+                (block.q_start..block.q_start + block.q_count)
+                    .map(|index| query_locator.decode(query_part[index as usize])),
+            );
             target_locs.clear();
             target_subjects.clear();
             for index in block.r_start..block.r_start + block.r_count {
                 let entry = ref_part[index as usize];
-                let target = super::seed_array::decode_seq_pos(&ref_offsets, entry);
+                let target = ref_locator.decode(entry);
                 // SeedEntry locations omit SequenceSet's perimeter and record
                 // delimiters. Convert once per distinct target, then reuse the
                 // absolute backing position across the whole query cross
@@ -793,7 +809,7 @@ where
                 target_locs.push(target);
                 target_subjects.push(subject);
             }
-            let mut batch = Vec::with_capacity(32);
+            batch.clear();
             let mut last_query = None;
             crate::search::hamming_filter::visit_hamming_group_for::<HAMMING_KERNEL, _>(
                 &query_locs,
@@ -833,6 +849,7 @@ where
                 partition_ungapped_count += map_batch(&batch, &mut output);
             }
         }
+        raw_count.fetch_add(partition_raw_count, Ordering::Relaxed);
         hamming_count.fetch_add(partition_hamming_count, Ordering::Relaxed);
         ungapped_count.fetch_add(partition_ungapped_count, Ordering::Relaxed);
         output
@@ -840,6 +857,7 @@ where
 
     let batch_size = partition_batch_size.max(1).min(num_partitions.max(1));
     if rayon::current_num_threads() == 1 {
+        let mut scratch = VisitScratch::default();
         for begin in (0..num_partitions).step_by(batch_size) {
             let end = (begin + batch_size).min(num_partitions);
             let output = query_parts[begin..end]
@@ -848,7 +866,7 @@ where
                 .zip(blocks[begin..end].iter())
                 .enumerate()
                 .map(|(offset, ((query_part, ref_part), blocks))| {
-                    process(begin + offset, query_part, ref_part, blocks)
+                    process(begin + offset, query_part, ref_part, blocks, &mut scratch)
                 })
                 .collect();
             consume(output);
@@ -863,6 +881,9 @@ where
         // active jobs + buffered outputs at or below `batch_size`.
         let (sender, receiver) = std::sync::mpsc::channel();
         let receiver = std::sync::Mutex::new(receiver);
+        let worker_scratch: Vec<std::sync::Mutex<VisitScratch>> = (0..rayon::current_num_threads())
+            .map(|_| std::sync::Mutex::new(VisitScratch::default()))
+            .collect();
         rayon::scope(|scope| {
             let mut pending = query_parts
                 .iter()
@@ -876,8 +897,13 @@ where
                 };
                 let sender = sender.clone();
                 let process = &process;
+                let worker_scratch = &worker_scratch;
                 scope.spawn(move |_| {
-                    let output = process(partition, query_part, ref_part, blocks);
+                    let worker = rayon::current_thread_index().unwrap_or(0);
+                    let mut scratch = worker_scratch[worker]
+                        .lock()
+                        .expect("stage-1 worker scratch poisoned");
+                    let output = process(partition, query_part, ref_part, blocks, &mut scratch);
                     sender
                         .send((partition, output))
                         .expect("stage-1 result receiver dropped");
@@ -920,8 +946,13 @@ where
                     };
                     let sender = sender.clone();
                     let process = &process;
+                    let worker_scratch = &worker_scratch;
                     scope.spawn(move |_| {
-                        let output = process(partition, query_part, ref_part, blocks);
+                        let worker = rayon::current_thread_index().unwrap_or(0);
+                        let mut scratch = worker_scratch[worker]
+                            .lock()
+                            .expect("stage-1 worker scratch poisoned");
+                        let output = process(partition, query_part, ref_part, blocks, &mut scratch);
                         sender
                             .send((partition, output))
                             .expect("stage-1 result receiver dropped");
