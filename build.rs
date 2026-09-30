@@ -23,7 +23,6 @@ fn build() {
     // System dependencies that DIAMOND requires
     println!("cargo:rustc-link-lib=z");
     println!("cargo:rustc-link-lib=pthread");
-    println!("cargo:rustc-link-lib=sqlite3");
     println!("cargo:rustc-link-lib=dl");
 
     // Rerun if C++ sources change

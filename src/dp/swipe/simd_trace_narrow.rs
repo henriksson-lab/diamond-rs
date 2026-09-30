@@ -17,7 +17,7 @@ pub struct NarrowTraceBatch {
 pub fn trace_batch_i8(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
-    score_matrix: &ScoreMatrix,
+    _score_matrix: &ScoreMatrix,
     query_cbs: &[i8],
 ) -> Option<NarrowTraceBatch> {
     if targets.is_empty()
@@ -30,7 +30,7 @@ pub fn trace_batch_i8(
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: AVX2 is runtime-detected and the kernel bounds every lane.
         let (results, overflow_mask) = unsafe {
-            super::simd_trace_upstream::trace_i8(query, targets, score_matrix, query_cbs)
+            super::simd_trace_upstream::trace_i8(query, targets, _score_matrix, query_cbs)
         };
         return Some(NarrowTraceBatch {
             results,
@@ -43,7 +43,7 @@ pub fn trace_batch_i8(
 pub fn trace_batch_i16(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
-    score_matrix: &ScoreMatrix,
+    _score_matrix: &ScoreMatrix,
     query_cbs: &[i8],
 ) -> Option<NarrowTraceBatch> {
     if targets.is_empty()
@@ -56,7 +56,7 @@ pub fn trace_batch_i16(
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: AVX2 is runtime-detected and the kernel bounds every lane.
         let (results, overflow_mask) = unsafe {
-            super::simd_trace_upstream::trace_i16(query, targets, score_matrix, query_cbs)
+            super::simd_trace_upstream::trace_i16(query, targets, _score_matrix, query_cbs)
         };
         return Some(NarrowTraceBatch {
             results,

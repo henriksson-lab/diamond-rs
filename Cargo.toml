@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
+libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 nalgebra = "0.32.6"
 rayon = "1"
 zstd = "0.13"

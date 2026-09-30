@@ -11,8 +11,10 @@
 //! default-mode output as selective as it is.
 use crate::basic::value::{Letter, DELIMITER_LETTER, LETTER_MASK};
 use crate::search::hamming::FingerPrint;
+use crate::search::hamming_all_vs_all::AlignedFingerprint48;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::search::hamming_all_vs_all::{
-    all_vs_all_pass_masks_avx2, all_vs_all_pass_masks_avx512bw, AlignedFingerprint48,
+    all_vs_all_pass_masks_avx2, all_vs_all_pass_masks_avx512bw,
 };
 use crate::search::seed_match::SeedMatch;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -30,6 +32,7 @@ type CachedFingerprint = ((u32, u32), [Letter; FP_LEN]);
 /// locations out of this hot array gives the same 48-byte stride (rather than
 /// 56 bytes for `(location, fingerprint)`) and guarantees the alignment used
 /// by its SSE/AVX loads.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 pub(crate) const FP_SCALAR: u8 = 0;
 pub(crate) const FP_SSE2: u8 = 1;
 pub(crate) const FP_AVX2: u8 = 2;
@@ -491,6 +494,7 @@ pub(crate) fn visit_hamming_group_for<const KERNEL: u8, F>(
             .zip(scratch.target.chunks(TILE_SIZE))
             .enumerate()
         {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             if KERNEL == FP_AVX512BW {
                 // SAFETY: this specialization is selected only after
                 // AVX-512BW detection at the group boundary. Masked loads
@@ -516,6 +520,19 @@ pub(crate) fn visit_hamming_group_for<const KERNEL: u8, F>(
                     );
                 }
             } else {
+                pass_masks[..query_fp_tile.len()].fill(0);
+                for (query_index, query_fp) in query_fp_tile.iter().enumerate() {
+                    for (target_index, target_fp) in target_fp_tile.iter().enumerate() {
+                        if fingerprint_equal_count_for::<KERNEL>(&query_fp.bytes, &target_fp.bytes)
+                            >= hamming_filter_id
+                        {
+                            pass_masks[query_index] |= 1u64 << target_index;
+                        }
+                    }
+                }
+            }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            {
                 pass_masks[..query_fp_tile.len()].fill(0);
                 for (query_index, query_fp) in query_fp_tile.iter().enumerate() {
                     for (target_index, target_fp) in target_fp_tile.iter().enumerate() {

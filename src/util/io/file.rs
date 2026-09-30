@@ -5,7 +5,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
 
-use super::{IoError, IoResult, TempFileData};
+#[cfg(unix)]
+use super::TempFileData;
+use super::{IoError, IoResult};
 
 #[derive(Debug)]
 pub struct File {
@@ -328,6 +330,7 @@ mod tests {
     #[test]
     fn temporary_file_owns_descriptor_and_is_move_safe() {
         let mut original = File::new_temporary(Temporary).unwrap();
+        #[cfg(unix)]
         let name = original.file_name().to_string();
         original.write(b"data").unwrap();
         let mut moved = original;

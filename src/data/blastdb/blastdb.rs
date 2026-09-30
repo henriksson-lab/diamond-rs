@@ -9,62 +9,23 @@ use crate::data::blastdb::volume::{
 };
 use crate::data::taxonomy::Rank;
 use crate::util::system::{absolute_path, exists, PATH_SEPARATOR};
+use libsqlite3_sys::{
+    sqlite3, sqlite3_bind_int, sqlite3_close, sqlite3_column_int, sqlite3_errmsg, sqlite3_finalize,
+    sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_step, sqlite3_stmt, SQLITE_DONE, SQLITE_OK,
+    SQLITE_OPEN_READONLY, SQLITE_ROW,
+};
+#[cfg(test)]
+use libsqlite3_sys::{sqlite3_exec, SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int};
-
-const SQLITE_OK: c_int = 0;
-const SQLITE_ROW: c_int = 100;
-const SQLITE_DONE: c_int = 101;
-const SQLITE_OPEN_READONLY: c_int = 1;
+use std::os::raw::c_int;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlastDbConfig {
     pub multiprocessing: bool,
 }
 
-#[repr(C)]
-struct Sqlite3 {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-struct Sqlite3Stmt {
-    _private: [u8; 0],
-}
-
-#[link(name = "sqlite3")]
-unsafe extern "C" {
-    fn sqlite3_open_v2(
-        filename: *const c_char,
-        database: *mut *mut Sqlite3,
-        flags: c_int,
-        vfs: *const c_char,
-    ) -> c_int;
-    fn sqlite3_close(database: *mut Sqlite3) -> c_int;
-    fn sqlite3_errmsg(database: *mut Sqlite3) -> *const c_char;
-    fn sqlite3_prepare_v2(
-        database: *mut Sqlite3,
-        sql: *const c_char,
-        bytes: c_int,
-        statement: *mut *mut Sqlite3Stmt,
-        tail: *mut *const c_char,
-    ) -> c_int;
-    fn sqlite3_step(statement: *mut Sqlite3Stmt) -> c_int;
-    fn sqlite3_column_int(statement: *mut Sqlite3Stmt, column: c_int) -> c_int;
-    fn sqlite3_finalize(statement: *mut Sqlite3Stmt) -> c_int;
-    fn sqlite3_bind_int(statement: *mut Sqlite3Stmt, index: c_int, value: c_int) -> c_int;
-    #[cfg(test)]
-    fn sqlite3_exec(
-        database: *mut Sqlite3,
-        sql: *const c_char,
-        callback: *const (),
-        context: *mut (),
-        error: *mut *mut c_char,
-    ) -> c_int;
-}
-
-struct SqliteStatement(*mut Sqlite3Stmt);
+struct SqliteStatement(*mut sqlite3_stmt);
 
 impl Drop for SqliteStatement {
     fn drop(&mut self) {
@@ -75,7 +36,7 @@ impl Drop for SqliteStatement {
     }
 }
 
-struct SqliteConnection(*mut Sqlite3);
+struct SqliteConnection(*mut sqlite3);
 
 impl std::fmt::Debug for SqliteConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -164,15 +125,14 @@ impl SqliteConnection {
 
     #[cfg(test)]
     fn create_test_database(path: &str) -> Result<(), String> {
-        const SQLITE_OPEN_READWRITE_CREATE: c_int = 2 | 4;
-        let connection = Self::open(path, SQLITE_OPEN_READWRITE_CREATE)?;
+        let connection = Self::open(path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)?;
         let sql = b"CREATE TABLE TaxidInfo(taxid INTEGER PRIMARY KEY, parent INTEGER); INSERT INTO TaxidInfo VALUES(1,1),(7,3),(42,7);\0";
         // SAFETY: SQL is NUL-terminated and no callback or error allocation is requested.
         let status = unsafe {
             sqlite3_exec(
                 connection.0,
                 sql.as_ptr().cast(),
-                std::ptr::null(),
+                None,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             )

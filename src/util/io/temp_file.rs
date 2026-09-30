@@ -31,6 +31,8 @@ impl TempFileData {
     /// Explicit-config equivalent of C++ `TempFile::init`, replacing accesses
     /// to the global `config.tmpdir` and `config.no_unlink`.
     pub fn init_in(unlink: bool, temp_dir: impl AsRef<Path>, no_unlink: bool) -> IoResult<Self> {
+        #[cfg(not(unix))]
+        let _ = (unlink, no_unlink);
         let temp_dir = temp_dir.as_ref();
         for _ in 0..128 {
             let serial = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);

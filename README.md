@@ -6,7 +6,7 @@ DIAMOND is a high-performance sequence aligner for protein and translated DNA se
 
 **This crate is under translation. Do not use it. Do not trust any text below**
 
-* 2026-09-30: More optimization
+* 2026-09-30: More optimization. portability work
 * 2026-09-28: Ondisk blastp mode, but also faster inmem mode (not in original). Parity on broader datasets
 * 2006-09-27: Closing the gaps in translation, optimization. Some more work left
 * 2026-08-01: CI added. Full translation is blocked until BLAST is translated

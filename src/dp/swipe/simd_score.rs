@@ -8,6 +8,7 @@
 
 use crate::basic::value::{Letter, AMINO_ACID_COUNT, LETTER_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::mem::MaybeUninit;
 
 /// One target lane for [`score_batch_avx2`].
@@ -316,6 +317,7 @@ unsafe fn score_batch_avx2_impl<const HAS_CBS: bool>(
 /// score-only specialization. The common moving band is essential: it keeps
 /// the query coordinate uniform across lanes and the substitution profile in
 /// vector form throughout the cell loop.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn score_batch_avx2_upstream_impl<const HAS_CBS: bool>(
     query: &[Letter],

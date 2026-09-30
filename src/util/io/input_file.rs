@@ -1,7 +1,9 @@
 //! Translation of `diamond/src/util/io/input_file.{h,cpp}`.
 
 use std::fs::File as StdFile;
-use std::io::{Seek, SeekFrom};
+#[cfg(unix)]
+use std::io::Seek;
+use std::io::SeekFrom;
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
 
