@@ -394,6 +394,11 @@ pub struct Params<'a> {
     pub query_id: Option<&'a str>,
     pub frame: i32,
     pub query_source_len: i32,
+    /// Whether query coordinates are amino-acid positions translated from a
+    /// nucleotide source. C++ obtains this from `align_mode`; keeping it on
+    /// the per-search parameters prevents blastp coordinates from being
+    /// multiplied by three when constructing `query_source_range`.
+    pub query_translated: bool,
     pub composition_bias: Option<&'a [i8]>,
     pub flags: Flags,
     pub reverse_targets: bool,
@@ -424,6 +429,7 @@ impl<'a> Params<'a> {
             query_id: None,
             frame: 0,
             query_source_len: query.len() as i32,
+            query_translated: false,
             composition_bias: None,
             flags: Flags::NONE,
             reverse_targets: false,
@@ -655,7 +661,7 @@ fn traceback_hsp(
         TranslatedPosition::new(hsp.query_range.begin, Frame::from_index(p.frame)),
         TranslatedPosition::new(hsp.query_range.end, Frame::from_index(p.frame)),
         p.query_source_len,
-        true,
+        p.query_translated,
     );
     hsp.subject_source_range = hsp.subject_range;
     hsp.target_seq = target.seq.clone();
@@ -2529,6 +2535,7 @@ mod tests {
         let mut params = Params::new(&query, &sm);
         params.frame = 1;
         params.query_source_len = 12;
+        params.query_translated = true;
         params.v = HspValues::TRANSCRIPT | HspValues::COORDS;
         let mut overflow = TargetVec::default();
         let out = dispatch_swipe(&[target], &mut overflow, &params);
@@ -2536,6 +2543,31 @@ mod tests {
         assert_eq!(out[0].query_range, Interval::new(0, 3));
         assert_eq!(out[0].query_source_range, Interval::new(1, 10));
         assert_eq!(out[0].subject_source_range, out[0].subject_range);
+    }
+
+    #[test]
+    fn test_swipe_query_source_range_stays_in_protein_coordinates() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query: Vec<Letter> = vec![0, 1, 2];
+        let target = DpTarget::new(
+            query.clone(),
+            query.len() as i32,
+            -1,
+            2,
+            0,
+            query.len() as i32,
+            CarryOver::default(),
+            Anchor::default(),
+        );
+        let mut params = Params::new(&query, &sm);
+        params.frame = 0;
+        params.query_source_len = query.len() as i32;
+        params.v = HspValues::TRANSCRIPT | HspValues::COORDS;
+        let mut overflow = TargetVec::default();
+        let out = dispatch_swipe(&[target], &mut overflow, &params);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].query_range, Interval::new(0, 3));
+        assert_eq!(out[0].query_source_range, out[0].query_range);
     }
 
     #[test]

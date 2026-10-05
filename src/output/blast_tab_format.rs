@@ -125,6 +125,7 @@ impl BlastTabFormat {
             return super::format::write_tabular_context_row_json(
                 writer,
                 context,
+                context.hit_num != 0 || context.hsp_num != 0,
                 &self.format.fields,
                 self.config.query_translated,
                 self.config.frame_shift != 0,

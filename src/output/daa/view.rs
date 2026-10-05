@@ -45,17 +45,43 @@ impl Default for DaaViewRuntimeConfig<'_> {
 /// Rust counterpart of C++ `ViewWriter`.
 pub struct ViewWriter<W> {
     writer: W,
+    wrote_query_output: bool,
 }
 
 impl<W: Write> ViewWriter<W> {
     pub fn new(writer: W) -> Self {
-        Self { writer }
+        Self {
+            writer,
+            wrote_query_output: false,
+        }
     }
 
     /// C++ `ViewWriter::operator()(TextBuffer&)`.
     pub fn consume(&mut self, buf: &mut Vec<u8>) -> io::Result<()> {
         self.writer.write_all(buf)?;
         buf.clear();
+        Ok(())
+    }
+
+    /// Write one query's output, inserting the format's query separator only
+    /// between non-empty query buffers. This is required for valid multi-query
+    /// JSON because hit numbering restarts for each DAA query record.
+    pub fn consume_query(
+        &mut self,
+        buf: &mut Vec<u8>,
+        query_separator: Option<u8>,
+    ) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if self.wrote_query_output {
+            if let Some(separator) = query_separator {
+                self.writer.write_all(&[separator])?;
+            }
+        }
+        self.writer.write_all(buf)?;
+        buf.clear();
+        self.wrote_query_output = true;
         Ok(())
     }
 
@@ -148,6 +174,12 @@ pub fn view_worker<W: Write>(
     score_matrix: &ScoreMatrix,
     config: &DaaViewConfig,
 ) -> io::Result<()> {
+    let query_separator = match format {
+        DaaViewFormat::Tabular(format) if format.query_separator != '\0' => {
+            Some(format.query_separator as u8)
+        }
+        _ => None,
+    };
     loop {
         let batch = fetcher.fetch_batch(daa)?;
         if batch.is_empty() {
@@ -159,7 +191,7 @@ pub fn view_worker<W: Write>(
             let mut output = Vec::new();
             view_query(&record, daa, &mut output, format, score_matrix, config)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            writer.consume(&mut output)?;
+            writer.consume_query(&mut output, query_separator)?;
         }
     }
 }
@@ -199,11 +231,17 @@ pub fn view_daa<W: Write + Seek>(
     write_header(output, daa, format, runtime, first_record.as_ref())?;
 
     let mut writer = ViewWriter::new(output);
+    let query_separator = match format {
+        DaaViewFormat::Tabular(format) if format.query_separator != '\0' => {
+            Some(format.query_separator as u8)
+        }
+        _ => None,
+    };
     if let Some(record) = first_record {
         let mut buf = Vec::new();
         view_query(&record, daa, &mut buf, format, &score_matrix, config)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        writer.consume(&mut buf)?;
+        writer.consume_query(&mut buf, query_separator)?;
     }
     let mut fetcher = ViewFetcher::new();
     view_worker(

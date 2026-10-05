@@ -154,6 +154,7 @@ fn recompute_alt_hsps_round(
         params.query_id = Some("");
         params.frame = context as i32;
         params.query_source_len = query_source_len;
+        params.query_translated = config.query_translated;
         params.composition_bias = composition_bias;
         params.flags = Flags::FULL_MATRIX;
         params.v = hsp_values;
@@ -317,8 +318,11 @@ mod tests {
     #[test]
     fn recomputation_finds_unmasked_subject_copy() {
         let score_matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
-        let query = vec![0, 1, 2, 3];
-        let subject = vec![0, 1, 2, 3, 0, 1, 2, 3];
+        // The alternate must occupy a different query range as well as a
+        // different subject range. Upstream inner culling rejects an exact
+        // repeated subject copy when it reuses the same query interval.
+        let query = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let subject = query.clone();
         let mut target_match = Match::new_extension(5, &subject, None, 0, 40, 1.0e-5);
         let mut original = hsp(0, 0, 4);
         original.score = 40;
@@ -343,7 +347,7 @@ mod tests {
         assert!(target_match
             .hsps
             .iter()
-            .any(|hsp| hsp.subject_range.begin >= 4));
+            .any(|hsp| hsp.query_range.begin >= 4 && hsp.subject_range.begin >= 4));
         assert!(statistics.get(crate::basic::statistics::StatValue::SwipeTasksTotal) > 0);
     }
 }

@@ -16,6 +16,16 @@ fn main() {
         return;
     }
 
+    // Upstream's command-line parser rejects `--unal` for the view workflow
+    // based on option presence, even when its value is zero. DAA archives do
+    // not contain records for queries with no reported alignments, so native
+    // view cannot implement this option faithfully either.
+    if args[1] == "view" && !has_flag(&args, "--legacy") && has_option(&args, &["--unal"]) {
+        print_banner();
+        eprintln!("Error: Option is not permitted for this workflow: unal");
+        std::process::exit(1);
+    }
+
     match args[1].as_str() {
         "version" => {
             println!("diamond version 2.1.24");
@@ -84,10 +94,14 @@ fn main() {
         "blastp" if !has_flag(&args, "--legacy") && !route_blastp_to_legacy(&args) => {
             // Native Rust blastp pipeline
             print_banner();
+            let (output, outfmt) = parse_native_search_output(&args).unwrap_or_else(|error| {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            });
             let config = BlastpConfig {
                 query_files: get_all_args(&args, &["-q", "--query"]),
                 database: get_arg(&args, &["-d", "--db"]).unwrap_or_default(),
-                output: get_arg(&args, &["-o", "--out"]),
+                output,
                 matrix: get_arg(&args, &["--matrix"]).unwrap_or_else(|| "blosum62".into()),
                 gap_open: parse_arg_or(&args, &["--gapopen"], -1),
                 gap_extend: parse_arg_or(&args, &["--gapextend"], -1),
@@ -101,7 +115,7 @@ fn main() {
                 // (`config.cpp:783`). Match that — `0` here is interpreted by
                 // `rayon::ThreadPoolBuilder` as "all cores".
                 threads: parse_arg_or(&args, &["-p", "--threads"], 0),
-                outfmt: get_all_args(&args, &["-f", "--outfmt"]),
+                outfmt,
                 sensitivity: parse_sensitivity(&args),
                 masking: diamond::masking::MaskingMode::parse(
                     &get_arg(&args, &["--masking"]).unwrap_or_else(|| "tantan".into()),
@@ -129,10 +143,14 @@ fn main() {
         }
         "blastx" if !has_flag(&args, "--legacy") && !route_blastx_to_legacy(&args) => {
             print_banner();
+            let (output, outfmt) = parse_native_search_output(&args).unwrap_or_else(|error| {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            });
             let config = BlastxConfig {
                 query_files: get_all_args(&args, &["-q", "--query"]),
                 database: get_arg(&args, &["-d", "--db"]).unwrap_or_default(),
-                output: get_arg(&args, &["-o", "--out"]),
+                output,
                 matrix: get_arg(&args, &["--matrix"]).unwrap_or_else(|| "blosum62".into()),
                 gap_open: parse_arg_or(&args, &["--gapopen"], -1),
                 gap_extend: parse_arg_or(&args, &["--gapextend"], -1),
@@ -144,7 +162,7 @@ fn main() {
                 min_id: parse_arg_or(&args, &["--id"], 0.0),
                 // C++ defaults `--threads` to `std::thread::hardware_concurrency()`.
                 threads: parse_arg_or(&args, &["-p", "--threads"], 0),
-                outfmt: get_all_args(&args, &["-f", "--outfmt"]),
+                outfmt,
                 sensitivity: parse_sensitivity(&args),
                 query_gencode: parse_arg_or(&args, &["--query-gencode"], 1),
                 strand: get_arg(&args, &["--strand"]).unwrap_or_else(|| "both".into()),
@@ -579,6 +597,46 @@ fn get_all_args(args: &[String], flags: &[&str]) -> Vec<String> {
     values
 }
 
+fn parse_native_search_output(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let daa_file = get_arg(args, &["-a", "--daa"]);
+    let mut output = get_arg(args, &["-o", "--out"]);
+    let mut outfmt = get_all_args(args, &["-f", "--outfmt"]);
+
+    if let Some(mut daa_file) = daa_file {
+        if output.is_some() {
+            return Err("Options --daa and --out cannot be used together.".to_string());
+        }
+        if outfmt
+            .first()
+            .is_some_and(|format| !format.eq_ignore_ascii_case("daa"))
+        {
+            return Err(
+                "Invalid parameter: --daa/-a. Output file is specified with the --out/-o parameter."
+                    .to_string(),
+            );
+        }
+        if !daa_file.ends_with(".daa") {
+            daa_file.push_str(".daa");
+        }
+        output = Some(daa_file);
+        if outfmt.is_empty() {
+            outfmt.push("daa".to_string());
+        }
+    } else if outfmt
+        .first()
+        .is_some_and(|format| format == "100" || format.eq_ignore_ascii_case("daa"))
+    {
+        let path = output
+            .as_mut()
+            .ok_or_else(|| "DAA output requires -a/--daa or -o/--out.".to_string())?;
+        if !path.ends_with(".daa") {
+            path.push_str(".daa");
+        }
+    }
+
+    Ok((output, outfmt))
+}
+
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
@@ -613,6 +671,7 @@ fn has_unknown_search_option(args: &[String], blastx: bool) -> bool {
         "--query",
         "--db",
         "--out",
+        "--daa",
         "--matrix",
         "--gapopen",
         "--gapextend",
@@ -666,7 +725,7 @@ fn has_unknown_search_option(args: &[String], blastx: bool) -> bool {
         "--swipe",
     ];
     const SHORT_COMMON: &[&str] = &[
-        "-q", "-d", "-o", "-e", "-k", "-p", "-f", "-x", "-t", "-b", "-c", "-h",
+        "-q", "-d", "-o", "-a", "-e", "-k", "-p", "-f", "-x", "-t", "-b", "-c", "-h",
     ];
 
     args.iter().skip(2).any(|arg| {
@@ -686,10 +745,12 @@ fn has_unknown_search_option(args: &[String], blastx: bool) -> bool {
 
 fn route_common_search_to_legacy(args: &[String]) -> bool {
     let requested_output = get_all_args(args, &["-f", "--outfmt"]);
-    let unsupported_output = requested_output
+    let unsupported_output = requested_output.first().is_some_and(|format| {
+        format != "6" && format != "tab" && format != "100" && format != "daa"
+    }) || (!requested_output
         .first()
-        .is_some_and(|format| format != "6" && format != "tab")
-        || requested_output.iter().skip(1).any(|name| {
+        .is_some_and(|format| format == "100" || format == "daa")
+        && requested_output.iter().skip(1).any(|name| {
             !matches!(
                 FieldId::from_name(name),
                 Some(
@@ -721,7 +782,7 @@ fn route_common_search_to_legacy(args: &[String]) -> bool {
                         | FieldId::SCovHsp
                 )
             )
-        });
+        }));
 
     unsupported_output
         || get_arg(args, &["--masking"]).is_some_and(|m| m.eq_ignore_ascii_case("seg"))
@@ -846,6 +907,45 @@ mod tests {
                 &["-f", "--outfmt"]
             ),
             ["6", "qseqid"]
+        );
+    }
+
+    #[test]
+    fn native_search_output_parses_daa_aliases_and_suffixes() {
+        assert_eq!(
+            parse_native_search_output(&args(&["diamond", "blastp", "-a", "hits"])),
+            Ok((Some("hits.daa".to_string()), vec!["daa".to_string()]))
+        );
+        assert_eq!(
+            parse_native_search_output(&args(&[
+                "diamond", "blastx", "--outfmt", "100", "--out", "hits"
+            ])),
+            Ok((Some("hits.daa".to_string()), vec!["100".to_string()]))
+        );
+        assert_eq!(
+            parse_native_search_output(&args(&[
+                "diamond",
+                "blastp",
+                "--daa=hits.daa",
+                "--outfmt",
+                "daa"
+            ])),
+            Ok((Some("hits.daa".to_string()), vec!["daa".to_string()]))
+        );
+    }
+
+    #[test]
+    fn native_search_output_rejects_conflicting_or_invalid_daa_options() {
+        assert!(parse_native_search_output(&args(&[
+            "diamond", "blastp", "-a", "hits", "-o", "other"
+        ]))
+        .is_err());
+        assert!(parse_native_search_output(&args(&[
+            "diamond", "blastp", "-a", "hits", "--outfmt", "6"
+        ]))
+        .is_err());
+        assert!(
+            parse_native_search_output(&args(&["diamond", "blastp", "--outfmt", "100"])).is_err()
         );
     }
 

@@ -266,6 +266,7 @@ pub fn align_targets_final(
             params.query_id = Some(query_id);
             params.frame = frame as i32;
             params.query_source_len = source_query_len;
+            params.query_translated = cfg.query_translated;
             params.composition_bias = composition_bias;
             params.flags = flags;
             params.v = hsp_values;

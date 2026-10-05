@@ -864,6 +864,7 @@ pub fn view_query_tabular(
 
     let matches = r.begin(file, score_matrix).collect::<Result<Vec<_>, _>>()?;
     let top_score = matches.first().map(|m| m.hsp.score).unwrap_or(0);
+    let mut json_records_written = 0usize;
 
     for m in matches {
         if m.hsp.frame > 2 && cfg.forward_only {
@@ -883,6 +884,7 @@ pub fn view_query_tabular(
             write_tabular_context_row_json(
                 out,
                 &context,
+                json_records_written != 0,
                 &format.fields,
                 file.mode() == 3,
                 false,
@@ -894,6 +896,7 @@ pub fn view_query_tabular(
                 None,
             )
             .map_err(|e| e.to_string())?;
+            json_records_written += 1;
         } else {
             write_tabular_context_row(out, &context, &format.fields, file.mode() == 3, false, 0, 0)
                 .map_err(|e| e.to_string())?;
@@ -1174,6 +1177,18 @@ pub fn write_daa_record_hsp(buf: &mut Vec<u8>, hsp: &Hsp, subject_id: u32) {
     write_packed(buf, hsp.subject_range.begin as u32);
     for op in hsp.transcript.data() {
         buf.push(op.code);
+    }
+    // A DAA transcript is terminated by a zero packed operation. Most traced
+    // DP paths retain it in `PackedTranscript`, but copied/shortcut HSPs and
+    // synthetic self matches may not. C++ relies on this wire invariant when
+    // finding the next record, so enforce it at the serialization boundary.
+    if !hsp
+        .transcript
+        .data()
+        .last()
+        .is_some_and(|operation| operation.is_terminator())
+    {
+        buf.push(0);
     }
 }
 
@@ -2102,7 +2117,6 @@ mod tests {
         hsp.subject_range = Interval::new(70_000, 70_008);
         hsp.transcript
             .push_with_count(crate::basic::packed_transcript::EditOperation::Match, 8);
-        hsp.transcript.push_terminator();
 
         let mut buf = Vec::new();
         write_daa_record_hsp(&mut buf, &hsp, 23);
@@ -2114,6 +2128,8 @@ mod tests {
         assert_eq!(raw.score, 1_000);
         assert_eq!(raw.query_begin, 12);
         assert_eq!(raw.subject_begin, 70_000);
+        // The encoder supplies the wire terminator even if the in-memory HSP
+        // came from a shortcut path that omitted it.
         assert_eq!(raw.transcript.len(), 2);
         assert!(!it.good());
     }

@@ -39,6 +39,16 @@ fn parse_header_arg(header: &[String]) -> Header {
     Header::parse(val).unwrap_or(Header::Simple)
 }
 
+fn reject_unsupported_options(config: &ViewConfig) -> io::Result<()> {
+    if config.report_unaligned {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Option is not permitted for this workflow: unal",
+        ));
+    }
+    Ok(())
+}
+
 /// Run the view command — show DAA file metadata.
 ///
 /// Non-DAA record rendering still uses FFI via the binary fallback.
@@ -78,6 +88,7 @@ pub fn run(daa_file: &str) -> io::Result<()> {
 
 /// Matches the DAA-output branch of C++ `view_daa`.
 pub fn run_daa(config: &ViewConfig) -> io::Result<()> {
+    reject_unsupported_options(config)?;
     let mut daa = DaaFile::open(&config.daa_file)?;
     let score_matrix = ScoreMatrix::new(
         &daa.score_matrix(),
@@ -120,6 +131,7 @@ pub fn run_daa(config: &ViewConfig) -> io::Result<()> {
 
 /// Matches the tabular-output branch of C++ `view_daa`.
 pub fn run_tabular(config: &ViewConfig) -> io::Result<()> {
+    reject_unsupported_options(config)?;
     let mut daa = DaaFile::open(&config.daa_file)?;
     let score_matrix = ScoreMatrix::new(
         &daa.score_matrix(),
@@ -169,6 +181,7 @@ pub fn run_tabular(config: &ViewConfig) -> io::Result<()> {
     let header = print_tabular_header(&format.fields, header_mode, format.is_json, "", "")
         .map_err(io::Error::other)?;
     out.write_all(header.as_bytes())?;
+    let mut json_query_written = false;
     while let Some((buf, query_num)) = daa.read_query_buffer()? {
         let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -183,6 +196,12 @@ pub fn run_tabular(config: &ViewConfig) -> io::Result<()> {
             config.report_unaligned,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if format.is_json && !query_out.is_empty() {
+            if json_query_written {
+                out.write_all(b",")?;
+            }
+            json_query_written = true;
+        }
         out.write_all(&query_out)?;
     }
     out.write_all(print_tabular_footer(format.is_json).as_bytes())?;
@@ -191,6 +210,7 @@ pub fn run_tabular(config: &ViewConfig) -> io::Result<()> {
 
 /// Matches the PAF-output branch of C++ `view_daa`.
 pub fn run_paf(config: &ViewConfig) -> io::Result<()> {
+    reject_unsupported_options(config)?;
     let mut daa = DaaFile::open(&config.daa_file)?;
     let score_matrix = ScoreMatrix::new(
         &daa.score_matrix(),
@@ -232,6 +252,7 @@ pub fn run_paf(config: &ViewConfig) -> io::Result<()> {
 
 /// Matches the SAM-output branch of C++ `view_daa`.
 pub fn run_sam(config: &ViewConfig) -> io::Result<()> {
+    reject_unsupported_options(config)?;
     let mut daa = DaaFile::open(&config.daa_file)?;
     let score_matrix = ScoreMatrix::new(
         &daa.score_matrix(),
@@ -281,6 +302,7 @@ pub fn run_sam(config: &ViewConfig) -> io::Result<()> {
 
 /// Matches the pairwise-output branch of C++ `view_daa`.
 pub fn run_pairwise(config: &ViewConfig) -> io::Result<()> {
+    reject_unsupported_options(config)?;
     let mut daa = DaaFile::open(&config.daa_file)?;
     let score_matrix = ScoreMatrix::new(
         &daa.score_matrix(),
@@ -324,6 +346,7 @@ pub fn run_pairwise(config: &ViewConfig) -> io::Result<()> {
 
 /// Matches the XML-output branch of C++ `view_daa`.
 pub fn run_xml(config: &ViewConfig) -> io::Result<()> {
+    reject_unsupported_options(config)?;
     let mut daa = DaaFile::open(&config.daa_file)?;
     let score_matrix = ScoreMatrix::new(
         &daa.score_matrix(),
@@ -397,6 +420,7 @@ pub fn run_xml(config: &ViewConfig) -> io::Result<()> {
 
 /// Matches the null-output branch of C++ `view_daa`.
 pub fn run_null(config: &ViewConfig) -> io::Result<()> {
+    reject_unsupported_options(config)?;
     let mut daa = DaaFile::open(&config.daa_file)?;
     let score_matrix = ScoreMatrix::new(
         &daa.score_matrix(),
@@ -436,6 +460,7 @@ pub fn run_null(config: &ViewConfig) -> io::Result<()> {
 
 /// Matches the edge-output branch of C++ `view_daa`.
 pub fn run_edge(config: &ViewConfig) -> io::Result<()> {
+    reject_unsupported_options(config)?;
     let mut daa = DaaFile::open(&config.daa_file)?;
     let score_matrix = ScoreMatrix::new(
         &daa.score_matrix(),
@@ -818,5 +843,102 @@ mod tests {
         let _ = std::fs::remove_file(output_xml);
         let _ = std::fs::remove_file(output_null);
         let _ = std::fs::remove_file(output_edge);
+    }
+
+    #[test]
+    fn test_run_tabular_json_separates_multiple_queries() {
+        let id = VIEW_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let input = std::env::temp_dir().join(format!(
+            "diamond_rs_view_multi_json_input_{}_{}.daa",
+            std::process::id(),
+            id
+        ));
+        let output = std::env::temp_dir().join(format!(
+            "diamond_rs_view_multi_json_output_{}_{}.json",
+            std::process::id(),
+            id
+        ));
+
+        let mut alignments = Vec::new();
+        for (name, score) in [("query0", 30u8), ("query1", 29u8)] {
+            let seek_pos =
+                write_daa_query_record(&mut alignments, name, &[0, 1, 2], SequenceType::AminoAcid);
+            let flag = compute_flag(u32::from(score), 0, 0, false);
+            alignments.extend_from_slice(&0u32.to_ne_bytes());
+            alignments.push(flag);
+            alignments.push(score);
+            alignments.push(0);
+            alignments.push(0);
+            alignments.push(PackedOperation::from_op_count(EditOperation::Match, 3).code);
+            alignments.push(PackedOperation::terminator().code);
+            crate::data::daa::finish_daa_query_record(&mut alignments, seek_pos);
+        }
+        alignments.extend_from_slice(&0u32.to_ne_bytes());
+
+        let mut h2 = DaaHeader2::with_params(1, 100, 11, 1, 2, -3, 0.7, 1.2, 0.001, "BLOSUM62", 2);
+        h2.db_seqs_used = 1;
+        h2.query_records = 2;
+        h2.block_type[0] = BlockType::Alignments as u8;
+        h2.block_type[1] = BlockType::RefNames as u8;
+        h2.block_type[2] = BlockType::RefLengths as u8;
+        h2.block_size[0] = alignments.len() as u64;
+        h2.block_size[1] = 5;
+        h2.block_size[2] = 4;
+
+        let mut file = File::create(&input).unwrap();
+        DaaHeader1::new().write_to(&mut file).unwrap();
+        h2.write_to(&mut file).unwrap();
+        file.write_all(&alignments).unwrap();
+        file.write_all(b"ref0\0").unwrap();
+        file.write_all(&100u32.to_ne_bytes()).unwrap();
+        drop(file);
+
+        run_tabular(&ViewConfig {
+            daa_file: input.to_string_lossy().to_string(),
+            output: output.to_string_lossy().to_string(),
+            outfmt: vec![
+                "104".to_string(),
+                "qseqid".to_string(),
+                "sseqid".to_string(),
+                "score".to_string(),
+            ],
+            max_target_seqs: 25,
+            ..ViewConfig::default()
+        })
+        .unwrap();
+
+        let actual = std::fs::read_to_string(&output).unwrap();
+        assert_eq!(
+            actual,
+            concat!(
+                "[\n\t{\n",
+                "\t\"qseqid\":\"query0\",\n",
+                "\t\"sseqid\":\"ref0\",\n",
+                "\t\"score\":30\n",
+                "\t},\n\t{\n",
+                "\t\"qseqid\":\"query1\",\n",
+                "\t\"sseqid\":\"ref0\",\n",
+                "\t\"score\":29\n",
+                "\t}\n]"
+            )
+        );
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn test_view_rejects_unaligned_reporting_before_opening_archive() {
+        let error = run_tabular(&ViewConfig {
+            daa_file: "does-not-exist.daa".to_string(),
+            report_unaligned: true,
+            ..ViewConfig::default()
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "Option is not permitted for this workflow: unal"
+        );
     }
 }

@@ -1424,6 +1424,7 @@ pub fn align_work_targets(
             params.query_id = query_id;
             params.frame = frame as i32;
             params.query_source_len = source_query_len;
+            params.query_translated = cfg.query_translated;
             params.composition_bias = cbs;
             params.flags = flags;
             params.v = hsp_values;
@@ -2329,8 +2330,8 @@ mod tests {
     #[test]
     fn test_recompute_alt_hsps_finds_unmasked_copy() {
         let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
-        let query = vec![0, 1, 2, 3];
-        let subject = vec![0, 1, 2, 3, 0, 1, 2, 3];
+        let query = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let subject = query.clone();
         let mut m = Match::new_extension(5, &subject, None, 0, 40, 1.0e-5);
         let mut hsp = Hsp::new();
         hsp.score = 40;
@@ -2355,7 +2356,10 @@ mod tests {
             &sm,
         );
         assert!(matches[0].hsps.len() >= 2);
-        assert!(matches[0].hsps.iter().any(|h| h.subject_range.begin >= 4));
+        assert!(matches[0]
+            .hsps
+            .iter()
+            .any(|h| h.query_range.begin >= 4 && h.subject_range.begin >= 4));
     }
 
     #[test]

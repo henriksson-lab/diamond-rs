@@ -1973,6 +1973,7 @@ pub fn write_tabular_context_row<W: Write>(
 pub fn write_tabular_context_row_json<W: Write>(
     writer: &mut W,
     r: &HspContext,
+    leading_comma: bool,
     fields: &[FieldId],
     query_translated: bool,
     frame_shift: bool,
@@ -1983,7 +1984,7 @@ pub fn write_tabular_context_row_json<W: Write>(
     query_qual: &str,
     mate_seq: Option<&[crate::basic::value::Letter]>,
 ) -> io::Result<()> {
-    if r.hit_num != 0 {
+    if leading_comma {
         write!(writer, ",")?;
     }
     writeln!(writer, "\n\t{{")?;
@@ -3348,6 +3349,7 @@ mod tests {
         write_tabular_context_row_json(
             &mut buf,
             &ctx,
+            false,
             &fields,
             false,
             false,
@@ -3393,6 +3395,7 @@ mod tests {
         write_tabular_context_row_json(
             &mut buf,
             &ctx,
+            true,
             &fields,
             false,
             false,

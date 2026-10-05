@@ -64,110 +64,10 @@ fn x86_backend() -> X86Backend {
     }
 }
 
-/// Compute lambda for the likelihood ratio matrix using bisection.
-///
-/// Finds lambda such that the sum of the inverse of exp(lambda * M) equals 1,
-/// matching C++ LambdaCalculator. For standard BLOSUM62 (20x20), lambda ≈ 0.324.
 fn compute_lambda_flat(scores: &[i8], stride: usize, n: usize) -> f64 {
-    // Build double matrix from flat scores array
-    let mut mat: Vec<Vec<f64>> = vec![vec![0.0; n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            mat[i][j] = scores[i * stride + j] as f64;
-        }
-    }
-
-    // Find upper bound
-    let mut r_max_min = f64::MAX;
-    for i in 0..n {
-        let mut r_max = f64::MIN;
-        for j in 0..n {
-            if mat[i][j] > r_max {
-                r_max = mat[i][j];
-            }
-        }
-        if r_max > 0.0 && r_max < r_max_min {
-            r_max_min = r_max;
-        }
-    }
-    if r_max_min == f64::MAX || r_max_min <= 0.0 {
-        return 0.3176; // fallback to standard BLOSUM62 lambda
-    }
-    let ub = 1.1 * (n as f64).ln() / r_max_min;
-
-    // Bisection: find lambda where sum(inv(exp(lambda * M))) ≈ 1
-    let lb = ub * 1e-6;
-    let mut lo = lb;
-    let mut hi = ub;
-
-    let inv_sum = |tau: f64| -> Option<f64> {
-        // Build exp(tau * M)
-        let mut em: Vec<Vec<f64>> = vec![vec![0.0; n]; n];
-        for i in 0..n {
-            for j in 0..n {
-                em[i][j] = (tau * mat[i][j]).exp();
-            }
-        }
-        // Invert using Gauss-Jordan
-        let mut inv: Vec<Vec<f64>> = vec![vec![0.0; n]; n];
-        for i in 0..n {
-            inv[i][i] = 1.0;
-        }
-        let mut a = em;
-        for col in 0..n {
-            // Partial pivot
-            let mut max_row = col;
-            let mut max_val = a[col][col].abs();
-            for row in col + 1..n {
-                if a[row][col].abs() > max_val {
-                    max_val = a[row][col].abs();
-                    max_row = row;
-                }
-            }
-            if max_val < 1e-15 {
-                return None;
-            }
-            a.swap(col, max_row);
-            inv.swap(col, max_row);
-            let pivot = a[col][col];
-            for j in 0..n {
-                a[col][j] /= pivot;
-                inv[col][j] /= pivot;
-            }
-            for row in 0..n {
-                if row == col {
-                    continue;
-                }
-                let factor = a[row][col];
-                for j in 0..n {
-                    a[row][j] -= factor * a[col][j];
-                    inv[row][j] -= factor * inv[col][j];
-                }
-            }
-        }
-        let s: f64 = inv.iter().flat_map(|r| r.iter()).sum();
-        Some(s)
-    };
-
-    let lo_sum = inv_sum(lo).unwrap_or(0.0);
-    let hi_sum = inv_sum(hi).unwrap_or(f64::MAX);
-    if (lo_sum - 1.0).signum() == (hi_sum - 1.0).signum() {
-        return 0.3176; // fallback
-    }
-
-    for _ in 0..100 {
-        let mid = (lo + hi) / 2.0;
-        if mid == lo || mid == hi {
-            break;
-        }
-        let mid_sum = inv_sum(mid).unwrap_or(f64::MAX);
-        if (lo_sum < 1.0 && mid_sum >= 1.0) || (lo_sum > 1.0 && mid_sum <= 1.0) {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-    (lo + hi) / 2.0
+    let mut calculator = crate::tantan::LambdaCalculator::new();
+    calculator.calculate_flat_i8(scores, stride, n);
+    calculator.lambda()
 }
 
 /// Pre-computed tantan masking state. Compute once, reuse for all sequences.
@@ -973,6 +873,16 @@ mod tests {
             (lambda - 0.324).abs() < 0.01,
             "Lambda should be ~0.324, got {:.6}",
             lambda
+        );
+    }
+
+    #[test]
+    fn test_lambda_pam250_matches_upstream_bad_state() {
+        let sm = &crate::stats::matrices::PAM250;
+        let lambda = compute_lambda_flat(&sm.scores, crate::basic::value::AMINO_ACID_COUNT, 20);
+        assert_eq!(
+            lambda, -1.0,
+            "upstream lib/tantan/LambdaCalculator rejects PAM250"
         );
     }
 

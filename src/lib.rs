@@ -52,6 +52,8 @@ pub mod output;
 pub mod run;
 pub mod search;
 pub mod stats;
+#[path = "lib/tantan/mod.rs"]
+pub mod tantan;
 pub mod tools;
 // Translation-audit fixtures read the pinned upstream C/C++ sources. Keep
 // them out of normal library builds so a published crate remains buildable

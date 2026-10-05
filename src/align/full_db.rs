@@ -36,6 +36,7 @@ pub fn full_db_align(
         params.query_id = Some("");
         params.frame = frame as i32;
         params.query_source_len = query_seq[frame].len() as i32;
+        params.query_translated = cfg.query_translated;
         params.composition_bias = composition_bias;
         params.flags = flags | Flags::FULL_MATRIX;
         params.target_max_len = ref_seqs.max_len(0, ref_seqs.len() as BlockId);

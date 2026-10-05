@@ -77,9 +77,10 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
     // protein query; the grouped extension path maps results back to the
     // source DNA query and DNA coordinates before formatting output.
     let mut protein_records = Vec::new();
+    let dna_query_count = dna_records.len();
     let mut translated_sources = Vec::with_capacity(dna_records.len());
 
-    for (dna_index, dna_rec) in dna_records.iter().enumerate() {
+    for (dna_index, dna_rec) in dna_records.into_iter().enumerate() {
         let dna_bytes: Vec<u8> = dna_rec.sequence.iter().map(|&l| l as u8).collect();
         let dna_len = dna_bytes.len() as i32;
         let frames =
@@ -95,6 +96,7 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
         translated_sources.push(TranslatedQuerySource {
             id: dna_short.clone(),
             dna_len,
+            sequence: dna_rec.sequence,
         });
 
         for (frame_idx, frame_seq) in frames.iter().enumerate() {
@@ -180,7 +182,6 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
     };
     let tmp_query = temp_dir.join(format!("diamond_blastx_query_{temp_tag}.faa"));
     let translated_frame_count = protein_records.len();
-    let dna_query_count = dna_records.len();
     eprintln!(
         "Translated {dna_query_count} DNA queries into {translated_frame_count} protein frames in {:.1}s",
         start.elapsed().as_secs_f64()
@@ -203,7 +204,6 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
     // The inner blastp reader owns the translated sequences from here. Do not
     // retain a second in-memory copy throughout seeding and extension.
     drop(protein_records);
-    drop(dna_records);
 
     let mut bp_config = blastp_config;
     bp_config.query_files = vec![tmp_query.to_string_lossy().to_string()];

@@ -18,6 +18,10 @@ use crate::data::fasta;
 use crate::data::seed_histogram::SeedPartitionRange;
 use crate::dp::swipe::{Flags, HspValues};
 use crate::masking::{MaskingAlgo, MaskingMode};
+use crate::output::daa::daa_write::{
+    finish_daa_from_sequence_file, finish_daa_query_record, init_daa, write_daa_query_record,
+    write_daa_record_hsp, DaaRunMetadata, DaaSequenceFile,
+};
 use crate::output::format::{self, FieldId, Hsp as OutputHsp};
 use crate::search::hit::Hit;
 use crate::search::hit_buffer::{CompactHit, HitBuffer, HitBufferMode};
@@ -749,6 +753,10 @@ pub struct BlastpConfig {
 pub struct TranslatedQuerySource {
     pub id: String,
     pub dna_len: i32,
+    /// Original nucleotide query, retained for native DAA records. The six
+    /// translated protein contexts are owned separately by the extension
+    /// groups, so this is the only stored source-DNA copy.
+    pub sequence: Vec<Letter>,
 }
 
 #[derive(Clone, Debug)]
@@ -756,10 +764,84 @@ pub struct TranslatedQueryLayout {
     pub sources: Vec<TranslatedQuerySource>,
 }
 
-struct TranslatedExtensionGroup {
+struct TranslatedExtensionGroup<'a> {
     id: String,
     dna_len: i32,
+    source_sequence: &'a [Letter],
     frames: Vec<Vec<Letter>>,
+}
+
+enum QueryOutput {
+    Tabular { bytes: Vec<u8>, rows: u64 },
+    Daa(Vec<Match>),
+}
+
+struct NativeDaaDictionary {
+    sequence_count: u64,
+    refs: Vec<(String, u32)>,
+}
+
+impl DaaSequenceFile for NativeDaaDictionary {
+    fn sequence_count(&self) -> u64 {
+        self.sequence_count
+    }
+
+    fn dict_size(&self) -> usize {
+        self.refs.len()
+    }
+
+    fn dict_title(&self, index: usize) -> String {
+        self.refs[index].0.clone()
+    }
+
+    fn dict_len(&self, index: usize) -> u32 {
+        self.refs[index].1
+    }
+}
+
+fn encode_daa_query(
+    output: &mut Vec<u8>,
+    query_name: &str,
+    query_source: &[Letter],
+    input_sequence_type: SequenceType,
+    matches: &[Match],
+    target_to_dict: &mut [Option<u32>],
+    dict_targets: &mut Vec<usize>,
+) -> io::Result<u64> {
+    let hsp_count = matches
+        .iter()
+        .map(|target| target.hsps.len() as u64)
+        .sum::<u64>();
+    if hsp_count == 0 {
+        return Ok(0);
+    }
+
+    let seek_pos = write_daa_query_record(output, query_name, query_source, input_sequence_type);
+    for target in matches {
+        let target_id = target.target_block_id as usize;
+        let slot = target_to_dict.get_mut(target_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("DAA target id {target_id} is outside the database block"),
+            )
+        })?;
+        let dict_id = match *slot {
+            Some(id) => id,
+            None => {
+                let id = u32::try_from(dict_targets.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "DAA dictionary exceeds u32")
+                })?;
+                *slot = Some(id);
+                dict_targets.push(target_id);
+                id
+            }
+        };
+        for hsp in &target.hsps {
+            write_daa_record_hsp(output, hsp, dict_id);
+        }
+    }
+    finish_daa_query_record(output, seek_pos);
+    Ok(hsp_count)
 }
 
 #[derive(Default)]
@@ -1342,6 +1424,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             groups.push(TranslatedExtensionGroup {
                 id: source.id.clone(),
                 dna_len: source.dna_len,
+                source_sequence: &source.sequence,
                 frames,
             });
         }
@@ -1350,10 +1433,22 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         None
     };
 
-    // Parse output format. Only tabular is implemented in the native pipeline.
-    // For PAF/SAM/XML/pairwise/DAA the user must use --legacy.
-    let fields = if config.outfmt.is_empty() || config.outfmt[0] == "6" || config.outfmt[0] == "tab"
-    {
+    // Parse the two native output paths. DAA uses the same completed `Match`
+    // objects as tabular output, but serializes all HSP transcripts and builds
+    // the reference dictionary in stable first-use order at the writer.
+    let daa_output = config
+        .outfmt
+        .first()
+        .is_some_and(|format| format == "100" || format.eq_ignore_ascii_case("daa"));
+    let fields = if daa_output {
+        if config.outfmt.len() > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DAA output does not accept tabular field names",
+            ));
+        }
+        Vec::new()
+    } else if config.outfmt.is_empty() || config.outfmt[0] == "6" || config.outfmt[0] == "tab" {
         if config.outfmt.len() > 1 {
             config.outfmt[1..]
                 .iter()
@@ -1365,17 +1460,35 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
     } else {
         return Err(io::Error::other(format!(
             "Output format '{}' is not implemented in the native blastp pipeline. \
-             Supported: 6/tab. Use --legacy to route to the C++ engine for other formats.",
+             Supported: 6/tab and 100/daa. Use --legacy to route to the C++ engine for other formats.",
             config.outfmt[0]
         )));
     };
 
-    // Set up output writer
-    let output: Box<dyn Write> = match &config.output {
-        Some(path) => Box::new(BufWriter::new(std::fs::File::create(path)?)),
-        None => Box::new(BufWriter::new(io::stdout())),
+    let mut text_writer: Option<Box<dyn Write>> = if daa_output {
+        None
+    } else {
+        Some(match &config.output {
+            Some(path) => Box::new(BufWriter::new(std::fs::File::create(path)?)),
+            None => Box::new(BufWriter::new(io::stdout())),
+        })
     };
-    let mut writer = output;
+    let mut daa_writer = if daa_output {
+        let path = config.output.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DAA output requires -a/--daa or -o/--out",
+            )
+        })?;
+        let mut writer = BufWriter::new(std::fs::File::create(path)?);
+        init_daa(&mut writer)?;
+        Some(writer)
+    } else {
+        None
+    };
+    let mut target_to_dict = vec![None; db_block.seqs().len()];
+    let mut dict_targets = Vec::new();
+    let mut aligned_queries = 0u64;
     const GAPPED_FILTER_EVALUE1: f64 = 2000.0;
     const GAPPED_FILTER_DIAG_BITS: f64 = 12.0;
     const GAPPED_FILTER_WINDOW: i32 = 200;
@@ -1401,7 +1514,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         &fasta::FastaRecord,
         &[CompactHit],
     )|
-     -> io::Result<Vec<u8>> {
+     -> io::Result<QueryOutput> {
         let query = &query_rec.sequence;
 
         // CBS (composition-based statistics) correction per query position.
@@ -1445,11 +1558,15 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 .map(|hit| Hit::with_score(0, hit.subject, hit.seed_offset, hit.score)),
         );
         let mut stat = Statistics::new();
-        let output_hsp_values = HspValues::COORDS
-            | HspValues::IDENT
-            | HspValues::LENGTH
-            | HspValues::MISMATCHES
-            | HspValues::GAP_OPENINGS;
+        let output_hsp_values = if daa_output {
+            HspValues::TRANSCRIPT
+        } else {
+            HspValues::COORDS
+                | HspValues::IDENT
+                | HspValues::LENGTH
+                | HspValues::MISMATCHES
+                | HspValues::GAP_OPENINGS
+        };
         let query_cbs_arg: &[Vec<i8>] = if query_cbs.is_empty() {
             &[]
         } else {
@@ -1487,10 +1604,14 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             GAPPED_FILTER_WINDOW,
             Option::<fn(u32, &crate::align::gapped_filter::SeedHitList) -> Vec<Match>>::None,
         );
+        if daa_output {
+            return Ok(QueryOutput::Daa(matches));
+        }
         // Format each completed match directly into its query buffer. The
         // match list is already in output order, so retaining a second
         // vector of copied HSP summaries only adds allocation and traffic.
         let mut buf: Vec<u8> = Vec::new();
+        let mut rows = 0u64;
         for m in matches {
             let Some(best_hsp) = m.hsps.first() else {
                 continue;
@@ -1528,14 +1649,15 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 query.len() as i32,
                 db_block.seqs().length(target_id) as i32,
             )?;
+            rows += 1;
         }
-        Ok(buf)
+        Ok(QueryOutput::Tabular { bytes: buf, rows })
     };
 
     let process_translated_query =
         |(query_idx, group, query_hits): (usize, &TranslatedExtensionGroup, &[Vec<CompactHit>]),
          scratch: &mut ExtensionWorkerScratch|
-         -> io::Result<Vec<u8>> {
+         -> io::Result<QueryOutput> {
             debug_assert_eq!(group.frames.len(), 6);
             debug_assert_eq!(query_hits.len(), 6);
             let ExtensionWorkerScratch {
@@ -1593,11 +1715,15 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 }));
             }
             let mut stat = Statistics::new();
-            let output_hsp_values = HspValues::COORDS
-                | HspValues::IDENT
-                | HspValues::LENGTH
-                | HspValues::MISMATCHES
-                | HspValues::GAP_OPENINGS;
+            let output_hsp_values = if daa_output {
+                HspValues::TRANSCRIPT
+            } else {
+                HspValues::COORDS
+                    | HspValues::IDENT
+                    | HspValues::LENGTH
+                    | HspValues::MISMATCHES
+                    | HspValues::GAP_OPENINGS
+            };
             let matches = extend_targets(
                 query_idx as u32,
                 hits,
@@ -1630,7 +1756,11 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                 GAPPED_FILTER_WINDOW,
                 Option::<fn(u32, &crate::align::gapped_filter::SeedHitList) -> Vec<Match>>::None,
             );
+            if daa_output {
+                return Ok(QueryOutput::Daa(matches));
+            }
             let mut buf = Vec::new();
+            let mut rows = 0u64;
             for m in matches {
                 let Some(best_hsp) = m.hsps.first() else {
                     continue;
@@ -1690,8 +1820,9 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                     group.dna_len,
                     db_block.seqs().length(target_id) as i32,
                 )?;
+                rows += 1;
             }
-            Ok(buf)
+            Ok(QueryOutput::Tabular { bytes: buf, rows })
         };
     let mut total_alignments = 0u64;
     // Preserve input order without retaining every query's formatted output.
@@ -1707,7 +1838,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             let local_begin = batch_idx * output_batch_size;
             let query_begin = range_begin + local_begin;
             let hit_batch = &hits_by_query[local_begin..local_begin + query_batch.len()];
-            let batch_output: Vec<Vec<u8>> = if rayon::current_num_threads() == 1 {
+            let batch_output: Vec<QueryOutput> = if rayon::current_num_threads() == 1 {
                 query_batch
                     .iter()
                     .zip(hit_batch)
@@ -1726,9 +1857,33 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                     })
                     .collect::<io::Result<Vec<_>>>()?
             };
-            for buf in batch_output {
-                total_alignments += buf.iter().filter(|&&b| b == b'\n').count() as u64;
-                writer.write_all(&buf)?;
+            for (record, output) in query_batch.iter().zip(batch_output) {
+                match output {
+                    QueryOutput::Tabular { bytes, rows } => {
+                        total_alignments += rows;
+                        text_writer
+                            .as_mut()
+                            .expect("tabular writer")
+                            .write_all(&bytes)?;
+                    }
+                    QueryOutput::Daa(matches) => {
+                        let mut bytes = Vec::new();
+                        let count = encode_daa_query(
+                            &mut bytes,
+                            &record.id,
+                            &record.sequence,
+                            SequenceType::AminoAcid,
+                            &matches,
+                            &mut target_to_dict,
+                            &mut dict_targets,
+                        )?;
+                        if count != 0 {
+                            aligned_queries += 1;
+                            total_alignments += count;
+                            daa_writer.as_mut().expect("DAA writer").write_all(&bytes)?;
+                        }
+                    }
+                }
             }
             if trim_between_batches && local_begin.saturating_add(query_batch.len()) < records.len()
             {
@@ -1767,9 +1922,9 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                             scratch,
                         )
                     })
-                    .collect::<io::Result<Vec<Vec<u8>>>>()
+                    .collect::<io::Result<Vec<QueryOutput>>>()
             };
-            let partition_output: Vec<io::Result<Vec<Vec<u8>>>> =
+            let partition_output: Vec<io::Result<Vec<QueryOutput>>> =
                 if rayon::current_num_threads() == 1 || partitions.len() <= 1 {
                     let mut scratch = ExtensionWorkerScratch::default();
                     (0..partitions.len())
@@ -1780,7 +1935,7 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                     use std::sync::OnceLock;
 
                     let next = AtomicUsize::new(0);
-                    let output: Vec<OnceLock<io::Result<Vec<Vec<u8>>>>> =
+                    let output: Vec<OnceLock<io::Result<Vec<QueryOutput>>>> =
                         (0..partitions.len()).map(|_| OnceLock::new()).collect();
                     let worker_count = rayon::current_num_threads().min(partitions.len());
                     rayon::scope(|scope| {
@@ -1810,10 +1965,36 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
                         })
                         .collect()
                 };
-            for partition in partition_output {
-                for buf in partition? {
-                    total_alignments += buf.iter().filter(|&&byte| byte == b'\n').count() as u64;
-                    writer.write_all(&buf)?;
+            for (partition_index, partition) in partition_output.into_iter().enumerate() {
+                let outputs = partition?;
+                for (offset, output) in partitions[partition_index].clone().zip(outputs) {
+                    match output {
+                        QueryOutput::Tabular { bytes, rows } => {
+                            total_alignments += rows;
+                            text_writer
+                                .as_mut()
+                                .expect("tabular writer")
+                                .write_all(&bytes)?;
+                        }
+                        QueryOutput::Daa(matches) => {
+                            let group = &source_groups[offset];
+                            let mut bytes = Vec::new();
+                            let count = encode_daa_query(
+                                &mut bytes,
+                                &group.id,
+                                group.source_sequence,
+                                SequenceType::Nucleotide,
+                                &matches,
+                                &mut target_to_dict,
+                                &mut dict_targets,
+                            )?;
+                            if count != 0 {
+                                aligned_queries += 1;
+                                total_alignments += count;
+                                daa_writer.as_mut().expect("DAA writer").write_all(&bytes)?;
+                            }
+                        }
+                    }
                 }
             }
             Ok(())
@@ -1916,7 +2097,48 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
             disk.total_disk_size() as f64 / (1024.0 * 1024.0)
         );
     }
-    writer.flush()?;
+    if let Some(writer) = text_writer.as_mut() {
+        writer.flush()?;
+    }
+    if let Some(writer) = daa_writer.as_mut() {
+        let mut refs = Vec::with_capacity(dict_targets.len());
+        for &target_id in &dict_targets {
+            let title = std::str::from_utf8(db_ids.get(target_id))
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid UTF-8 database title: {error}"),
+                    )
+                })?
+                .to_owned();
+            refs.push((title, db_block.seqs().length(target_id) as u32));
+        }
+        let dictionary = NativeDaaDictionary {
+            sequence_count: db_block.seqs().len() as u64,
+            refs,
+        };
+        let metadata = DaaRunMetadata {
+            db_letters: score_matrix.db_letters(),
+            gap_open: score_matrix.gap_open(),
+            gap_extend: score_matrix.gap_extend(),
+            // These configuration values are meaningful only for blastn but
+            // upstream writes their defaults into every DAA header.
+            reward: 2,
+            penalty: -3,
+            k: score_matrix.k(),
+            lambda: score_matrix.lambda(),
+            max_evalue: config.max_evalue,
+            matrix: score_matrix.name().to_owned(),
+            mode: if translated_groups.is_some() {
+                crate::basic::value::AlignMode::BLASTX as u32
+            } else {
+                crate::basic::value::AlignMode::BLASTP as u32
+            },
+            aligned_queries,
+        };
+        finish_daa_from_sequence_file(writer, &dictionary, &metadata)?;
+        writer.flush()?;
+    }
 
     let elapsed = start.elapsed();
     eprintln!(
