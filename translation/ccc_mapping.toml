@@ -1,0 +1,462 @@
+# Explicit mappings for names that do not normalize automatically. Keep this
+# list restricted to source pairs that have been manually audited.
+
+[[entries]]
+other = "makeindex"
+rust = "make_index"
+
+[[entries]]
+other = "buildExpMatrix"
+rust = "build_exp_matrix"
+
+[[entries]]
+other = "luDecompose"
+rust = "lu_decompose"
+
+[[entries]]
+other = "luSolve"
+rust = "lu_solve"
+
+[[entries]]
+other = "invSum"
+rust = "inv_sum"
+
+[[entries]]
+other = "findUpperBound"
+rust = "find_upper_bound"
+
+[[entries]]
+other = "write_daa_record"
+rust = "write_daa_record_intermediate"
+
+[[entries]]
+other = "finish_daa"
+rust = "finish_daa_from_sequence_file"
+
+[[entries]]
+other = "Nlm_DenseMatrixNew"
+rust = "nlm_dense_matrix_new"
+
+[[entries]]
+other = "Nlm_LtriangMatrixNew"
+rust = "nlm_ltriang_matrix_new"
+
+[[entries]]
+other = "Nlm_DenseMatrixFree"
+rust = "nlm_dense_matrix_free"
+
+[[entries]]
+other = "Nlm_Int4MatrixNew"
+rust = "nlm_int4_matrix_new"
+
+[[entries]]
+other = "Nlm_Int4MatrixFree"
+rust = "nlm_int4_matrix_free"
+
+[[entries]]
+other = "Nlm_FactorLtriangPosDef"
+rust = "nlm_factor_ltriang_pos_def"
+
+[[entries]]
+other = "Nlm_SolveLtriangPosDef"
+rust = "nlm_solve_ltriang_pos_def"
+
+[[entries]]
+other = "Nlm_EuclideanNorm"
+rust = "nlm_euclidean_norm"
+
+[[entries]]
+other = "Nlm_AddVectors"
+rust = "nlm_add_vectors"
+
+[[entries]]
+other = "Nlm_StepBound"
+rust = "nlm_step_bound"
+
+[[entries]]
+other = "LocalMaxStat::copy"
+rust = "copy_full"
+
+[[entries]]
+other = "sls_basic::get_current_time"
+rust = "get_current_time"
+
+[[entries]]
+other = "sls_basic::random_seed_from_time"
+rust = "random_seed_from_time"
+
+[[entries]]
+other = "run_single_mode"
+rust = "run_single_mode_with_size"
+
+[[entries]]
+other = "operator()"
+rust = "call"
+
+[[entries]]
+other = "process_window"
+rust = "process_window_with"
+
+[[entries]]
+other = "is_excluded"
+rust = "is_excluded_with"
+
+[[entries]]
+other = "find_shapes"
+rust = "find_shapes_with"
+
+[[entries]]
+other = "ScaledSymmetricProductA20"
+rust = "scaled_symmetric_product_a20"
+
+[[entries]]
+other = "MultiplyByA20"
+rust = "multiply_by_a20"
+
+[[entries]]
+other = "MultiplyByATranspose20"
+rust = "multiply_by_a_transpose20"
+
+[[entries]]
+other = "ResidualsLinearConstraints20"
+rust = "residuals_linear_constraints20"
+
+[[entries]]
+other = "DualResiduals20"
+rust = "dual_residuals20"
+
+[[entries]]
+other = "CalculateResiduals20"
+rust = "calculate_residuals20"
+
+[[entries]]
+other = "EvaluateReFunctions20"
+rust = "evaluate_re_functions20"
+
+[[entries]]
+other = "FactorNewton20"
+rust = "factor_newton20"
+
+[[entries]]
+other = "SolveNewton20"
+rust = "solve_newton20"
+
+[[entries]]
+other = "New_OptimizeTargetFrequencies"
+rust = "new_optimize_target_frequencies"
+
+[[entries]]
+other = "MultiplyByAtranspose"
+rust = "multiply_by_a_transpose"
+
+[[entries]]
+other = "HitBuffer::HitBuffer"
+rust = "with_limits"
+
+[[entries]]
+other = "Blast_CalcFreqRatios"
+rust = "calc_freq_ratios"
+
+[[entries]]
+other = "s_ScoresStdAlphabet"
+rust = "scores_std_alphabet"
+
+[[entries]]
+other = "s_TestToApplyREAdjustmentConditional"
+rust = "test_to_apply_re_adjustment_conditional"
+
+[[entries]]
+other = "s_CalcLambda"
+rust = "calc_lambda"
+
+[[entries]]
+other = "s_GetScoreRange"
+rust = "get_score_range"
+
+[[entries]]
+other = "s_GetMatrixScoreProbs"
+rust = "matrix_score_probs"
+
+[[entries]]
+other = "Blast_FreqRatioToScore"
+rust = "freq_ratio_to_score"
+
+[[entries]]
+other = "s_RoundScoreMatrix"
+rust = "round_score_matrix"
+
+[[entries]]
+other = "s_CalcAvgScore"
+rust = "calc_avg_score"
+
+[[entries]]
+other = "s_CalcXScore"
+rust = "calc_x_score"
+
+[[entries]]
+other = "s_SetXUOScores"
+rust = "set_xuo_scores"
+
+[[entries]]
+other = "s_ScaleSquareMatrix"
+rust = "scale_square_matrix"
+
+[[entries]]
+other = "BestCentroid"
+rust = "new"
+
+[[entries]]
+other = "Cascaded::run"
+rust = "run"
+
+[[entries]]
+other = "DynProgProb::free2"
+rust = "free_arrays"
+
+[[entries]]
+other = "DynProgProb::clear"
+rust = "clear_capacity"
+
+[[entries]]
+other = "DynProgProb::copy"
+rust = "copy_state"
+
+[[entries]]
+other = "DynProgProb::initInput"
+rust = "init_input"
+
+[[entries]]
+other = "DynProgProb::freeInput"
+rust = "free_input"
+
+[[entries]]
+other = "DynProgProb::setInput"
+rust = "set_input"
+
+[[entries]]
+other = "DynProgProb::update"
+rust = "update_state"
+
+[[entries]]
+other = "DynProgProb::setValueBegin"
+rust = "set_value_begin"
+
+[[entries]]
+other = "LocalMaxStatUtil::flatten"
+rust = "flatten"
+
+[[entries]]
+other = "LocalMaxStatUtil::lambda"
+rust = "lambda"
+
+[[entries]]
+other = "LocalMaxStatUtil::mu"
+rust = "mu"
+
+[[entries]]
+other = "LocalMaxStatUtil::muPowerAssoc"
+rust = "muPowerAssoc"
+
+[[entries]]
+other = "LocalMaxStatUtil::thetaMin"
+rust = "thetaMin"
+
+[[entries]]
+other = "LocalMaxStatUtil::rMin"
+rust = "rMin"
+
+[[entries]]
+other = "LocalMaxStatUtil::r"
+rust = "r"
+
+[[entries]]
+other = "LocalMaxStatUtil::descendingLadderEpochRepeat"
+rust = "descendingLadderEpochRepeat"
+
+[[entries]]
+other = "LocalMaxStatUtil::descendingLadderEpoch"
+rust = "descendingLadderEpoch"
+
+[[entries]]
+other = "alp_data::alp_data"
+rust = "new_from_files"
+
+[[entries]]
+other = "alp_data::alp_data"
+rust = "new_from_parameters"
+
+[[entries]]
+other = "alp_data::read_RR"
+rust = "read_RR_with_sum"
+
+[[entries]]
+other = "is_outranked"
+rust = "is_outranked_partition"
+
+[[entries]]
+other = "HitIterator"
+rust = "new"
+
+[[entries]]
+other = "MaskingTable::operator="
+rust = "assign_from"
+
+[[entries]]
+other = "Masking::operator()"
+rust = "apply_masking"
+
+[[entries]]
+other = "SMessageOriginNew"
+rust = "s_message_origin_new"
+
+[[entries]]
+other = "SMessageOriginFree"
+rust = "s_message_origin_free"
+
+[[entries]]
+other = "BlastKarlinEtoS_simple"
+rust = "blast_karlin_e_to_s_simple"
+
+[[entries]]
+other = "BLAST_KarlinStoE_simple"
+rust = "blast_karlin_s_to_e_simple"
+
+[[entries]]
+other = "SBlastScoreMatrixFree"
+rust = "s_blast_score_matrix_free"
+
+[[entries]]
+other = "SPsiBlastScoreMatrixFree"
+rust = "s_psi_blast_score_matrix_free"
+
+[[entries]]
+other = "BlastKarlinLHtoK"
+rust = "blast_karlin_lh_to_k"
+
+[[entries]]
+other = "s_SplitArrayOf8"
+rust = "s_split_array_of_8"
+
+[[entries]]
+other = "BlastKarlinLtoH"
+rust = "blast_karlin_l_to_h"
+
+[[entries]]
+other = "_PSIDeallocateMatrix"
+rust = "psi_deallocate_matrix"
+
+[[entries]]
+other = "_PSIAllocateMatrix"
+rust = "psi_allocate_matrix"
+
+[[entries]]
+other = "_PSIMatrixFrequencyRatiosNew"
+rust = "psi_matrix_frequency_ratios_new"
+
+[[entries]]
+other = "_PSIMatrixFrequencyRatiosFree"
+rust = "psi_matrix_frequency_ratios_free"
+
+[[entries]]
+other = "IoUtil::setFormat"
+rust = "setFormat"
+
+[[entries]]
+other = "IoUtil::clearFormat"
+rust = "clearFormat"
+
+[[entries]]
+other = "IoUtil::setTerminator"
+rust = "setTerminator"
+
+[[entries]]
+other = "IoUtil::clearTerminator"
+rust = "clearTerminator"
+
+[[entries]]
+other = "IoUtil::getLine"
+rust = "getLine"
+
+[[entries]]
+other = "IoUtil::in"
+rust = "in_double"
+
+[[entries]]
+other = "Random::seed"
+rust = "seed"
+
+[[entries]]
+other = "Random::number"
+rust = "number"
+
+[[entries]]
+other = "LocalMaxStatMatrix::copy"
+rust = "copy_matrix"
+
+[[entries]]
+other = "operator<<"
+rust = "fmt"
+
+[[entries]]
+other = "operator>>"
+rust = "from_str"
+
+# The C++ parser treats FORCE_INLINE fmix return types as function names.
+[[entries]]
+other = "uint32_t"
+rust = "fmix32"
+
+[[entries]]
+other = "uint64_t"
+rust = "fmix64"
+
+[[entries]]
+other = "AlignmentEvaluer::initParameters"
+rust = "initParametersWithErrors"
+
+[[entries]]
+other = "AlignmentEvaluer::calc"
+rust = "calc_without_errors"
+
+# Rust names the four-argument overload for the database-size adjustment.
+[[entries]]
+other = "Blastn_Score::calculate_length_adjustment"
+rust = "calculate_length_adjustment_db"
+
+[[entries]]
+other = "FamilyMapping"
+rust = "parse"
+
+[[entries]]
+other = "FamilyMapping"
+rust = "new"
+
+[[entries]]
+other = "Histogram"
+rust = "new"
+
+[[entries]]
+other = "operator+="
+rust = "add_assign"
+
+[[entries]]
+other = "operator<<"
+rust = "format"
+
+[[entries]]
+other = "QueryStats"
+rust = "new"
+
+[[entries]]
+other = "roc"
+rust = "roc_from_text"
+
+[[entries]]
+other = "ExtendedSeed"
+rust = "new"
+
+# The seed-only overload has no CIGAR argument and therefore has a distinct
+# Rust name; the other overload retains `cigar_to_hsp`.
+[[entries]]
+other = "cigar_to_hsp"
+rust = "cigar_to_hsp_seed_match"
