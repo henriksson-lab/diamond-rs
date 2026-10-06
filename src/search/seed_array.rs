@@ -146,9 +146,34 @@ impl SeedArray {
         sketch_size: usize,
         min_query_len: usize,
     ) -> Self {
+        Self::build_sketch_with_min_query_len_partition_range(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            sketch_size,
+            min_query_len,
+            0,
+            seed::seedp_count(seedp_bits) as usize,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_sketch_with_min_query_len_partition_range(
+        seqs: &[&[Letter]],
+        shape: &Shape,
+        reduction: &Reduction,
+        seedp_bits: i32,
+        sketch_size: usize,
+        min_query_len: usize,
+        partition_begin: usize,
+        partition_end: usize,
+    ) -> Self {
         use rayon::prelude::*;
 
         let num_partitions = seed::seedp_count(seedp_bits) as usize;
+        debug_assert!(partition_begin <= partition_end);
+        debug_assert!(partition_end <= num_partitions);
         let mask = seed::seedp_mask(seedp_bits);
         let seq_offsets = Self::sequence_offsets(seqs);
         let buckets = seqs
@@ -170,10 +195,12 @@ impl SeedArray {
                     while iterator.good() {
                         let packed = iterator.get();
                         let partition = seed::seed_partition(packed, mask) as usize;
-                        buckets[partition].push(SeedEntry {
-                            key: seed::seed_partition_offset(packed, seedp_bits as u64) as u32,
-                            loc: seq_offsets[seq_id] + iterator.pos() as u32,
-                        });
+                        if partition >= partition_begin && partition < partition_end {
+                            buckets[partition].push(SeedEntry {
+                                key: seed::seed_partition_offset(packed, seedp_bits as u64) as u32,
+                                loc: seq_offsets[seq_id] + iterator.pos() as u32,
+                            });
+                        }
                         iterator.increment();
                     }
                     buckets

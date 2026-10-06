@@ -514,6 +514,13 @@ pub fn mask(
                 super::tantan_simd::sum_neon(&f)
             }
         };
+        #[cfg(target_arch = "x86_64")]
+        let z = if matches!(x86_backend(), X86Backend::Avx2) {
+            b.mul_add(b2b, f_total * p_repeat_end)
+        } else {
+            b * b2b + f_total * p_repeat_end
+        };
+        #[cfg(not(target_arch = "x86_64"))]
         let z = b * b2b + f_total * p_repeat_end;
         let zinv = 1.0 / z;
 
@@ -522,6 +529,13 @@ pub fn mask(
         f.fill(p_repeat_end);
 
         for i in (0..len).rev() {
+            #[cfg(target_arch = "x86_64")]
+            let pf = if matches!(x86_backend(), X86Backend::Avx2) {
+                (pb[i] * b).mul_add(-zinv, 1.0)
+            } else {
+                1.0 - (pb[i] * b * zinv)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
             let pf = 1.0 - (pb[i] * b * zinv);
 
             // Rescale
@@ -862,6 +876,34 @@ mod tests {
             masked.len() > 0,
             "Q6GZX3 repeat region should have some masking"
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn blosum50_terminal_stop_mask_matches_upstream_avx2() {
+        if !super::super::tantan_simd::has_avx2() {
+            return;
+        }
+        let source = b"MEMIKCIQLEKEFAGRSLFTIQQLSLQAGQKVGLVGNNGVGKSTFLKILLGLDRDFAGQIEVKADWAYVPQLQEVTCLSGGEQVWKSIQEAFAQRPQLLIMDEPTANLDQEHQEKLIKQIKRYRGSLLVVSHDRHFLNQIASHIWHLEEGTIQVYPGNYEAFVESRRAKRESQQEAYEAYQKKVAQLKKAQQERQAKAQKMGKRKKGVSSSEWKVNAMMGSYDSQAKSMAKSAKHLEKRMERLDKVEQPRKEAWVKMETKGALDTGLHSLFRLQDGQLWIGEKYLFDFPQLGMTFGDKLALVGSNGSGKTSFVRKLISKELEGYYNPKLKIAYFSQDLTSLNEEETAFVNASSTSLQDRVTVLNLLGMLGLSYDKAQQKVANLSGGERVRLSLAKVLLSDANLLIVDEPTNYLDITAIEALEKFLQEYQGSVLLISHDQRFVESVVHRKWLVENCQLNEQL*";
+        let traits = crate::basic::value::ValueTraits::new(
+            crate::basic::value::AMINO_ACID_ALPHABET,
+            MASK_LETTER,
+            b"-U",
+            crate::basic::value::SequenceType::AminoAcid,
+        );
+        let mut seq: Vec<Letter> = source
+            .iter()
+            .map(|&c| traits.from_char.convert(c).unwrap())
+            .collect();
+        let matrix = ScoreMatrix::new("BLOSUM50", 13, 2, 0, 1, 1).unwrap();
+        TantanMasker::from_score_matrix(&matrix, DEFAULT_MIN_MASK_PROB).mask(&mut seq);
+        let masked: Vec<usize> = seq
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &letter)| (letter & SEED_MASK != 0).then_some(i))
+            .collect();
+
+        assert_eq!(masked, (190..197).collect::<Vec<_>>());
     }
 
     #[test]

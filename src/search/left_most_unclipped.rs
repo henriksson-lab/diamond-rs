@@ -1,10 +1,4 @@
-//! Left-most filtering for a subject window already proven to be wholly inside
-//! one database sequence.
-//!
-//! The regular implementation must search for delimiter letters at both ends
-//! of every candidate window.  Its caller can often prove from the sequence
-//! index that no delimiter is present; this variant preserves the filtering
-//! logic while eliding that redundant scan.
+//! Left-most filtering over the original contiguous sequence-set storage.
 
 use crate::basic::shape::Shape;
 use crate::basic::value::Letter;
@@ -12,10 +6,11 @@ use crate::data::seed_histogram::SeedPartitionRange;
 use crate::search::hamming::match_positions;
 use crate::search::left_most::Context;
 use crate::search::sse_dist::{reduced_match, seed_mask};
+use crate::util::sequence;
 
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-pub fn left_most_filter_with_range_unclipped(
+pub fn left_most_filter_with_range_backed(
     query: &[Letter],
     query_start: usize,
     query_len: usize,
@@ -35,14 +30,24 @@ pub fn left_most_filter_with_range_unclipped(
     const WINDOW_RIGHT: i32 = 32;
 
     let d = (seed_offset - WINDOW_LEFT).max(0) as usize;
-    let window_left = seed_offset.min(WINDOW_LEFT).max(0) as usize;
+    let mut window_left = seed_offset.min(WINDOW_LEFT).max(0) as usize;
     debug_assert!(query_start + query_len <= query.len());
-    debug_assert!(subject_start + query_len <= subject.len());
-    let q_base = query_start + d;
-    let s_base = subject_start + d;
-    let q = &query[q_base..query_start + query_len];
-    let s = &subject[s_base..subject_start + query_len];
-    let window = (query_len - d).min(window_left + 1 + WINDOW_RIGHT as usize);
+    let q0 = query_start + d;
+    let s0 = subject_start + d;
+    let mut window = (query_len - d).min(window_left + 1 + WINDOW_RIGHT as usize);
+    debug_assert!(s0 + window <= subject.len());
+
+    // This is C++ `Util::Seq::clip(s, window, window_left)`: locate record
+    // delimiters in the logical comparison window, while retaining absolute
+    // pointers into the complete SequenceSet backing store for FingerPrint.
+    let subject_clipped = sequence::clip(&subject[s0..s0 + window], window_left as i32);
+    let clipped_start = subject_clipped.as_ptr() as usize - subject[s0..].as_ptr() as usize;
+    let q_base = q0 + clipped_start;
+    let s_base = s0 + clipped_start;
+    window_left -= clipped_start;
+    window = subject_clipped.len();
+    let q = &query[q_base..q_base + window];
+    let s = &subject[s_base..s_base + window];
 
     let match_mask = reduced_match(q, s, window as i32, context.reduction);
     let query_seed_mask = !seed_mask(q, window as i32);

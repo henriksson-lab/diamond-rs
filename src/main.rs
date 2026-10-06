@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use diamond::commands::blastp::BlastpConfig;
 use diamond::commands::blastx::BlastxConfig;
-use diamond::commands::cluster_cmd::ClusterConfig;
+use diamond::commands::cluster_cmd::{ClusterConfig, ClusterWorkflow};
 use diamond::commands::view::ViewConfig;
 use diamond::config::Sensitivity;
 use diamond::output::format::FieldId;
@@ -194,13 +194,20 @@ fn main() {
         }
         "cluster" | "linclust" | "deepclust" if !has_flag(&args, "--legacy") => {
             print_banner();
+            let workflow = match args[1].as_str() {
+                "linclust" => ClusterWorkflow::LinClust,
+                "deepclust" => ClusterWorkflow::DeepClust,
+                _ => ClusterWorkflow::Cascaded,
+            };
             let config = ClusterConfig {
+                workflow,
                 database: get_arg(&args, &["-d", "--db"]).unwrap_or_default(),
-                output: get_arg(&args, &["-o", "--out"]).unwrap_or_else(|| "clusters.tsv".into()),
-                threads: parse_arg_or(&args, &["-p", "--threads"], 1),
+                output: get_arg(&args, &["-o", "--out"]).unwrap_or_default(),
+                threads: parse_arg_or(&args, &["-p", "--threads"], 0),
                 member_cover: parse_arg_or(&args, &["--member-cover"], 80.0),
-                approx_id: parse_arg_or(&args, &["--approx-id"], 0.0),
-                sensitivity: parse_sensitivity(&args),
+                approx_id: get_arg(&args, &["--approx-id"]).and_then(|s| s.parse().ok()),
+                cluster_steps: get_all_args(&args, &["--cluster-steps"]),
+                alignment_output: get_arg(&args, &["--aln-out"]),
             };
             run_or_exit(diamond::commands::cluster_cmd::run(&config));
         }

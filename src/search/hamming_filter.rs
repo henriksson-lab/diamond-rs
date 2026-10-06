@@ -564,6 +564,38 @@ pub(crate) fn visit_hamming_group_for<const KERNEL: u8, F>(
     STREAMING_FINGERPRINT_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
 }
 
+/// Streaming form of upstream `stage1_self`: load the target seed group once
+/// and visit only its strict upper triangle. This is a distinct stage-1
+/// kernel, not a filter applied to a full query/target cross product.
+#[inline]
+pub(crate) fn visit_hamming_self_group_for<const KERNEL: u8, F>(
+    target_locs: &[(u32, u32)],
+    target_seqs: &[&[Letter]],
+    hamming_filter_id: u32,
+    mut visit: F,
+) where
+    F: FnMut((u32, u32), (u32, u32), usize),
+{
+    let mut scratch =
+        STREAMING_FINGERPRINT_SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    scratch.target.clear();
+    scratch.target.extend(target_locs.iter().map(|&(id, pos)| {
+        AlignedFingerprint48::new(load_sequence_set_fingerprint(target_seqs, id, pos))
+    }));
+    for i in 0..scratch.target.len() {
+        for j in i + 1..scratch.target.len() {
+            if fingerprint_equal_count_for::<KERNEL>(
+                &scratch.target[i].bytes,
+                &scratch.target[j].bytes,
+            ) >= hamming_filter_id
+            {
+                visit(target_locs[i], target_locs[j], j);
+            }
+        }
+    }
+    STREAMING_FINGERPRINT_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
+}
+
 pub(crate) fn retain_hamming_filter_sequence_set(
     matches: &mut Vec<SeedMatch>,
     query_seqs: &[&[Letter]],

@@ -59,6 +59,7 @@ impl BestCentroid {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WrapperCommand {
     Cascaded,
+    DeepClust,
     LinClust,
 }
 
@@ -311,6 +312,7 @@ pub fn run<B: CascadedWrapperBackend>(
         .ok_or_else(|| "Database is required.".to_owned())?;
     config.thresholds.command = match config.command {
         WrapperCommand::LinClust => ClusterCommand::LinClust,
+        WrapperCommand::DeepClust => ClusterCommand::DeepClust,
         WrapperCommand::Cascaded => ClusterCommand::Other,
     };
     init_thresholds(&mut config.thresholds)?;
@@ -466,6 +468,7 @@ mod tests {
         dense: Vec<SuperBlockId>,
         centroid_ids: Vec<OId>,
         searches: Vec<CentroidSearchConfig>,
+        dense_linear: Vec<bool>,
         output: Option<WrapperOutput>,
         external_calls: usize,
         closed_db: usize,
@@ -547,9 +550,10 @@ mod tests {
         fn cascaded_database(
             &mut self,
             _: &mut Db,
-            _: bool,
+            linear: bool,
             _: &mut CascadedConfig,
         ) -> Result<Vec<SuperBlockId>, String> {
+            self.dense_linear.push(linear);
             Ok(self.dense.clone())
         }
         fn cascaded_block(
@@ -635,6 +639,28 @@ mod tests {
         run(&mut backend, &mut cfg).unwrap();
         assert_eq!(backend.output, Some(WrapperOutput::Dense(vec![0, 0, 2])));
         assert_eq!(backend.closed_db, 1);
+    }
+
+    #[test]
+    fn command_defaults_and_linear_selection_match_upstream() {
+        for (command, expected_identity, expected_linear) in [
+            (WrapperCommand::Cascaded, 50.0, false),
+            (WrapperCommand::DeepClust, 0.0, false),
+            (WrapperCommand::LinClust, 90.0, true),
+        ] {
+            let mut backend = Backend {
+                db_count: 1,
+                db_letters: 10,
+                dense: vec![0],
+                ..Default::default()
+            };
+            let mut cfg = config();
+            cfg.command = command;
+            run(&mut backend, &mut cfg).unwrap();
+            assert_eq!(cfg.thresholds.approx_min_id, Some(expected_identity));
+            assert_eq!(cfg.core.approx_min_id, expected_identity);
+            assert_eq!(backend.dense_linear, vec![expected_linear]);
+        }
     }
 
     #[test]

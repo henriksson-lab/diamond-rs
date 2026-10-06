@@ -191,7 +191,6 @@ pub fn total_ram() -> f64 {
 
 #[cfg(not(windows))]
 unsafe extern "C" {
-    fn open(pathname: *const c_char, flags: i32) -> i32;
     fn mmap(
         addr: *mut c_void,
         length: usize,
@@ -202,6 +201,20 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn munmap(addr: *mut c_void, length: usize) -> i32;
     fn close(fd: i32) -> i32;
+}
+
+// Darwin declares `open` as `int open(const char *, int, ...)`. Its native
+// symbol must therefore be called through a variadic declaration even when
+// O_RDONLY does not require the optional mode argument. Keep the existing
+// fixed-arity declaration elsewhere so Linux code generation is unchanged.
+#[cfg(all(not(windows), target_vendor = "apple"))]
+unsafe extern "C" {
+    fn open(pathname: *const c_char, flags: i32, ...) -> i32;
+}
+
+#[cfg(all(not(windows), not(target_vendor = "apple")))]
+unsafe extern "C" {
+    fn open(pathname: *const c_char, flags: i32) -> i32;
 }
 
 pub fn mmap_file(filename: &str) -> Result<(*mut u8, usize, i32), String> {

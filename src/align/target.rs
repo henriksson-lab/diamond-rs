@@ -440,7 +440,7 @@ where
         ungapped_cfg,
         score_matrix,
     );
-    align_work_targets(
+    let aligned = align_work_targets(
         &mut targets,
         query_seq,
         query_id,
@@ -452,7 +452,8 @@ where
         stat,
         cfg,
         score_matrix,
-    )
+    );
+    aligned
 }
 
 enum TargetBlockAccess<'a> {

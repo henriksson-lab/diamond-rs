@@ -50,6 +50,10 @@ pub struct CascadedSearchConfig {
     pub lowmem: i32,
     pub sensitivity: Sensitivity,
     pub lin_stage1_query: bool,
+    pub approx_min_id: f64,
+    pub max_evalue: f64,
+    pub comp_based_stats: i32,
+    pub threads: i32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -318,6 +322,10 @@ pub fn cluster<B: CascadedBackend>(
         lowmem: config.lowmem,
         sensitivity: config.sensitivity,
         lin_stage1_query: config.lin_stage1_query,
+        approx_min_id: config.approx_min_id,
+        max_evalue: config.max_evalue,
+        comp_based_stats: config.comp_based_stats,
+        threads: config.threads,
     };
     let mut callback: Box<dyn EdgeCallback> = if mutual {
         Box::<CallbackBidirectional>::default()

@@ -157,6 +157,194 @@ impl PartialOrd for SketchKmer {
     }
 }
 
+// libstdc++ `std::sort` as used by C++ SketchIterator. Its comparator observes
+// only `hash`, so the unstable permutation of equal-hash occurrences is part
+// of the selected bottom-N sketch whenever a repeated seed straddles the
+// cutoff. Rust's stable `slice::sort` kept the earliest positions instead.
+fn cpp_sort_sketch_kmers(v: &mut [SketchKmer]) {
+    if v.len() < 2 {
+        return;
+    }
+    let depth = 2 * (usize::BITS as usize - 1 - v.len().leading_zeros() as usize);
+    cpp_sort_sketch_kmers_with_depth(v, depth);
+}
+
+fn cpp_sort_sketch_kmers_with_depth(v: &mut [SketchKmer], depth: usize) {
+    const THRESHOLD: usize = 16;
+
+    #[inline]
+    fn less(a: SketchKmer, b: SketchKmer) -> bool {
+        a.hash < b.hash
+    }
+
+    fn move_median_to_first(v: &mut [SketchKmer], result: usize, a: usize, b: usize, c: usize) {
+        if less(v[a], v[b]) {
+            if less(v[b], v[c]) {
+                v.swap(result, b);
+            } else if less(v[a], v[c]) {
+                v.swap(result, c);
+            } else {
+                v.swap(result, a);
+            }
+        } else if less(v[a], v[c]) {
+            v.swap(result, a);
+        } else if less(v[b], v[c]) {
+            v.swap(result, c);
+        } else {
+            v.swap(result, b);
+        }
+    }
+
+    fn partition(v: &mut [SketchKmer], mut first: usize, mut last: usize, pivot: usize) -> usize {
+        loop {
+            while less(v[first], v[pivot]) {
+                first += 1;
+            }
+            last -= 1;
+            while less(v[pivot], v[last]) {
+                last -= 1;
+            }
+            if first >= last {
+                return first;
+            }
+            v.swap(first, last);
+            first += 1;
+        }
+    }
+
+    fn insertion_sort(v: &mut [SketchKmer], first: usize, last: usize) {
+        if first == last {
+            return;
+        }
+        for i in first + 1..last {
+            let value = v[i];
+            if less(value, v[first]) {
+                v.copy_within(first..i, first + 1);
+                v[first] = value;
+            } else {
+                let mut hole = i;
+                while less(value, v[hole - 1]) {
+                    v[hole] = v[hole - 1];
+                    hole -= 1;
+                }
+                v[hole] = value;
+            }
+        }
+    }
+
+    fn unguarded_insertion_sort(v: &mut [SketchKmer], first: usize, last: usize) {
+        for i in first..last {
+            let value = v[i];
+            let mut hole = i;
+            while less(value, v[hole - 1]) {
+                v[hole] = v[hole - 1];
+                hole -= 1;
+            }
+            v[hole] = value;
+        }
+    }
+
+    fn push_heap(
+        v: &mut [SketchKmer],
+        first: usize,
+        mut hole: usize,
+        top: usize,
+        value: SketchKmer,
+    ) {
+        let mut parent = hole.saturating_sub(1) / 2;
+        while hole > top && less(v[first + parent], value) {
+            v[first + hole] = v[first + parent];
+            hole = parent;
+            parent = hole.saturating_sub(1) / 2;
+        }
+        v[first + hole] = value;
+    }
+
+    fn adjust_heap(
+        v: &mut [SketchKmer],
+        first: usize,
+        mut hole: usize,
+        len: usize,
+        value: SketchKmer,
+    ) {
+        let top = hole;
+        let mut second_child = hole;
+        while second_child < (len - 1) / 2 {
+            second_child = 2 * (second_child + 1);
+            if less(v[first + second_child], v[first + second_child - 1]) {
+                second_child -= 1;
+            }
+            v[first + hole] = v[first + second_child];
+            hole = second_child;
+        }
+        if len & 1 == 0 && second_child == (len - 2) / 2 {
+            second_child = 2 * (second_child + 1);
+            v[first + hole] = v[first + second_child - 1];
+            hole = second_child - 1;
+        }
+        push_heap(v, first, hole, top, value);
+    }
+
+    fn pop_heap(v: &mut [SketchKmer], first: usize, last: usize, result: usize) {
+        let value = v[result];
+        v[result] = v[first];
+        adjust_heap(v, first, 0, last - first, value);
+    }
+
+    fn make_heap(v: &mut [SketchKmer], first: usize, last: usize) {
+        if last - first < 2 {
+            return;
+        }
+        let len = last - first;
+        let mut parent = (len - 2) / 2;
+        loop {
+            let value = v[first + parent];
+            adjust_heap(v, first, parent, len, value);
+            if parent == 0 {
+                return;
+            }
+            parent -= 1;
+        }
+    }
+
+    fn partial_sort(v: &mut [SketchKmer], first: usize, middle: usize, last: usize) {
+        make_heap(v, first, middle);
+        for i in middle..last {
+            if less(v[i], v[first]) {
+                pop_heap(v, first, middle, i);
+            }
+        }
+        let mut heap_last = middle;
+        while heap_last - first > 1 {
+            heap_last -= 1;
+            pop_heap(v, first, heap_last, heap_last);
+        }
+    }
+
+    fn introsort(v: &mut [SketchKmer], first: usize, mut last: usize, mut depth: usize) {
+        while last - first > THRESHOLD {
+            if depth == 0 {
+                partial_sort(v, first, last, last);
+                return;
+            }
+            depth -= 1;
+            let mid = first + (last - first) / 2;
+            move_median_to_first(v, first, first + 1, mid, last - 1);
+            let cut = partition(v, first + 1, last, first);
+            introsort(v, cut, last, depth);
+            last = cut;
+        }
+    }
+
+    introsort(v, 0, v.len(), depth);
+    if v.len() > THRESHOLD {
+        insertion_sort(v, 0, THRESHOLD);
+        unguarded_insertion_sort(v, THRESHOLD, v.len());
+    } else {
+        insertion_sort(v, 0, v.len());
+    }
+}
+
 pub struct SketchIterator {
     data: Vec<SketchKmer>,
     it: usize,
@@ -179,7 +367,7 @@ impl SketchIterator {
                 });
             }
         }
-        v.sort();
+        cpp_sort_sketch_kmers(&mut v);
         v.truncate((n as usize).min(v.len()));
         Self { data: v, it: 0 }
     }
@@ -331,7 +519,6 @@ impl<'a, const L: usize, const B: u64, const FILTER_MASKED: bool>
 mod tests {
     use super::*;
     use crate::basic::value::MASK_LETTER;
-
     #[test]
     fn test_seed_iterator_reduced() {
         let r = Reduction::default_reduction();
@@ -374,6 +561,44 @@ mod tests {
         assert_ne!(a, b);
         it.increment();
         assert!(!it.good());
+    }
+
+    #[test]
+    fn sketch_equal_hash_order_matches_libstdcxx_std_sort() {
+        let mut kmers = (0..32)
+            .map(|pos| SketchKmer {
+                seed: 1,
+                hash: 7,
+                pos,
+            })
+            .collect::<Vec<_>>();
+        cpp_sort_sketch_kmers(&mut kmers);
+        assert_eq!(
+            kmers.iter().map(|k| k.pos).collect::<Vec<_>>(),
+            vec![
+                16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 0, 15, 14, 13, 12,
+                11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+            ]
+        );
+    }
+
+    #[test]
+    fn sketch_depth_limit_matches_libstdcxx_partial_sort() {
+        let mut kmers = (0..32)
+            .map(|pos| SketchKmer {
+                seed: 1,
+                hash: 7,
+                pos,
+            })
+            .collect::<Vec<_>>();
+        cpp_sort_sketch_kmers_with_depth(&mut kmers, 0);
+        assert_eq!(
+            kmers.iter().map(|k| k.pos).collect::<Vec<_>>(),
+            vec![
+                18, 22, 10, 16, 26, 8, 20, 4, 24, 12, 31, 28, 7, 17, 3, 19, 9, 21, 1, 23, 11, 25,
+                5, 27, 13, 15, 29, 0, 2, 6, 14, 30,
+            ]
+        );
     }
 
     #[test]

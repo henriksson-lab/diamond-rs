@@ -6,6 +6,7 @@ DIAMOND is a high-performance sequence aligner for protein and translated DNA se
 
 **This crate is under translation. Do not use it. Do not trust any text below**
 
+* 2026-10-05: More fixes
 * 2026-09-30: More optimization. portability work
 * 2026-09-28: Ondisk blastp mode, but also faster inmem mode (not in original). Parity on broader datasets
 * 2006-09-27: Closing the gaps in translation, optimization. Some more work left
@@ -43,6 +44,7 @@ This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 - **Native Rust commands**: `blastp`, `blastx`, `makedb`, `dbinfo`, `getseq`, `version`, `help`
 - **Parallel**: Seed search uses rayon for multi-threaded processing
 - **SIMD**: SSE4.1/AVX2 dynamic-programming kernels and runtime-selected AVX-512 search workers on supported x86-64 hosts
+- **Portability target**: Native Linux, macOS, and Windows support; platform-specific low-level code must use each target's ABI and remain covered by CI
 - **Library API**: Core types, scoring matrices, DP kernels, FASTA parsing, and seed search
 - **Tests**: More than 1,600 passing library tests plus CLI and integration suites, including the C++ regression inventory and native-vs-FFI equivalence
 - **Not yet translated**: SQLite-backed taxonomy lookup for NCBI BLAST databases (`taxonomy4blast.sqlite3`), used by taxonomy-aware output fields such as `slineages`, `sskingdoms`, `skingdoms`, and `sphylums`
