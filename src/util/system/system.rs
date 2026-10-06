@@ -203,18 +203,12 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
 }
 
-// Darwin declares `open` as `int open(const char *, int, ...)`. Its native
-// symbol must therefore be called through a variadic declaration even when
-// O_RDONLY does not require the optional mode argument. Keep the existing
-// fixed-arity declaration elsewhere so Linux code generation is unchanged.
-#[cfg(all(not(windows), target_vendor = "apple"))]
+// POSIX declares `open` as `int open(const char *, int, ...)`. Rust's standard
+// library also treats this runtime symbol as variadic on Unix, even when
+// O_RDONLY means that no optional mode argument is passed.
+#[cfg(not(windows))]
 unsafe extern "C" {
     fn open(pathname: *const c_char, flags: i32, ...) -> i32;
-}
-
-#[cfg(all(not(windows), not(target_vendor = "apple")))]
-unsafe extern "C" {
-    fn open(pathname: *const c_char, flags: i32) -> i32;
 }
 
 pub fn mmap_file(filename: &str) -> Result<(*mut u8, usize, i32), String> {
