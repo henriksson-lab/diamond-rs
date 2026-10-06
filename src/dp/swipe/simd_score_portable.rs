@@ -9,7 +9,7 @@
 use super::simd_score::{BatchScores, ScoreTarget};
 use crate::basic::value::Letter;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
-use crate::basic::value::{LETTER_MASK, SEED_MASK};
+use crate::basic::value::LETTER_MASK;
 use crate::stats::score_matrix::ScoreMatrix;
 
 #[cfg(target_arch = "aarch64")]
@@ -58,14 +58,14 @@ fn valid_common(query: &[Letter], target_count: usize, cbs: &[i8]) -> bool {
 /// `None` means that the current architecture has no supported backend, the
 /// arguments are outside the kernel contract, or the gap penalties are not
 /// safely representable. Lanes in `overflow_mask` must be recomputed in i32.
-/// Scores are unshifted with a zero baseline; this is also the exact decoded
-/// recurrence for lanes promoted from the signed-byte semi-global (`DELTA=0`)
-/// tier, so no separate mode flag is required at i16 width.
+/// `semi_global` selects upstream's `DELTA=0` specialization; local alignment
+/// uses the `SHRT_MIN`-biased specialization.
 pub fn score_batch_portable_i16(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
     matrix: &ScoreMatrix,
     cbs: &[i8],
+    semi_global: bool,
     scratch: &mut PortableSimdScoreScratch,
 ) -> Option<BatchScores> {
     if !valid_common(query, targets.len(), cbs) {
@@ -79,29 +79,53 @@ pub fn score_batch_portable_i16(
             // SAFETY: SSSE3 was detected at runtime. The implementation only
             // accesses slices after checking their bounds.
             return Some(unsafe {
-                score_batch_ssse3_impl(
-                    query,
-                    targets,
-                    matrix.matrix16(),
-                    cbs,
-                    open,
-                    extend,
-                    scratch,
-                )
+                if semi_global {
+                    score_batch_ssse3_impl::<true>(
+                        query,
+                        targets,
+                        matrix.matrix16(),
+                        cbs,
+                        open,
+                        extend,
+                        scratch,
+                    )
+                } else {
+                    score_batch_ssse3_impl::<false>(
+                        query,
+                        targets,
+                        matrix.matrix16(),
+                        cbs,
+                        open,
+                        extend,
+                        scratch,
+                    )
+                }
             });
         }
         if std::arch::is_x86_feature_detected!("sse2") {
             // SAFETY: SSE2 was detected at runtime.
             return Some(unsafe {
-                score_batch_sse2_impl(
-                    query,
-                    targets,
-                    matrix.matrix16(),
-                    cbs,
-                    open,
-                    extend,
-                    scratch,
-                )
+                if semi_global {
+                    score_batch_sse2_impl::<true>(
+                        query,
+                        targets,
+                        matrix.matrix16(),
+                        cbs,
+                        open,
+                        extend,
+                        scratch,
+                    )
+                } else {
+                    score_batch_sse2_impl::<false>(
+                        query,
+                        targets,
+                        matrix.matrix16(),
+                        cbs,
+                        open,
+                        extend,
+                        scratch,
+                    )
+                }
             });
         }
         None
@@ -114,33 +138,54 @@ pub fn score_batch_portable_i16(
         }
         // SAFETY: NEON was detected at runtime.
         Some(unsafe {
-            score_batch_neon_impl(
-                query,
-                targets,
-                matrix.matrix16(),
-                cbs,
-                open,
-                extend,
-                scratch,
-            )
+            if semi_global {
+                score_batch_neon_impl::<true>(
+                    query,
+                    targets,
+                    matrix.matrix16(),
+                    cbs,
+                    open,
+                    extend,
+                    scratch,
+                )
+            } else {
+                score_batch_neon_impl::<false>(
+                    query,
+                    targets,
+                    matrix.matrix16(),
+                    cbs,
+                    open,
+                    extend,
+                    scratch,
+                )
+            }
         })
     }
 
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        let _ = (query, targets, matrix, cbs, scratch, open, extend);
+        let _ = (
+            query,
+            targets,
+            matrix,
+            cbs,
+            semi_global,
+            scratch,
+            open,
+            extend,
+        );
         None
     }
 }
 
 /// Score up to eight complete Smith-Waterman matrices using the best
 /// available non-AVX2 128-bit `i16` kernel.
-/// The unshifted zero baseline also preserves promoted semi-global i8 scores.
 pub fn score_full_batch_portable_i16(
     query: &[Letter],
     targets: &[&[Letter]],
     matrix: &ScoreMatrix,
     cbs: &[i8],
+    semi_global: bool,
     scratch: &mut PortableSimdScoreScratch,
 ) -> Option<BatchScores> {
     if !valid_common(query, targets.len(), cbs) {
@@ -153,29 +198,53 @@ pub fn score_full_batch_portable_i16(
         if std::arch::is_x86_feature_detected!("ssse3") {
             // SAFETY: SSSE3 was detected at runtime.
             return Some(unsafe {
-                score_full_ssse3_impl(
-                    query,
-                    targets,
-                    matrix.matrix16(),
-                    cbs,
-                    open,
-                    extend,
-                    scratch,
-                )
+                if semi_global {
+                    score_full_ssse3_impl::<true>(
+                        query,
+                        targets,
+                        matrix.matrix16(),
+                        cbs,
+                        open,
+                        extend,
+                        scratch,
+                    )
+                } else {
+                    score_full_ssse3_impl::<false>(
+                        query,
+                        targets,
+                        matrix.matrix16(),
+                        cbs,
+                        open,
+                        extend,
+                        scratch,
+                    )
+                }
             });
         }
         if std::arch::is_x86_feature_detected!("sse2") {
             // SAFETY: SSE2 was detected at runtime.
             return Some(unsafe {
-                score_full_sse2_impl(
-                    query,
-                    targets,
-                    matrix.matrix16(),
-                    cbs,
-                    open,
-                    extend,
-                    scratch,
-                )
+                if semi_global {
+                    score_full_sse2_impl::<true>(
+                        query,
+                        targets,
+                        matrix.matrix16(),
+                        cbs,
+                        open,
+                        extend,
+                        scratch,
+                    )
+                } else {
+                    score_full_sse2_impl::<false>(
+                        query,
+                        targets,
+                        matrix.matrix16(),
+                        cbs,
+                        open,
+                        extend,
+                        scratch,
+                    )
+                }
             });
         }
         None
@@ -188,28 +257,49 @@ pub fn score_full_batch_portable_i16(
         }
         // SAFETY: NEON was detected at runtime.
         Some(unsafe {
-            score_full_neon_impl(
-                query,
-                targets,
-                matrix.matrix16(),
-                cbs,
-                open,
-                extend,
-                scratch,
-            )
+            if semi_global {
+                score_full_neon_impl::<true>(
+                    query,
+                    targets,
+                    matrix.matrix16(),
+                    cbs,
+                    open,
+                    extend,
+                    scratch,
+                )
+            } else {
+                score_full_neon_impl::<false>(
+                    query,
+                    targets,
+                    matrix.matrix16(),
+                    cbs,
+                    open,
+                    extend,
+                    scratch,
+                )
+            }
         })
     }
 
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        let _ = (query, targets, matrix, cbs, scratch, open, extend);
+        let _ = (
+            query,
+            targets,
+            matrix,
+            cbs,
+            semi_global,
+            scratch,
+            open,
+            extend,
+        );
         None
     }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "ssse3")]
-unsafe fn score_batch_ssse3_impl(
+unsafe fn score_batch_ssse3_impl<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
     matrix: &[i16; 32 * 32],
@@ -221,12 +311,12 @@ unsafe fn score_batch_ssse3_impl(
     // SSSE3 is the preferred 128-bit dispatch target used by upstream. The
     // recurrence itself needs only SSE2 because banded lanes can have distinct
     // query rows and therefore cannot share a pshufb score-table lookup.
-    score_batch_sse2_impl(query, targets, matrix, cbs, open, extend, scratch)
+    score_batch_sse2_impl::<SEMI_GLOBAL>(query, targets, matrix, cbs, open, extend, scratch)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "ssse3")]
-unsafe fn score_full_ssse3_impl(
+unsafe fn score_full_ssse3_impl<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[&[Letter]],
     matrix: &[i16; 32 * 32],
@@ -235,12 +325,12 @@ unsafe fn score_full_ssse3_impl(
     extend: i16,
     scratch: &mut PortableSimdScoreScratch,
 ) -> BatchScores {
-    score_full_sse2_impl(query, targets, matrix, cbs, open, extend, scratch)
+    score_full_sse2_impl::<SEMI_GLOBAL>(query, targets, matrix, cbs, open, extend, scratch)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse2")]
-unsafe fn score_batch_sse2_impl(
+unsafe fn score_batch_sse2_impl<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
     matrix: &[i16; 32 * 32],
@@ -249,7 +339,6 @@ unsafe fn score_batch_sse2_impl(
     extend: i16,
     scratch: &mut PortableSimdScoreScratch,
 ) -> BatchScores {
-    const NEG: i16 = -16_384;
     let band = targets
         .iter()
         .map(|target| (target.d_end - target.d_begin).max(0) as usize)
@@ -259,14 +348,15 @@ unsafe fn score_batch_sse2_impl(
         return empty_result(targets.len());
     }
 
-    let zero = arch::_mm_setzero_si128();
-    let neg = arch::_mm_set1_epi16(NEG);
-    prepare_rows(scratch, band + 1, zero, neg);
+    let delta = if SEMI_GLOBAL { 0 } else { i16::MIN };
+    let zero = arch::_mm_set1_epi16(delta);
+    let bits_zero = arch::_mm_setzero_si128();
+    prepare_rows(scratch, band + 1, zero, zero);
     let open_v = arch::_mm_set1_epi16(open);
     let extend_v = arch::_mm_set1_epi16(extend);
     let max_v = arch::_mm_set1_epi16(i16::MAX);
     let mut best = zero;
-    let mut overflow = zero;
+    let mut overflow = bits_zero;
     let max_len = targets
         .iter()
         .map(|target| target.subject.len())
@@ -275,8 +365,8 @@ unsafe fn score_batch_sse2_impl(
 
     for j in 0..max_len {
         scratch.curr_h[band] = zero;
-        scratch.curr_e[band] = neg;
-        let mut vertical = neg;
+        scratch.curr_e[band] = zero;
+        let mut vertical = zero;
         for row in 0..band {
             let mut substitutions = [0i16; 8];
             let mut valid = [0i16; 8];
@@ -308,8 +398,7 @@ unsafe fn score_batch_sse2_impl(
             let horizontal = scratch.prev_e[row + 1];
             let mut h = arch::_mm_max_epi16(diag, horizontal);
             h = arch::_mm_max_epi16(h, vertical);
-            h = arch::_mm_max_epi16(h, zero);
-            h = arch::_mm_and_si128(h, mask);
+            h = select_x86(mask, h, zero);
             overflow = arch::_mm_or_si128(overflow, arch::_mm_cmpeq_epi16(h, max_v));
             overflow = mark_x86_overflow(overflow, scalar_overflow);
 
@@ -317,19 +406,19 @@ unsafe fn score_batch_sse2_impl(
             let e = arch::_mm_max_epi16(arch::_mm_subs_epi16(horizontal, extend_v), opened);
             vertical = arch::_mm_max_epi16(arch::_mm_subs_epi16(vertical, extend_v), opened);
             scratch.curr_h[row] = h;
-            scratch.curr_e[row] = select_x86(mask, e, neg);
-            vertical = select_x86(mask, vertical, neg);
+            scratch.curr_e[row] = select_x86(mask, e, zero);
+            vertical = select_x86(mask, vertical, zero);
             best = arch::_mm_max_epi16(best, h);
         }
         std::mem::swap(&mut scratch.prev_h, &mut scratch.curr_h);
         std::mem::swap(&mut scratch.prev_e, &mut scratch.curr_e);
     }
-    finish_x86(best, overflow, targets.len())
+    finish_x86(best, overflow, targets.len(), delta)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse2")]
-unsafe fn score_full_sse2_impl(
+unsafe fn score_full_sse2_impl<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[&[Letter]],
     matrix: &[i16; 32 * 32],
@@ -338,22 +427,22 @@ unsafe fn score_full_sse2_impl(
     extend: i16,
     scratch: &mut PortableSimdScoreScratch,
 ) -> BatchScores {
-    const NEG: i16 = -16_384;
     let rows = query.len() + 1;
-    let zero = arch::_mm_setzero_si128();
-    let neg = arch::_mm_set1_epi16(NEG);
-    prepare_rows(scratch, rows, zero, neg);
+    let delta = if SEMI_GLOBAL { 0 } else { i16::MIN };
+    let zero = arch::_mm_set1_epi16(delta);
+    let bits_zero = arch::_mm_setzero_si128();
+    prepare_rows(scratch, rows, zero, zero);
     let open_v = arch::_mm_set1_epi16(open);
     let extend_v = arch::_mm_set1_epi16(extend);
     let max_v = arch::_mm_set1_epi16(i16::MAX);
     let mut best = zero;
-    let mut overflow = zero;
+    let mut overflow = bits_zero;
     let max_len = targets.iter().map(|target| target.len()).max().unwrap_or(0);
 
     for j in 0..max_len {
         scratch.curr_h[0] = zero;
-        scratch.curr_e[0] = neg;
-        let mut vertical = neg;
+        scratch.curr_e[0] = zero;
+        let mut vertical = zero;
         for (qpos, &ql) in query.iter().enumerate() {
             let mut substitutions = [0i16; 8];
             let mut valid = [0i16; 8];
@@ -376,22 +465,21 @@ unsafe fn score_full_sse2_impl(
             let horizontal = scratch.prev_e[qpos + 1];
             let mut h = arch::_mm_max_epi16(diag, horizontal);
             h = arch::_mm_max_epi16(h, vertical);
-            h = arch::_mm_max_epi16(h, zero);
-            h = arch::_mm_and_si128(h, mask);
+            h = select_x86(mask, h, zero);
             overflow = arch::_mm_or_si128(overflow, arch::_mm_cmpeq_epi16(h, max_v));
             overflow = mark_x86_overflow(overflow, scalar_overflow);
             let opened = arch::_mm_subs_epi16(h, open_v);
             let e = arch::_mm_max_epi16(arch::_mm_subs_epi16(horizontal, extend_v), opened);
             vertical = arch::_mm_max_epi16(arch::_mm_subs_epi16(vertical, extend_v), opened);
             scratch.curr_h[qpos + 1] = h;
-            scratch.curr_e[qpos + 1] = select_x86(mask, e, neg);
-            vertical = select_x86(mask, vertical, neg);
+            scratch.curr_e[qpos + 1] = select_x86(mask, e, zero);
+            vertical = select_x86(mask, vertical, zero);
             best = arch::_mm_max_epi16(best, h);
         }
         std::mem::swap(&mut scratch.prev_h, &mut scratch.curr_h);
         std::mem::swap(&mut scratch.prev_e, &mut scratch.curr_e);
     }
-    finish_x86(best, overflow, targets.len())
+    finish_x86(best, overflow, targets.len(), delta)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -440,17 +528,22 @@ unsafe fn mark_x86_overflow(mut overflow: ArchVector, mask: u8) -> ArchVector {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse2")]
-unsafe fn finish_x86(best: ArchVector, overflow: ArchVector, len: usize) -> BatchScores {
+unsafe fn finish_x86(
+    best: ArchVector,
+    overflow: ArchVector,
+    len: usize,
+    delta: i16,
+) -> BatchScores {
     let mut raw_scores = [0i16; 8];
     let mut raw_overflow = [0i16; 8];
     arch::_mm_storeu_si128(raw_scores.as_mut_ptr().cast(), best);
     arch::_mm_storeu_si128(raw_overflow.as_mut_ptr().cast(), overflow);
-    finish_result(raw_scores, raw_overflow, len)
+    finish_result(raw_scores, raw_overflow, len, delta)
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn score_batch_neon_impl(
+unsafe fn score_batch_neon_impl<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
     matrix: &[i16; 32 * 32],
@@ -459,7 +552,6 @@ unsafe fn score_batch_neon_impl(
     extend: i16,
     scratch: &mut PortableSimdScoreScratch,
 ) -> BatchScores {
-    const NEG: i16 = -16_384;
     let band = targets
         .iter()
         .map(|target| (target.d_end - target.d_begin).max(0) as usize)
@@ -468,9 +560,9 @@ unsafe fn score_batch_neon_impl(
     if band == 0 {
         return empty_result(targets.len());
     }
-    let zero = arch::vdupq_n_s16(0);
-    let neg = arch::vdupq_n_s16(NEG);
-    prepare_rows_neon(scratch, band + 1, zero, neg);
+    let delta = if SEMI_GLOBAL { 0 } else { i16::MIN };
+    let zero = arch::vdupq_n_s16(delta);
+    prepare_rows_neon(scratch, band + 1, zero, zero);
     let open_v = arch::vdupq_n_s16(open);
     let extend_v = arch::vdupq_n_s16(extend);
     let max_v = arch::vdupq_n_s16(i16::MAX);
@@ -484,8 +576,8 @@ unsafe fn score_batch_neon_impl(
 
     for j in 0..max_len {
         scratch.curr_h[band] = zero;
-        scratch.curr_e[band] = neg;
-        let mut vertical = neg;
+        scratch.curr_e[band] = zero;
+        let mut vertical = zero;
         for row in 0..band {
             let mut substitutions = [0i16; 8];
             let mut valid = [0i16; 8];
@@ -516,27 +608,26 @@ unsafe fn score_batch_neon_impl(
             let horizontal = scratch.prev_e[row + 1];
             let mut h = arch::vmaxq_s16(diag, horizontal);
             h = arch::vmaxq_s16(h, vertical);
-            h = arch::vmaxq_s16(h, zero);
-            h = arch::vandq_s16(h, mask);
+            h = select_neon(mask, h, zero);
             overflow = arch::vorrq_u16(overflow, arch::vceqq_s16(h, max_v));
             overflow = arch::vorrq_u16(overflow, arch::vld1q_u16(overflow_lanes.as_ptr()));
             let opened = arch::vqsubq_s16(h, open_v);
             let e = arch::vmaxq_s16(arch::vqsubq_s16(horizontal, extend_v), opened);
             vertical = arch::vmaxq_s16(arch::vqsubq_s16(vertical, extend_v), opened);
             scratch.curr_h[row] = h;
-            scratch.curr_e[row] = select_neon(mask, e, neg);
-            vertical = select_neon(mask, vertical, neg);
+            scratch.curr_e[row] = select_neon(mask, e, zero);
+            vertical = select_neon(mask, vertical, zero);
             best = arch::vmaxq_s16(best, h);
         }
         std::mem::swap(&mut scratch.prev_h, &mut scratch.curr_h);
         std::mem::swap(&mut scratch.prev_e, &mut scratch.curr_e);
     }
-    finish_neon(best, overflow, targets.len())
+    finish_neon(best, overflow, targets.len(), delta)
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn score_full_neon_impl(
+unsafe fn score_full_neon_impl<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[&[Letter]],
     matrix: &[i16; 32 * 32],
@@ -545,11 +636,10 @@ unsafe fn score_full_neon_impl(
     extend: i16,
     scratch: &mut PortableSimdScoreScratch,
 ) -> BatchScores {
-    const NEG: i16 = -16_384;
     let rows = query.len() + 1;
-    let zero = arch::vdupq_n_s16(0);
-    let neg = arch::vdupq_n_s16(NEG);
-    prepare_rows_neon(scratch, rows, zero, neg);
+    let delta = if SEMI_GLOBAL { 0 } else { i16::MIN };
+    let zero = arch::vdupq_n_s16(delta);
+    prepare_rows_neon(scratch, rows, zero, zero);
     let open_v = arch::vdupq_n_s16(open);
     let extend_v = arch::vdupq_n_s16(extend);
     let max_v = arch::vdupq_n_s16(i16::MAX);
@@ -559,8 +649,8 @@ unsafe fn score_full_neon_impl(
 
     for j in 0..max_len {
         scratch.curr_h[0] = zero;
-        scratch.curr_e[0] = neg;
-        let mut vertical = neg;
+        scratch.curr_e[0] = zero;
+        let mut vertical = zero;
         for (qpos, &ql) in query.iter().enumerate() {
             let mut substitutions = [0i16; 8];
             let mut valid = [0i16; 8];
@@ -583,22 +673,21 @@ unsafe fn score_full_neon_impl(
             let horizontal = scratch.prev_e[qpos + 1];
             let mut h = arch::vmaxq_s16(diag, horizontal);
             h = arch::vmaxq_s16(h, vertical);
-            h = arch::vmaxq_s16(h, zero);
-            h = arch::vandq_s16(h, mask);
+            h = select_neon(mask, h, zero);
             overflow = arch::vorrq_u16(overflow, arch::vceqq_s16(h, max_v));
             overflow = arch::vorrq_u16(overflow, arch::vld1q_u16(overflow_lanes.as_ptr()));
             let opened = arch::vqsubq_s16(h, open_v);
             let e = arch::vmaxq_s16(arch::vqsubq_s16(horizontal, extend_v), opened);
             vertical = arch::vmaxq_s16(arch::vqsubq_s16(vertical, extend_v), opened);
             scratch.curr_h[qpos + 1] = h;
-            scratch.curr_e[qpos + 1] = select_neon(mask, e, neg);
-            vertical = select_neon(mask, vertical, neg);
+            scratch.curr_e[qpos + 1] = select_neon(mask, e, zero);
+            vertical = select_neon(mask, vertical, zero);
             best = arch::vmaxq_s16(best, h);
         }
         std::mem::swap(&mut scratch.prev_h, &mut scratch.curr_h);
         std::mem::swap(&mut scratch.prev_e, &mut scratch.curr_e);
     }
-    finish_neon(best, overflow, targets.len())
+    finish_neon(best, overflow, targets.len(), delta)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -625,23 +714,24 @@ unsafe fn select_neon(mask: ArchVector, yes: ArchVector, no: ArchVector) -> Arch
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn finish_neon(best: ArchVector, overflow: arch::uint16x8_t, len: usize) -> BatchScores {
+unsafe fn finish_neon(
+    best: ArchVector,
+    overflow: arch::uint16x8_t,
+    len: usize,
+    delta: i16,
+) -> BatchScores {
     let mut raw_scores = [0i16; 8];
     let mut raw_overflow = [0u16; 8];
     arch::vst1q_s16(raw_scores.as_mut_ptr(), best);
     arch::vst1q_u16(raw_overflow.as_mut_ptr(), overflow);
     let raw_overflow = raw_overflow.map(|lane| lane as i16);
-    finish_result(raw_scores, raw_overflow, len)
+    finish_result(raw_scores, raw_overflow, len, delta)
 }
 
 #[inline]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 fn substitution(query: Letter, subject: Letter, matrix: &[i16; 32 * 32]) -> i32 {
-    if subject & SEED_MASK != 0 {
-        0
-    } else {
-        matrix[((query & LETTER_MASK) as usize) * 32 + (subject & LETTER_MASK) as usize] as i32
-    }
+    matrix[((query & LETTER_MASK) as usize) * 32 + (subject & LETTER_MASK) as usize] as i32
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
@@ -654,11 +744,16 @@ fn empty_result(len: usize) -> BatchScores {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
-fn finish_result(raw_scores: [i16; 8], raw_overflow: [i16; 8], len: usize) -> BatchScores {
+fn finish_result(
+    raw_scores: [i16; 8],
+    raw_overflow: [i16; 8],
+    len: usize,
+    delta: i16,
+) -> BatchScores {
     let mut scores = [0i32; 16];
     let mut overflow_mask = 0u16;
     for lane in 0..len {
-        scores[lane] = raw_scores[lane] as i32;
+        scores[lane] = raw_scores[lane] as i32 - delta as i32;
         if raw_overflow[lane] != 0 {
             overflow_mask |= 1 << lane;
         }
@@ -676,6 +771,7 @@ fn finish_result(raw_scores: [i16; 8], raw_overflow: [i16; 8], len: usize) -> Ba
 ))]
 mod tests {
     use super::*;
+    use crate::basic::value::SEED_MASK;
 
     fn scalar(query: &[Letter], target: ScoreTarget<'_>, matrix: &ScoreMatrix, cbs: &[i8]) -> i32 {
         let neg = i32::MIN / 4;
@@ -788,11 +884,46 @@ mod tests {
                 targets,
                 matrix,
                 cbs,
+                false,
                 &mut PortableSimdScoreScratch::default(),
             )
             .expect("128-bit SIMD is available on supported test targets");
             assert_batch(query, targets, matrix, cbs, got);
         });
+    }
+
+    #[test]
+    fn portable_i16_treats_seed_mask_as_lookup_only_metadata() {
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let query = vec![17; 12];
+        let plain = vec![17; 12];
+        let marked: Vec<_> = plain.iter().map(|&letter| letter | SEED_MASK).collect();
+        let targets = [
+            ScoreTarget {
+                subject: &plain,
+                d_begin: 0,
+                d_end: 1,
+            },
+            ScoreTarget {
+                subject: &marked,
+                d_begin: 0,
+                d_end: 1,
+            },
+        ];
+        let mut scratch = PortableSimdScoreScratch::default();
+        let banded =
+            score_batch_portable_i16(&query, &targets, &matrix, &[], false, &mut scratch).unwrap();
+        assert_eq!(banded.scores[0], banded.scores[1]);
+        let full = score_full_batch_portable_i16(
+            &query,
+            &[plain.as_slice(), marked.as_slice()],
+            &matrix,
+            &[],
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(full.scores[0], full.scores[1]);
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -802,7 +933,7 @@ mod tests {
             let subjects: Vec<&[Letter]> = targets.iter().map(|target| target.subject).collect();
             if std::arch::is_x86_feature_detected!("sse2") {
                 let got = unsafe {
-                    score_batch_sse2_impl(
+                    score_batch_sse2_impl::<false>(
                         query,
                         targets,
                         matrix.matrix16(),
@@ -814,7 +945,7 @@ mod tests {
                 };
                 assert_batch(query, targets, matrix, cbs, got);
                 let got = unsafe {
-                    score_full_sse2_impl(
+                    score_full_sse2_impl::<false>(
                         query,
                         &subjects,
                         matrix.matrix16(),
@@ -828,7 +959,7 @@ mod tests {
             }
             if std::arch::is_x86_feature_detected!("ssse3") {
                 let got = unsafe {
-                    score_batch_ssse3_impl(
+                    score_batch_ssse3_impl::<false>(
                         query,
                         targets,
                         matrix.matrix16(),
@@ -840,7 +971,7 @@ mod tests {
                 };
                 assert_batch(query, targets, matrix, cbs, got);
                 let got = unsafe {
-                    score_full_ssse3_impl(
+                    score_full_ssse3_impl::<false>(
                         query,
                         &subjects,
                         matrix.matrix16(),
@@ -864,6 +995,7 @@ mod tests {
                 &subjects,
                 matrix,
                 cbs,
+                false,
                 &mut PortableSimdScoreScratch::default(),
             )
             .expect("128-bit SIMD is available on supported test targets");
@@ -874,8 +1006,8 @@ mod tests {
     #[test]
     fn reports_i16_overflow_per_lane() {
         let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
-        let query = vec![17; 4_000];
-        let long = vec![17; 4_000];
+        let query = vec![17; 7_000];
+        let long = vec![17; 7_000];
         let short = vec![17; 20];
         let targets = [
             ScoreTarget {
@@ -894,11 +1026,41 @@ mod tests {
             &targets,
             &matrix,
             &[],
+            false,
             &mut PortableSimdScoreScratch::default(),
         )
         .unwrap();
         assert_eq!(got.overflow_mask, 1);
         assert_eq!(got.scores[1], 220);
+    }
+
+    #[test]
+    fn semi_global_does_not_clamp_each_cell_to_zero() {
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let query: Vec<Letter> = b"011000010110111010111100000101"
+            .iter()
+            .map(|&x| (x - b'0') as Letter)
+            .collect();
+        let subject: Vec<Letter> = b"11010110011001100101010101"
+            .iter()
+            .map(|&x| (x - b'0') as Letter)
+            .collect();
+        let targets = [ScoreTarget {
+            subject: &subject,
+            d_begin: -3,
+            d_end: 13,
+        }];
+        let got = score_batch_portable_i16(
+            &query,
+            &targets,
+            &matrix,
+            &[],
+            true,
+            &mut PortableSimdScoreScratch::default(),
+        )
+        .unwrap();
+        assert_eq!(got.overflow_mask, 0);
+        assert_eq!(got.scores[0], 69);
     }
 
     #[test]
@@ -911,13 +1073,18 @@ mod tests {
             d_end: 1,
         };
         let mut scratch = PortableSimdScoreScratch::default();
-        assert!(score_batch_portable_i16(&query, &[], &matrix, &[], &mut scratch).is_none());
+        assert!(score_batch_portable_i16(&query, &[], &matrix, &[], false, &mut scratch).is_none());
         assert!(
-            score_batch_portable_i16(&query, &[target; 8], &matrix, &[], &mut scratch).is_some()
+            score_batch_portable_i16(&query, &[target; 8], &matrix, &[], false, &mut scratch)
+                .is_some()
         );
         assert!(
-            score_batch_portable_i16(&query, &[target; 9], &matrix, &[], &mut scratch).is_none()
+            score_batch_portable_i16(&query, &[target; 9], &matrix, &[], false, &mut scratch)
+                .is_none()
         );
-        assert!(score_batch_portable_i16(&query, &[target], &matrix, &[], &mut scratch).is_some());
+        assert!(
+            score_batch_portable_i16(&query, &[target], &matrix, &[], false, &mut scratch)
+                .is_some()
+        );
     }
 }

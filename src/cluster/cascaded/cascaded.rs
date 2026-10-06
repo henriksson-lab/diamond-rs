@@ -39,6 +39,7 @@ pub struct CascadedSearchConfig {
     pub query_cover: f64,
     pub subject_cover: f64,
     pub query_or_target_cover: f64,
+    pub mutual_cover: bool,
     pub double_indexed: bool,
     pub max_target_seqs: i64,
     pub self_search: bool,
@@ -50,9 +51,17 @@ pub struct CascadedSearchConfig {
     pub lowmem: i32,
     pub sensitivity: Sensitivity,
     pub lin_stage1_query: bool,
+    pub current_ref_block: i32,
+    pub kmer_ranking: bool,
+    pub min_length_ratio: f64,
+    pub global_ranking_targets: bool,
+    pub lin_stage1_combo: bool,
     pub approx_min_id: f64,
     pub max_evalue: f64,
     pub comp_based_stats: i32,
+    pub hamming_ext: bool,
+    pub diag_filter_cov: Option<f64>,
+    pub diag_filter_id: Option<f64>,
     pub threads: i32,
 }
 
@@ -68,6 +77,9 @@ pub struct CascadedConfig {
     pub anchored_swipe: bool,
     pub extension_mode: String,
     pub comp_based_stats: i32,
+    pub hamming_ext: bool,
+    pub diag_filter_cov: Option<f64>,
+    pub diag_filter_id: Option<f64>,
     pub memory_limit: u64,
     pub threads: i32,
     pub sensitivity: Sensitivity,
@@ -100,6 +112,9 @@ impl Default for CascadedConfig {
             anchored_swipe: false,
             extension_mode: String::new(),
             comp_based_stats: 1,
+            hamming_ext: false,
+            diag_filter_cov: None,
+            diag_filter_id: None,
             memory_limit: 16_000_000_000,
             threads: 1,
             sensitivity: Sensitivity::Default,
@@ -208,6 +223,24 @@ fn sensitivity_from_name(name: &str) -> Result<Sensitivity, String> {
     }
 }
 
+/// `Search::Config::Config()`'s protein-search `min_length_ratio` derivation.
+fn derived_min_length_ratio(
+    query_cover: f64,
+    subject_cover: f64,
+    lin_stage1_query: bool,
+    sensitivity: Sensitivity,
+) -> f64 {
+    if query_cover >= 50.0 && query_cover == subject_cover {
+        if lin_stage1_query && sensitivity < Sensitivity::Linclust40 {
+            (query_cover / 100.0 + 0.05).min(0.92)
+        } else {
+            (query_cover / 100.0 - 0.05).max(0.0)
+        }
+    } else {
+        0.0
+    }
+}
+
 fn member_counts(mapping: &[SuperBlockId]) -> Result<Vec<SuperBlockId>, String> {
     let mut counts = vec![0u32; mapping.len()];
     for &centroid in mapping {
@@ -311,6 +344,7 @@ pub fn cluster<B: CascadedBackend>(
         query_cover: config.query_cover,
         subject_cover: config.subject_cover,
         query_or_target_cover: config.query_or_target_cover,
+        mutual_cover: config.mutual_cover.is_some(),
         double_indexed: true,
         max_target_seqs: i64::MAX,
         self_search: true,
@@ -322,9 +356,27 @@ pub fn cluster<B: CascadedBackend>(
         lowmem: config.lowmem,
         sensitivity: config.sensitivity,
         lin_stage1_query: config.lin_stage1_query,
+        // `Search::keep_target_id` observes this value before the reference
+        // loop. Upstream leaves the constructor field uninitialized; the
+        // cascaded call sequence deterministically presents a nonzero value,
+        // then 0, then nonzero values for this workflow. Preserve that
+        // observed search state explicitly instead of relying on UB.
+        current_ref_block: if round == 1 { 0 } else { 1 },
+        kmer_ranking: false,
+        min_length_ratio: derived_min_length_ratio(
+            config.query_cover,
+            config.subject_cover,
+            config.lin_stage1_query,
+            config.sensitivity,
+        ),
+        global_ranking_targets: false,
+        lin_stage1_combo: false,
         approx_min_id: config.approx_min_id,
         max_evalue: config.max_evalue,
         comp_based_stats: config.comp_based_stats,
+        hamming_ext: config.hamming_ext,
+        diag_filter_cov: config.diag_filter_cov,
+        diag_filter_id: config.diag_filter_id,
         threads: config.threads,
     };
     let mut callback: Box<dyn EdgeCallback> = if mutual {
@@ -581,6 +633,26 @@ mod tests {
     }
 
     #[test]
+    fn min_length_ratio_matches_search_config_derivation() {
+        assert!(
+            (derived_min_length_ratio(80.0, 80.0, true, Sensitivity::Fast) - 0.85).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            derived_min_length_ratio(90.0, 90.0, true, Sensitivity::Fast),
+            0.92
+        );
+        assert_eq!(
+            derived_min_length_ratio(80.0, 80.0, true, Sensitivity::Linclust40),
+            0.75
+        );
+        assert_eq!(
+            derived_min_length_ratio(80.0, 70.0, true, Sensitivity::Fast),
+            0.0
+        );
+    }
+
+    #[test]
     fn update_clustering_composes_previous_mapping() {
         let previous = DbFilter {
             oid_filter: vec![true, false, true, false],
@@ -606,6 +678,9 @@ mod tests {
         let mut config = CascadedConfig {
             graph_algo: GraphAlgo::LengthSorted,
             alignment_output: Some("edges.tsv".into()),
+            hamming_ext: true,
+            diag_filter_cov: Some(70.0),
+            diag_filter_id: Some(80.0),
             ..Default::default()
         };
         let (mapping, count) = cluster(&mut backend, &mut config, None, None, 0, 1).unwrap();
@@ -618,6 +693,10 @@ mod tests {
         let search = &backend.searches[0].0;
         assert_eq!((search.command, search.output_format), ("blastp", "edge"));
         assert!(search.double_indexed && search.self_search);
+        assert!(search.hamming_ext);
+        assert!(!search.mutual_cover);
+        assert_eq!(search.diag_filter_cov, Some(70.0));
+        assert_eq!(search.diag_filter_id, Some(80.0));
         assert_eq!(
             (
                 search.query_cover,
@@ -654,6 +733,7 @@ mod tests {
         assert_eq!(backend.searches[0].1, None);
         assert_eq!(backend.searches[1].1, Some(vec![true, false, true]));
         assert_eq!(backend.searches[0].0.chunk_size, 32768.0);
+        assert!(backend.searches[0].0.mutual_cover);
         assert_eq!(
             (
                 backend.searches[0].0.query_cover,

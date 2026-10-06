@@ -204,12 +204,11 @@ unsafe fn score_full_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
 ) -> BatchScores8 {
     let delta = if SEMI_GLOBAL { 0i8 } else { i8::MIN };
     let zero = arch::_mm256_set1_epi8(delta);
-    let neg = arch::_mm256_set1_epi8(i8::MIN);
     let rows = query.len() + 1;
     scratch.prev_h.resize(rows, zero);
-    scratch.prev_e.resize(rows, neg);
+    scratch.prev_e.resize(rows, zero);
     scratch.prev_h.fill(zero);
-    scratch.prev_e.fill(neg);
+    scratch.prev_e.fill(zero);
     if HAS_CBS {
         scratch.cbs.clear();
         scratch.cbs.reserve(query.len());
@@ -229,8 +228,8 @@ unsafe fn score_full_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
         // a register. Two additional AVX2 rows are costly for long reads.
         let mut diagonal = scratch.prev_h[0];
         scratch.prev_h[0] = zero;
-        scratch.prev_e[0] = neg;
-        let mut vertical = neg;
+        scratch.prev_e[0] = zero;
+        let mut vertical = zero;
         for q in 0..query.len() {
             // `prev_*` have query_len + 1 rows and q is bounded by the query.
             let next_diagonal = *scratch.prev_h.get_unchecked(q + 1);
@@ -246,9 +245,6 @@ unsafe fn score_full_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
             let horizontal = *scratch.prev_e.get_unchecked(q + 1);
             let mut h = arch::_mm256_max_epi8(diag, horizontal);
             h = arch::_mm256_max_epi8(h, vertical);
-            if SEMI_GLOBAL {
-                h = arch::_mm256_max_epi8(h, zero);
-            }
             h = arch::_mm256_or_si256(
                 arch::_mm256_and_si256(mask, h),
                 arch::_mm256_andnot_si256(mask, zero),
@@ -259,11 +255,11 @@ unsafe fn score_full_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
             *scratch.prev_h.get_unchecked_mut(q + 1) = h;
             *scratch.prev_e.get_unchecked_mut(q + 1) = arch::_mm256_or_si256(
                 arch::_mm256_and_si256(mask, e),
-                arch::_mm256_andnot_si256(mask, neg),
+                arch::_mm256_andnot_si256(mask, zero),
             );
             vertical = arch::_mm256_or_si256(
                 arch::_mm256_and_si256(mask, vertical),
-                arch::_mm256_andnot_si256(mask, neg),
+                arch::_mm256_andnot_si256(mask, zero),
             );
             best = arch::_mm256_max_epi8(best, h);
             diagonal = next_diagonal;
@@ -491,9 +487,6 @@ unsafe fn score_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
                         arch::_mm256_adds_epi8(*scratch.prev_e.get_unchecked(r + 1), band_mask);
                     let mut h = arch::_mm256_max_epi8(diag, horizontal);
                     h = arch::_mm256_max_epi8(h, vertical);
-                    if SEMI_GLOBAL {
-                        h = arch::_mm256_max_epi8(h, zero);
-                    }
                     let open = arch::_mm256_subs_epi8(h, go_v);
                     let e = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(horizontal, ge_v), open);
                     vertical = arch::_mm256_max_epi8(arch::_mm256_subs_epi8(vertical, ge_v), open);
@@ -542,8 +535,14 @@ mod tests {
     use super::*;
     use crate::basic::value::SEED_MASK;
 
-    fn scalar(query: &[Letter], target: ScoreTarget<'_>, matrix: &ScoreMatrix, cbs: &[i8]) -> i32 {
-        let neg = i32::MIN / 4;
+    fn scalar(
+        query: &[Letter],
+        target: ScoreTarget<'_>,
+        matrix: &ScoreMatrix,
+        cbs: &[i8],
+        semi_global: bool,
+    ) -> i32 {
+        let neg = if semi_global { 0 } else { i32::MIN / 4 };
         let go = matrix.gap_open() + matrix.gap_extend();
         let ge = matrix.gap_extend();
         let mut ph = vec![0; query.len() + 1];
@@ -558,10 +557,25 @@ mod tests {
                 if q as i32 >= target.d_begin + j as i32 && (q as i32) < target.d_end + j as i32 {
                     let subst = matrix.score(query[q] & LETTER_MASK, sl & LETTER_MASK)
                         + cbs.get(q).copied().unwrap_or(0) as i32;
-                    let h = (ph[i - 1] + subst).max(pe[i]).max(f).max(0);
+                    let diag = if semi_global {
+                        (ph[i - 1] + subst.clamp(i8::MIN as i32, i8::MAX as i32))
+                            .clamp(i8::MIN as i32, i8::MAX as i32)
+                    } else {
+                        ph[i - 1] + subst
+                    };
+                    let h = diag.max(pe[i]).max(f);
+                    let h = if semi_global { h } else { h.max(0) };
                     ch[i] = h;
-                    ce[i] = (pe[i] - ge).max(h - go);
-                    f = (f - ge).max(h - go);
+                    let gap_sub = |value: i32, penalty: i32| {
+                        let value = value - penalty;
+                        if semi_global {
+                            value.clamp(i8::MIN as i32, i8::MAX as i32)
+                        } else {
+                            value
+                        }
+                    };
+                    ce[i] = gap_sub(pe[i], ge).max(gap_sub(h, go));
+                    f = gap_sub(f, ge).max(gap_sub(h, go));
                     best = best.max(h);
                 }
             }
@@ -624,10 +638,9 @@ mod tests {
             let semi_global =
                 score_batch_avx2_i8(&query, &targets, &matrix, &cbs, true, &mut scratch).unwrap();
             for lane in 0..count {
-                let expected = scalar(&query, targets[lane], &matrix, &cbs);
+                let expected = scalar(&query, targets[lane], &matrix, &cbs, false);
                 if expected >= u8::MAX as i32 {
                     assert_ne!(got.overflow_mask & (1 << lane), 0);
-                    assert_ne!(semi_global.overflow_mask & (1 << lane), 0);
                 } else {
                     assert_eq!(
                         got.overflow_mask & (1 << lane),
@@ -636,8 +649,11 @@ mod tests {
                         got.scores[lane]
                     );
                     assert_eq!(got.scores[lane], expected);
-                    assert_eq!(semi_global.scores[lane], expected);
                 }
+                assert_eq!(
+                    semi_global.overflow_mask & (1 << lane) != 0,
+                    semi_global.scores[lane] == i8::MAX as i32
+                );
             }
         }
     }
@@ -681,15 +697,51 @@ mod tests {
                 },
                 &matrix,
                 &[],
+                false,
             );
             if expected >= 255 {
                 assert_ne!(got.overflow_mask & (1 << lane), 0);
-                assert_ne!(semi_global.overflow_mask & (1 << lane), 0);
             } else {
                 assert_eq!(got.scores[lane], expected);
-                assert_eq!(semi_global.scores[lane], expected);
             }
+            assert_eq!(
+                semi_global.overflow_mask & (1 << lane) != 0,
+                semi_global.scores[lane] == i8::MAX as i32
+            );
         }
+    }
+
+    #[test]
+    fn semi_global_does_not_clamp_each_cell_to_zero() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let query: Vec<Letter> = b"011000010110111010111100000101"
+            .iter()
+            .map(|&x| (x - b'0') as Letter)
+            .collect();
+        let subject: Vec<Letter> = b"11010110011001100101010101"
+            .iter()
+            .map(|&x| (x - b'0') as Letter)
+            .collect();
+        let targets = [ScoreTarget {
+            subject: &subject,
+            d_begin: -3,
+            d_end: 13,
+        }];
+        let got = score_batch_avx2_i8(
+            &query,
+            &targets,
+            &matrix,
+            &[],
+            true,
+            &mut Scratch8::default(),
+        )
+        .unwrap();
+        assert_eq!(got.overflow_mask, 0);
+        assert_eq!(got.scores[0], 69);
+        assert_eq!(scalar(&query, targets[0], &matrix, &[], true), 69);
     }
 
     #[test]

@@ -60,6 +60,7 @@ pub fn score_batch_avx2(
     targets: &[ScoreTarget<'_>],
     score_matrix: &ScoreMatrix,
     query_cbs: &[i8],
+    semi_global: bool,
     scratch: &mut SimdScoreScratch,
 ) -> Option<BatchScores> {
     if targets.is_empty()
@@ -93,8 +94,32 @@ pub fn score_batch_avx2(
         // SAFETY: guarded by runtime AVX2 detection; all memory accesses in
         // the implementation are bounds checked or use fixed-size arrays.
         return Some(unsafe {
-            if query_cbs.is_empty() {
-                score_batch_avx2_impl::<false>(
+            if semi_global && query_cbs.is_empty() {
+                score_batch_avx2_impl::<true, false>(
+                    query,
+                    targets,
+                    score_matrix.matrix8u_low(),
+                    score_matrix.matrix8u_high(),
+                    score_matrix.bias(),
+                    query_cbs,
+                    gap_open as i16,
+                    gap_extend as i16,
+                    scratch,
+                )
+            } else if semi_global {
+                score_batch_avx2_impl::<true, true>(
+                    query,
+                    targets,
+                    score_matrix.matrix8u_low(),
+                    score_matrix.matrix8u_high(),
+                    score_matrix.bias(),
+                    query_cbs,
+                    gap_open as i16,
+                    gap_extend as i16,
+                    scratch,
+                )
+            } else if query_cbs.is_empty() {
+                score_batch_avx2_impl::<false, false>(
                     query,
                     targets,
                     score_matrix.matrix8u_low(),
@@ -106,7 +131,7 @@ pub fn score_batch_avx2(
                     scratch,
                 )
             } else {
-                score_batch_avx2_impl::<true>(
+                score_batch_avx2_impl::<false, true>(
                     query,
                     targets,
                     score_matrix.matrix8u_low(),
@@ -123,7 +148,14 @@ pub fn score_batch_avx2(
 
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     {
-        let _ = (query, targets, score_matrix, query_cbs, scratch);
+        let _ = (
+            query,
+            targets,
+            score_matrix,
+            query_cbs,
+            semi_global,
+            scratch,
+        );
         None
     }
 }
@@ -139,6 +171,7 @@ pub fn score_full_batch_avx2(
     targets: &[&[Letter]],
     score_matrix: &ScoreMatrix,
     query_cbs: &[i8],
+    semi_global: bool,
     scratch: &mut SimdScoreScratch,
 ) -> Option<BatchScores> {
     if targets.is_empty()
@@ -161,27 +194,46 @@ pub fn score_full_batch_avx2(
         }
         // SAFETY: guarded by runtime AVX2 detection.
         return Some(unsafe {
-            score_full_batch_avx2_impl(
-                query,
-                targets,
-                score_matrix.matrix16(),
-                query_cbs,
-                gap_open as i16,
-                gap_extend as i16,
-                scratch,
-            )
+            if semi_global {
+                score_full_batch_avx2_impl::<true>(
+                    query,
+                    targets,
+                    score_matrix.matrix16(),
+                    query_cbs,
+                    gap_open as i16,
+                    gap_extend as i16,
+                    scratch,
+                )
+            } else {
+                score_full_batch_avx2_impl::<false>(
+                    query,
+                    targets,
+                    score_matrix.matrix16(),
+                    query_cbs,
+                    gap_open as i16,
+                    gap_extend as i16,
+                    scratch,
+                )
+            }
         });
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     {
-        let _ = (query, targets, score_matrix, query_cbs, scratch);
+        let _ = (
+            query,
+            targets,
+            score_matrix,
+            query_cbs,
+            semi_global,
+            scratch,
+        );
         None
     }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn score_full_batch_avx2_impl(
+unsafe fn score_full_batch_avx2_impl<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[&[Letter]],
     matrix: &[i16; 32 * 32],
@@ -190,20 +242,20 @@ unsafe fn score_full_batch_avx2_impl(
     gap_extend: i16,
     scratch: &mut SimdScoreScratch,
 ) -> BatchScores {
-    const NEG: i16 = -16_384;
     let rows = query.len() + 1;
-    let zero = arch::_mm256_setzero_si256();
-    let neg = arch::_mm256_set1_epi16(NEG);
+    let delta = if SEMI_GLOBAL { 0 } else { i16::MIN };
+    let zero = arch::_mm256_set1_epi16(delta);
+    let bits_zero = arch::_mm256_setzero_si256();
     scratch.prev_h.resize(rows, zero);
-    scratch.prev_e.resize(rows, neg);
+    scratch.prev_e.resize(rows, zero);
     scratch.prev_h.fill(zero);
-    scratch.prev_e.fill(neg);
+    scratch.prev_e.fill(zero);
     let go = arch::_mm256_set1_epi16(gap_open);
     let ge = arch::_mm256_set1_epi16(gap_extend);
 
     let max_i16 = arch::_mm256_set1_epi16(i16::MAX);
     let mut best = zero;
-    let mut overflow = zero;
+    let mut overflow = bits_zero;
     let max_subject_len = targets.iter().map(|target| target.len()).max().unwrap_or(0);
 
     for j in 0..max_subject_len {
@@ -211,8 +263,8 @@ unsafe fn score_full_batch_avx2_impl(
         // retain the overwritten score as the next cell's diagonal input.
         let mut diagonal = scratch.prev_h[0];
         scratch.prev_h[0] = zero;
-        scratch.prev_e[0] = neg;
-        let mut vertical = neg;
+        scratch.prev_e[0] = zero;
+        let mut vertical = zero;
         for (qpos, &ql) in query.iter().enumerate() {
             let next_diagonal = scratch.prev_h[qpos + 1];
             let mut subst = [0i16; 16];
@@ -223,13 +275,9 @@ unsafe fn score_full_batch_avx2_impl(
                 }
                 valid[lane] = -1;
                 let sl = targets[lane][j];
-                let base = if sl & crate::basic::value::SEED_MASK != 0 {
-                    0
-                } else {
-                    matrix[((ql & crate::basic::value::LETTER_MASK) as usize) * 32
-                        + (sl & crate::basic::value::LETTER_MASK) as usize]
-                        as i32
-                };
+                let base = matrix[((ql & crate::basic::value::LETTER_MASK) as usize) * 32
+                    + (sl & crate::basic::value::LETTER_MASK) as usize]
+                    as i32;
                 let value = base + query_cbs.get(qpos).copied().unwrap_or(0) as i32;
                 if !(i16::MIN as i32..=i16::MAX as i32).contains(&value) {
                     let mut lane_mask = [0i16; 16];
@@ -247,8 +295,10 @@ unsafe fn score_full_batch_avx2_impl(
             let horizontal = scratch.prev_e[qpos + 1];
             let mut score = arch::_mm256_max_epi16(diag, horizontal);
             score = arch::_mm256_max_epi16(score, vertical);
-            score = arch::_mm256_max_epi16(score, zero);
-            score = arch::_mm256_and_si256(score, mask);
+            score = arch::_mm256_or_si256(
+                arch::_mm256_and_si256(mask, score),
+                arch::_mm256_andnot_si256(mask, zero),
+            );
             overflow = arch::_mm256_or_si256(overflow, arch::_mm256_cmpeq_epi16(score, max_i16));
             let open = arch::_mm256_subs_epi16(score, go);
             let next_horizontal =
@@ -257,11 +307,11 @@ unsafe fn score_full_batch_avx2_impl(
             scratch.prev_h[qpos + 1] = score;
             scratch.prev_e[qpos + 1] = arch::_mm256_or_si256(
                 arch::_mm256_and_si256(mask, next_horizontal),
-                arch::_mm256_andnot_si256(mask, neg),
+                arch::_mm256_andnot_si256(mask, zero),
             );
             vertical = arch::_mm256_or_si256(
                 arch::_mm256_and_si256(mask, vertical),
-                arch::_mm256_andnot_si256(mask, neg),
+                arch::_mm256_andnot_si256(mask, zero),
             );
             best = arch::_mm256_max_epi16(best, score);
             diagonal = next_diagonal;
@@ -275,7 +325,7 @@ unsafe fn score_full_batch_avx2_impl(
     let mut scores = [0i32; 16];
     let mut overflow_mask = 0u16;
     for lane in 0..targets.len() {
-        scores[lane] = raw_scores[lane] as i32;
+        scores[lane] = raw_scores[lane] as i32 - delta as i32;
         if raw_overflow[lane] != 0 {
             overflow_mask |= 1 << lane;
         }
@@ -289,7 +339,7 @@ unsafe fn score_full_batch_avx2_impl(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn score_batch_avx2_impl<const HAS_CBS: bool>(
+unsafe fn score_batch_avx2_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
     matrix_low: &[i8; 32 * 32],
@@ -300,7 +350,7 @@ unsafe fn score_batch_avx2_impl<const HAS_CBS: bool>(
     gap_extend: i16,
     scratch: &mut SimdScoreScratch,
 ) -> BatchScores {
-    score_batch_avx2_upstream_impl::<HAS_CBS>(
+    score_batch_avx2_upstream_impl::<SEMI_GLOBAL, HAS_CBS>(
         query,
         targets,
         matrix_low,
@@ -319,7 +369,7 @@ unsafe fn score_batch_avx2_impl<const HAS_CBS: bool>(
 /// vector form throughout the cell loop.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn score_batch_avx2_upstream_impl<const HAS_CBS: bool>(
+unsafe fn score_batch_avx2_upstream_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
     matrix_low: &[i8; 32 * 32],
@@ -363,8 +413,10 @@ unsafe fn score_batch_avx2_upstream_impl<const HAS_CBS: bool>(
         columns = columns.max((subject_end - subject_start[lane]).max(0) as usize);
     }
 
+    let delta = if SEMI_GLOBAL { 0 } else { i16::MIN };
     let zero = arch::_mm256_setzero_si256();
-    let dp_zero = arch::_mm256_set1_epi16(i16::MIN);
+    let dp_zero = arch::_mm256_set1_epi16(delta);
+    let lane_off = arch::_mm256_set1_epi16(i16::MIN);
     scratch.prev_h.resize(band, dp_zero);
     scratch.prev_e.resize(band + 1, dp_zero);
     scratch.prev_h.fill(dp_zero);
@@ -392,7 +444,7 @@ unsafe fn score_batch_avx2_upstream_impl<const HAS_CBS: bool>(
     ordered_offsets[..targets.len()].sort_unstable();
     let mut segment_begin = [0usize; LANES];
     let mut segment_end = [0usize; LANES];
-    let mut segment_masks = [dp_zero; LANES];
+    let mut segment_masks = [lane_off; LANES];
     let mut segment_count = 0usize;
     let mut lanes = [i16::MIN; LANES];
     let mut cursor = 0usize;
@@ -418,23 +470,16 @@ unsafe fn score_batch_avx2_upstream_impl<const HAS_CBS: bool>(
     for column in 0..columns {
         let mut subject = [0i16; LANES];
         let mut inactive_lanes = [i16::MIN; LANES];
-        let mut seeded = [0i16; LANES];
         for lane in 0..targets.len() {
             let pos = subject_start[lane] + column as i32;
             if pos >= 0 && pos < targets[lane].subject.len() as i32 {
                 let letter = targets[lane].subject[pos as usize];
                 subject[lane] = (letter & crate::basic::value::LETTER_MASK) as i16;
                 inactive_lanes[lane] = 0;
-                seeded[lane] = if letter & crate::basic::value::SEED_MASK != 0 {
-                    -1
-                } else {
-                    0
-                };
             }
         }
         let subject = arch::_mm256_loadu_si256(subject.as_ptr().cast());
         let inactive = arch::_mm256_loadu_si256(inactive_lanes.as_ptr().cast());
-        let seeded = arch::_mm256_loadu_si256(seeded.as_ptr().cast());
         let mut profile: [MaybeUninit<ArchVector>; AMINO_ACID_COUNT] =
             [const { MaybeUninit::uninit() }; AMINO_ACID_COUNT];
         // Direct port of AVX2 ScoreVector<int16_t>(letter, subject-vector):
@@ -467,10 +512,7 @@ unsafe fn score_batch_avx2_upstream_impl<const HAS_CBS: bool>(
                 arch::_mm256_and_si256(arch::_mm256_or_si256(lo_score, hi_score), byte_mask);
             profile
                 .get_unchecked_mut(query_letter)
-                .write(arch::_mm256_andnot_si256(
-                    seeded,
-                    arch::_mm256_subs_epi16(expanded, bias),
-                ));
+                .write(arch::_mm256_subs_epi16(expanded, bias));
         }
 
         let moving_i0 = i0 + column as i32;
@@ -549,7 +591,7 @@ unsafe fn score_batch_avx2_upstream_impl<const HAS_CBS: bool>(
     let mut scores = [0i32; LANES];
     let mut overflow_mask = 0u16;
     for lane in 0..targets.len() {
-        scores[lane] = raw_scores[lane] as i32 - i16::MIN as i32;
+        scores[lane] = raw_scores[lane] as i32 - delta as i32;
         if raw_overflow[lane] != 0 {
             overflow_mask |= 1 << lane;
         }
@@ -585,11 +627,8 @@ mod tests {
                 if !valid {
                     continue;
                 }
-                let subst = if s & SEED_MASK != 0 {
-                    0
-                } else {
-                    matrix.score(query[qpos] & LETTER_MASK, s & LETTER_MASK)
-                } + if cbs.is_empty() { 0 } else { cbs[qpos] as i32 };
+                let subst = matrix.score(query[qpos] & LETTER_MASK, s & LETTER_MASK)
+                    + if cbs.is_empty() { 0 } else { cbs[qpos] as i32 };
                 let h = (ph[i - 1] + subst).max(pe[i]).max(f).max(0);
                 ch[i] = h;
                 ce[i] = (pe[i] - ge).max(h - go);
@@ -642,9 +681,10 @@ mod tests {
                     d_end,
                 })
                 .collect();
-            let got = score_batch_avx2(&query, &targets, &matrix, &cbs, &mut scratch).unwrap();
+            let got =
+                score_batch_avx2(&query, &targets, &matrix, &cbs, false, &mut scratch).unwrap();
             let got_without_cbs =
-                score_batch_avx2(&query, &targets, &matrix, &[], &mut scratch).unwrap();
+                score_batch_avx2(&query, &targets, &matrix, &[], false, &mut scratch).unwrap();
             assert_eq!(got.overflow_mask, 0);
             assert_eq!(got_without_cbs.overflow_mask, 0);
             for lane in 0..lane_count {
@@ -662,6 +702,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn avx2_score_treats_seed_mask_as_lookup_only_metadata() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let query = vec![17; 12];
+        let plain = vec![17; 12];
+        let marked: Vec<_> = plain.iter().map(|&letter| letter | SEED_MASK).collect();
+        let targets = [
+            ScoreTarget {
+                subject: &plain,
+                d_begin: 0,
+                d_end: 1,
+            },
+            ScoreTarget {
+                subject: &marked,
+                d_begin: 0,
+                d_end: 1,
+            },
+        ];
+        let mut scratch = SimdScoreScratch::default();
+        let banded = score_batch_avx2(&query, &targets, &matrix, &[], false, &mut scratch).unwrap();
+        assert_eq!(banded.scores[0], banded.scores[1]);
+        let full = score_full_batch_avx2(
+            &query,
+            &[plain.as_slice(), marked.as_slice()],
+            &matrix,
+            &[],
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(full.scores[0], full.scores[1]);
     }
 
     #[test]
@@ -692,11 +768,44 @@ mod tests {
             &targets,
             &matrix,
             &[],
+            false,
             &mut SimdScoreScratch::default(),
         )
         .unwrap();
         assert_eq!(got.overflow_mask, 1);
         assert_eq!(got.scores[1], 220);
+    }
+
+    #[test]
+    fn semi_global_does_not_clamp_each_cell_to_zero() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let query: Vec<Letter> = b"011000010110111010111100000101"
+            .iter()
+            .map(|&x| (x - b'0') as Letter)
+            .collect();
+        let subject: Vec<Letter> = b"11010110011001100101010101"
+            .iter()
+            .map(|&x| (x - b'0') as Letter)
+            .collect();
+        let targets = [ScoreTarget {
+            subject: &subject,
+            d_begin: -3,
+            d_end: 13,
+        }];
+        let got = score_batch_avx2(
+            &query,
+            &targets,
+            &matrix,
+            &[],
+            true,
+            &mut SimdScoreScratch::default(),
+        )
+        .unwrap();
+        assert_eq!(got.overflow_mask, 0);
+        assert_eq!(got.scores[0], 69);
     }
 
     #[test]
@@ -716,6 +825,7 @@ mod tests {
             &target,
             &matrix,
             &[],
+            false,
             &mut SimdScoreScratch::default(),
         )
         .is_none());
@@ -745,7 +855,8 @@ mod tests {
                 })
                 .collect();
             let refs: Vec<&[Letter]> = subjects.iter().map(Vec::as_slice).collect();
-            let got = score_full_batch_avx2(&query, &refs, &matrix, &cbs, &mut scratch).unwrap();
+            let got =
+                score_full_batch_avx2(&query, &refs, &matrix, &cbs, false, &mut scratch).unwrap();
             assert_eq!(got.overflow_mask, 0);
             for lane in 0..count {
                 let target = ScoreTarget {

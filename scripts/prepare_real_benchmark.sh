@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=lib/portable.sh
+source "$script_dir/lib/portable.sh"
+
 if (($# < 1 || $# > 2)); then
     echo "usage: $0 SOURCE_FASTA [OUTPUT_DIR]" >&2
     exit 2
@@ -84,9 +88,9 @@ then
     exit 1
 fi
 
-reference_sha=$(sha256sum "$reference" | awk '{ print $1 }')
-query_sha=$(sha256sum "$query" | awk '{ print $1 }')
-source_sha=$(sha256sum "$source_fasta" | awk '{ print $1 }')
+reference_sha=$(sha256_file "$reference")
+query_sha=$(sha256_file "$query")
+source_sha=$(sha256_file "$source_fasta")
 printf 'source=%s sha256=%s\n' "$source_fasta" "$source_sha"
 printf 'reference=%s records=%s sha256=%s\n' "$reference" "$reference_count" "$reference_sha"
 printf 'query=%s records=%s sha256=%s\n' "$query" "$query_count" "$query_sha"

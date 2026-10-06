@@ -98,6 +98,7 @@ pub fn trace_batch_i8(
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
     cbs: &[i8],
+    semi_global: bool,
 ) -> Option<NarrowTraceBatch> {
     if !valid(query, targets, cbs, 16) {
         return None;
@@ -105,11 +106,23 @@ pub fn trace_batch_i8(
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::arch::is_x86_feature_detected!("sse4.1") && std::arch::is_x86_feature_detected!("ssse3")
     {
-        return Some(unsafe { trace_i8_core(query, targets, matrix, cbs) });
+        return Some(unsafe {
+            if semi_global {
+                trace_i8_core::<true>(query, targets, matrix, cbs)
+            } else {
+                trace_i8_core::<false>(query, targets, matrix, cbs)
+            }
+        });
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
-        return Some(unsafe { trace_i8_core(query, targets, matrix, cbs) });
+        return Some(unsafe {
+            if semi_global {
+                trace_i8_core::<true>(query, targets, matrix, cbs)
+            } else {
+                trace_i8_core::<false>(query, targets, matrix, cbs)
+            }
+        });
     }
     None
 }
@@ -123,17 +136,30 @@ pub fn trace_batch_i16(
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
     cbs: &[i8],
+    semi_global: bool,
 ) -> Option<NarrowTraceBatch> {
     if !valid(query, targets, cbs, 8) {
         return None;
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::arch::is_x86_feature_detected!("sse2") {
-        return Some(unsafe { trace_i16_core(query, targets, matrix, cbs) });
+        return Some(unsafe {
+            if semi_global {
+                trace_i16_core::<true>(query, targets, matrix, cbs)
+            } else {
+                trace_i16_core::<false>(query, targets, matrix, cbs)
+            }
+        });
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
-        return Some(unsafe { trace_i16_core(query, targets, matrix, cbs) });
+        return Some(unsafe {
+            if semi_global {
+                trace_i16_core::<true>(query, targets, matrix, cbs)
+            } else {
+                trace_i16_core::<false>(query, targets, matrix, cbs)
+            }
+        });
     }
     None
 }
@@ -148,6 +174,7 @@ pub fn score_batch_i8(
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
     cbs: &[i8],
+    semi_global: bool,
 ) -> Option<NarrowScores> {
     if !valid(query, targets, cbs, 16) {
         return None;
@@ -155,11 +182,23 @@ pub fn score_batch_i8(
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::arch::is_x86_feature_detected!("sse4.1") && std::arch::is_x86_feature_detected!("ssse3")
     {
-        return Some(unsafe { score_i8_core(query, targets, matrix, cbs) });
+        return Some(unsafe {
+            if semi_global {
+                score_i8_core::<true>(query, targets, matrix, cbs)
+            } else {
+                score_i8_core::<false>(query, targets, matrix, cbs)
+            }
+        });
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
-        return Some(unsafe { score_i8_core(query, targets, matrix, cbs) });
+        return Some(unsafe {
+            if semi_global {
+                score_i8_core::<true>(query, targets, matrix, cbs)
+            } else {
+                score_i8_core::<false>(query, targets, matrix, cbs)
+            }
+        });
     }
     None
 }
@@ -174,17 +213,30 @@ pub fn score_batch_i16(
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
     cbs: &[i8],
+    semi_global: bool,
 ) -> Option<NarrowScores> {
     if !valid(query, targets, cbs, 8) {
         return None;
     }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::arch::is_x86_feature_detected!("sse2") {
-        return Some(unsafe { score_i16_core(query, targets, matrix, cbs) });
+        return Some(unsafe {
+            if semi_global {
+                score_i16_core::<true>(query, targets, matrix, cbs)
+            } else {
+                score_i16_core::<false>(query, targets, matrix, cbs)
+            }
+        });
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
-        return Some(unsafe { score_i16_core(query, targets, matrix, cbs) });
+        return Some(unsafe {
+            if semi_global {
+                score_i16_core::<true>(query, targets, matrix, cbs)
+            } else {
+                score_i16_core::<false>(query, targets, matrix, cbs)
+            }
+        });
     }
     None
 }
@@ -226,7 +278,7 @@ fn geometry<const LANES: usize>(
     target_feature(enable = "sse4.1,ssse3")
 )]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-unsafe fn score_i8_core(
+unsafe fn score_i8_core<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
@@ -234,7 +286,8 @@ unsafe fn score_i8_core(
 ) -> NarrowScores {
     const LANES: usize = 16;
     let (band, i0, starts, offsets, cols) = geometry::<LANES>(query.len(), targets);
-    let zero = v8_splat(i8::MIN);
+    let delta = if SEMI_GLOBAL { 0 } else { i8::MIN };
+    let zero = v8_splat(delta);
     let mut ph = vec![zero; band];
     let mut ch = vec![zero; band];
     let mut pe = vec![zero; band + 1];
@@ -301,11 +354,11 @@ unsafe fn score_i8_core(
             let maskv = v8_load(mask);
             let diag = v8_adds(ph[r], v8_load(subst));
             let horizontal = pe[r + 1];
-            let h = v8_select(
-                maskv,
-                v8_max(v8_max(v8_max(diag, horizontal), vertical), zero),
-                zero,
-            );
+            let mut h = v8_max(v8_max(diag, horizontal), vertical);
+            if !SEMI_GLOBAL {
+                h = v8_max(h, zero);
+            }
+            let h = v8_select(maskv, h, zero);
             let open = v8_subs(h, go);
             let nh = v8_max(v8_subs(horizontal, ge), open);
             let nv = v8_max(v8_subs(vertical, ge), open);
@@ -325,7 +378,7 @@ unsafe fn score_i8_core(
     NarrowScores {
         scores: v8_store(best)[..targets.len()]
             .iter()
-            .map(|&x| i32::from(x) - i32::from(i8::MIN))
+            .map(|&x| i32::from(x) - i32::from(delta))
             .collect(),
         overflow_mask: overflow,
     }
@@ -337,7 +390,7 @@ unsafe fn score_i8_core(
     target_feature(enable = "sse2")
 )]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-unsafe fn score_i16_core(
+unsafe fn score_i16_core<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
@@ -345,7 +398,8 @@ unsafe fn score_i16_core(
 ) -> NarrowScores {
     const LANES: usize = 8;
     let (band, i0, starts, offsets, cols) = geometry::<LANES>(query.len(), targets);
-    let zero = v16_splat(i16::MIN);
+    let delta = if SEMI_GLOBAL { 0 } else { i16::MIN };
+    let zero = v16_splat(delta);
     let mut ph = vec![zero; band];
     let mut ch = vec![zero; band];
     let mut pe = vec![zero; band + 1];
@@ -407,11 +461,11 @@ unsafe fn score_i16_core(
             let maskv = v16_load(mask);
             let diag = v16_adds(ph[r], v16_load(subst));
             let horizontal = pe[r + 1];
-            let h = v16_select(
-                maskv,
-                v16_max(v16_max(v16_max(diag, horizontal), vertical), zero),
-                zero,
-            );
+            let mut h = v16_max(v16_max(diag, horizontal), vertical);
+            if !SEMI_GLOBAL {
+                h = v16_max(h, zero);
+            }
+            let h = v16_select(maskv, h, zero);
             let open = v16_subs(h, go);
             let nh = v16_max(v16_subs(horizontal, ge), open);
             let nv = v16_max(v16_subs(vertical, ge), open);
@@ -431,7 +485,7 @@ unsafe fn score_i16_core(
     NarrowScores {
         scores: v16_store(best)[..targets.len()]
             .iter()
-            .map(|&x| i32::from(x) - i32::from(i16::MIN))
+            .map(|&x| i32::from(x) - i32::from(delta))
             .collect(),
         overflow_mask: overflow,
     }
@@ -443,7 +497,7 @@ unsafe fn score_i16_core(
     target_feature(enable = "sse4.1,ssse3")
 )]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-unsafe fn trace_i8_core(
+unsafe fn trace_i8_core<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
@@ -451,7 +505,8 @@ unsafe fn trace_i8_core(
 ) -> NarrowTraceBatch {
     const LANES: usize = 16;
     let (band, i0, subject_start, band_offset, cols) = geometry::<LANES>(query.len(), targets);
-    let zero = v8_splat(i8::MIN);
+    let delta = if SEMI_GLOBAL { 0 } else { i8::MIN };
+    let zero = v8_splat(delta);
     let mut go_lanes = [0i8; LANES];
     let mut ge_lanes = [0i8; LANES];
     let mut overflow_mask = 0u32;
@@ -472,7 +527,7 @@ unsafe fn trace_i8_core(
     let mut pe = vec![zero; band + 1];
     let mut ce = vec![zero; band + 1];
     let mut trace = allocate_trace(targets);
-    let mut best = [i8::MIN; LANES];
+    let mut best = [delta; LANES];
     let mut best_i = [0; LANES];
     let mut best_j = [0; LANES];
 
@@ -524,11 +579,11 @@ unsafe fn trace_i8_core(
             let maskv = v8_load(mask);
             let diag = v8_adds(ph[r], v8_load(subst));
             let horizontal = pe[r + 1];
-            let score = v8_select(
-                maskv,
-                v8_max(v8_max(v8_max(diag, horizontal), vertical), zero),
-                zero,
-            );
+            let mut score = v8_max(v8_max(diag, horizontal), vertical);
+            if !SEMI_GLOBAL {
+                score = v8_max(score, zero);
+            }
+            let score = v8_select(maskv, score, zero);
             let open = v8_subs(score, go);
             let next_h = v8_max(v8_subs(horizontal, ge), open);
             let next_v = v8_max(v8_subs(vertical, ge), open);
@@ -551,7 +606,7 @@ unsafe fn trace_i8_core(
                 let width = (target.d_end - target.d_begin) as usize;
                 let lower = (target.d_begin + subject_pos[lane] as i32).max(0) as usize;
                 let idx = (subject_pos[lane] + 1) * (width + 2) + qpos - lower;
-                trace[lane][idx] = u8::from(scores[lane] > i8::MIN) * ACTIVE
+                trace[lane][idx] = u8::from(SEMI_GLOBAL || scores[lane] > delta) * ACTIVE
                     | u8::from(scores[lane] == verticals[lane]) * GAP_V
                     | u8::from(scores[lane] == horizontals[lane]) * GAP_H
                     | u8::from(next_vs[lane] == opens[lane]) * OPEN_V
@@ -570,10 +625,20 @@ unsafe fn trace_i8_core(
     }
     let scores: Vec<i32> = best[..targets.len()]
         .iter()
-        .map(|&x| i32::from(x) - i32::from(i8::MIN))
+        .map(|&x| i32::from(x) - i32::from(delta))
         .collect();
     NarrowTraceBatch {
-        results: finish_results(query, targets, &trace, &scores, &best_i, &best_j),
+        results: finish_results::<SEMI_GLOBAL, LANES>(
+            query,
+            targets,
+            matrix,
+            cbs,
+            &trace,
+            &scores,
+            &best_i,
+            &best_j,
+            overflow_mask,
+        ),
         overflow_mask,
     }
 }
@@ -584,7 +649,7 @@ unsafe fn trace_i8_core(
     target_feature(enable = "sse2")
 )]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-unsafe fn trace_i16_core(
+unsafe fn trace_i16_core<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
@@ -592,7 +657,8 @@ unsafe fn trace_i16_core(
 ) -> NarrowTraceBatch {
     const LANES: usize = 8;
     let (band, i0, subject_start, band_offset, cols) = geometry::<LANES>(query.len(), targets);
-    let zero = v16_splat(i16::MIN);
+    let delta = if SEMI_GLOBAL { 0 } else { i16::MIN };
+    let zero = v16_splat(delta);
     let mut go_lanes = [0i16; LANES];
     let mut ge_lanes = [0i16; LANES];
     let mut overflow_mask = 0u32;
@@ -613,7 +679,7 @@ unsafe fn trace_i16_core(
     let mut pe = vec![zero; band + 1];
     let mut ce = vec![zero; band + 1];
     let mut trace = allocate_trace(targets);
-    let mut best = [i16::MIN; LANES];
+    let mut best = [delta; LANES];
     let mut best_i = [0; LANES];
     let mut best_j = [0; LANES];
 
@@ -661,11 +727,11 @@ unsafe fn trace_i16_core(
             let maskv = v16_load(mask);
             let diag = v16_adds(ph[r], v16_load(subst));
             let horizontal = pe[r + 1];
-            let score = v16_select(
-                maskv,
-                v16_max(v16_max(v16_max(diag, horizontal), vertical), zero),
-                zero,
-            );
+            let mut score = v16_max(v16_max(diag, horizontal), vertical);
+            if !SEMI_GLOBAL {
+                score = v16_max(score, zero);
+            }
+            let score = v16_select(maskv, score, zero);
             let open = v16_subs(score, go);
             let next_h = v16_max(v16_subs(horizontal, ge), open);
             let next_v = v16_max(v16_subs(vertical, ge), open);
@@ -688,7 +754,7 @@ unsafe fn trace_i16_core(
                 let width = (target.d_end - target.d_begin) as usize;
                 let lower = (target.d_begin + subject_pos[lane] as i32).max(0) as usize;
                 let idx = (subject_pos[lane] + 1) * (width + 2) + qpos - lower;
-                trace[lane][idx] = u8::from(scores[lane] > i16::MIN) * ACTIVE
+                trace[lane][idx] = u8::from(SEMI_GLOBAL || scores[lane] > delta) * ACTIVE
                     | u8::from(scores[lane] == verticals[lane]) * GAP_V
                     | u8::from(scores[lane] == horizontals[lane]) * GAP_H
                     | u8::from(next_vs[lane] == opens[lane]) * OPEN_V
@@ -707,10 +773,20 @@ unsafe fn trace_i16_core(
     }
     let scores: Vec<i32> = best[..targets.len()]
         .iter()
-        .map(|&x| i32::from(x) - i32::from(i16::MIN))
+        .map(|&x| i32::from(x) - i32::from(delta))
         .collect();
     NarrowTraceBatch {
-        results: finish_results(query, targets, &trace, &scores, &best_i, &best_j),
+        results: finish_results::<SEMI_GLOBAL, LANES>(
+            query,
+            targets,
+            matrix,
+            cbs,
+            &trace,
+            &scores,
+            &best_i,
+            &best_j,
+            overflow_mask,
+        ),
         overflow_mask,
     }
 }
@@ -727,19 +803,24 @@ fn allocate_trace(targets: &[TraceTarget<'_>]) -> Vec<Vec<u8>> {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
-fn finish_results<const LANES: usize>(
+fn finish_results<const SEMI_GLOBAL: bool, const LANES: usize>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
+    matrix: &ScoreMatrix,
+    cbs: &[i8],
     trace: &[Vec<u8>],
     scores: &[i32],
     best_i: &[usize; LANES],
     best_j: &[usize; LANES],
+    overflow_mask: u32,
 ) -> Vec<SwResult> {
     targets
         .iter()
         .enumerate()
         .map(|(lane, target)| {
-            if scores[lane] == 0 {
+            // Upstream never traceback-decodes a saturated narrow lane. The
+            // lane is promoted and recomputed at the next score width.
+            if scores[lane] == 0 || overflow_mask & (1 << lane) != 0 {
                 return SwResult::default();
             }
             let rows = (target.d_end - target.d_begin) as usize + 2;
@@ -762,8 +843,15 @@ fn finish_results<const LANES: usize>(
                 ..Default::default()
             };
             let mut operations = Vec::new();
-            while i > 0 && j > 0 && at(i, j) & ACTIVE != 0 {
+            let scale = target.matrix_scale.max(1);
+            let gap_open = matrix.gap_open() * scale;
+            let gap_extend = matrix.gap_extend() * scale;
+            let mut traceback_score = 0i32;
+            while i > 0 && j > 0 && (!SEMI_GLOBAL || traceback_score < scores[lane]) {
                 let flags = at(i, j);
+                if !SEMI_GLOBAL && flags & ACTIVE == 0 {
+                    break;
+                }
                 if flags & GAP_V != 0 {
                     let mut n = 0;
                     loop {
@@ -777,6 +865,7 @@ fn finish_results<const LANES: usize>(
                     out.gap_openings += 1;
                     out.gaps += n;
                     out.length += n;
+                    traceback_score -= gap_open + n * gap_extend;
                 } else if flags & GAP_H != 0 {
                     let mut n = 0;
                     loop {
@@ -790,7 +879,20 @@ fn finish_results<const LANES: usize>(
                     out.gap_openings += 1;
                     out.gaps += n;
                     out.length += n;
+                    traceback_score -= gap_open + n * gap_extend;
                 } else {
+                    let qpos = i - 1;
+                    let spos = j - 1;
+                    let ql = query[qpos];
+                    let sl = target.subject[spos];
+                    traceback_score += if let Some(adjusted) = target.matrix {
+                        adjusted.scores
+                            [(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize]
+                            as i32
+                    } else {
+                        matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
+                            + cbs.get(qpos).copied().unwrap_or(0) as i32
+                    };
                     if query[i - 1] & LETTER_MASK == target.subject[j - 1] & LETTER_MASK {
                         operations.push((EditOperation::Match, 1));
                         out.identities += 1;
@@ -803,6 +905,10 @@ fn finish_results<const LANES: usize>(
                     j -= 1;
                 }
             }
+            assert_eq!(
+                traceback_score, scores[lane],
+                "traceback score does not reproduce the selected SWIPE maximum"
+            );
             out.query_begin = i as i32;
             out.subject_begin = j as i32;
             operations.reverse();
@@ -1038,9 +1144,9 @@ mod tests {
                     })
                     .collect();
                 let got = if bin == 0 {
-                    trace_batch_i8(&query, &targets, &matrix, &cbs)
+                    trace_batch_i8(&query, &targets, &matrix, &cbs, false)
                 } else {
-                    trace_batch_i16(&query, &targets, &matrix, &cbs)
+                    trace_batch_i16(&query, &targets, &matrix, &cbs, false)
                 }
                 .unwrap();
                 for lane in 0..count {
@@ -1084,13 +1190,11 @@ mod tests {
             matrix: None,
             matrix_scale: 1,
         };
-        assert_eq!(
-            trace_batch_i8(&query, &[target], &matrix, &[])
-                .unwrap()
-                .overflow_mask,
-            1
-        );
-        let word = trace_batch_i16(&query, &[target], &matrix, &[]).unwrap();
+        let byte = trace_batch_i8(&query, &[target], &matrix, &[], false).unwrap();
+        assert_eq!(byte.overflow_mask, 1);
+        assert_eq!(byte.results[0].score, 0);
+        assert!(byte.results[0].operations.is_empty());
+        let word = trace_batch_i16(&query, &[target], &matrix, &[], false).unwrap();
         assert_eq!(word.overflow_mask, 0);
         let expected = banded_sw_cbs_range(
             &query,
@@ -1115,11 +1219,9 @@ mod tests {
             matrix: None,
             matrix_scale: 1,
         };
-        assert_eq!(
-            trace_batch_i16(&query, &[target], &matrix, &[])
-                .unwrap()
-                .overflow_mask,
-            1
-        );
+        let word = trace_batch_i16(&query, &[target], &matrix, &[], false).unwrap();
+        assert_eq!(word.overflow_mask, 1);
+        assert_eq!(word.results[0].score, 0);
+        assert!(word.results[0].operations.is_empty());
     }
 }

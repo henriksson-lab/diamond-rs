@@ -3104,6 +3104,10 @@ mod tests {
             print_rank_taxon_names(&[20, 30], &tree, "phylum", false),
             "Proteobacteria;Euryarchaeota"
         );
+        assert_eq!(
+            print_rank_taxon_names(&[20, 30], &tree, "species", false),
+            "0"
+        );
     }
 
     #[test]
@@ -3244,7 +3248,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "query\t20;30\tProteobacteria;Euryarchaeota\tBacteria;Archaea\tPseudomonadati\tProteobacteria;Euryarchaeota\tBacteria; Pseudomonadati; Proteobacteria<>Archaea; Euryarchaeota\n"
+            "query\t20;30\tProteobacteria;Euryarchaeota\tBacteria;Archaea\t0;Pseudomonadati\tProteobacteria;Euryarchaeota\tBacteria; Pseudomonadati; Proteobacteria<>Archaea; Euryarchaeota\n"
         );
     }
 

@@ -327,6 +327,9 @@ pub fn run<B: CascadedWrapperBackend>(
         return Err("Option is not permitted for this workflow: --parallel-tmpdir".to_owned());
     }
     config.hamming_ext = config.core.approx_min_id >= 50.0;
+    config.core.hamming_ext = config.hamming_ext;
+    config.core.diag_filter_cov = config.thresholds.diag_filter_cov;
+    config.core.diag_filter_id = config.thresholds.diag_filter_id;
 
     let mut database = backend.open_database(&database_path)?;
     if backend.database_is_blast(&database) {
@@ -659,6 +662,10 @@ mod tests {
             run(&mut backend, &mut cfg).unwrap();
             assert_eq!(cfg.thresholds.approx_min_id, Some(expected_identity));
             assert_eq!(cfg.core.approx_min_id, expected_identity);
+            assert_eq!(cfg.hamming_ext, expected_identity >= 50.0);
+            assert_eq!(cfg.core.hamming_ext, expected_identity >= 50.0);
+            assert_eq!(cfg.core.diag_filter_id, cfg.thresholds.diag_filter_id);
+            assert_eq!(cfg.core.diag_filter_cov, cfg.thresholds.diag_filter_cov);
             assert_eq!(backend.dense_linear, vec![expected_linear]);
         }
     }

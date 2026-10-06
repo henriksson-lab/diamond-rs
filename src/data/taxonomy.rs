@@ -167,10 +167,10 @@ impl TaxonomyTree {
     pub fn rank_taxids(&self, taxids: &[TaxId], rank: &str) -> std::collections::BTreeSet<TaxId> {
         let mut out = std::collections::BTreeSet::new();
         for &taxid in taxids {
-            let ranked = self.rank_taxid(taxid, rank);
-            if ranked > 0 {
-                out.insert(ranked);
-            }
+            // C++ inserts the result unconditionally, including the `0`
+            // sentinel used when the requested rank is absent. The tabular
+            // formatter consequently prints `0` for that case.
+            out.insert(self.rank_taxid(taxid, rank));
         }
         out
     }
@@ -447,7 +447,7 @@ mod tests {
             tree.rank_taxids(&[10, 999], "superkingdom")
                 .into_iter()
                 .collect::<Vec<_>>(),
-            vec![2]
+            vec![0, 2]
         );
     }
 

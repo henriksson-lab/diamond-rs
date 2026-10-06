@@ -18,7 +18,11 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
+          # macos-latest is the GitHub-hosted arm64 image. Keep an explicit
+          # Intel runner as well: RSS/Mach bindings and the target C runtime
+          # must be exercised natively on both supported architectures.
           - macos-latest
+          - macos-15-intel
           - windows-latest
 
     steps:
@@ -45,3 +49,261 @@ jobs:
 
       - name: Build
         run: cargo build --all-targets
+
+      - name: Test
+        run: cargo test --all-targets
+
+  ffi-conformance:
+    name: Optional C++ conformance oracle (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Checkout upstream DIAMOND translation baseline
+        uses: actions/checkout@v5
+        with:
+          repository: bbuchfink/diamond
+          ref: 1d162b4fefb5e6b4d868c24e6ad551cad2dcf246
+          path: diamond
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Select Rust
+        run: rustup default stable
+
+      # Keep the default cross-platform matrix C++-free. This separate job is
+      # the only CI path that builds the optional upstream comparison oracle.
+      - name: Test C++ conformance adapter
+        run: cargo test --features ffi --test regression -- --test-threads=1
+
+  rng-conformance:
+    name: Target C-runtime RNG oracle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          # C rand/srand are target-runtime compatibility requirements, so
+          # capture both macOS ABIs rather than relying on cross-compilation.
+          - macos-latest
+          - macos-15-intel
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Checkout upstream DIAMOND translation baseline
+        uses: actions/checkout@v5
+        with:
+          repository: bbuchfink/diamond
+          ref: 1d162b4fefb5e6b4d868c24e6ad551cad2dcf246
+          path: diamond
+
+      - name: Configure MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Select Rust
+        run: rustup default stable
+
+      # This ignored test compiles a tiny target-native C++ executable from the
+      # pinned sources. It compares live rand/srand vectors and downstream
+      # numerical paths without adding C++ to the production dependency graph.
+      - name: Compare Rust with target C/C++ runtime
+        env:
+          DIAMOND_RNG_ORACLE_CAPTURE: target/compat-rng-oracle.txt
+        run: cargo test --test compat_rng_oracle -- --ignored --exact target_c_runtime_and_downstream_paths_match_pinned_cpp --test-threads=1 --nocapture
+
+      - name: Validate retained RNG evidence
+        run: bash scripts/validate_native_conformance_artifact.sh rng target/compat-rng-oracle.txt
+
+      - name: Upload target RNG vectors
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-rng-oracle-${{ matrix.os }}
+          path: target/compat-rng-oracle.txt
+          if-no-files-found: error
+          retention-days: 90
+
+  native-spill-conformance:
+    name: Native delayed spill (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - macos-15-intel
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Checkout upstream DIAMOND translation baseline
+        uses: actions/checkout@v5
+        with:
+          repository: bbuchfink/diamond
+          ref: 1d162b4fefb5e6b4d868c24e6ad551cad2dcf246
+          path: diamond
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Select Rust
+        run: rustup default stable
+
+      - name: Build release executable
+        run: cargo build --release --bin diamond
+
+      # Git for Windows supplies the same bash/awk/coreutils surface used on
+      # Linux and macOS. The driver calibrates from target-native RSS behavior;
+      # it does not reuse a threshold measured on another runner.
+      - name: Calibrate and test delayed spilling
+        shell: bash
+        run: scripts/run_native_spill_conformance.sh target/native-spill-conformance
+
+      - name: Upload spill decision evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-spill-conformance-${{ matrix.os }}
+          path: target/native-spill-conformance
+          if-no-files-found: error
+          retention-days: 90
+
+  linux-musl:
+    name: Test (Linux x86-64 musl)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Checkout upstream DIAMOND translation baseline
+        uses: actions/checkout@v5
+        with:
+          repository: bbuchfink/diamond
+          ref: 1d162b4fefb5e6b4d868c24e6ad551cad2dcf246
+          path: diamond
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Install Rust with musl target
+        run: rustup toolchain install stable --profile minimal --no-self-update --target x86_64-unknown-linux-musl
+
+      - name: Select Rust
+        run: rustup default stable
+
+      # Execute the resulting static musl test binaries on the Ubuntu runner.
+      # Keep the optional C++ oracle out of this portable production build.
+      - name: Test
+        run: cargo test --target x86_64-unknown-linux-musl --all-targets
+
+      - name: Build release executable for spill conformance
+        run: cargo build --release --target x86_64-unknown-linux-musl --bin diamond
+
+      - name: Calibrate and test delayed spilling with musl
+        env:
+          DIAMOND_BIN: target/x86_64-unknown-linux-musl/release/diamond
+        run: scripts/run_native_spill_conformance.sh target/native-spill-conformance-linux-musl
+
+      - name: Upload musl spill decision evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-spill-conformance-linux-musl
+          path: target/native-spill-conformance-linux-musl
+          if-no-files-found: error
+          retention-days: 90
+
+      # The production test above deliberately ignores the C++ oracle. Run it
+      # separately with both sides linked against musl, retaining the vectors
+      # as target-runtime evidence rather than inferring them from glibc.
+      - name: Install Zig for the musl C++ oracle
+        uses: mlugg/setup-zig@v2.2.1
+
+      - name: Compare Rust with the musl C/C++ runtime
+        env:
+          SKIP_MUSL_BUILD: "1"
+          DIAMOND_RNG_ORACLE_CAPTURE: target/compat-rng-oracle-musl.txt
+        run: scripts/run_musl_rng_oracle.sh
+
+      - name: Validate retained musl RNG evidence
+        run: bash scripts/validate_native_conformance_artifact.sh rng target/compat-rng-oracle-musl.txt
+
+      - name: Upload musl RNG vectors
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-rng-oracle-linux-musl
+          path: target/compat-rng-oracle-musl.txt
+          if-no-files-found: error
+          retention-days: 90
+
+  linux-32-bit:
+    name: Check (Linux i686 GNU)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Checkout upstream DIAMOND translation baseline
+        uses: actions/checkout@v5
+        with:
+          repository: bbuchfink/diamond
+          ref: 1d162b4fefb5e6b4d868c24e6ad551cad2dcf246
+          path: diamond
+
+      - name: Install 32-bit C toolchain
+        run: sudo apt-get update && sudo apt-get install --yes gcc-multilib
+
+      - name: Install Rust with i686 target
+        run: rustup toolchain install stable --profile minimal --no-self-update --target i686-unknown-linux-gnu
+
+      - name: Select Rust
+        run: rustup default stable
+
+      - name: Check
+        run: cargo check --target i686-unknown-linux-gnu --all-targets
+
+  windows-32-bit:
+    name: Check (Windows i686 MSVC)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Checkout upstream DIAMOND translation baseline
+        uses: actions/checkout@v5
+        with:
+          repository: bbuchfink/diamond
+          ref: 1d162b4fefb5e6b4d868c24e6ad551cad2dcf246
+          path: diamond
+
+      - name: Configure x86 MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Install Rust with i686 target
+        run: rustup toolchain install stable --profile minimal --no-self-update --target i686-pc-windows-msvc
+
+      - name: Select Rust
+        run: rustup default stable
+
+      - name: Check
+        run: cargo check --target i686-pc-windows-msvc --all-targets

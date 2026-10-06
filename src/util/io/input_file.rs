@@ -4,8 +4,6 @@ use std::fs::File as StdFile;
 #[cfg(unix)]
 use std::io::Seek;
 use std::io::SeekFrom;
-#[cfg(unix)]
-use std::os::fd::FromRawFd;
 
 use super::{
     Compressor, Deserializer, FilePrimitive, FileSource, InputStreamBuffer, IoError, IoResult,
@@ -180,14 +178,7 @@ impl InputFile {
     ) -> IoResult<Self> {
         #[cfg(unix)]
         let source = {
-            let fd = unsafe { super::dup(data.fd) };
-            if fd < 0 {
-                return Err(IoError::Other(format!(
-                    "Error opening temporary file {}",
-                    data.name
-                )));
-            }
-            let mut file = unsafe { StdFile::from_raw_fd(fd) };
+            let mut file = data.try_clone_file()?;
             file.seek(SeekFrom::Start(0))
                 .map_err(|_| IoError::Other("Error calling fseek.".to_string()))?;
             FileSource::from_file(&data.name, file)

@@ -1,8 +1,5 @@
 //! Resident-set-size helpers translated from `util/system/getRSS.cpp`.
 
-#[cfg(unix)]
-use std::ffi::{c_int, c_long, c_void};
-
 /// C++ `getCurrentRSS`.
 pub fn get_current_rss() -> usize {
     #[cfg(target_os = "linux")]
@@ -15,14 +12,20 @@ pub fn get_current_rss() -> usize {
 
     #[cfg(target_os = "macos")]
     unsafe {
-        let mut info = MachTaskBasicInfo::default();
+        use mach2::task::task_info;
+        use mach2::task_info::{
+            mach_task_basic_info, MACH_TASK_BASIC_INFO, MACH_TASK_BASIC_INFO_COUNT,
+        };
+        use mach2::traps::mach_task_self;
+
+        let mut info = mach_task_basic_info::default();
         let mut count = MACH_TASK_BASIC_INFO_COUNT;
         if task_info(
-            mach_task_self_,
+            mach_task_self(),
             MACH_TASK_BASIC_INFO,
-            (&mut info as *mut MachTaskBasicInfo).cast(),
+            (&mut info as *mut mach_task_basic_info).cast(),
             &mut count,
-        ) != KERN_SUCCESS
+        ) != mach2::kern_return::KERN_SUCCESS
         {
             return 0;
         }
@@ -31,16 +34,17 @@ pub fn get_current_rss() -> usize {
 
     #[cfg(windows)]
     unsafe {
-        let mut info = ProcessMemoryCounters::default();
-        if get_process_memory_info(
-            get_current_process(),
-            &mut info,
-            std::mem::size_of::<ProcessMemoryCounters>() as u32,
-        ) == 0
-        {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let mut info: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        info.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut info, info.cb) == 0 {
             return 0;
         }
-        return info.working_set_size;
+        return info.WorkingSetSize;
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -52,33 +56,32 @@ pub fn get_current_rss() -> usize {
 /// C++ `getPeakRSS`.
 pub fn get_peak_rss() -> usize {
     #[cfg(unix)]
-    unsafe {
-        // `ru_maxrss` follows two `timeval` values on the supported Unix
-        // layouts. The oversized scratch storage also gives `getrusage` room
-        // for platform-specific trailing counters.
-        let mut usage = [0 as c_long; 64];
-        if getrusage(RUSAGE_SELF, usage.as_mut_ptr().cast()) != 0 {
+    {
+        use nix::sys::resource::{getrusage, UsageWho};
+
+        let Ok(usage) = getrusage(UsageWho::RUSAGE_SELF) else {
             return 0;
-        }
-        let max_rss = usage[4].max(0) as usize;
-        #[cfg(target_os = "macos")]
+        };
+        let max_rss = usage.max_rss().max(0) as usize;
+        #[cfg(target_vendor = "apple")]
         return max_rss;
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         return max_rss.saturating_mul(1024);
     }
 
     #[cfg(windows)]
     unsafe {
-        let mut info = ProcessMemoryCounters::default();
-        if get_process_memory_info(
-            get_current_process(),
-            &mut info,
-            std::mem::size_of::<ProcessMemoryCounters>() as u32,
-        ) == 0
-        {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let mut info: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        info.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut info, info.cb) == 0 {
             return 0;
         }
-        return info.peak_working_set_size;
+        return info.PeakWorkingSetSize;
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -99,87 +102,7 @@ fn current_rss_from_statm(statm: &str, page_size: usize) -> Option<usize> {
 
 #[cfg(target_os = "linux")]
 fn page_size() -> usize {
-    let size = unsafe { sysconf(SC_PAGESIZE) };
-    usize::try_from(size)
-        .ok()
-        .filter(|&size| size > 0)
-        .unwrap_or(0)
-}
-
-#[cfg(unix)]
-const RUSAGE_SELF: c_int = 0;
-#[cfg(target_os = "linux")]
-const SC_PAGESIZE: c_int = 30;
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn getrusage(who: c_int, usage: *mut c_void) -> c_int;
-}
-
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn sysconf(name: c_int) -> c_long;
-}
-
-#[cfg(target_os = "macos")]
-const KERN_SUCCESS: c_int = 0;
-#[cfg(target_os = "macos")]
-const MACH_TASK_BASIC_INFO: c_int = 20;
-#[cfg(target_os = "macos")]
-const MACH_TASK_BASIC_INFO_COUNT: u32 =
-    (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Default)]
-struct MachTaskBasicInfo {
-    virtual_size: usize,
-    resident_size: usize,
-    resident_size_max: usize,
-    user_time: [i32; 2],
-    system_time: [i32; 2],
-    policy: i32,
-    suspend_count: i32,
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    static mach_task_self_: u32;
-    fn task_info(target: u32, flavor: c_int, info: *mut c_int, count: *mut u32) -> c_int;
-}
-
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Default)]
-struct ProcessMemoryCounters {
-    cb: u32,
-    page_fault_count: u32,
-    peak_working_set_size: usize,
-    working_set_size: usize,
-    quota_peak_paged_pool_usage: usize,
-    quota_paged_pool_usage: usize,
-    quota_peak_non_paged_pool_usage: usize,
-    quota_non_paged_pool_usage: usize,
-    pagefile_usage: usize,
-    peak_pagefile_usage: usize,
-}
-
-#[cfg(windows)]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    #[link_name = "GetCurrentProcess"]
-    fn get_current_process() -> *mut std::ffi::c_void;
-}
-
-#[cfg(windows)]
-#[link(name = "psapi")]
-unsafe extern "system" {
-    #[link_name = "GetProcessMemoryInfo"]
-    fn get_process_memory_info(
-        process: *mut std::ffi::c_void,
-        counters: *mut ProcessMemoryCounters,
-        size: u32,
-    ) -> i32;
+    rustix::param::page_size()
 }
 
 #[cfg(test)]
@@ -203,5 +126,38 @@ mod tests {
             assert!(current > 0);
             assert!(peak > 0);
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn current_rss_observes_touched_memory_in_an_isolated_process() {
+        const CHILD_ENV: &str = "DIAMOND_RSS_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "util::system::get_rss::tests::current_rss_observes_touched_memory_in_an_isolated_process",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("launch isolated RSS test");
+            assert!(status.success(), "isolated RSS test failed: {status}");
+            return;
+        }
+
+        let before = get_current_rss();
+        let mut allocation = vec![0u8; 32 * 1024 * 1024];
+        for byte in allocation.iter_mut().step_by(4096) {
+            // A volatile store ensures that every page is physically touched.
+            unsafe { std::ptr::write_volatile(byte, 1) };
+        }
+        std::hint::black_box(&allocation);
+        let after = get_current_rss();
+        assert!(before > 0 && after > 0);
+        assert!(
+            after.saturating_sub(before) >= 16 * 1024 * 1024,
+            "current RSS did not observe touched pages: before={before}, after={after}"
+        );
     }
 }

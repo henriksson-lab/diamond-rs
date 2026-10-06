@@ -2,23 +2,25 @@
 
 use std::fs::{File as StdFile, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::fd::FromRawFd;
 use std::sync::Mutex;
 
 use super::{IoError, IoResult, StreamEntity};
 
-#[cfg(unix)]
-pub fn posix_flags(mode: &str) -> IoResult<i32> {
-    const O_WRONLY: i32 = 1;
-    const O_RDWR: i32 = 2;
-    const O_CREAT: i32 = 64;
-    const O_TRUNC: i32 = 512;
-    match mode {
-        "wb" => Ok(O_WRONLY | O_CREAT | O_TRUNC),
-        "r+b" => Ok(O_RDWR),
-        "w+b" => Ok(O_RDWR | O_CREAT | O_TRUNC),
-        _ => Err(IoError::Other("Invalid fopen mode.".to_string())),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileMode {
+    Write,
+    ReadWrite,
+    WriteRead,
+}
+
+impl FileMode {
+    fn parse(mode: &str) -> IoResult<Self> {
+        match mode {
+            "wb" => Ok(Self::Write),
+            "r+b" => Ok(Self::ReadWrite),
+            "w+b" => Ok(Self::WriteRead),
+            _ => Err(IoError::Other("Invalid fopen mode.".to_string())),
+        }
     }
 }
 
@@ -34,28 +36,26 @@ pub struct FileSink {
 impl FileSink {
     /// C++ `FileSink(file_name, mode, async, buffer_size)`.
     pub fn new(file_name: &str, mode: &str, async_: bool, _buffer_size: usize) -> IoResult<Self> {
-        #[cfg(unix)]
-        let _ = posix_flags(mode)?;
+        let mode = FileMode::parse(mode)?;
 
         let mut options = OpenOptions::new();
         let is_stdout = file_name.is_empty();
         if is_stdout {
             options.write(true);
-            if mode.contains('+') {
+            if mode != FileMode::Write {
                 options.read(true);
             }
         } else {
             match mode {
-                "wb" => {
+                FileMode::Write => {
                     options.write(true).create(true).truncate(true);
                 }
-                "r+b" => {
+                FileMode::ReadWrite => {
                     options.read(true).write(true);
                 }
-                "w+b" => {
+                FileMode::WriteRead => {
                     options.read(true).write(true).create(true).truncate(true);
                 }
-                _ => return Err(IoError::Other("Invalid fopen mode.".to_string())),
             }
         }
 
@@ -77,23 +77,18 @@ impl FileSink {
         })
     }
 
-    /// Unix C++ `FileSink(file_name, fd, mode, async, buffer_size)`.
-    ///
-    /// # Safety
-    ///
-    /// `fd` must be a valid, open descriptor whose ownership is transferred to
-    /// the returned sink. It must not be used elsewhere after this call.
-    #[cfg(unix)]
-    pub unsafe fn from_fd(
+    /// Safe equivalent of Unix C++ `FileSink(file_name, fd, mode, async,
+    /// buffer_size)`, taking ownership of an already-open file.
+    pub fn from_file(
         file_name: &str,
-        fd: i32,
+        file: StdFile,
         mode: &str,
         async_: bool,
         _buffer_size: usize,
     ) -> IoResult<Self> {
-        let _ = posix_flags(mode)?;
+        let _ = FileMode::parse(mode)?;
         Ok(Self {
-            file: Some(unsafe { StdFile::from_raw_fd(fd) }),
+            file: Some(file),
             file_name: file_name.to_string(),
             async_,
             is_stdout: false,
@@ -284,6 +279,19 @@ mod tests {
     }
 
     #[test]
+    fn file_mode_accepts_only_upstream_spellings() {
+        assert!(matches!(FileMode::parse("wb"), Ok(FileMode::Write)));
+        assert!(matches!(FileMode::parse("r+b"), Ok(FileMode::ReadWrite)));
+        assert!(matches!(FileMode::parse("w+b"), Ok(FileMode::WriteRead)));
+        for rejected in ["", "rb", "ab", "append"] {
+            assert_eq!(
+                FileMode::parse(rejected).unwrap_err(),
+                IoError::Other("Invalid fopen mode.".to_string())
+            );
+        }
+    }
+
+    #[test]
     fn closing_standard_output_preserves_its_handle() {
         let mut sink = FileSink::new("", "wb", false, 0).unwrap();
         sink.close().unwrap();
@@ -293,23 +301,40 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn from_fd_takes_ownership_and_writes_exact_bytes() {
-        use std::os::fd::IntoRawFd;
-
+    fn from_file_takes_ownership_and_writes_exact_bytes() {
         let path = path("fd");
         let _ = std::fs::remove_file(&path);
-        let descriptor = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(&path)
-            .unwrap()
-            .into_raw_fd();
+            .unwrap();
         let name = path.to_string_lossy();
-        let mut sink = unsafe { FileSink::from_fd(&name, descriptor, "w+b", false, 0) }.unwrap();
+        let mut sink = FileSink::from_file(&name, file, "w+b", false, 0).unwrap();
         sink.write(b"fd").unwrap();
         sink.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"fd");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_file_validates_write_mode_without_retruncating_open_file() {
+        let path = path("from-file-no-truncate");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"existing").unwrap();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        let name = path.to_string_lossy();
+        let mut sink = FileSink::from_file(&name, file, "w+b", false, 0).unwrap();
+        sink.write(b"+").unwrap();
+        sink.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing+");
         std::fs::remove_file(path).unwrap();
     }
 }

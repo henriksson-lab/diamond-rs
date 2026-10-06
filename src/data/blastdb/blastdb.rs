@@ -9,34 +9,15 @@ use crate::data::blastdb::volume::{
 };
 use crate::data::taxonomy::Rank;
 use crate::util::system::{absolute_path, exists, PATH_SEPARATOR};
-use libsqlite3_sys::{
-    sqlite3, sqlite3_bind_int, sqlite3_close, sqlite3_column_int, sqlite3_errmsg, sqlite3_finalize,
-    sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_step, sqlite3_stmt, SQLITE_DONE, SQLITE_OK,
-    SQLITE_OPEN_READONLY, SQLITE_ROW,
-};
-#[cfg(test)]
-use libsqlite3_sys::{sqlite3_exec, SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::{CStr, CString};
-use std::os::raw::c_int;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlastDbConfig {
     pub multiprocessing: bool,
 }
 
-struct SqliteStatement(*mut sqlite3_stmt);
-
-impl Drop for SqliteStatement {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: the statement was returned by sqlite3_prepare_v2 and is owned here.
-            unsafe { sqlite3_finalize(self.0) };
-        }
-    }
-}
-
-struct SqliteConnection(*mut sqlite3);
+struct SqliteConnection(Connection);
 
 impl std::fmt::Debug for SqliteConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -46,112 +27,54 @@ impl std::fmt::Debug for SqliteConnection {
 
 impl SqliteConnection {
     fn open_readonly(path: &str) -> Result<Self, String> {
-        Self::open(path, SQLITE_OPEN_READONLY)
+        Self::open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
     }
 
-    fn open(path: &str, flags: c_int) -> Result<Self, String> {
-        let path =
-            CString::new(path).map_err(|_| "SQLite path contains a null byte".to_string())?;
-        let mut database = std::ptr::null_mut();
-        // SAFETY: path is a valid NUL-terminated string and database is a valid out-pointer.
-        let status =
-            unsafe { sqlite3_open_v2(path.as_ptr(), &mut database, flags, std::ptr::null()) };
-        if status != SQLITE_OK {
-            let message = if database.is_null() {
-                "unknown error".to_string()
-            } else {
-                // SAFETY: SQLite owns a valid error string for this live connection.
-                unsafe { CStr::from_ptr(sqlite3_errmsg(database)) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            if !database.is_null() {
-                // SAFETY: failed sqlite3_open_v2 handles must still be closed.
-                unsafe { sqlite3_close(database) };
-            }
-            return Err(message);
+    fn open(path: &str, flags: OpenFlags) -> Result<Self, String> {
+        if path.as_bytes().contains(&0) {
+            return Err("SQLite path contains a null byte".to_string());
         }
-        Ok(Self(database))
-    }
-
-    fn error(&self) -> String {
-        // SAFETY: self.0 is a live SQLite connection while Self exists.
-        unsafe { CStr::from_ptr(sqlite3_errmsg(self.0)) }
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    fn prepare(&self, sql: &'static [u8]) -> Result<SqliteStatement, String> {
-        let mut statement = std::ptr::null_mut();
-        // SAFETY: sql is statically NUL-terminated at each call site and output is valid.
-        let status = unsafe {
-            sqlite3_prepare_v2(
-                self.0,
-                sql.as_ptr().cast(),
-                -1,
-                &mut statement,
-                std::ptr::null_mut(),
-            )
-        };
-        if status != SQLITE_OK {
-            return Err(format!("Failed to prepare statement: {}", self.error()));
-        }
-        Ok(SqliteStatement(statement))
+        Connection::open_with_flags(path, flags)
+            .map(Self)
+            .map_err(|error| error.to_string())
     }
 
     fn max_taxid(&self) -> Result<TaxId, String> {
-        let statement = self.prepare(b"SELECT max(taxid) FROM TaxidInfo;\0")?;
-        // SAFETY: statement is live until the guard is dropped.
-        match unsafe { sqlite3_step(statement.0) } {
-            SQLITE_ROW => Ok(unsafe { sqlite3_column_int(statement.0, 0) }),
-            _ => Err(format!("SQLite step error: {}", self.error())),
-        }
+        let mut statement = self
+            .0
+            .prepare("SELECT max(taxid) FROM TaxidInfo;")
+            .map_err(|error| format!("Failed to prepare statement: {error}"))?;
+        statement
+            .query_row([], |row| row.get::<_, Option<TaxId>>(0))
+            .map(|value| value.unwrap_or(0))
+            .map_err(|error| format!("SQLite step error: {error}"))
     }
 
     fn parent(&self, taxid: TaxId) -> Result<TaxId, String> {
-        let statement =
-            self.prepare(b"SELECT parent FROM TaxidInfo WHERE taxid = ?1 LIMIT 1;\0")?;
-        // SAFETY: statement is live and parameter 1 exists in the prepared query.
-        if unsafe { sqlite3_bind_int(statement.0, 1, taxid) } != SQLITE_OK {
-            return Err(format!("Failed to bind parameter: {}", self.error()));
-        }
-        // SAFETY: statement remains live until the guard is dropped.
-        match unsafe { sqlite3_step(statement.0) } {
-            SQLITE_ROW => Ok(unsafe { sqlite3_column_int(statement.0, 0) }),
-            SQLITE_DONE => Ok(-1),
-            _ => Err(format!("SQLite step error: {}", self.error())),
-        }
+        let mut statement = self
+            .0
+            .prepare("SELECT parent FROM TaxidInfo WHERE taxid = ?1 LIMIT 1;")
+            .map_err(|error| format!("Failed to prepare statement: {error}"))?;
+        statement
+            .query_row([taxid], |row| row.get(0))
+            .optional()
+            .map(|value| value.unwrap_or(-1))
+            .map_err(|error| format!("SQLite step error: {error}"))
     }
 
     #[cfg(test)]
     fn create_test_database(path: &str) -> Result<(), String> {
-        let connection = Self::open(path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)?;
-        let sql = b"CREATE TABLE TaxidInfo(taxid INTEGER PRIMARY KEY, parent INTEGER); INSERT INTO TaxidInfo VALUES(1,1),(7,3),(42,7);\0";
-        // SAFETY: SQL is NUL-terminated and no callback or error allocation is requested.
-        let status = unsafe {
-            sqlite3_exec(
-                connection.0,
-                sql.as_ptr().cast(),
-                None,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+        let connection = Self::open(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )?;
+        connection
+            .0
+            .execute_batch(
+                "CREATE TABLE TaxidInfo(taxid INTEGER PRIMARY KEY, parent INTEGER); \
+                 INSERT INTO TaxidInfo VALUES(1,1),(3,1),(7,3),(42,7);",
             )
-        };
-        if status == SQLITE_OK {
-            Ok(())
-        } else {
-            Err(connection.error())
-        }
-    }
-}
-
-impl Drop for SqliteConnection {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: this wrapper uniquely owns the live connection.
-            unsafe { sqlite3_close(self.0) };
-            self.0 = std::ptr::null_mut();
-        }
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -854,6 +777,248 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_connection_uses_readonly_queries_and_preserves_sentinels() {
+        let dir = temp_dir("sqlite");
+        let populated_path = dir.join("taxonomy4blast.sqlite3");
+        let populated = populated_path.to_str().unwrap();
+        SqliteConnection::create_test_database(populated).unwrap();
+
+        {
+            let connection = SqliteConnection::open_readonly(populated).unwrap();
+            assert_eq!(connection.max_taxid().unwrap(), 42);
+            assert_eq!(connection.parent(1).unwrap(), 1);
+            assert_eq!(connection.parent(3).unwrap(), 1);
+            assert_eq!(connection.parent(7).unwrap(), 3);
+            assert_eq!(connection.parent(42).unwrap(), 7);
+            assert_eq!(connection.parent(8).unwrap(), -1);
+            assert!(connection
+                .0
+                .execute("INSERT INTO TaxidInfo VALUES(99, 1)", [])
+                .is_err());
+        }
+
+        let empty_path = dir.join("empty.sqlite3");
+        {
+            let connection = SqliteConnection::open(
+                empty_path.to_str().unwrap(),
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .unwrap();
+            connection
+                .0
+                .execute(
+                    "CREATE TABLE TaxidInfo(taxid INTEGER PRIMARY KEY, parent INTEGER)",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(connection.max_taxid().unwrap(), 0);
+            assert_eq!(connection.parent(1).unwrap(), -1);
+        }
+
+        assert_eq!(
+            SqliteConnection::open_readonly("bad\0path").unwrap_err(),
+            "SQLite path contains a null byte"
+        );
+
+        let wrong_schema_path = dir.join("wrong-schema.sqlite3");
+        {
+            let connection = Connection::open(&wrong_schema_path).unwrap();
+            connection
+                .execute("CREATE TABLE Other(value INTEGER)", [])
+                .unwrap();
+        }
+        let wrong_schema =
+            SqliteConnection::open_readonly(wrong_schema_path.to_str().unwrap()).unwrap();
+        assert!(wrong_schema
+            .max_taxid()
+            .unwrap_err()
+            .starts_with("Failed to prepare statement:"));
+
+        let corrupt_path = dir.join("corrupt.sqlite3");
+        std::fs::write(&corrupt_path, b"not a sqlite database").unwrap();
+        let corrupt = SqliteConnection::open_readonly(corrupt_path.to_str().unwrap()).unwrap();
+        assert!(corrupt
+            .max_taxid()
+            .unwrap_err()
+            .starts_with("Failed to prepare statement:"));
+
+        std::fs::remove_file(populated_path).unwrap();
+        std::fs::remove_file(empty_path).unwrap();
+        std::fs::remove_file(wrong_schema_path).unwrap();
+        std::fs::remove_file(corrupt_path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// Validates the reader against NCBI's actual `taxdb.tar.gz` artifact.
+    ///
+    /// Download and extract `https://ftp.ncbi.nlm.nih.gov/blast/db/taxdb.tar.gz`,
+    /// then run:
+    /// `DIAMOND_REAL_TAXONOMY_DB=/path/to/taxonomy4blast.sqlite3 cargo test --lib validate_real_ncbi_taxonomy4blast_database -- --ignored`
+    #[test]
+    #[ignore = "requires NCBI's external taxonomy4blast.sqlite3 artifact"]
+    fn validate_real_ncbi_taxonomy4blast_database() {
+        let path = std::env::var("DIAMOND_REAL_TAXONOMY_DB")
+            .expect("DIAMOND_REAL_TAXONOMY_DB must name taxonomy4blast.sqlite3");
+        let connection = SqliteConnection::open_readonly(&path).unwrap();
+
+        // These stable NCBI taxonomy relationships exercise two distant parts
+        // of the real table rather than accepting a merely compatible schema.
+        assert_eq!(connection.parent(1).unwrap(), 1);
+        assert_eq!(connection.parent(2).unwrap(), 131_567);
+        assert_eq!(connection.parent(562).unwrap(), 561);
+        assert_eq!(connection.parent(9_606).unwrap(), 9_605);
+        assert!(connection.max_taxid().unwrap() > 1_000_000);
+        assert_eq!(connection.parent(i32::MAX).unwrap(), -1);
+    }
+
+    /// Exercises taxonomy lookup through a BLAST database produced by NCBI
+    /// `makeblastdb`, not through the synthetic volume writer used above.
+    /// The database directory must also contain NCBI's
+    /// `taxonomy4blast.sqlite3` from `taxdb.tar.gz`.
+    #[test]
+    #[ignore = "requires an external NCBI makeblastdb database and taxdb artifact"]
+    fn validate_real_ncbi_blastdb_taxonomy_mapping_and_parents() {
+        let prefix = std::env::var("DIAMOND_REAL_BLASTDB_PREFIX")
+            .expect("DIAMOND_REAL_BLASTDB_PREFIX must name an NCBI makeblastdb prefix");
+        let mut database = BlastDB::new(
+            &prefix,
+            SequenceFileFlags::TAXON_MAPPING | SequenceFileFlags::TAXON_NODES,
+        )
+        .unwrap();
+
+        assert_eq!(database.sequence_count(), 2);
+        assert_eq!(database.taxids(0), vec![9_606]);
+        assert_eq!(database.taxids(1), vec![562]);
+        assert_eq!(database.get_parent(9_606), 9_605);
+        assert_eq!(database.get_parent(562), 561);
+        assert!(database.max_taxid() > 1_000_000);
+    }
+
+    /// Compares the translated taxonomy formatters with rows emitted by the
+    /// upstream DIAMOND binary from the same real NCBI BLAST database.
+    /// `DIAMOND_REAL_TAXONOMY_OUTPUT` must contain outfmt columns
+    /// `qseqid sseqid staxids sscinames slineages sskingdoms skingdoms sphylums`.
+    #[test]
+    #[ignore = "requires external NCBI taxonomy artifacts and upstream DIAMOND output"]
+    fn validate_real_ncbi_taxonomy_output_fields_against_upstream() {
+        use crate::data::taxonomy::{TaxonomyNode, TaxonomyTree};
+        use crate::output::format::{
+            print_lineage, print_rank_taxon_names, print_staxids, print_taxon_names,
+        };
+
+        let prefix = std::env::var("DIAMOND_REAL_BLASTDB_PREFIX")
+            .expect("DIAMOND_REAL_BLASTDB_PREFIX must name an NCBI makeblastdb prefix");
+        let expected_path = std::env::var("DIAMOND_REAL_TAXONOMY_OUTPUT")
+            .expect("DIAMOND_REAL_TAXONOMY_OUTPUT must name upstream tabular output");
+        let mut database = BlastDB::new(
+            &prefix,
+            SequenceFileFlags::TAXON_MAPPING
+                | SequenceFileFlags::TAXON_NODES
+                | SequenceFileFlags::TAXON_RANKS
+                | SequenceFileFlags::TAXON_SCIENTIFIC_NAMES,
+        )
+        .unwrap();
+
+        let mut tree = TaxonomyTree::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for oid in 0..database.sequence_count() as usize {
+            for mut taxid in database.taxids(oid) {
+                while taxid > 0 && seen.insert(taxid) {
+                    let parent = database.get_parent(taxid);
+                    let rank_index = database.rank(taxid);
+                    let rank = usize::try_from(rank_index)
+                        .ok()
+                        .and_then(Rank::from_index)
+                        .map_or_else(String::new, |rank| rank.name().to_owned());
+                    tree.add_node(TaxonomyNode {
+                        taxid,
+                        parent,
+                        rank,
+                        name: database.taxon_scientific_name(taxid),
+                    });
+                    if taxid == 1 || parent == taxid {
+                        break;
+                    }
+                    taxid = parent;
+                }
+            }
+        }
+
+        let mut expected_by_taxid = std::collections::BTreeMap::new();
+        let expected = std::fs::read_to_string(expected_path).unwrap();
+        for row in expected.lines() {
+            let cells = row.split('\t').collect::<Vec<_>>();
+            assert_eq!(cells.len(), 8, "unexpected upstream taxonomy row: {row}");
+            expected_by_taxid.insert(cells[2].parse::<TaxId>().unwrap(), cells[2..].join("\t"));
+        }
+
+        for oid in 0..database.sequence_count() as usize {
+            let taxids = database.taxids(oid);
+            assert_eq!(
+                taxids.len(),
+                1,
+                "fixture must assign one taxid per sequence"
+            );
+            let actual = [
+                print_staxids(&taxids, false),
+                print_taxon_names(taxids.iter().copied(), &tree, false),
+                print_lineage(&taxids, &tree, false),
+                print_rank_taxon_names(&taxids, &tree, "superkingdom", false),
+                print_rank_taxon_names(&taxids, &tree, "kingdom", false),
+                print_rank_taxon_names(&taxids, &tree, "phylum", false),
+            ]
+            .join("\t");
+            assert_eq!(actual, expected_by_taxid[&taxids[0]]);
+        }
+    }
+
+    /// Diagnostic wrapper-overhead benchmark. Run with:
+    /// `cargo test --release --lib benchmark_sqlite_taxonomy_open_and_parent -- --ignored --nocapture`
+    #[test]
+    #[ignore = "release-mode diagnostic benchmark"]
+    fn benchmark_sqlite_taxonomy_open_and_parent() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const OPEN_ITERATIONS: usize = 1_000;
+        const LOOKUP_ITERATIONS: usize = 100_000;
+        let dir = temp_dir("sqlite-benchmark");
+        let path = dir.join("taxonomy4blast.sqlite3");
+        let path = path.to_str().unwrap();
+        SqliteConnection::create_test_database(path).unwrap();
+
+        let started = Instant::now();
+        let mut open_checksum = 0;
+        for _ in 0..OPEN_ITERATIONS {
+            let connection = black_box(SqliteConnection::open_readonly(black_box(path))).unwrap();
+            open_checksum += black_box(connection.max_taxid().unwrap()) as usize;
+        }
+        let open_elapsed = started.elapsed();
+
+        let connection = SqliteConnection::open_readonly(path).unwrap();
+        let started = Instant::now();
+        let mut parent_checksum = 0i64;
+        for index in 0..LOOKUP_ITERATIONS {
+            let taxid = [1, 3, 7, 42, 8][index % 5];
+            parent_checksum += black_box(connection.parent(black_box(taxid)).unwrap()) as i64;
+        }
+        let parent_elapsed = started.elapsed();
+
+        assert_eq!(open_checksum, OPEN_ITERATIONS * 42);
+        assert_eq!(parent_checksum, 220_000);
+        eprintln!(
+            "taxonomy SQLite: {OPEN_ITERATIONS} cold opens+max={open_elapsed:?} ({:.3} us/op); \
+             {LOOKUP_ITERATIONS} parent queries={parent_elapsed:?} ({:.3} us/op)",
+            open_elapsed.as_secs_f64() * 1e6 / OPEN_ITERATIONS as f64,
+            parent_elapsed.as_secs_f64() * 1e6 / LOOKUP_ITERATIONS as f64,
+        );
+
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn test_blastdb_read_seq_seqinfo_raw_chunk_and_filter() {
         let dir = temp_dir("basic");
         let prefix = dir.join("db");
@@ -1022,9 +1187,31 @@ mod tests {
         assert_eq!(db3.max_taxid(), 42);
         assert_eq!(db3.get_parent(42), 7);
         assert_eq!(db3.get_parent(42), 7); // cached path
+        assert_eq!(db3.get_parent(7), 3);
+        assert_eq!(db3.get_parent(3), 1);
+        assert_eq!(db3.get_parent(1), 1);
         assert_eq!(db3.get_parent(8), -1);
         assert!(db3.print_info().contains("Maximum taxid in database: 42"));
         db3.close();
+
+        // Exercise the repository's synthetic BLAST volume and all three
+        // taxonomy sidecars together. This is the closest local equivalent of
+        // an NCBI BLAST taxonomy database without downloading the external
+        // taxonomy4blast distribution.
+        let mut combined = BlastDB::new(
+            db_path,
+            SequenceFileFlags::TAXON_MAPPING
+                | SequenceFileFlags::TAXON_NODES
+                | SequenceFileFlags::TAXON_RANKS
+                | SequenceFileFlags::TAXON_SCIENTIFIC_NAMES,
+        )
+        .unwrap();
+        assert_eq!(combined.taxids(0), vec![7]);
+        assert_eq!(combined.get_parent(7), 3);
+        assert_eq!(combined.get_parent(3), 1);
+        assert_eq!(combined.rank(7), Rank::Species as i32);
+        assert_eq!(combined.taxon_scientific_name(7), "Alpha species");
+        combined.close();
 
         std::fs::remove_file(prefix.with_extension("pin")).unwrap();
         std::fs::remove_file(prefix.with_extension("phr")).unwrap();

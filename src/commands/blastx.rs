@@ -43,7 +43,7 @@ pub struct BlastxConfig {
     pub comp_based_stats: CbsMode,
     pub no_self_hits: bool,
     pub ungapped_xdrop_bits: f64,
-    pub memory_limit: Option<usize>,
+    pub memory_limit: Option<u64>,
     pub tmpdir: PathBuf,
 }
 

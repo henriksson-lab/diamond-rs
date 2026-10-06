@@ -107,18 +107,12 @@ impl OutputFile {
     ) -> IoResult<Self> {
         #[cfg(unix)]
         {
-            let fd = unsafe { super::dup(data.fd) };
-            if fd < 0 {
-                return Err(IoError::Other(format!(
-                    "Error opening temporary file {}",
-                    data.name
-                )));
-            }
-            let sink = unsafe { FileSink::from_fd(&data.name, fd, mode, false, 0)? };
-            return Ok(Self {
+            let file = data.try_clone_file()?;
+            let sink = FileSink::from_file(&data.name, file, mode, false, 0)?;
+            Ok(Self {
                 serializer: Serializer::new(make_compressor(sink, compressor)),
                 file_name: data.name.clone(),
-            });
+            })
         }
         #[cfg(not(unix))]
         {
@@ -135,19 +129,16 @@ impl OutputFile {
     pub fn advise_need(&mut self) -> IoResult<()> {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
-            use std::os::fd::AsRawFd;
+            use std::num::NonZeroU64;
 
-            unsafe extern "C" {
-                fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
-            }
-            let size = self.serializer.file_size()?;
-            let fd = self.serializer.file()?.as_raw_fd();
-            // Preserve the upstream bitwise expression. On POSIX this resolves
-            // to the WILLNEED advice value.
-            const POSIX_FADV_SEQUENTIAL: i32 = 2;
-            const POSIX_FADV_WILLNEED: i32 = 3;
+            let size = u64::try_from(self.serializer.file_size()?).unwrap_or(0);
+            let file = self.serializer.file()?;
+            // Upstream passes SEQUENTIAL | WILLNEED. POSIX advice values are
+            // an enum rather than bitflags, and on the supported Unix targets
+            // that expression resolves to WILLNEED. Preserve that one-call
+            // behavior while using a typed descriptor API.
             let _ =
-                unsafe { posix_fadvise(fd, 0, size, POSIX_FADV_SEQUENTIAL | POSIX_FADV_WILLNEED) };
+                rustix::fs::fadvise(file, 0, NonZeroU64::new(size), rustix::fs::Advice::WillNeed);
         }
         Ok(())
     }

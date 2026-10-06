@@ -108,13 +108,6 @@ record_pair() {
         if "${compare_command[@]}" > "$compare_log" 2>&1; then
             parity=PASS
             status=PASS
-        elif [[ "$comparator" == json ]] \
-            && python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$rust_out" 2>/dev/null \
-            && ! python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$cpp_out" 2>/dev/null; then
-            parity=EXPECTED_DIFFERENCE
-            status=EXPECTED_DIFFERENCE
-            note="${note:+$note; }Rust emits one valid multi-query JSON document; pinned upstream omits inter-query separators"
-            printf '%s\n' "$note" >> "$compare_log"
         fi
     else
         printf 'C++ exit=%s; Rust exit=%s\n' "$CPP_STATUS" "$RUST_STATUS" > "$compare_log"
@@ -409,7 +402,11 @@ run_daa_view_suite() {
         if [[ "$producer" == cpp ]]; then daa=$cpp_daa; else daa=$rust_daa; fi
         run_view_case "$dataset-$producer" daa 100 exact "$daa"
         run_view_case "$dataset-$producer" tab 6 exact "$daa" "${outfmt[@]}"
-        run_view_case "$dataset-$producer" json-flat 104 json "$daa"
+        # Pinned upstream view output is malformed for a multi-query DAA: its
+        # ViewWriter omits OutputFormat::query_separator between query buffers.
+        # Translation fidelity therefore requires exact bytes, not a repaired
+        # JSON document.
+        run_view_case "$dataset-$producer" json-flat 104 exact "$daa"
         run_view_case "$dataset-$producer" paf 103 sorted-lines "$daa"
         run_view_case "$dataset-$producer" sam 101 sam "$daa"
         run_view_case "$dataset-$producer" pairwise 0 exact "$daa"

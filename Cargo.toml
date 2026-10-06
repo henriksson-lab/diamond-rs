@@ -16,14 +16,34 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
-libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
+libc = "0.2"
+memmap2 = "0.9"
 nalgebra = "0.32.6"
 rayon = "1"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 zstd = "0.13"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["resource"] }
+rustix = { version = "1", features = ["fs", "param"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 [features]
 default = []
 ffi = ["dep:cmake"]
+# Diagnostic A/B switch for measuring the glibc-specific RSS trim calls.
+# Production builds keep trimming enabled.
+disable-malloc-trim = []
 
 [build-dependencies]
 cmake = { version = "0.1", optional = true }

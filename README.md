@@ -47,7 +47,7 @@ This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 - **Portability target**: Native Linux, macOS, and Windows support; platform-specific low-level code must use each target's ABI and remain covered by CI
 - **Library API**: Core types, scoring matrices, DP kernels, FASTA parsing, and seed search
 - **Tests**: More than 1,600 passing library tests plus CLI and integration suites, including the C++ regression inventory and native-vs-FFI equivalence
-- **Not yet translated**: SQLite-backed taxonomy lookup for NCBI BLAST databases (`taxonomy4blast.sqlite3`), used by taxonomy-aware output fields such as `slineages`, `sskingdoms`, `skingdoms`, and `sphylums`
+- **NCBI BLAST taxonomy reader**: SQLite-backed parent lookup (`taxonomy4blast.sqlite3`), scientific names (`names.dmp`), and ranks (`nodes.dmp`) are implemented natively. They are covered by synthetic fixtures and an ignored external-data gate against current NCBI artifacts, an NCBI `makeblastdb` volume, and byte-exact upstream taxonomy-field output. This reader is not yet wired into native `blastp`/`blastx`; taxonomy-aware search output fields (`staxids`, `sscinames`, `slineages`, `sskingdoms`, `skingdoms`, and `sphylums`) remain compatibility-backend paths.
 
 ## Building
 
@@ -55,7 +55,8 @@ This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 
 - Rust 1.70+
 - Default native Rust build: no CMake or C++ toolchain required
-- Optional non-Windows FFI test build: CMake 2.6+, a C++ compiler, zlib, SQLite3, and pthreads. SQLite3 is currently required by the vendored C++ build, but SQLite-backed BLAST taxonomy lookup has not yet been translated into native Rust.
+- Default native build: SQLite is bundled through `rusqlite`; no system SQLite package is required
+- Optional non-Windows FFI test build: CMake 2.6+, a C++ compiler, zlib, SQLite3, and pthreads. The system SQLite dependency belongs to the vendored C++ compatibility build.
 
 For the optional FFI build on Ubuntu/Debian:
 ```bash
@@ -147,6 +148,33 @@ println!("E-value: {:.2e}, Bit score: {:.1}", evalue, bitscore);
 ## Benchmarks
 
 Original benchmark baseline: vendored upstream DIAMOND from `https://github.com/bbuchfink/diamond.git`, commit `1d162b4fefb5` (`v2.1.24-2-g1d162b4f-dirty`).
+
+### Native-ABI reduction regression gate
+
+The portable-system rewrite was also compared directly with its clean Rust
+checkpoint (`c954916`) so that ABI cleanup could not hide a Rust-to-Rust
+regression behind the upstream comparison. Four alternating release runs per
+cell used natural, nonduplicated AMRFinderPlus records. `Speed` is checkpoint
+time divided by rewritten time; `RSS ratio` is rewritten/checkpoint peak RSS.
+All paired outputs were byte-identical.
+
+| Workload | Memory | Threads | Checkpoint | Rewritten | Speed | Checkpoint RSS | Rewritten RSS | RSS ratio | Parity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| `blastp`, 300 queries | 16G | 1 | 3.593 s | 3.590 s | 1.001x | 28,041 KiB | 27,910 KiB | 0.995x | PASS |
+| `blastp`, 300 queries | 16G | 4 | 1.033 s | 1.040 s | 0.993x | 31,187 KiB | 31,184 KiB | 1.000x | PASS |
+| `blastp`, 300 queries | 0G | 1 | 3.498 s | 3.528 s | 0.991x | 18,471 KiB | 17,899 KiB | 0.969x | PASS |
+| `blastp`, 300 queries | 0G | 4 | 1.123 s | 1.098 s | 1.023x | 26,205 KiB | 24,525 KiB | 0.936x | PASS |
+| `blastp`, 2,000 queries | delayed 64M spill | 1 | 19.683 s | 19.620 s | 1.003x | 69,360 KiB | 69,426 KiB | 1.001x | PASS |
+| `blastp`, 2,000 queries | delayed 64M spill | 4 | 5.578 s | 5.565 s | 1.002x | 68,305 KiB | 69,302 KiB | 1.015x | PASS |
+| `cluster`, 500 sequences | n/a | 1 | 2.403 s | 2.380 s | 1.010x | 26,992 KiB | 27,150 KiB | 1.006x | PASS |
+| `cluster`, 500 sequences | n/a | 4 | 1.138 s | 1.133 s | 1.004x | 38,681 KiB | 39,466 KiB | 1.020x | PASS |
+
+An initial `memchr`-crate implementation failed this gate by 2.8–7.5%.
+Profiling showed that its AVX2 dispatcher replaced glibc's faster EVEX kernel.
+The final code therefore calls the original C-runtime `memchr` through the
+maintained `libc` crate binding: the handwritten ABI is gone without changing
+the optimized kernel. Full commands, hashes, counters, and the rejected
+intermediate measurements are documented in `FFI_REDUCTION_PLAN.md`.
 
 ### Default adaptive mode (`--memory-limit 16G`)
 

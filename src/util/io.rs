@@ -12,8 +12,6 @@ pub use file::{File, FilePrimitive, Temporary};
 pub mod file_source;
 pub use file_source::FileSource;
 pub mod file_sink;
-#[cfg(unix)]
-pub use file_sink::posix_flags;
 pub use file_sink::FileSink;
 pub mod temp_file;
 pub use temp_file::{TempFile, TempFileData, TempFileHandler, TEMP_FILE_HANDLER};
@@ -31,11 +29,6 @@ pub mod text_input_file;
 pub use text_input_file::TextInputFile;
 pub mod input_file;
 pub use input_file::{detect_compressor, InputFile, InputFileStream};
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn dup(oldfd: i32) -> i32;
-}
 
 const DEFAULT_FILE_BUFFER_SIZE: usize = 1 << 20;
 pub const MEGABYTES: usize = 1 << 20;
@@ -515,19 +508,8 @@ mod tests {
         stdout_sink.close().unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
-    fn test_file_sink_posix_flags_and_from_fd() {
-        use std::os::fd::IntoRawFd;
-
-        assert_eq!(posix_flags("wb").unwrap(), 1 | 64 | 512);
-        assert_eq!(posix_flags("r+b").unwrap(), 2);
-        assert_eq!(posix_flags("w+b").unwrap(), 2 | 64 | 512);
-        assert_eq!(
-            posix_flags("bad").unwrap_err().to_string(),
-            "Invalid fopen mode."
-        );
-
+    fn test_file_sink_modes_and_from_file() {
         let path = std::env::temp_dir().join(format!(
             "diamond-rs-io-fd-{}-{}.tmp",
             std::process::id(),
@@ -537,15 +519,26 @@ mod tests {
                 .as_nanos()
         ));
         let name = path.to_string_lossy().into_owned();
-        let fd = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)
-            .unwrap()
-            .into_raw_fd();
-        let mut sink = unsafe { FileSink::from_fd(&name, fd, "w+b", false, 0).unwrap() };
+            .unwrap();
+        assert_eq!(
+            FileSink::new(&name, "bad", false, 0)
+                .unwrap_err()
+                .to_string(),
+            "Invalid fopen mode."
+        );
+        assert_eq!(
+            FileSink::from_file(&name, file.try_clone().unwrap(), "bad", false, 0)
+                .unwrap_err()
+                .to_string(),
+            "Invalid fopen mode."
+        );
+        let mut sink = FileSink::from_file(&name, file, "w+b", false, 0).unwrap();
         sink.write(b"fd").unwrap();
         sink.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"fd");

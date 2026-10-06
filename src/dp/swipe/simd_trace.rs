@@ -8,7 +8,7 @@
 use crate::basic::packed_transcript::EditOperation;
 use crate::basic::value::Letter;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use crate::basic::value::{LETTER_MASK, SEED_MASK};
+use crate::basic::value::LETTER_MASK;
 use crate::dp::smith_waterman::SwResult;
 use crate::stats::cbs::TargetMatrix;
 use crate::stats::score_matrix::ScoreMatrix;
@@ -39,19 +39,31 @@ pub fn trace_batch_tier_avx2(
     score_matrix: &ScoreMatrix,
     query_cbs: &[i8],
     score_bin: usize,
+    semi_global: bool,
 ) -> Option<TraceBatch> {
     match score_bin {
-        0 => super::simd_trace_narrow::trace_batch_i8(query, targets, score_matrix, query_cbs).map(
-            |batch| TraceBatch {
-                results: batch.results,
-                overflow_mask: batch.overflow_mask,
-            },
-        ),
-        1 => super::simd_trace_narrow::trace_batch_i16(query, targets, score_matrix, query_cbs)
-            .map(|batch| TraceBatch {
-                results: batch.results,
-                overflow_mask: batch.overflow_mask,
-            }),
+        0 => super::simd_trace_narrow::trace_batch_i8(
+            query,
+            targets,
+            score_matrix,
+            query_cbs,
+            semi_global,
+        )
+        .map(|batch| TraceBatch {
+            results: batch.results,
+            overflow_mask: batch.overflow_mask,
+        }),
+        1 => super::simd_trace_narrow::trace_batch_i16(
+            query,
+            targets,
+            score_matrix,
+            query_cbs,
+            semi_global,
+        )
+        .map(|batch| TraceBatch {
+            results: batch.results,
+            overflow_mask: batch.overflow_mask,
+        }),
         _ => trace_batch_avx2(query, targets, score_matrix, query_cbs).map(|results| TraceBatch {
             results,
             overflow_mask: 0,
@@ -171,9 +183,7 @@ unsafe fn score_adjusted_impl(
                 valid[lane] = -1;
                 let ql = query[q as usize];
                 let sl = target.subject[j];
-                subst[lane] = if sl & SEED_MASK != 0 {
-                    0
-                } else if let Some(matrix) = target.matrix {
+                subst[lane] = if let Some(matrix) = target.matrix {
                     matrix.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize]
                         as i32
                 } else {
@@ -277,9 +287,7 @@ unsafe fn trace_batch_avx2_impl(
                 trace_idx[lane] = (j0 + 1) * band_rows + (qpos + 1 - (lower + 1));
                 let ql = query[qpos];
                 let sl = target.subject[j0];
-                subst[lane] = if sl & SEED_MASK != 0 {
-                    0
-                } else if let Some(matrix) = target.matrix {
+                subst[lane] = if let Some(matrix) = target.matrix {
                     matrix.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize]
                         as i32
                 } else {
@@ -424,6 +432,7 @@ unsafe fn trace_batch_avx2_impl(
 #[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
 mod tests {
     use super::*;
+    use crate::basic::value::SEED_MASK;
     use crate::dp::swipe::{banded_sw_cbs_range, TracebackScratch};
     use crate::stats::cbs::TargetMatrix;
     use std::sync::Arc;
@@ -561,6 +570,57 @@ mod tests {
     }
 
     #[test]
+    fn avx2_trace_treats_seed_mask_as_lookup_only_metadata() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let query = vec![17; 12];
+        let plain = vec![17; 12];
+        let marked: Vec<_> = plain.iter().map(|&letter| letter | SEED_MASK).collect();
+        let targets = [
+            TraceTarget {
+                subject: &plain,
+                d_begin: 0,
+                d_end: 1,
+                matrix: None,
+                matrix_scale: 1,
+            },
+            TraceTarget {
+                subject: &marked,
+                d_begin: 0,
+                d_end: 1,
+                matrix: None,
+                matrix_scale: 1,
+            },
+        ];
+        let scored = score_adjusted_batch_avx2(&query, &targets, &matrix, &[]).unwrap();
+        assert_eq!(scored[0], scored[1]);
+        let traced = trace_batch_avx2(&query, &targets, &matrix, &[]).unwrap();
+        assert_sw_result_eq(&traced[0], &traced[1], "plain vs SEED_MASK");
+
+        let adjusted = TargetMatrix::new(
+            (0..1024)
+                .map(|index| if index / 32 == index % 32 { 5 } else { -3 })
+                .collect(),
+            -3,
+            5,
+        );
+        let adjusted_targets = targets.map(|target| TraceTarget {
+            matrix: Some(&adjusted),
+            ..target
+        });
+        let scored = score_adjusted_batch_avx2(&query, &adjusted_targets, &matrix, &[]).unwrap();
+        assert_eq!(scored[0], scored[1]);
+        let traced = trace_batch_avx2(&query, &adjusted_targets, &matrix, &[]).unwrap();
+        assert_sw_result_eq(
+            &traced[0],
+            &traced[1],
+            "plain vs SEED_MASK with adjusted matrix",
+        );
+    }
+
+    #[test]
     fn randomized_narrow_traceback_matches_scalar() {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
@@ -622,7 +682,7 @@ mod tests {
                         matrix_scale: 1,
                     })
                     .collect();
-                let got = trace_batch_tier_avx2(&query, &targets, &matrix, &cbs, score_bin)
+                let got = trace_batch_tier_avx2(&query, &targets, &matrix, &cbs, score_bin, false)
                     .expect("AVX2 narrow tier");
                 for lane in 0..count {
                     if got.overflow_mask & (1 << lane) != 0 {
@@ -672,9 +732,9 @@ mod tests {
             matrix: None,
             matrix_scale: 1,
         };
-        let byte = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 0).unwrap();
+        let byte = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 0, false).unwrap();
         assert_eq!(byte.overflow_mask, 1);
-        let word = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 1).unwrap();
+        let word = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 1, false).unwrap();
         assert_eq!(word.overflow_mask, 0);
         let mut scratch = TracebackScratch::default();
         let expected =
@@ -691,9 +751,9 @@ mod tests {
             matrix: None,
             matrix_scale: 1,
         };
-        let word = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 1).unwrap();
+        let word = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 1, false).unwrap();
         assert_eq!(word.overflow_mask, 1);
-        let exact = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 2).unwrap();
+        let exact = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 2, false).unwrap();
         assert_eq!(exact.overflow_mask, 0);
         let mut scratch = TracebackScratch::default();
         let expected =
@@ -730,7 +790,8 @@ mod tests {
             })
             .collect();
         for score_bin in [0, 1] {
-            let got = trace_batch_tier_avx2(&query, &targets, &matrix, &[], score_bin).unwrap();
+            let got =
+                trace_batch_tier_avx2(&query, &targets, &matrix, &[], score_bin, false).unwrap();
             assert_eq!(got.overflow_mask, 0);
             for lane in 0..targets.len() {
                 let mut scratch = TracebackScratch::default();
@@ -877,18 +938,16 @@ mod tests {
                 for score_bin in [0usize, 1] {
                     let scores = if score_bin == 0 {
                         super::super::simd_adjusted_narrow::score_batch_avx2_i8(
-                            &query, &targets, &matrix, &cbs,
+                            &query, &targets, &matrix, &cbs, false,
                         )
                     } else {
                         super::super::simd_adjusted_narrow::score_batch_avx2_i16(
-                            &query, &targets, &matrix, &cbs,
+                            &query, &targets, &matrix, &cbs, false,
                         )
                     }
                     .unwrap();
-                    let traced =
-                        trace_batch_tier_avx2(&query, &targets, &matrix, &cbs, score_bin).unwrap();
                     for lane in 0..targets.len() {
-                        if (scores.overflow_mask | traced.overflow_mask) & (1 << lane) != 0 {
+                        if scores.overflow_mask & (1 << lane) != 0 {
                             continue;
                         }
                         let mut scratch = TracebackScratch::default();
@@ -906,6 +965,29 @@ mod tests {
                         assert_eq!(
                             scores.scores[lane], expected.score,
                             "score bin={score_bin} lane={lane}"
+                        );
+                    }
+
+                    // Upstream banded SWIPE traces adjusted and ordinary
+                    // lanes together; only full-matrix SWIPE rejects an
+                    // adjusted traceback.
+                    let traced =
+                        trace_batch_tier_avx2(&query, &targets, &matrix, &cbs, score_bin, false)
+                            .unwrap();
+                    for lane in 0..targets.len() {
+                        if traced.overflow_mask & (1 << lane) != 0 {
+                            continue;
+                        }
+                        let expected = banded_sw_cbs_range(
+                            &query,
+                            &subjects[lane],
+                            targets[lane].d_begin,
+                            targets[lane].d_end,
+                            &matrix,
+                            &cbs,
+                            targets[lane].matrix,
+                            targets[lane].matrix_scale,
+                            &mut TracebackScratch::default(),
                         );
                         assert_sw_result_eq(
                             &traced.results[lane],
@@ -927,6 +1009,7 @@ mod tests {
                             portable_targets,
                             &matrix,
                             &cbs,
+                            false,
                         )
                     } else {
                         super::super::simd_trace_narrow_portable::score_batch_i16(
@@ -934,6 +1017,7 @@ mod tests {
                             portable_targets,
                             &matrix,
                             &cbs,
+                            false,
                         )
                     }
                     .unwrap();
@@ -943,6 +1027,7 @@ mod tests {
                             portable_targets,
                             &matrix,
                             &cbs,
+                            false,
                         )
                     } else {
                         super::super::simd_trace_narrow_portable::trace_batch_i16(
@@ -950,14 +1035,12 @@ mod tests {
                             portable_targets,
                             &matrix,
                             &cbs,
+                            false,
                         )
                     }
                     .unwrap();
                     for lane in 0..portable_len {
-                        if (portable_scores.overflow_mask | portable_trace.overflow_mask)
-                            & (1 << lane)
-                            != 0
-                        {
+                        if portable_scores.overflow_mask & (1 << lane) != 0 {
                             continue;
                         }
                         let mut scratch = TracebackScratch::default();
@@ -973,6 +1056,22 @@ mod tests {
                             &mut scratch,
                         );
                         assert_eq!(portable_scores.scores[lane], expected.score);
+                    }
+                    for lane in 0..portable_len {
+                        if portable_trace.overflow_mask & (1 << lane) != 0 {
+                            continue;
+                        }
+                        let expected = banded_sw_cbs_range(
+                            &query,
+                            &subjects[lane],
+                            targets[lane].d_begin,
+                            targets[lane].d_end,
+                            &matrix,
+                            &cbs,
+                            targets[lane].matrix,
+                            targets[lane].matrix_scale,
+                            &mut TracebackScratch::default(),
+                        );
                         assert_sw_result_eq(
                             &portable_trace.results[lane],
                             &expected,
@@ -985,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn adjusted_narrow_saturation_promotes_through_both_bins() {
+    fn adjusted_score_saturation_promotes_through_both_bins() {
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
@@ -1008,11 +1107,10 @@ mod tests {
             &[target],
             &matrix,
             &[],
+            false,
         )
         .unwrap();
-        let byte_trace = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 0).unwrap();
         assert_eq!(byte_score.overflow_mask, 1);
-        assert_eq!(byte_trace.overflow_mask, 1);
 
         let query = vec![0; 700];
         let subject = query.clone();
@@ -1028,13 +1126,184 @@ mod tests {
             &[target],
             &matrix,
             &[],
+            false,
         )
         .unwrap();
-        let word_trace = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 1).unwrap();
         assert_eq!(word_score.overflow_mask, 1);
-        assert_eq!(word_trace.overflow_mask, 1);
-        let exact = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 2).unwrap();
-        assert_eq!(exact.overflow_mask, 0);
-        assert_eq!(exact.results[0].score, 70_000);
+        let exact = score_adjusted_batch_avx2(&query, &[target], &matrix, &[]).unwrap();
+        assert_eq!(exact[0], 70_000);
+    }
+
+    #[test]
+    fn semi_global_narrow_trace_and_adjusted_score_use_delta_zero() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        // Pinned regression from the score kernels: clamping intermediate
+        // cells to zero changes this DELTA=0 alignment's maximum.
+        let query: Vec<Letter> = b"011000010110111010111100000101"
+            .iter()
+            .map(|&x| (x - b'0') as Letter)
+            .collect();
+        let subject: Vec<Letter> = b"11010110011001100101010101"
+            .iter()
+            .map(|&x| (x - b'0') as Letter)
+            .collect();
+        let target = TraceTarget {
+            subject: &subject,
+            d_begin: -3,
+            d_end: 13,
+            matrix: None,
+            matrix_scale: 1,
+        };
+        let local = trace_batch_tier_avx2(&query, &[target], &matrix, &[], 0, false).unwrap();
+        assert_eq!(local.overflow_mask, 0);
+        let expected_local = banded_sw_cbs_range(
+            &query,
+            &subject,
+            target.d_begin,
+            target.d_end,
+            &matrix,
+            &[],
+            None,
+            1,
+            &mut TracebackScratch::default(),
+        );
+        assert_sw_result_eq(&local.results[0], &expected_local, "local regression");
+
+        let adjusted = TargetMatrix::new(
+            (0..1024)
+                .map(|index| matrix.matrix8()[(index % 32) * 32 + index / 32])
+                .collect(),
+            i8::MIN as i32,
+            i8::MAX as i32,
+        );
+        let adjusted_target = TraceTarget {
+            matrix: Some(&adjusted),
+            ..target
+        };
+        let adjusted_score = super::super::simd_adjusted_narrow::score_batch_avx2_i8(
+            &query,
+            &[adjusted_target],
+            &matrix,
+            &[],
+            true,
+        )
+        .unwrap();
+        assert_eq!(adjusted_score.overflow_mask, 0);
+        assert_eq!(adjusted_score.scores, vec![69]);
+
+        // A transcript-producing semi-global lane reaches the same narrow
+        // DELTA=0 specialization. Use a monotone exact-match traceback, as
+        // upstream's vector traceback reconstructs score from the endpoint.
+        let trace_query = vec![17; 5];
+        let trace_subject = trace_query.clone();
+        let trace_target = TraceTarget {
+            subject: &trace_subject,
+            d_begin: 0,
+            d_end: 1,
+            matrix: None,
+            matrix_scale: 1,
+        };
+        let semi =
+            trace_batch_tier_avx2(&trace_query, &[trace_target], &matrix, &[], 0, true).unwrap();
+        assert_eq!(semi.overflow_mask, 0);
+        assert_eq!(semi.results[0].score, 55);
+        assert_eq!(semi.results[0].operations, vec![(EditOperation::Match, 5)]);
+        let adjusted_trace_target = TraceTarget {
+            matrix: Some(&adjusted),
+            ..trace_target
+        };
+        let adjusted_trace = trace_batch_tier_avx2(
+            &trace_query,
+            &[adjusted_trace_target],
+            &matrix,
+            &[],
+            0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(adjusted_trace.overflow_mask, 0);
+        assert_eq!(adjusted_trace.results[0].score, 55);
+        assert_eq!(
+            adjusted_trace.results[0].operations,
+            semi.results[0].operations
+        );
+
+        let portable_adjusted_score = super::super::simd_trace_narrow_portable::score_batch_i8(
+            &query,
+            &[adjusted_target],
+            &matrix,
+            &[],
+            true,
+        )
+        .unwrap();
+        assert_eq!(portable_adjusted_score.scores, vec![69]);
+        let portable_trace = super::super::simd_trace_narrow_portable::trace_batch_i8(
+            &trace_query,
+            &[adjusted_trace_target],
+            &matrix,
+            &[],
+            true,
+        )
+        .unwrap();
+        assert_eq!(portable_trace.results[0].score, 55);
+        assert_eq!(portable_trace.results[0].length, 5);
+        assert!(portable_trace.results[0]
+            .operations
+            .iter()
+            .all(|&(op, count)| op == EditOperation::Match && count > 0));
+    }
+
+    #[test]
+    fn local_narrow_trace_stops_at_nonzero_alignment_start() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let query = vec![0, 0, 17, 17, 17, 17, 17];
+        let subject = vec![1, 1, 17, 17, 17, 17, 17];
+        let target = TraceTarget {
+            subject: &subject,
+            d_begin: 0,
+            d_end: 1,
+            matrix: None,
+            matrix_scale: 1,
+        };
+        let expected = banded_sw_cbs_range(
+            &query,
+            &subject,
+            0,
+            1,
+            &matrix,
+            &[],
+            None,
+            1,
+            &mut TracebackScratch::default(),
+        );
+        assert!(expected.query_begin > 0);
+        assert!(expected.subject_begin > 0);
+
+        for score_bin in [0, 1] {
+            let got =
+                trace_batch_tier_avx2(&query, &[target], &matrix, &[], score_bin, false).unwrap();
+            assert_eq!(got.overflow_mask, 0);
+            assert_sw_result_eq(
+                &got.results[0],
+                &expected,
+                &format!("AVX2 local bin {score_bin}"),
+            );
+        }
+        let portable = super::super::simd_trace_narrow_portable::trace_batch_i8(
+            &query,
+            &[target],
+            &matrix,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(portable.overflow_mask, 0);
+        assert_sw_result_eq(&portable.results[0], &expected, "portable local byte");
     }
 }

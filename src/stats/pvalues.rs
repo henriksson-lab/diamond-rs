@@ -8,11 +8,7 @@ use crate::stats::sls_basic::{normal_probability, one_minus_exp_function, Error,
 
 pub const NAT_CUT_OFF_IN_MAX: f64 = 2.0;
 
-unsafe extern "C" {
-    fn rand() -> i32;
-}
-
-const RAND_MAX_F64: f64 = 2147483647.0;
+const RAND_MAX_F64: f64 = libc::RAND_MAX as f64;
 
 fn normal_probability_stable(value: f64) -> f64 {
     // libm erfc, used by the C++ source, saturates in these tails. The local
@@ -545,7 +541,7 @@ impl pvalues {
     }
 
     pub fn ran3() -> f64 {
-        unsafe { rand() as f64 / RAND_MAX_F64 }
+        crate::util::compat_rng::c_rand() as f64 / RAND_MAX_F64
     }
 
     pub fn standard_normal() -> f64 {

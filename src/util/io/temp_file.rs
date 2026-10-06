@@ -1,5 +1,7 @@
 //! Translation of `diamond/src/util/io/temp_file.{h,cpp}`.
 
+#[cfg(unix)]
+use std::fs::File as StdFile;
 use std::fs::OpenOptions;
 use std::path::Path;
 #[cfg(test)]
@@ -8,19 +10,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[cfg(unix)]
-use std::os::fd::IntoRawFd;
-#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
 use super::{Compressor, IoError, IoResult, OutputFile};
 
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct TempFileData {
     pub name: String,
-    pub fd: i32,
     pub unlinked: bool,
+    #[cfg(unix)]
+    file: Option<StdFile>,
 }
 
 impl TempFileData {
@@ -50,21 +51,24 @@ impl TempFileData {
                     let name = path.to_string_lossy().into_owned();
                     #[cfg(unix)]
                     {
-                        let fd = file.into_raw_fd();
                         let unlinked = if no_unlink || !unlink {
                             false
                         } else {
                             std::fs::remove_file(&path).is_ok()
                         };
-                        return Ok(Self { name, fd, unlinked });
+                        return Ok(Self {
+                            name,
+                            unlinked,
+                            file: Some(file),
+                        });
                     }
                     #[cfg(not(unix))]
                     {
-                        // Windows C++ returns a name and opens it later.
+                        // Preserve the Windows C++ lifecycle: creation reserves
+                        // the name, and later consumers reopen it by path.
                         drop(file);
                         return Ok(Self {
                             name,
-                            fd: -1,
                             unlinked: false,
                         });
                     }
@@ -85,21 +89,19 @@ impl TempFileData {
     }
 
     #[cfg(unix)]
-    pub(crate) fn take_fd(&mut self) -> i32 {
-        std::mem::replace(&mut self.fd, -1)
+    pub(crate) fn try_clone_file(&self) -> IoResult<StdFile> {
+        self.file
+            .as_ref()
+            .ok_or_else(|| IoError::Other(format!("Error opening temporary file {}", self.name)))?
+            .try_clone()
+            .map_err(|_| IoError::Other(format!("Error opening temporary file {}", self.name)))
     }
-}
 
-#[cfg(unix)]
-impl Drop for TempFileData {
-    fn drop(&mut self) {
-        if self.fd >= 0 {
-            unsafe extern "C" {
-                fn close(fd: i32) -> i32;
-            }
-            let _ = unsafe { close(self.fd) };
-            self.fd = -1;
-        }
+    #[cfg(unix)]
+    pub(crate) fn take_file(&mut self) -> IoResult<StdFile> {
+        self.file
+            .take()
+            .ok_or_else(|| IoError::Other(format!("Error opening temporary file {}", self.name)))
     }
 }
 
@@ -217,7 +219,47 @@ impl std::ops::DerefMut for TempFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::io::Write;
     use std::io::{Read, Seek, SeekFrom};
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    const LEAK_TEST_CHILD_ENV: &str = "DIAMOND_TEMP_FILE_LEAK_TEST_CHILD";
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn open_file_count() -> usize {
+        let directory = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        std::fs::read_dir(directory).unwrap().count()
+    }
+
+    #[cfg(windows)]
+    fn open_file_count() -> usize {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+        let mut count = 0;
+        // SAFETY: GetCurrentProcess returns a non-owning pseudo-handle and
+        // `count` is a valid output pointer for the duration of the call.
+        let success = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+        assert_ne!(success, 0, "GetProcessHandleCount failed");
+        count as usize
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn create_and_drop_temp_pair(dir: &Path, unlink: bool) {
+        let data = TempFile::init_in(unlink, dir, false).unwrap();
+        let name = data.name.clone();
+        let unlinked = data.unlinked;
+        let temp = TempFile::from_temp_file_data(&data).unwrap();
+        drop(temp);
+        drop(data);
+        if !unlinked {
+            std::fs::remove_file(name).unwrap();
+        }
+    }
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -254,6 +296,7 @@ mod tests {
         let dir = test_dir("descriptor");
         let data = TempFile::init_in(true, &dir, false).unwrap();
         let mut temp = TempFile::from_temp_file_data(&data).unwrap();
+        drop(data);
         temp.write_raw(b"abc").unwrap();
         temp.flush().unwrap();
         temp.file().unwrap().seek(SeekFrom::Start(0)).unwrap();
@@ -261,7 +304,29 @@ mod tests {
         temp.file().unwrap().read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"abc");
         temp.close().unwrap();
-        drop(data);
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloned_temp_files_share_cursor_and_preserve_closed_error_text() {
+        let dir = test_dir("clone-cursor");
+        let mut data = TempFile::init_in(true, &dir, false).unwrap();
+        let mut first = data.try_clone_file().unwrap();
+        let mut second = data.try_clone_file().unwrap();
+
+        first.write_all(b"abcdef").unwrap();
+        assert_eq!(second.stream_position().unwrap(), 6);
+        second.seek(SeekFrom::Start(2)).unwrap();
+        assert_eq!(first.stream_position().unwrap(), 2);
+
+        drop(first);
+        drop(second);
+        drop(data.take_file().unwrap());
+        assert_eq!(
+            data.try_clone_file().unwrap_err().to_string(),
+            format!("Error opening temporary file {}", data.name)
+        );
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -303,5 +368,50 @@ mod tests {
         let mut handler = TempFileHandler::new();
         handler.init("first").unwrap();
         handler.init("second").unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn linked_and_unlinked_temp_files_do_not_leak_descriptors() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "util::io::temp_file::tests::temp_file_descriptor_leak_child",
+                "--test-threads=1",
+            ])
+            .env(LEAK_TEST_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated descriptor-leak check failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    #[ignore = "subprocess-only helper for the descriptor-leak regression"]
+    fn temp_file_descriptor_leak_child() {
+        assert_eq!(
+            std::env::var_os(LEAK_TEST_CHILD_ENV).as_deref(),
+            Some("1".as_ref())
+        );
+        let dir = test_dir("descriptor-leak");
+
+        // Stabilize lazy standard-library/CRT initialization before measuring.
+        create_and_drop_temp_pair(&dir, true);
+        create_and_drop_temp_pair(&dir, false);
+        let before = open_file_count();
+
+        for iteration in 0..256 {
+            create_and_drop_temp_pair(&dir, iteration % 2 == 0);
+        }
+
+        let after = open_file_count();
+        assert_eq!(after, before, "temporary-file descriptors/handles leaked");
+        std::fs::remove_dir(dir).unwrap();
     }
 }

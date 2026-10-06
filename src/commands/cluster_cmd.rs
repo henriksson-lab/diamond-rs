@@ -104,6 +104,49 @@ fn length_sort_linear_active(active: &mut [(OId, FastaRecord)], linear: bool) {
     });
 }
 
+/// Literal translation of `Search::keep_target_id` and the query ordering
+/// predicate in upstream `run/double_indexed.cpp`.
+fn keep_target_id(config: &cascaded::CascadedSearchConfig) -> bool {
+    keep_target_id_values(
+        config.min_length_ratio,
+        config.global_ranking_targets,
+        config.self_search,
+        config.current_ref_block,
+        config.lin_stage1_combo,
+    )
+}
+
+fn keep_target_id_values(
+    min_length_ratio: f64,
+    global_ranking_targets: bool,
+    self_search: bool,
+    current_ref_block: i32,
+    lin_stage1_combo: bool,
+) -> bool {
+    min_length_ratio != 0.0
+        || global_ranking_targets
+        || (self_search && current_ref_block == 0)
+        || lin_stage1_combo
+}
+
+fn should_length_sort_queries(config: &cascaded::CascadedSearchConfig) -> bool {
+    should_length_sort_query_values(
+        keep_target_id(config),
+        config.lin_stage1_query,
+        config.kmer_ranking,
+        config.min_length_ratio,
+    )
+}
+
+fn should_length_sort_query_values(
+    keep_target_id: bool,
+    lin_stage1_query: bool,
+    kmer_ranking: bool,
+    min_length_ratio: f64,
+) -> bool {
+    (!keep_target_id && lin_stage1_query && !kmer_ranking) || min_length_ratio > 0.0
+}
+
 impl NativeBlock {
     fn letter_count(&self) -> u64 {
         self.records.iter().map(|r| r.sequence.len() as u64).sum()
@@ -197,7 +240,7 @@ impl CascadedBackend for NativeBlock {
             .filter(|(oid, _)| filter.is_none_or(|set| set.get(*oid as OId)))
             .map(|(oid, record)| (oid as OId, record.clone()))
             .collect::<Vec<_>>();
-        length_sort_linear_active(&mut active, config.lin_stage1_query);
+        length_sort_linear_active(&mut active, should_length_sort_queries(config));
         let local_to_block = active.iter().map(|(oid, _)| *oid).collect::<Vec<_>>();
         let records = active
             .into_iter()
@@ -245,8 +288,20 @@ impl CascadedBackend for NativeBlock {
             records,
             config.approx_min_id,
             config.lin_stage1_query,
+            config.lin_stage1_target,
             config.self_search,
             config.query_or_target_cover,
+            config.mutual_cover,
+            crate::chaining::HammingExtConfig {
+                hamming_ext: config.hamming_ext,
+                approx_min_id: config.approx_min_id,
+                query_or_target_cover: config.query_or_target_cover,
+                query_cover: config.query_cover,
+                subject_cover: config.subject_cover,
+                max_evalue: config.max_evalue,
+                diag_filter_cov: config.diag_filter_cov,
+                diag_filter_id: config.diag_filter_id,
+            },
         )
         .map_err(|error| error.to_string())?;
         edges.sort_by_key(|edge| (edge.edge.query, edge.edge.target));
@@ -529,6 +584,20 @@ mod tests {
             nonlinear.iter().map(|(oid, _)| *oid).collect::<Vec<_>>(),
             vec![4, 7, 9, 12]
         );
+    }
+
+    #[test]
+    fn query_sort_predicate_preserves_self_search_target_ids() {
+        assert!(!keep_target_id_values(0.0, false, true, 1, false));
+        assert!(keep_target_id_values(0.0, false, true, 0, false));
+        assert!(keep_target_id_values(0.1, false, false, 1, false));
+        assert!(keep_target_id_values(0.0, true, false, 1, false));
+        assert!(keep_target_id_values(0.0, false, false, 1, true));
+        assert!(should_length_sort_query_values(false, true, false, 0.0));
+        assert!(!should_length_sort_query_values(true, true, false, 0.0));
+        assert!(!should_length_sort_query_values(false, true, true, 0.0));
+        assert!(!should_length_sort_query_values(false, false, false, 0.0));
+        assert!(should_length_sort_query_values(true, false, true, 0.5));
     }
 
     #[test]

@@ -11,11 +11,11 @@
 //! default-mode output as selective as it is.
 use crate::basic::value::{Letter, DELIMITER_LETTER, LETTER_MASK};
 use crate::search::hamming::FingerPrint;
-use crate::search::hamming_all_vs_all::AlignedFingerprint48;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use crate::search::hamming_all_vs_all::{
-    all_vs_all_pass_masks_avx2, all_vs_all_pass_masks_avx512bw,
-};
+use crate::search::hamming_all_vs_all::all_vs_all_pass_masks_avx2;
+#[cfg(target_arch = "x86_64")]
+use crate::search::hamming_all_vs_all::all_vs_all_pass_masks_avx512bw;
+use crate::search::hamming_all_vs_all::AlignedFingerprint48;
 use crate::search::seed_match::SeedMatch;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::cell::RefCell;
@@ -62,13 +62,14 @@ thread_local! {
 
 #[inline]
 fn fingerprint_equal_count(query: &[Letter; FP_LEN], target: &[Letter; FP_LEN]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512bw") {
+        // SAFETY: AVX-512BW was detected; the masked loads touch exactly
+        // the 48 initialized bytes in each fingerprint.
+        return unsafe { fingerprint_equal_count_avx512(query, target) };
+    }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if std::arch::is_x86_feature_detected!("avx512bw") {
-            // SAFETY: AVX-512BW was detected; the masked loads touch exactly
-            // the 48 initialized bytes in each fingerprint.
-            return unsafe { fingerprint_equal_count_avx512(query, target) };
-        }
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 was detected and both fixed arrays contain all 48
             // bytes loaded by the kernel.
@@ -107,7 +108,7 @@ fn fingerprint_equal_count_for<const KERNEL: u8>(
 ) -> u32 {
     match KERNEL {
         FP_AVX512BW => {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(target_arch = "x86_64")]
             // SAFETY: this instantiation is selected only after AVX-512BW
             // detection at the group boundary.
             unsafe {
@@ -146,7 +147,7 @@ fn fingerprint_equal_count_for<const KERNEL: u8>(
         .sum()
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn fingerprint_equal_count_avx512(
     query: &[Letter; FP_LEN],
@@ -409,18 +410,19 @@ pub(crate) fn visit_hamming_group<F>(
 ) where
     F: FnMut((u32, u32), (u32, u32), usize),
 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512bw") {
+        return visit_hamming_group_for::<FP_AVX512BW, F>(
+            query_locs,
+            target_locs,
+            query_seqs,
+            ref_seqs,
+            hamming_filter_id,
+            visit,
+        );
+    }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if std::arch::is_x86_feature_detected!("avx512bw") {
-            return visit_hamming_group_for::<FP_AVX512BW, F>(
-                query_locs,
-                target_locs,
-                query_seqs,
-                ref_seqs,
-                hamming_filter_id,
-                visit,
-            );
-        }
         if std::arch::is_x86_feature_detected!("avx2") {
             return visit_hamming_group_for::<FP_AVX2, F>(
                 query_locs,
@@ -494,7 +496,7 @@ pub(crate) fn visit_hamming_group_for<const KERNEL: u8, F>(
             .zip(scratch.target.chunks(TILE_SIZE))
             .enumerate()
         {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(target_arch = "x86_64")]
             if KERNEL == FP_AVX512BW {
                 // SAFETY: this specialization is selected only after
                 // AVX-512BW detection at the group boundary. Masked loads
@@ -508,6 +510,31 @@ pub(crate) fn visit_hamming_group_for<const KERNEL: u8, F>(
                     );
                 }
             } else if KERNEL == FP_AVX2 {
+                // SAFETY: AVX2 was detected at the group boundary. Inputs
+                // contain complete fingerprints, target tiles have at most 64
+                // rows, and the output covers every query in this tile.
+                unsafe {
+                    all_vs_all_pass_masks_avx2(
+                        query_fp_tile,
+                        target_fp_tile,
+                        hamming_filter_id,
+                        &mut pass_masks[..query_fp_tile.len()],
+                    );
+                }
+            } else {
+                pass_masks[..query_fp_tile.len()].fill(0);
+                for (query_index, query_fp) in query_fp_tile.iter().enumerate() {
+                    for (target_index, target_fp) in target_fp_tile.iter().enumerate() {
+                        if fingerprint_equal_count_for::<KERNEL>(&query_fp.bytes, &target_fp.bytes)
+                            >= hamming_filter_id
+                        {
+                            pass_masks[query_index] |= 1u64 << target_index;
+                        }
+                    }
+                }
+            }
+            #[cfg(target_arch = "x86")]
+            if KERNEL == FP_AVX2 {
                 // SAFETY: AVX2 was detected at the group boundary. Inputs
                 // contain complete fingerprints, target tiles have at most 64
                 // rows, and the output covers every query in this tile.

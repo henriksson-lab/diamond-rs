@@ -181,7 +181,6 @@ pub fn run_tabular(config: &ViewConfig) -> io::Result<()> {
     let header = print_tabular_header(&format.fields, header_mode, format.is_json, "", "")
         .map_err(io::Error::other)?;
     out.write_all(header.as_bytes())?;
-    let mut json_query_written = false;
     while let Some((buf, query_num)) = daa.read_query_buffer()? {
         let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -196,12 +195,12 @@ pub fn run_tabular(config: &ViewConfig) -> io::Result<()> {
             config.report_unaligned,
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if format.is_json && !query_out.is_empty() {
-            if json_query_written {
-                out.write_all(b",")?;
-            }
-            json_query_written = true;
-        }
+        // Deliberately do not insert `format.query_separator` here.  Pinned
+        // upstream `view_daa` writes each per-query TextBuffer verbatim via
+        // `ViewWriter::operator()`; unlike the search join path, that writer
+        // never consults `OutputFormat::query_separator`.  Consequently its
+        // multi-query flat JSON omits commas at query boundaries.  Preserve
+        // those bytes until the upstream contract itself changes.
         out.write_all(&query_out)?;
     }
     out.write_all(print_tabular_footer(format.is_json).as_bytes())?;
@@ -846,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_tabular_json_separates_multiple_queries() {
+    fn test_run_tabular_json_preserves_upstream_query_boundary_bytes() {
         let id = VIEW_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
         let input = std::env::temp_dir().join(format!(
             "diamond_rs_view_multi_json_input_{}_{}.daa",
@@ -915,13 +914,14 @@ mod tests {
                 "\t\"qseqid\":\"query0\",\n",
                 "\t\"sseqid\":\"ref0\",\n",
                 "\t\"score\":30\n",
-                "\t},\n\t{\n",
+                "\t}\n\t{\n",
                 "\t\"qseqid\":\"query1\",\n",
                 "\t\"sseqid\":\"ref0\",\n",
                 "\t\"score\":29\n",
                 "\t}\n]"
             )
         );
+        assert!(actual.contains("\t}\n\t{\n"));
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);

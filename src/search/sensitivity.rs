@@ -955,7 +955,7 @@ mod tests {
         assert!(!use_single_indexed(
             0.1,
             3_000_000,
-            10_000_000_000,
+            usize::MAX,
             Sensitivity::Fast
         ));
         assert!(use_single_indexed(
@@ -967,7 +967,7 @@ mod tests {
         assert!(!use_single_indexed(
             0.1,
             300_000,
-            10_000_000_000,
+            usize::MAX,
             Sensitivity::Sensitive
         ));
     }

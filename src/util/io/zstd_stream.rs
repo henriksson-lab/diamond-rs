@@ -241,11 +241,42 @@ pub fn zstd_decompress_file(src: &mut StdFile, dst: &mut [u8]) -> IoResult<usize
 
 #[cfg(test)]
 mod tests {
-    use super::super::VecStream;
+    use super::super::{Compressor, InputFile, OutputFile, TempFileData, VecStream};
     use super::*;
 
     fn compressed(bytes: &[u8]) -> Vec<u8> {
         zstd::stream::encode_all(bytes, 0).unwrap()
+    }
+
+    #[test]
+    fn decodes_frame_emitted_by_upstream_cpp_stream() {
+        // Produced by the checked-in `diamond/src/util/io/zstd_stream.cpp`
+        // through ZstdSink, linked to libzstd 1.4.8. Keeping the encoded bytes
+        // here makes C++ -> Rust compatibility a normal, toolchain-independent
+        // test instead of relying only on frames produced by our own backend.
+        const CPP_FRAME: &[u8] = &[
+            0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x58, 0xd1, 0x00, 0x00, 0x75, 0x70, 0x73, 0x74, 0x72,
+            0x65, 0x61, 0x6d, 0x2d, 0x63, 0x70, 0x70, 0x2d, 0x7a, 0x73, 0x74, 0x64, 0x2d, 0x66,
+            0x69, 0x78, 0x74, 0x75, 0x72, 0x65, 0x0a,
+        ];
+        const PLAIN: &[u8] = b"upstream-cpp-zstd-fixture\n";
+
+        let mut whole = vec![0; PLAIN.len()];
+        assert_eq!(zstd_decompress(CPP_FRAME, &mut whole).unwrap(), PLAIN.len());
+        assert_eq!(whole, PLAIN);
+
+        let input = InputStreamBuffer::new(VecStream::from_vec(CPP_FRAME.to_vec()), 0);
+        let mut source = ZstdSource::new(input).unwrap();
+        let mut streamed = Vec::new();
+        let mut chunk = [0; 7];
+        loop {
+            let count = source.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            streamed.extend_from_slice(&chunk[..count]);
+        }
+        assert_eq!(streamed, PLAIN);
     }
 
     #[test]
@@ -259,6 +290,51 @@ mod tests {
         assert_eq!(decoded, plain);
         assert!(!source.eof().unwrap());
         assert_eq!(source.read(&mut [0]).unwrap(), 0);
+        assert!(source.eof().unwrap());
+    }
+
+    #[test]
+    fn empty_frame_has_standard_magic_and_roundtrips() {
+        let encoded = compressed(b"");
+        // Zstandard frames use this little-endian magic in the upstream C++
+        // implementation and in the Rust zstd backend.
+        assert!(encoded.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]));
+
+        let mut whole_output = [];
+        assert_eq!(zstd_decompress(&encoded, &mut whole_output).unwrap(), 0);
+
+        let input = InputStreamBuffer::new(VecStream::from_vec(encoded), 0);
+        let mut source = ZstdSource::new(input).unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(source.read(&mut byte).unwrap(), 0);
+        assert!(source.eof().unwrap());
+    }
+
+    #[test]
+    fn concatenated_frames_roundtrip_with_whole_and_streaming_decoders() {
+        let expected = b"first-framesecond-frame";
+        let mut encoded = compressed(b"first-frame");
+        encoded.extend_from_slice(&compressed(b"second-frame"));
+
+        let mut whole_output = vec![0; expected.len()];
+        assert_eq!(
+            zstd_decompress(&encoded, &mut whole_output).unwrap(),
+            expected.len()
+        );
+        assert_eq!(whole_output, expected);
+
+        let input = InputStreamBuffer::new(VecStream::from_vec(encoded), 0);
+        let mut source = ZstdSource::new(input).unwrap();
+        let mut streamed = Vec::new();
+        let mut chunk = [0; 5];
+        loop {
+            let count = source.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            streamed.extend_from_slice(&chunk[..count]);
+        }
+        assert_eq!(streamed, expected);
         assert!(source.eof().unwrap());
     }
 
@@ -329,6 +405,43 @@ mod tests {
         );
         assert!(sink.write(b"closed").is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn large_temp_file_roundtrips_through_output_and_input_streams() {
+        let data = TempFileData::init(true).unwrap();
+        let name = data.name.clone();
+        let unlinked = data.unlinked;
+        let plain = (0..(3 * (1 << 20) + 137))
+            .map(|index| ((index * 31 + index / 251) & 0xff) as u8)
+            .collect::<Vec<_>>();
+
+        {
+            let mut output =
+                OutputFile::from_temp_file_data(&data, Compressor::Zstd, "w+b").unwrap();
+            for chunk in plain.chunks(65_521) {
+                output.write_raw(chunk).unwrap();
+            }
+            output.close().unwrap();
+        }
+
+        let mut input = InputFile::from_temp_file_data(&data, 0, Compressor::Zstd).unwrap();
+        let mut decoded = Vec::with_capacity(plain.len());
+        let mut chunk = vec![0; 37_117];
+        loop {
+            let count = input.read_raw(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            decoded.extend_from_slice(&chunk[..count]);
+        }
+        input.close().unwrap();
+        assert_eq!(decoded, plain);
+
+        drop(data);
+        if !unlinked {
+            std::fs::remove_file(name).unwrap();
+        }
     }
 
     #[test]

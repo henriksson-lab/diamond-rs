@@ -9,7 +9,7 @@ use crate::align::hsp::Hsp;
 use crate::basic::statistics::{StatValue, Statistics};
 use crate::basic::value::Letter;
 use crate::config::Sensitivity;
-use crate::dp::anchored::{smith_waterman_simd, Stats, Target};
+use crate::dp::anchored::{smith_waterman_simd_profiled, Stats, Target};
 use crate::dp::score_profile::{make_profile16, LongScoreProfile};
 use crate::dp::swipe::{self, DpTarget, Params, Targets};
 use crate::stats::cbs::{
@@ -251,6 +251,16 @@ pub fn swipe_threads(
     query: &[Letter],
     cfg: &AnchoredSwipeConfig<'_>,
 ) -> Stats {
+    swipe_threads_profiled(targets, query, cfg, None, None)
+}
+
+fn swipe_threads_profiled(
+    targets: &mut [Target],
+    query: &[Letter],
+    cfg: &AnchoredSwipeConfig<'_>,
+    profile: Option<&LongScoreProfile<i16>>,
+    profile_reverse: Option<&LongScoreProfile<i16>>,
+) -> Stats {
     let threshold = cfg.swipe_task_size.max(1);
     let mut ranges = Vec::new();
     let mut begin = 0usize;
@@ -277,7 +287,13 @@ pub fn swipe_threads(
     }
     let mut out = Stats::default();
     for (begin, end) in ranges.iter().copied() {
-        let stats = smith_waterman_simd(query, &mut targets[begin..end], cfg.score_matrix);
+        let stats = smith_waterman_simd_profiled(
+            query,
+            &mut targets[begin..end],
+            cfg.score_matrix,
+            profile,
+            profile_reverse,
+        );
         out.gross_cells += stats.gross_cells;
         out.net_cells += stats.net_cells;
     }
@@ -323,7 +339,7 @@ pub fn anchored_swipe(targets: &mut Targets, cfg: &AnchoredSwipeConfig<'_>) -> V
             select_matrix(cfg.query.len() as i32, cfg.score_matrix),
         )
     });
-    let _profiles_reverse = profiles.as_ref().map(Profiles::reverse);
+    let profiles_reverse = profiles.as_ref().map(Profiles::reverse);
     inc(cfg, StatValue::TimeProfile, micros(timer));
 
     let timer = Instant::now();
@@ -345,7 +361,13 @@ pub fn anchored_swipe(targets: &mut Targets, cfg: &AnchoredSwipeConfig<'_>) -> V
     inc(cfg, StatValue::TimeAnchoredSwipeSort, micros(timer));
 
     let timer = Instant::now();
-    let cell_stats = swipe_threads(&mut target_vec.int16, cfg.query, cfg);
+    let cell_stats = swipe_threads_profiled(
+        &mut target_vec.int16,
+        cfg.query,
+        cfg,
+        profiles.as_ref().map(|profiles| &profiles.int16),
+        profiles_reverse.as_ref().map(|profiles| &profiles.int16),
+    );
     inc(cfg, StatValue::GrossDpCells, cell_stats.gross_cells);
     inc(cfg, StatValue::NetDpCells, cell_stats.net_cells);
     inc(cfg, StatValue::TimeSw, micros(timer));

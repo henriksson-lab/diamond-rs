@@ -834,9 +834,9 @@ fn parse_arg_or<T: std::str::FromStr>(args: &[String], flags: &[&str], default: 
         .unwrap_or(default)
 }
 
-const DEFAULT_NATIVE_MEMORY_LIMIT: usize = 16_000_000_000;
+const DEFAULT_NATIVE_MEMORY_LIMIT: u64 = 16_000_000_000;
 
-fn parse_memory_limit_arg(args: &[String]) -> Option<usize> {
+fn parse_memory_limit_arg(args: &[String]) -> Option<u64> {
     Some(
         get_arg(args, &["--memory-limit"]).map_or(DEFAULT_NATIVE_MEMORY_LIMIT, |value| {
             parse_byte_size(&value).unwrap_or_else(|error| {
@@ -847,10 +847,10 @@ fn parse_memory_limit_arg(args: &[String]) -> Option<usize> {
     )
 }
 
-fn parse_byte_size(value: &str) -> Result<usize, &'static str> {
+fn parse_byte_size(value: &str) -> Result<u64, &'static str> {
     let bytes = diamond::util::string::interpret_number(value)
         .map_err(|_| "use K, M, G, or T (for example 4G)")?;
-    usize::try_from(bytes).map_err(|_| "value is out of range")
+    u64::try_from(bytes).map_err(|_| "value is out of range")
 }
 
 fn parse_sensitivity(args: &[String]) -> Sensitivity {

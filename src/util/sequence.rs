@@ -76,23 +76,22 @@ pub fn format(
     Ok(())
 }
 
-unsafe extern "C" {
-    #[link_name = "memchr"]
-    fn c_memchr(ptr: *const std::ffi::c_void, byte: i32, len: usize) -> *mut std::ffi::c_void;
-}
-
 #[inline(always)]
 pub fn clip(seq: &[Letter], anchor: i32) -> &[Letter] {
     let anchor = anchor as usize;
     let mut begin = 0usize;
     loop {
         let remaining = &seq[begin..];
-        // Upstream calls libc memchr here. Rust's iterator search compiled to
-        // a byte-at-a-time loop in this stage-2 hotspot.
+        // Keep upstream's C-runtime memchr exactly: on glibc this resolves to
+        // its CPU-specific EVEX implementation, which is materially faster in
+        // this stage-2 hotspot than the portable crate's AVX2 dispatcher. The
+        // maintained libc crate supplies the target ABI, so no handwritten
+        // declaration remains. `remaining` is live for the call and contains
+        // exactly `remaining.len()` contiguous one-byte letters.
         let found = unsafe {
-            let ptr = c_memchr(
+            let ptr = libc::memchr(
                 remaining.as_ptr().cast(),
-                crate::basic::value::DELIMITER_LETTER as i32,
+                crate::basic::value::DELIMITER_LETTER as libc::c_int,
                 remaining.len(),
             );
             (!ptr.is_null()).then(|| ptr as usize - remaining.as_ptr() as usize)
@@ -474,6 +473,134 @@ mod tests {
         );
         assert!(is_fully_masked(&[MASK_LETTER, STOP_LETTER]));
         assert!(!is_fully_masked(&[0, MASK_LETTER]));
+    }
+
+    #[test]
+    fn clip_matches_scalar_reference_for_edge_layouts() {
+        fn scalar_clip(seq: &[Letter], anchor: i32) -> &[Letter] {
+            let anchor = anchor as usize;
+            let mut begin = 0;
+            loop {
+                match seq[begin..]
+                    .iter()
+                    .position(|&letter| letter == crate::basic::value::DELIMITER_LETTER)
+                {
+                    None => return &seq[begin..],
+                    Some(relative) => {
+                        let delimiter = begin + relative;
+                        if delimiter >= anchor {
+                            return &seq[begin..delimiter];
+                        }
+                        begin = delimiter + 1;
+                    }
+                }
+            }
+        }
+
+        let non_delimiters = [i8::MIN, -1, 0, 30, 32, i8::MAX];
+        for len in 0..=10 {
+            for delimiter_mask in 0..(1usize << len) {
+                let seq = (0..len)
+                    .map(|index| {
+                        if delimiter_mask & (1 << index) != 0 {
+                            crate::basic::value::DELIMITER_LETTER
+                        } else {
+                            non_delimiters[index % non_delimiters.len()]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                for anchor in -2..=(len as i32 + 2) {
+                    let actual = clip(&seq, anchor);
+                    let expected = scalar_clip(&seq, anchor);
+                    assert_eq!(
+                        actual, expected,
+                        "len={len}, mask={delimiter_mask:#x}, anchor={anchor}"
+                    );
+                    assert!(
+                        std::ptr::eq(actual.as_ptr(), expected.as_ptr()),
+                        "wrong subslice start for len={len}, mask={delimiter_mask:#x}, anchor={anchor}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Diagnostic microbenchmark for the stage-2 delimiter scan. Run with:
+    /// `cargo test --release --lib benchmark_clip_memchr_layouts -- --ignored --nocapture`
+    #[test]
+    #[ignore = "release-mode diagnostic benchmark"]
+    fn benchmark_clip_memchr_layouts() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn scalar_clip(seq: &[Letter], anchor: i32) -> &[Letter] {
+            let anchor = anchor as usize;
+            let mut begin = 0;
+            loop {
+                match seq[begin..]
+                    .iter()
+                    .position(|&letter| letter == crate::basic::value::DELIMITER_LETTER)
+                {
+                    None => return &seq[begin..],
+                    Some(relative) => {
+                        let delimiter = begin + relative;
+                        if delimiter >= anchor {
+                            return &seq[begin..delimiter];
+                        }
+                        begin = delimiter + 1;
+                    }
+                }
+            }
+        }
+
+        const LEN: usize = 64 * 1024;
+        const ITERATIONS: usize = 20_000;
+        let delimiter = crate::basic::value::DELIMITER_LETTER;
+        let layouts = [
+            ("delimiter-free", vec![1; LEN]),
+            (
+                "dense-delimiter",
+                (0..LEN)
+                    .map(|index| if index % 17 == 0 { delimiter } else { 1 })
+                    .collect(),
+            ),
+            (
+                "near-anchor",
+                (0..LEN)
+                    .map(|index| {
+                        if index == LEN / 2 - 1 || index == LEN / 2 + 1 {
+                            delimiter
+                        } else {
+                            1
+                        }
+                    })
+                    .collect(),
+            ),
+        ];
+
+        for (name, sequence) in layouts {
+            let anchor = (LEN / 2) as i32;
+            let started = Instant::now();
+            let mut memchr_checksum = 0;
+            for _ in 0..ITERATIONS {
+                memchr_checksum += black_box(clip(black_box(&sequence), anchor)).len();
+            }
+            let memchr_elapsed = started.elapsed();
+
+            let started = Instant::now();
+            let mut scalar_checksum = 0;
+            for _ in 0..ITERATIONS {
+                scalar_checksum += black_box(scalar_clip(black_box(&sequence), anchor)).len();
+            }
+            let scalar_elapsed = started.elapsed();
+
+            assert_eq!(memchr_checksum, scalar_checksum);
+            eprintln!(
+                "clip/{name}: memchr={memchr_elapsed:?} scalar={scalar_elapsed:?} ratio={:.3}",
+                memchr_elapsed.as_secs_f64() / scalar_elapsed.as_secs_f64()
+            );
+        }
     }
 
     #[test]

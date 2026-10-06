@@ -41,7 +41,7 @@ fn all_vs_all_pass_masks(
         return;
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx512bw") {
         // SAFETY: AVX-512BW is runtime-detected and masked loads consume only
         // the 48 initialized fingerprint bytes.
@@ -65,7 +65,7 @@ fn all_vs_all_pass_masks(
 /// Four masked query loads remain resident in ZMM registers for the complete
 /// target pass. Each 48-byte target is loaded once and compared to all four
 /// queries, producing one query-major 64-bit pass mask.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn all_vs_all_pass_masks_avx512bw(
     query: &[AlignedFingerprint48],
     target: &[AlignedFingerprint48],
@@ -369,7 +369,7 @@ mod tests {
                         };
                         assert_eq!(avx2, expected);
                     }
-                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                    #[cfg(target_arch = "x86_64")]
                     if std::arch::is_x86_feature_detected!("avx512bw") {
                         let mut avx512 = vec![u64::MAX; query_count];
                         unsafe {

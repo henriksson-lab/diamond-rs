@@ -1,14 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use super::{get_current_rss, get_peak_rss};
+use memmap2::{Mmap, MmapOptions};
 
-#[cfg(windows)]
-use std::ffi::c_void;
-#[cfg(not(windows))]
-use std::ffi::{c_char, c_void, CString};
-#[cfg(target_os = "linux")]
-use std::os::raw::{c_int, c_long};
+use super::{get_current_rss, get_peak_rss};
 
 #[cfg(windows)]
 pub const PATH_SEPARATOR: char = '\\';
@@ -30,6 +25,11 @@ pub enum Color {
 pub fn set_color(color: Color, err: bool) {
     #[cfg(windows)]
     unsafe {
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, SetConsoleTextAttribute, FOREGROUND_GREEN, FOREGROUND_RED,
+            STD_OUTPUT_HANDLE,
+        };
+
         let attribute = match color {
             Color::Red => FOREGROUND_RED,
             Color::Green => FOREGROUND_GREEN,
@@ -38,7 +38,7 @@ pub fn set_color(color: Color, err: bool) {
         // The upstream Windows implementation always addresses stdout and
         // ignores `err`; preserve that behavior.
         let _ = err;
-        set_console_text_attribute(get_std_handle(STD_OUTPUT_HANDLE), attribute);
+        SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), attribute);
     }
     #[cfg(not(windows))]
     {
@@ -54,9 +54,14 @@ pub fn set_color(color: Color, err: bool) {
 pub fn reset_color(err: bool) {
     #[cfg(windows)]
     unsafe {
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, SetConsoleTextAttribute, FOREGROUND_BLUE, FOREGROUND_GREEN,
+            FOREGROUND_RED, STD_OUTPUT_HANDLE,
+        };
+
         let _ = err;
-        set_console_text_attribute(
-            get_std_handle(STD_OUTPUT_HANDLE),
+        SetConsoleTextAttribute(
+            GetStdHandle(STD_OUTPUT_HANDLE),
             FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE,
         );
     }
@@ -82,24 +87,6 @@ fn color_escape_sequence(color: Color) -> &'static str {
 #[cfg(not(windows))]
 fn reset_color_escape_sequence() -> &'static str {
     "\x1b[0;39m"
-}
-
-#[cfg(windows)]
-const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
-#[cfg(windows)]
-const FOREGROUND_BLUE: u16 = 0x0001;
-#[cfg(windows)]
-const FOREGROUND_GREEN: u16 = 0x0002;
-#[cfg(windows)]
-const FOREGROUND_RED: u16 = 0x0004;
-
-#[cfg(windows)]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    #[link_name = "GetStdHandle"]
-    fn get_std_handle(which: u32) -> *mut c_void;
-    #[link_name = "SetConsoleTextAttribute"]
-    fn set_console_text_attribute(console: *mut c_void, attributes: u16) -> i32;
 }
 
 #[cfg(windows)]
@@ -135,14 +122,6 @@ pub fn auto_append_extension_if_exists(str_: &str, ext: &str) -> String {
     } else {
         str_.to_string()
     }
-}
-
-#[cfg(target_os = "linux")]
-const _SC_LEVEL3_CACHE_SIZE: c_int = 194;
-
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    fn sysconf(name: c_int) -> c_long;
 }
 
 pub fn log_rss() -> std::io::Result<()> {
@@ -189,86 +168,94 @@ pub fn total_ram() -> f64 {
     }
 }
 
-#[cfg(not(windows))]
-unsafe extern "C" {
-    fn mmap(
-        addr: *mut c_void,
-        length: usize,
-        prot: i32,
-        flags: i32,
-        fd: i32,
-        offset: isize,
-    ) -> *mut c_void;
-    fn munmap(addr: *mut c_void, length: usize) -> i32;
-    fn close(fd: i32) -> i32;
-}
-
-// POSIX declares `open` as `int open(const char *, int, ...)`. Rust's standard
-// library also treats this runtime symbol as variadic on Unix, even when
-// O_RDONLY means that no optional mode argument is passed.
-#[cfg(not(windows))]
-unsafe extern "C" {
-    fn open(pathname: *const c_char, flags: i32, ...) -> i32;
-}
-
-pub fn mmap_file(filename: &str) -> Result<(*mut u8, usize, i32), String> {
-    #[cfg(windows)]
-    {
-        let _ = filename;
-        Err("Memory mapping not supported on Windows.".to_string())
+/// Open `filename` as an owning, read-only memory map.
+///
+/// The map owns its platform mapping and releases it on drop.
+/// Unlike the former raw Unix-only helper, this intentionally uses memmap2's
+/// native Windows implementation as well.
+///
+/// # Safety
+///
+/// The caller must ensure that no process truncates or otherwise mutates the
+/// file while the returned map is alive. This is the safety condition required
+/// by all file-backed memory maps.
+pub unsafe fn mmap_file(filename: &str) -> Result<Mmap, String> {
+    let file = fs::File::open(filename).map_err(|_| format!("Error opening file: {filename}"))?;
+    if file.metadata().map(|metadata| metadata.len()).unwrap_or(0) == 0 {
+        return Err(format!(
+            "Error mapping file {filename}: empty files cannot be memory-mapped"
+        ));
     }
-    #[cfg(not(windows))]
-    {
-        const O_RDONLY: i32 = 0;
-        const PROT_READ: i32 = 1;
-        const MAP_SHARED: i32 = 1;
-        let c_filename =
-            CString::new(filename).map_err(|_| format!("Error opening file: {filename}"))?;
-        let fd = unsafe { open(c_filename.as_ptr(), O_RDONLY) };
-        if fd == -1 {
-            return Err(format!("Error opening file: {filename}"));
-        }
-        let length = fs::metadata(filename)
-            .map_err(|_| {
-                unsafe { close(fd) };
-                format!("Error calling fstat on file: {filename}")
-            })?
-            .len() as usize;
-        let addr = unsafe { mmap(std::ptr::null_mut(), length, PROT_READ, MAP_SHARED, fd, 0) };
-        if addr as isize == -1 {
-            unsafe { close(fd) };
-            return Err(format!("Error calling mmap on file: {filename}"));
-        }
-        Ok((addr as *mut u8, length, fd))
-    }
-}
-
-pub fn unmap_file(ptr: *mut u8, size: usize, fd: i32) {
-    #[cfg(windows)]
-    {
-        let _ = (ptr, size, fd);
-    }
-    #[cfg(not(windows))]
-    unsafe {
-        munmap(ptr as *mut c_void, size);
-        close(fd);
-    }
+    // SAFETY: this function creates a read-only map and never mutates the
+    // backing file itself. The external-mutation requirement is documented on
+    // the returned public API above.
+    unsafe { MmapOptions::new().map(&file) }
+        .map_err(|error| format!("Error mapping file {filename}: {error}"))
 }
 
 pub fn l3_cache_size() -> usize {
     #[cfg(target_os = "linux")]
     {
-        let s = unsafe { sysconf(_SC_LEVEL3_CACHE_SIZE) };
-        if s == -1 {
-            0
-        } else {
-            s as usize
-        }
+        linux_l3_cache_size_at(Path::new("/sys/devices/system/cpu"))
     }
     #[cfg(not(target_os = "linux"))]
     {
         0
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_l3_cache_size_at(cpu_root: &Path) -> usize {
+    let Ok(cpus) = fs::read_dir(cpu_root) else {
+        return 0;
+    };
+    let mut largest = 0;
+    for cpu in cpus.flatten() {
+        let cpu_name = cpu.file_name();
+        let cpu_name = cpu_name.to_string_lossy();
+        if !cpu_name.strip_prefix("cpu").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            continue;
+        }
+        let Ok(indices) = fs::read_dir(cpu.path().join("cache")) else {
+            continue;
+        };
+        for index in indices.flatten() {
+            if !index.file_name().to_string_lossy().starts_with("index") {
+                continue;
+            }
+            let path = index.path();
+            let level = fs::read_to_string(path.join("level")).unwrap_or_default();
+            let kind = fs::read_to_string(path.join("type")).unwrap_or_default();
+            if level.trim() != "3" || !matches!(kind.trim(), "Data" | "Unified") {
+                continue;
+            }
+            if let Ok(size) = fs::read_to_string(path.join("size")) {
+                largest = largest.max(parse_linux_cache_size(&size).unwrap_or(0));
+            }
+        }
+    }
+    largest
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_cache_size(value: &str) -> Option<usize> {
+    let value = value.trim();
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let amount = value[..digits].parse::<usize>().ok()?;
+    let suffix = value[digits..].trim().to_ascii_lowercase();
+    let multiplier = match suffix.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    amount.checked_mul(multiplier)
 }
 
 pub fn mkdir(dir: &str) -> Result<(), String> {
@@ -501,6 +488,50 @@ mod tests {
         log_rss().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_cache_sizes_without_overflow() {
+        assert_eq!(parse_linux_cache_size("32K\n"), Some(32 * 1024));
+        assert_eq!(parse_linux_cache_size("4 MiB"), Some(4 * 1024 * 1024));
+        assert_eq!(parse_linux_cache_size("1024"), Some(1024));
+        assert_eq!(parse_linux_cache_size(""), None);
+        assert_eq!(parse_linux_cache_size("K"), None);
+        assert_eq!(parse_linux_cache_size("12XB"), None);
+        assert_eq!(parse_linux_cache_size(&format!("{}G", usize::MAX)), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovers_largest_shared_l3_cache_from_sysfs_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "diamond-rs-cache-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let caches = [
+            ("cpu0/cache/index0", "1", "Data", "32K"),
+            ("cpu0/cache/index3", "3", "Unified", "8M"),
+            ("cpu1/cache/index3", "3", "Unified", "8M"),
+            ("cpu8/cache/index3", "3", "Data", "32M"),
+            ("cpu9/cache/index3", "3", "Instruction", "64M"),
+        ];
+        for (relative, level, kind, size) in caches {
+            let directory = root.join(relative);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("level"), level).unwrap();
+            fs::write(directory.join("type"), kind).unwrap();
+            fs::write(directory.join("size"), size).unwrap();
+        }
+        // Non-CPU directories must not affect discovery.
+        fs::create_dir_all(root.join("cpufreq/cache/index3")).unwrap();
+
+        assert_eq!(linux_l3_cache_size_at(&root), 32 * 1024 * 1024);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn test_directory_and_existing_extension_helpers() {
         let root = std::env::temp_dir().join(format!(
@@ -539,27 +570,37 @@ mod tests {
     }
 
     #[test]
-    fn test_mmap_file_and_unmap_file() {
-        #[cfg(not(windows))]
-        {
-            let path = std::env::temp_dir().join(format!(
-                "diamond-rs-mmap-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            fs::write(&path, b"abcd").unwrap();
-            let path_str = path.to_str().unwrap();
-            let (ptr, size, fd) = mmap_file(path_str).unwrap();
-            assert_eq!(size, 4);
-            unsafe {
-                assert_eq!(std::slice::from_raw_parts(ptr, size), b"abcd");
-            }
-            unmap_file(ptr, size, fd);
-            fs::remove_file(path).unwrap();
-        }
+    fn test_mmap_file_is_an_owning_slice() {
+        let path = std::env::temp_dir().join(format!(
+            "diamond-rs-mmap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"abcd").unwrap();
+        // SAFETY: this test exclusively owns the file until the map is dropped.
+        let map = unsafe { mmap_file(path.to_str().unwrap()) }.unwrap();
+        assert_eq!(&map[..], b"abcd");
+        drop(map);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_mmap_file_preserves_empty_file_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "diamond-rs-empty-mmap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, []).unwrap();
+        // SAFETY: this test exclusively owns the file during the attempted map.
+        assert!(unsafe { mmap_file(path.to_str().unwrap()) }.is_err());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -4,7 +4,7 @@ use super::simd_score::ScoreTarget;
 use super::simd_score8::BatchScores8;
 use crate::basic::value::Letter;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
-use crate::basic::value::{LETTER_MASK, SEED_MASK};
+use crate::basic::value::LETTER_MASK;
 use crate::stats::score_matrix::ScoreMatrix;
 
 #[cfg(target_arch = "aarch64")]
@@ -111,18 +111,32 @@ fn dispatch_banded(
     {
         if std::arch::is_x86_feature_detected!("sse4.1") {
             return Some(unsafe {
-                banded_sse41(query, targets, matrix, cbs, go, ge, semi, scratch)
+                if semi {
+                    banded_sse41::<true>(query, targets, matrix, cbs, go, ge, scratch)
+                } else {
+                    banded_sse41::<false>(query, targets, matrix, cbs, go, ge, scratch)
+                }
             });
         }
         if std::arch::is_x86_feature_detected!("ssse3") {
             return Some(unsafe {
-                banded_ssse3(query, targets, matrix, cbs, go, ge, semi, scratch)
+                if semi {
+                    banded_ssse3::<true>(query, targets, matrix, cbs, go, ge, scratch)
+                } else {
+                    banded_ssse3::<false>(query, targets, matrix, cbs, go, ge, scratch)
+                }
             });
         }
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
-        return Some(unsafe { banded_core(query, targets, matrix, cbs, go, ge, semi, scratch) });
+        return Some(unsafe {
+            if semi {
+                banded_core::<true>(query, targets, matrix, cbs, go, ge, scratch)
+            } else {
+                banded_core::<false>(query, targets, matrix, cbs, go, ge, scratch)
+            }
+        });
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = (query, targets, matrix, cbs, go, ge, semi, scratch);
@@ -142,15 +156,33 @@ fn dispatch_full(
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("sse4.1") {
-            return Some(unsafe { full_sse41(query, targets, matrix, cbs, go, ge, semi, scratch) });
+            return Some(unsafe {
+                if semi {
+                    full_sse41::<true>(query, targets, matrix, cbs, go, ge, scratch)
+                } else {
+                    full_sse41::<false>(query, targets, matrix, cbs, go, ge, scratch)
+                }
+            });
         }
         if std::arch::is_x86_feature_detected!("ssse3") {
-            return Some(unsafe { full_ssse3(query, targets, matrix, cbs, go, ge, semi, scratch) });
+            return Some(unsafe {
+                if semi {
+                    full_ssse3::<true>(query, targets, matrix, cbs, go, ge, scratch)
+                } else {
+                    full_ssse3::<false>(query, targets, matrix, cbs, go, ge, scratch)
+                }
+            });
         }
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("neon") {
-        return Some(unsafe { full_core(query, targets, matrix, cbs, go, ge, semi, scratch) });
+        return Some(unsafe {
+            if semi {
+                full_core::<true>(query, targets, matrix, cbs, go, ge, scratch)
+            } else {
+                full_core::<false>(query, targets, matrix, cbs, go, ge, scratch)
+            }
+        });
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = (query, targets, matrix, cbs, go, ge, semi, scratch);
@@ -159,59 +191,55 @@ fn dispatch_full(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse4.1")]
-unsafe fn banded_sse41(
+unsafe fn banded_sse41<const SEMI_GLOBAL: bool>(
     q: &[Letter],
     t: &[ScoreTarget<'_>],
     m: &[i8; 1024],
     c: &[i8],
     go: i8,
     ge: i8,
-    s: bool,
     x: &mut PortableScratch8,
 ) -> BatchScores8 {
-    banded_core(q, t, m, c, go, ge, s, x)
+    banded_core::<SEMI_GLOBAL>(q, t, m, c, go, ge, x)
 }
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "ssse3")]
-unsafe fn banded_ssse3(
+unsafe fn banded_ssse3<const SEMI_GLOBAL: bool>(
     q: &[Letter],
     t: &[ScoreTarget<'_>],
     m: &[i8; 1024],
     c: &[i8],
     go: i8,
     ge: i8,
-    s: bool,
     x: &mut PortableScratch8,
 ) -> BatchScores8 {
-    banded_core(q, t, m, c, go, ge, s, x)
+    banded_core::<SEMI_GLOBAL>(q, t, m, c, go, ge, x)
 }
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "sse4.1")]
-unsafe fn full_sse41(
+unsafe fn full_sse41<const SEMI_GLOBAL: bool>(
     q: &[Letter],
     t: &[&[Letter]],
     m: &[i8; 1024],
     c: &[i8],
     go: i8,
     ge: i8,
-    s: bool,
     x: &mut PortableScratch8,
 ) -> BatchScores8 {
-    full_core(q, t, m, c, go, ge, s, x)
+    full_core::<SEMI_GLOBAL>(q, t, m, c, go, ge, x)
 }
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "ssse3")]
-unsafe fn full_ssse3(
+unsafe fn full_ssse3<const SEMI_GLOBAL: bool>(
     q: &[Letter],
     t: &[&[Letter]],
     m: &[i8; 1024],
     c: &[i8],
     go: i8,
     ge: i8,
-    s: bool,
     x: &mut PortableScratch8,
 ) -> BatchScores8 {
-    full_core(q, t, m, c, go, ge, s, x)
+    full_core::<SEMI_GLOBAL>(q, t, m, c, go, ge, x)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
@@ -220,17 +248,16 @@ unsafe fn full_ssse3(
     target_feature(enable = "sse2")
 )]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-unsafe fn banded_core(
+unsafe fn banded_core<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],
     matrix: &[i8; 1024],
     cbs: &[i8],
     go: i8,
     ge: i8,
-    semi: bool,
     scratch: &mut PortableScratch8,
 ) -> BatchScores8 {
-    let delta = if semi { 0 } else { i8::MIN };
+    let delta = if SEMI_GLOBAL { 0 } else { i8::MIN };
     let band = targets
         .iter()
         .map(|t| (t.d_end - t.d_begin).max(0) as usize)
@@ -240,8 +267,7 @@ unsafe fn banded_core(
         return empty(targets.len());
     }
     let zero = splat(delta);
-    let neg = splat(i8::MIN);
-    prepare(scratch, band + 1, zero, neg);
+    prepare(scratch, band + 1, zero, zero);
     let gov = splat(go);
     let gev = splat(ge);
     let maxv = splat(i8::MAX);
@@ -249,15 +275,15 @@ unsafe fn banded_core(
     let mut overflow = splat(0);
     let max_len = targets.iter().map(|t| t.subject.len()).max().unwrap_or(0);
     for j in 0..max_len {
-        let (subject, seeded) = pack_banded_column(targets, j);
-        let profile_v = build_profile(matrix, subject, seeded);
+        let subject = pack_banded_column(targets, j);
+        let profile_v = build_profile(matrix, subject);
         let mut profile = [[0i8; 16]; 32];
         for (letter, vector) in profile_v.into_iter().enumerate() {
             profile[letter] = store(vector);
         }
         scratch.curr_h[band] = zero;
-        scratch.curr_e[band] = neg;
-        let mut vertical = neg;
+        scratch.curr_e[band] = zero;
+        let mut vertical = zero;
         for r in 0..band {
             let mut subst = [0i8; 16];
             let mut valid = [0i8; 16];
@@ -287,15 +313,15 @@ unsafe fn banded_core(
             let diag = adds(scratch.prev_h[r], load(subst));
             let horizontal = scratch.prev_e[r + 1];
             let mut h = max(diag, horizontal);
-            h = max(max(h, vertical), zero);
+            h = max(h, vertical);
             h = select(mask, h, zero);
             overflow = or(overflow, eq(h, maxv));
             let opened = subs(h, gov);
             let e = max(subs(horizontal, gev), opened);
             vertical = max(subs(vertical, gev), opened);
             scratch.curr_h[r] = h;
-            scratch.curr_e[r] = select(mask, e, neg);
-            vertical = select(mask, vertical, neg);
+            scratch.curr_e[r] = select(mask, e, zero);
+            vertical = select(mask, vertical, zero);
             best = max(best, h);
         }
         std::mem::swap(&mut scratch.prev_h, &mut scratch.curr_h);
@@ -310,20 +336,18 @@ unsafe fn banded_core(
     target_feature(enable = "sse2")
 )]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-unsafe fn full_core(
+unsafe fn full_core<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[&[Letter]],
     matrix: &[i8; 1024],
     cbs: &[i8],
     go: i8,
     ge: i8,
-    semi: bool,
     scratch: &mut PortableScratch8,
 ) -> BatchScores8 {
-    let delta = if semi { 0 } else { i8::MIN };
+    let delta = if SEMI_GLOBAL { 0 } else { i8::MIN };
     let zero = splat(delta);
-    let neg = splat(i8::MIN);
-    prepare(scratch, query.len() + 1, zero, neg);
+    prepare(scratch, query.len() + 1, zero, zero);
     let gov = splat(go);
     let gev = splat(ge);
     let maxv = splat(i8::MAX);
@@ -331,11 +355,11 @@ unsafe fn full_core(
     let mut overflow = splat(0);
     let max_len = targets.iter().map(|t| t.len()).max().unwrap_or(0);
     for j in 0..max_len {
-        let (subject, valid, seeded) = pack_full_column(targets, j);
-        let profile = build_profile(matrix, subject, seeded);
+        let (subject, valid) = pack_full_column(targets, j);
+        let profile = build_profile(matrix, subject);
         scratch.curr_h[0] = zero;
-        scratch.curr_e[0] = neg;
-        let mut vertical = neg;
+        scratch.curr_e[0] = zero;
+        let mut vertical = zero;
         for (q, &ql) in query.iter().enumerate() {
             let mask = valid;
             let cbs_v = splat(cbs.get(q).copied().unwrap_or(0));
@@ -344,15 +368,15 @@ unsafe fn full_core(
             let diag = adds(scratch.prev_h[q], adds(base, cbs_v));
             let horizontal = scratch.prev_e[q + 1];
             let mut h = max(diag, horizontal);
-            h = max(max(h, vertical), zero);
+            h = max(h, vertical);
             h = select(mask, h, zero);
             overflow = or(overflow, eq(h, maxv));
             let opened = subs(h, gov);
             let e = max(subs(horizontal, gev), opened);
             vertical = max(subs(vertical, gev), opened);
             scratch.curr_h[q + 1] = h;
-            scratch.curr_e[q + 1] = select(mask, e, neg);
-            vertical = select(mask, vertical, neg);
+            scratch.curr_e[q + 1] = select(mask, e, zero);
+            vertical = select(mask, vertical, zero);
             best = max(best, h);
         }
         std::mem::swap(&mut scratch.prev_h, &mut scratch.curr_h);
@@ -367,18 +391,16 @@ unsafe fn full_core(
     target_feature(enable = "sse2")
 )]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-unsafe fn pack_full_column(targets: &[&[Letter]], column: usize) -> (V, V, V) {
+unsafe fn pack_full_column(targets: &[&[Letter]], column: usize) -> (V, V) {
     let mut subject = [0i8; 16];
     let mut valid = [0i8; 16];
-    let mut seeded = [0i8; 16];
     for lane in 0..targets.len() {
         if let Some(&letter) = targets[lane].get(column) {
             subject[lane] = (letter & LETTER_MASK) as i8;
             valid[lane] = -1;
-            seeded[lane] = if letter & SEED_MASK != 0 { -1 } else { 0 };
         }
     }
-    (load(subject), load(valid), load(seeded))
+    (load(subject), load(valid))
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
@@ -387,21 +409,19 @@ unsafe fn pack_full_column(targets: &[&[Letter]], column: usize) -> (V, V, V) {
     target_feature(enable = "sse2")
 )]
 #[cfg_attr(target_arch = "aarch64", target_feature(enable = "neon"))]
-unsafe fn pack_banded_column(targets: &[ScoreTarget<'_>], column: usize) -> (V, V) {
+unsafe fn pack_banded_column(targets: &[ScoreTarget<'_>], column: usize) -> V {
     let mut subject = [0i8; 16];
-    let mut seeded = [0i8; 16];
     for lane in 0..targets.len() {
         if let Some(&letter) = targets[lane].subject.get(column) {
             subject[lane] = (letter & LETTER_MASK) as i8;
-            seeded[lane] = if letter & SEED_MASK != 0 { -1 } else { 0 };
         }
     }
-    (load(subject), load(seeded))
+    load(subject)
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "ssse3")]
-unsafe fn build_profile(matrix: &[i8; 1024], subject: V, seeded: V) -> [V; 32] {
+unsafe fn build_profile(matrix: &[i8; 1024], subject: V) -> [V; 32] {
     let index = arch::_mm_and_si128(subject, arch::_mm_set1_epi8(15));
     let high_mask = arch::_mm_cmpgt_epi8(subject, arch::_mm_set1_epi8(15));
     let zero = arch::_mm_setzero_si128();
@@ -413,14 +433,14 @@ unsafe fn build_profile(matrix: &[i8; 1024], subject: V, seeded: V) -> [V; 32] {
         let lo_score = arch::_mm_shuffle_epi8(low, index);
         let hi_score = arch::_mm_shuffle_epi8(high, index);
         let score = select(high_mask, hi_score, lo_score);
-        *slot = select(seeded, zero, score);
+        *slot = score;
     }
     profile
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn build_profile(matrix: &[i8; 1024], subject: V, seeded: V) -> [V; 32] {
+unsafe fn build_profile(matrix: &[i8; 1024], subject: V) -> [V; 32] {
     let index = arch::vandq_s8(subject, arch::vdupq_n_s8(15));
     let high_mask = arch::vcgtq_s8(subject, arch::vdupq_n_s8(15));
     let zero = arch::vdupq_n_s8(0);
@@ -432,7 +452,7 @@ unsafe fn build_profile(matrix: &[i8; 1024], subject: V, seeded: V) -> [V; 32] {
         let lo_score = arch::vqtbl1q_s8(low, arch::vreinterpretq_u8_s8(index));
         let hi_score = arch::vqtbl1q_s8(high, arch::vreinterpretq_u8_s8(index));
         let score = arch::vbslq_s8(high_mask, hi_score, lo_score);
-        *slot = arch::vbslq_s8(arch::vreinterpretq_u8_s8(seeded), zero, score);
+        *slot = score;
     }
     profile
 }
@@ -597,8 +617,15 @@ unsafe fn select(m: V, y: V, n: V) -> V {
 ))]
 mod tests {
     use super::*;
-    fn scalar(query: &[Letter], target: ScoreTarget<'_>, matrix: &ScoreMatrix, cbs: &[i8]) -> i32 {
-        let neg = i32::MIN / 4;
+    use crate::basic::value::SEED_MASK;
+    fn scalar(
+        query: &[Letter],
+        target: ScoreTarget<'_>,
+        matrix: &ScoreMatrix,
+        cbs: &[i8],
+        semi_global: bool,
+    ) -> i32 {
+        let neg = if semi_global { 0 } else { i32::MIN / 4 };
         let go = matrix.gap_open() + matrix.gap_extend();
         let ge = matrix.gap_extend();
         let mut ph = vec![0; query.len() + 1];
@@ -611,15 +638,27 @@ mod tests {
             for i in 1..=query.len() {
                 let q = i - 1;
                 if q as i32 >= target.d_begin + j as i32 && (q as i32) < target.d_end + j as i32 {
-                    let subst = if sl & SEED_MASK != 0 {
-                        0
+                    let subst = matrix.score(query[q] & LETTER_MASK, sl & LETTER_MASK)
+                        + cbs.get(q).copied().unwrap_or(0) as i32;
+                    let diag = if semi_global {
+                        (ph[i - 1] + subst.clamp(i8::MIN as i32, i8::MAX as i32))
+                            .clamp(i8::MIN as i32, i8::MAX as i32)
                     } else {
-                        matrix.score(query[q] & LETTER_MASK, sl & LETTER_MASK)
-                    } + cbs.get(q).copied().unwrap_or(0) as i32;
-                    let h = (ph[i - 1] + subst).max(pe[i]).max(f).max(0);
+                        ph[i - 1] + subst
+                    };
+                    let h = diag.max(pe[i]).max(f);
+                    let h = if semi_global { h } else { h.max(0) };
                     ch[i] = h;
-                    ce[i] = (pe[i] - ge).max(h - go);
-                    f = (f - ge).max(h - go);
+                    let gap_sub = |value: i32, penalty: i32| {
+                        let value = value - penalty;
+                        if semi_global {
+                            value.clamp(i8::MIN as i32, i8::MAX as i32)
+                        } else {
+                            value
+                        }
+                    };
+                    ce[i] = gap_sub(pe[i], ge).max(gap_sub(h, go));
+                    f = gap_sub(f, ge).max(gap_sub(h, go));
                     best = best.max(h);
                 }
             }
@@ -684,7 +723,7 @@ mod tests {
         got: BatchScores8,
     ) {
         for lane in 0..targets.len() {
-            let expected = scalar(query, targets[lane], matrix, cbs);
+            let expected = scalar(query, targets[lane], matrix, cbs, semi);
             let ceiling = if semi { 127 } else { 255 };
             if expected >= ceiling {
                 assert_ne!(
@@ -705,6 +744,42 @@ mod tests {
                 score_batch_portable_i8(q, t, m, c, s, &mut PortableScratch8::default()).unwrap();
             assert_scores(q, t, m, c, s, got);
         });
+    }
+
+    #[test]
+    fn portable_i8_treats_seed_mask_as_lookup_only_metadata() {
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let query = vec![17; 8];
+        let plain = vec![17; 8];
+        let marked: Vec<_> = plain.iter().map(|&letter| letter | SEED_MASK).collect();
+        let targets = [
+            ScoreTarget {
+                subject: &plain,
+                d_begin: 0,
+                d_end: 1,
+            },
+            ScoreTarget {
+                subject: &marked,
+                d_begin: 0,
+                d_end: 1,
+            },
+        ];
+        let mut scratch = PortableScratch8::default();
+        let banded =
+            score_batch_portable_i8(&query, &targets, &matrix, &[], false, &mut scratch).unwrap();
+        assert_eq!(banded.overflow_mask, 0);
+        assert_eq!(banded.scores[0], banded.scores[1]);
+        let full = score_full_batch_portable_i8(
+            &query,
+            &[plain.as_slice(), marked.as_slice()],
+            &matrix,
+            &[],
+            false,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(full.overflow_mask, 0);
+        assert_eq!(full.scores[0], full.scores[1]);
     }
     #[test]
     fn randomized_full_matches_scalar_or_promotes() {
@@ -737,14 +812,13 @@ mod tests {
         }];
         if std::arch::is_x86_feature_detected!("ssse3") {
             let got = unsafe {
-                banded_ssse3(
+                banded_ssse3::<false>(
                     &q,
                     &t,
                     m.matrix8(),
                     &[],
                     12,
                     1,
-                    false,
                     &mut PortableScratch8::default(),
                 )
             };
@@ -752,14 +826,13 @@ mod tests {
         }
         if std::arch::is_x86_feature_detected!("sse4.1") {
             let got = unsafe {
-                banded_sse41(
+                banded_sse41::<false>(
                     &q,
                     &t,
                     m.matrix8(),
                     &[],
                     12,
                     1,
-                    false,
                     &mut PortableScratch8::default(),
                 )
             };
@@ -798,11 +871,41 @@ mod tests {
             &targets,
             &matrix,
             &[],
+            true,
             &mut PortableSimdScoreScratch::default(),
         )
         .unwrap();
         assert_eq!(promoted.overflow_mask, 0);
-        assert_eq!(promoted.scores[0], scalar(&query, targets[0], &matrix, &[]));
         assert_eq!(promoted.scores[0], 220);
+    }
+
+    #[test]
+    fn semi_global_does_not_clamp_each_cell_to_zero() {
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let query: Vec<Letter> = b"011000010110111010111100000101"
+            .iter()
+            .map(|&x| (x - b'0') as Letter)
+            .collect();
+        let subject: Vec<Letter> = b"11010110011001100101010101"
+            .iter()
+            .map(|&x| (x - b'0') as Letter)
+            .collect();
+        let targets = [ScoreTarget {
+            subject: &subject,
+            d_begin: -3,
+            d_end: 13,
+        }];
+        let got = score_batch_portable_i8(
+            &query,
+            &targets,
+            &matrix,
+            &[],
+            true,
+            &mut PortableScratch8::default(),
+        )
+        .unwrap();
+        assert_eq!(got.overflow_mask, 0);
+        assert_eq!(got.scores[0], 69);
+        assert_eq!(scalar(&query, targets[0], &matrix, &[], true), 69);
     }
 }

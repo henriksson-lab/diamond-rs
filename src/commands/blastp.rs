@@ -12,6 +12,7 @@ use crate::basic::seed::{seed_partition, seedp_count, seedp_mask};
 use crate::basic::shape::Shape;
 use crate::basic::statistics::Statistics;
 use crate::basic::value::{Letter, SequenceType};
+use crate::chaining::HammingExtConfig;
 use crate::config::Sensitivity;
 use crate::data::block::Block;
 use crate::data::fasta;
@@ -33,6 +34,7 @@ use crate::search::{parallel, sensitivity};
 use crate::stats::cbs::CbsMode;
 use crate::stats::score_matrix::{CutoffTable2D, ScoreMatrix};
 use crate::util::algo::PatternMatcher;
+use crate::util::system::trim_freed_heap_pages;
 
 #[inline]
 fn stage2_query_bounds(query_len: usize, seed_pos: usize) -> (usize, usize) {
@@ -128,7 +130,7 @@ fn run_ungapped_kernel<const KERNEL: u8>(
 struct AdaptiveHitStore {
     memory: Option<Vec<Vec<CompactHit>>>,
     disk: Option<HitBuffer>,
-    memory_limit: Option<usize>,
+    memory_limit: Option<u64>,
     tmpdir: PathBuf,
     query_count: usize,
     query_bins: usize,
@@ -144,7 +146,7 @@ impl AdaptiveHitStore {
         query_bins: usize,
         max_subject: u64,
         query_group_size: usize,
-        memory_limit: Option<usize>,
+        memory_limit: Option<u64>,
         tmpdir: PathBuf,
     ) -> Self {
         Self {
@@ -173,7 +175,10 @@ impl AdaptiveHitStore {
                 self.rss_checked_once = true;
                 self.bytes_since_rss_check = 0;
                 let limit = self.memory_limit.unwrap();
-                if crate::util::system::get_current_rss().saturating_add(incoming_bytes) >= limit {
+                if (crate::util::system::get_current_rss() as u64)
+                    .saturating_add(incoming_bytes as u64)
+                    >= limit
+                {
                     self.spill_to_disk()?;
                 }
             }
@@ -236,6 +241,7 @@ impl AdaptiveHitStore {
         .map_err(io::Error::other)?;
 
         let memory = self.memory.take().unwrap_or_default();
+        let migrated_hits = memory.iter().map(Vec::len).sum::<usize>();
         for (query, hits) in memory.into_iter().enumerate() {
             for hit in hits {
                 disk.append_disk_hit(Hit::with_score(
@@ -250,7 +256,7 @@ impl AdaptiveHitStore {
         disk.take_error().map_err(io::Error::other)?;
         self.disk = Some(disk);
         eprintln!(
-            "Hit buffer: RSS reached --memory-limit; spilling retained hits to {}",
+            "Hit buffer: RSS reached --memory-limit; spilling {migrated_hits} retained hits to {}",
             if self.tmpdir.as_os_str().is_empty() {
                 std::env::temp_dir().display().to_string()
             } else {
@@ -583,18 +589,6 @@ fn filter_partition_to_hits_impl<
     ungapped_count
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-unsafe extern "C" {
-    fn malloc_trim(pad: usize) -> i32;
-}
-
-fn trim_freed_heap_pages() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        let _ = malloc_trim(0);
-    }
-}
-
 /// Port of `align.cpp::make_partition` for translated queries. Hit records
 /// are already grouped by context, so count all six contexts of a source and
 /// extend every threshold crossing through that complete source query.
@@ -700,7 +694,7 @@ pub struct BlastpConfig {
     pub ungapped_xdrop_bits: f64,
     /// Soft process-RSS ceiling. Once reached, retained seed hits are stored in
     /// compressed temporary bins. `None` keeps the all-in-memory fast path.
-    pub memory_limit: Option<usize>,
+    pub memory_limit: Option<u64>,
     /// Directory for spill files; an empty path uses the OS temporary directory.
     pub tmpdir: PathBuf,
     /// Internal blastx layout. When present, every source query contributes
@@ -822,7 +816,9 @@ struct ExtensionWorkerScratch {
 /// 5. Perform gapped Smith-Waterman alignment
 /// 6. Filter by e-value and output
 pub fn run(config: &BlastpConfig) -> io::Result<()> {
-    run_impl(config, None, None, None, None, false, false, false, 0.0)
+    run_impl(
+        config, None, None, None, None, false, false, false, false, 0.0, false, None,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -851,8 +847,11 @@ pub fn run_edges_in_memory(
     queries: Vec<fasta::FastaRecord>,
     approx_min_id: f64,
     linear_stage1_query: bool,
+    linear_stage1_target: bool,
     self_search: bool,
     query_or_target_cover: f64,
+    mutual_cover: bool,
+    hamming_ext: HammingExtConfig,
 ) -> io::Result<Vec<InMemorySearchEdge>> {
     let edges = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     run_impl(
@@ -863,8 +862,11 @@ pub fn run_edges_in_memory(
         Some(approx_min_id),
         true,
         linear_stage1_query,
+        linear_stage1_target,
         self_search,
         query_or_target_cover,
+        mutual_cover,
+        Some(hamming_ext),
     )?;
     let result = edges.lock().unwrap().clone();
     Ok(result)
@@ -878,8 +880,11 @@ fn run_impl(
     approx_min_id_override: Option<f64>,
     soft_tantan_override: bool,
     linear_stage1_query: bool,
+    linear_stage1_target: bool,
     self_search: bool,
     query_or_target_cover: f64,
+    mutual_cover: bool,
+    hamming_ext: Option<HammingExtConfig>,
 ) -> io::Result<()> {
     let start = Instant::now();
 
@@ -1640,11 +1645,15 @@ fn run_impl(
         };
         let query_comp = crate::stats::cbs::compute_composition(query);
         let ungapped_cfg = UngappedStageConfig {
+            hamming_ext: hamming_ext.unwrap_or_default(),
+            mutual_cover,
+            lin_stage1_query: linear_stage1_query,
+            lin_stage1_target: linear_stage1_target,
             comp_based_stats: config.comp_based_stats,
             xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
             ..UngappedStageConfig::default()
         };
-        let ext_mode = if linear_stage1_query {
+        let ext_mode = if linear_stage1_query || linear_stage1_target {
             sensitivity::ExtensionMode::Full
         } else {
             sensitivity::default_ext_mode(config.sensitivity)
@@ -1739,7 +1748,8 @@ fn run_impl(
                         qcovhsp: if query.is_empty() {
                             0.0
                         } else {
-                            100.0 * hsp.query_range.length() as f32 / query.len() as f32
+                            (hsp.query_source_range.length() as f64 * 100.0 / query.len() as f64)
+                                as f32
                         },
                         scovhsp: {
                             let target_len =
@@ -1747,7 +1757,8 @@ fn run_impl(
                             if target_len == 0 {
                                 0.0
                             } else {
-                                100.0 * hsp.subject_range.length() as f32 / target_len as f32
+                                (hsp.subject_range.length() as f64 * 100.0 / target_len as f64)
+                                    as f32
                             }
                         },
                         // Output::Format::Edge serializes corrected bit score
@@ -1846,11 +1857,15 @@ fn run_impl(
             let ungapped_cfg = UngappedStageConfig {
                 query_contexts: 6,
                 query_translated: true,
+                hamming_ext: hamming_ext.unwrap_or_default(),
+                mutual_cover,
+                lin_stage1_query: linear_stage1_query,
+                lin_stage1_target: linear_stage1_target,
                 comp_based_stats: config.comp_based_stats,
                 xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
                 ..UngappedStageConfig::default()
             };
-            let ext_mode = if linear_stage1_query {
+            let ext_mode = if linear_stage1_query || linear_stage1_target {
                 sensitivity::ExtensionMode::Full
             } else {
                 sensitivity::default_ext_mode(config.sensitivity)

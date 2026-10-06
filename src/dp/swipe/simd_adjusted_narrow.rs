@@ -7,7 +7,7 @@
 use super::simd_trace::TraceTarget;
 use crate::basic::value::Letter;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-use crate::basic::value::{LETTER_MASK, SEED_MASK};
+use crate::basic::value::LETTER_MASK;
 use crate::stats::score_matrix::ScoreMatrix;
 
 #[cfg(target_arch = "x86")]
@@ -35,6 +35,7 @@ pub fn score_batch_avx2_i8(
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
     cbs: &[i8],
+    semi_global: bool,
 ) -> Option<AdjustedScores> {
     if !valid(query, targets, cbs, 32) {
         return None;
@@ -42,7 +43,13 @@ pub fn score_batch_avx2_i8(
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: AVX2 is runtime detected; fixed arrays cover every lane.
-        return Some(unsafe { score_i8(query, targets, matrix, cbs) });
+        return Some(unsafe {
+            if semi_global {
+                score_i8::<true>(query, targets, matrix, cbs)
+            } else {
+                score_i8::<false>(query, targets, matrix, cbs)
+            }
+        });
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     let _ = matrix;
@@ -56,6 +63,7 @@ pub fn score_batch_avx2_i16(
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
     cbs: &[i8],
+    semi_global: bool,
 ) -> Option<AdjustedScores> {
     if !valid(query, targets, cbs, 16) {
         return None;
@@ -63,7 +71,13 @@ pub fn score_batch_avx2_i16(
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: AVX2 is runtime detected; fixed arrays cover every lane.
-        return Some(unsafe { score_i16(query, targets, matrix, cbs) });
+        return Some(unsafe {
+            if semi_global {
+                score_i16::<true>(query, targets, matrix, cbs)
+            } else {
+                score_i16::<false>(query, targets, matrix, cbs)
+            }
+        });
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     let _ = matrix;
@@ -103,7 +117,7 @@ fn geometry<const LANES: usize>(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn score_i8(
+unsafe fn score_i8<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
@@ -111,7 +125,8 @@ unsafe fn score_i8(
 ) -> AdjustedScores {
     const LANES: usize = 32;
     let (band, i0, starts, offsets, cols) = geometry::<LANES>(query.len(), targets);
-    let zero = arch::_mm256_set1_epi8(i8::MIN);
+    let delta = if SEMI_GLOBAL { 0 } else { i8::MIN };
+    let zero = arch::_mm256_set1_epi8(delta);
     let max = arch::_mm256_set1_epi8(i8::MAX);
     let mut ph = vec![zero; band];
     let mut ch = vec![zero; band];
@@ -149,9 +164,7 @@ unsafe fn score_i8(
             pos[lane] = p as usize;
             let sl = targets[lane].subject[p as usize];
             for ql in 0..32 {
-                if sl & SEED_MASK != 0 {
-                    profile[ql][lane] = 0;
-                } else if let Some(adjusted) = targets[lane].matrix {
+                if let Some(adjusted) = targets[lane].matrix {
                     profile[ql][lane] = adjusted.scores[(sl & LETTER_MASK) as usize * 32 + ql];
                 } else {
                     profile[ql][lane] = matrix.matrix8()[ql * 32 + (sl & LETTER_MASK) as usize];
@@ -187,7 +200,9 @@ unsafe fn score_i8(
             let horizontal = pe[r + 1];
             let mut h = arch::_mm256_max_epi8(diag, horizontal);
             h = arch::_mm256_max_epi8(h, vertical);
-            h = arch::_mm256_max_epi8(h, zero);
+            if !SEMI_GLOBAL {
+                h = arch::_mm256_max_epi8(h, zero);
+            }
             h = arch::_mm256_blendv_epi8(zero, h, mv);
             overflow |= arch::_mm256_movemask_epi8(arch::_mm256_cmpeq_epi8(h, max)) as u32;
             let open = arch::_mm256_subs_epi8(h, gov);
@@ -206,7 +221,7 @@ unsafe fn score_i8(
     AdjustedScores {
         scores: raw[..targets.len()]
             .iter()
-            .map(|&x| i32::from(x) - i32::from(i8::MIN))
+            .map(|&x| i32::from(x) - i32::from(delta))
             .collect(),
         overflow_mask: overflow & ((1u64 << targets.len()).wrapping_sub(1) as u32),
     }
@@ -214,7 +229,7 @@ unsafe fn score_i8(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
-unsafe fn score_i16(
+unsafe fn score_i16<const SEMI_GLOBAL: bool>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
@@ -222,7 +237,8 @@ unsafe fn score_i16(
 ) -> AdjustedScores {
     const LANES: usize = 16;
     let (band, i0, starts, offsets, cols) = geometry::<LANES>(query.len(), targets);
-    let zero = arch::_mm256_set1_epi16(i16::MIN);
+    let delta = if SEMI_GLOBAL { 0 } else { i16::MIN };
+    let zero = arch::_mm256_set1_epi16(delta);
     let max = arch::_mm256_set1_epi16(i16::MAX);
     let mut ph = vec![zero; band];
     let mut ch = vec![zero; band];
@@ -258,9 +274,7 @@ unsafe fn score_i16(
             live[lane] = true;
             let sl = targets[lane].subject[p as usize];
             for ql in 0..32 {
-                profile[ql][lane] = if sl & SEED_MASK != 0 {
-                    0
-                } else if let Some(adjusted) = targets[lane].matrix {
+                profile[ql][lane] = if let Some(adjusted) = targets[lane].matrix {
                     i16::from(adjusted.scores[(sl & LETTER_MASK) as usize * 32 + ql])
                 } else {
                     i16::from(matrix.matrix8()[ql * 32 + (sl & LETTER_MASK) as usize])
@@ -290,7 +304,9 @@ unsafe fn score_i16(
             let horizontal = pe[r + 1];
             let mut h = arch::_mm256_max_epi16(diag, horizontal);
             h = arch::_mm256_max_epi16(h, vertical);
-            h = arch::_mm256_max_epi16(h, zero);
+            if !SEMI_GLOBAL {
+                h = arch::_mm256_max_epi16(h, zero);
+            }
             h = arch::_mm256_blendv_epi8(zero, h, mv);
             let saturated = arch::_mm256_movemask_epi8(arch::_mm256_cmpeq_epi16(h, max)) as u32;
             for lane in 0..targets.len() {
@@ -314,8 +330,55 @@ unsafe fn score_i16(
     AdjustedScores {
         scores: raw[..targets.len()]
             .iter()
-            .map(|&x| i32::from(x) - i32::from(i16::MIN))
+            .map(|&x| i32::from(x) - i32::from(delta))
             .collect(),
         overflow_mask: overflow,
+    }
+}
+
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+mod tests {
+    use super::*;
+    use crate::basic::value::SEED_MASK;
+    use crate::stats::cbs::TargetMatrix;
+
+    #[test]
+    fn adjusted_narrow_tiers_treat_seed_mask_as_lookup_only_metadata() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 10_000).unwrap();
+        let adjusted = TargetMatrix::new(
+            (0..1024)
+                .map(|index| if index / 32 == index % 32 { 5 } else { -3 })
+                .collect(),
+            -3,
+            5,
+        );
+        let query = vec![7; 12];
+        let plain = vec![7; 12];
+        let marked: Vec<_> = plain.iter().map(|&letter| letter | SEED_MASK).collect();
+        let targets = [
+            TraceTarget {
+                subject: &plain,
+                d_begin: 0,
+                d_end: 1,
+                matrix: Some(&adjusted),
+                matrix_scale: 1,
+            },
+            TraceTarget {
+                subject: &marked,
+                d_begin: 0,
+                d_end: 1,
+                matrix: Some(&adjusted),
+                matrix_scale: 1,
+            },
+        ];
+        let byte = score_batch_avx2_i8(&query, &targets, &matrix, &[], false).unwrap();
+        assert_eq!(byte.overflow_mask, 0);
+        assert_eq!(byte.scores[0], byte.scores[1]);
+        let word = score_batch_avx2_i16(&query, &targets, &matrix, &[], false).unwrap();
+        assert_eq!(word.overflow_mask, 0);
+        assert_eq!(word.scores[0], word.scores[1]);
     }
 }

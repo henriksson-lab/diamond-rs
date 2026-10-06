@@ -1,13 +1,11 @@
 //! Translation of `diamond/src/util/io/file.{h,cpp}`.
 
+use super::{IoError, IoResult};
 use std::fs::{File as StdFile, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::fd::FromRawFd;
 
 #[cfg(unix)]
 use super::TempFileData;
-use super::{IoError, IoResult};
 
 #[derive(Debug)]
 pub struct File {
@@ -63,9 +61,9 @@ impl File {
         #[cfg(unix)]
         {
             let mut data = TempFileData::init(true)?;
-            let fd = data.take_fd();
+            let file = data.take_file()?;
             return Ok(Self {
-                file: Some(unsafe { StdFile::from_raw_fd(fd) }),
+                file: Some(file),
                 auto_delete: true,
                 unlinked: data.unlinked,
                 file_name: data.name.clone(),

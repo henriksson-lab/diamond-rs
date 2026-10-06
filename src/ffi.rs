@@ -21,8 +21,9 @@ pub fn run_cpp(args: &[&str]) -> i32 {
         .map(|s| CString::new(*s).expect("argument contains null byte"))
         .collect();
     let c_ptrs: Vec<*const c_char> = c_strings.iter().map(|s| s.as_ptr()).collect();
+    let argc = c_int::try_from(c_ptrs.len()).expect("too many arguments for C++ adapter");
 
-    unsafe { diamond_main(c_ptrs.len() as c_int, c_ptrs.as_ptr()) }
+    unsafe { diamond_main(argc, c_ptrs.as_ptr()) }
 }
 
 /// Backward-compatible name for the optional C++ conformance adapter.

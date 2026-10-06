@@ -1,6 +1,7 @@
 pub mod algo;
 pub mod binary_buffer;
 pub mod command_line_parser;
+pub(crate) mod compat_rng;
 pub mod data_structures;
 pub mod endianness;
 pub mod enum_utils;

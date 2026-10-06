@@ -6,6 +6,7 @@
 //! same anchored band semantics per target.
 
 use crate::basic::value::{Letter, LETTER_MASK};
+use crate::dp::score_profile::LongScoreProfile;
 use crate::stats::cbs::TargetMatrix;
 use crate::stats::score_matrix::ScoreMatrix;
 use std::sync::Arc;
@@ -109,6 +110,16 @@ pub fn smith_waterman(
     targets: &mut [Target],
     score_matrix: &ScoreMatrix,
 ) -> Stats {
+    smith_waterman_profiled(query, targets, score_matrix, None, None)
+}
+
+pub(crate) fn smith_waterman_profiled(
+    query: &[Letter],
+    targets: &mut [Target],
+    score_matrix: &ScoreMatrix,
+    profile: Option<&LongScoreProfile<i16>>,
+    profile_reverse: Option<&LongScoreProfile<i16>>,
+) -> Stats {
     let mut stats = Stats::default();
     let neg_inf = i32::MIN / 4;
 
@@ -163,7 +174,17 @@ pub fn smith_waterman(
                 let s = target.seq[target_pos] & LETTER_MASK;
                 let current = idx(i, j);
                 let substitution = target.matrix.as_ref().map_or_else(
-                    || score_matrix.score(q, s),
+                    || {
+                        let active_profile = if target.reverse {
+                            profile_reverse
+                        } else {
+                            profile
+                        };
+                        active_profile.map_or_else(
+                            || score_matrix.score(q, s),
+                            |profile| profile.get(s, qpos as usize)[0] as i32,
+                        )
+                    },
                     |matrix| matrix.scores[s as usize * 32 + q as usize] as i32,
                 );
                 let diag = h[idx(i - 1, j - 1)] + substitution;
@@ -204,15 +225,27 @@ pub fn smith_waterman_simd(
     targets: &mut [Target],
     score_matrix: &ScoreMatrix,
 ) -> Stats {
+    smith_waterman_simd_profiled(query, targets, score_matrix, None, None)
+}
+
+pub(crate) fn smith_waterman_simd_profiled(
+    query: &[Letter],
+    targets: &mut [Target],
+    score_matrix: &ScoreMatrix,
+    profile: Option<&LongScoreProfile<i16>>,
+    profile_reverse: Option<&LongScoreProfile<i16>>,
+) -> Stats {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             // SAFETY: AVX2 was detected at runtime. The implementation only
             // accesses slices after explicit bounds checks.
-            return unsafe { smith_waterman_avx2(query, targets, score_matrix) };
+            return unsafe {
+                smith_waterman_avx2(query, targets, score_matrix, profile, profile_reverse)
+            };
         }
     }
-    smith_waterman(query, targets, score_matrix)
+    smith_waterman_profiled(query, targets, score_matrix, profile, profile_reverse)
 }
 
 #[cfg(target_arch = "x86")]
@@ -226,6 +259,8 @@ unsafe fn smith_waterman_avx2(
     query: &[Letter],
     targets: &mut [Target],
     score_matrix: &ScoreMatrix,
+    profile: Option<&LongScoreProfile<i16>>,
+    profile_reverse: Option<&LongScoreProfile<i16>>,
 ) -> Stats {
     const LANES: usize = 8;
     // Low enough that subtracting ordinary protein gap penalties stays well
@@ -322,7 +357,17 @@ unsafe fn smith_waterman_avx2(
                     let q = query[qidx] & LETTER_MASK;
                     let s = target.seq[target_pos] & LETTER_MASK;
                     subst[lane] = target.matrix.as_ref().map_or_else(
-                        || score_matrix.score(q, s),
+                        || {
+                            let active_profile = if target.reverse {
+                                profile_reverse
+                            } else {
+                                profile
+                            };
+                            active_profile.map_or_else(
+                                || score_matrix.score(q, s),
+                                |profile| profile.get(s, qpos as usize)[0] as i32,
+                            )
+                        },
                         |matrix| matrix.scores[s as usize * 32 + q as usize] as i32,
                     );
                     let scale = target.matrix_scale.max(1);
@@ -393,6 +438,7 @@ pub use crate::dp::swipe::anchored_wrapper::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dp::score_profile::make_profile16;
 
     #[test]
     fn target_cells_match_banded_geometry() {
@@ -465,6 +511,37 @@ mod tests {
                     "count={count} lane={lane}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn anchored_kernels_use_forward_and_reverse_query_profiles() {
+        let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query = vec![0, 0, 0];
+        let profile = make_profile16(&query, Some(&[-2, -2, -2]), query.len() + 32, &matrix);
+        let profile_reverse = profile.reverse();
+        for reverse in [false, true] {
+            let target = Target::new(vec![0, 0, 0], 0, 1, 0, 3, 0, reverse);
+            let mut raw = vec![target.clone()];
+            let mut scalar = vec![target.clone()];
+            let mut simd = vec![target];
+            smith_waterman(&query, &mut raw, &matrix);
+            smith_waterman_profiled(
+                &query,
+                &mut scalar,
+                &matrix,
+                Some(&profile),
+                Some(&profile_reverse),
+            );
+            smith_waterman_simd_profiled(
+                &query,
+                &mut simd,
+                &matrix,
+                Some(&profile),
+                Some(&profile_reverse),
+            );
+            assert_ne!(scalar[0].score, raw[0].score);
+            assert_eq!(simd, scalar);
         }
     }
 }
