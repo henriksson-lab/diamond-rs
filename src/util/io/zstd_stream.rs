@@ -3,13 +3,18 @@
 use std::fs::File as StdFile;
 use std::io::Read;
 
-use zstd::zstd_safe::{CCtx, DCtx, InBuffer, OutBuffer};
+use zstd_pure_rs::decompress::zstd_decompress::ZSTD_decompressContinue_into_history;
+use zstd_pure_rs::prelude::{
+    ERR_getErrorName, ERR_isError, ZSTD_CStream, ZSTD_DStream, ZSTD_compressStream,
+    ZSTD_createCStream, ZSTD_createDStream, ZSTD_decompress, ZSTD_endStream, ZSTD_initCStream,
+    ZSTD_initDStream, ZSTD_nextSrcSizeToDecompress, ZSTD_resetDStream, ZSTD_CLEVEL_DEFAULT,
+};
 
 use super::{InputStreamBuffer, IoError, IoResult, OutputStreamBuffer, StreamEntity};
 
 pub struct ZstdSink<S: StreamEntity> {
     prev: OutputStreamBuffer<S>,
-    stream: Option<CCtx<'static>>,
+    stream: Option<Box<ZSTD_CStream>>,
 }
 
 impl<S: StreamEntity> std::fmt::Debug for ZstdSink<S> {
@@ -23,11 +28,10 @@ impl<S: StreamEntity> std::fmt::Debug for ZstdSink<S> {
 
 impl<S: StreamEntity> ZstdSink<S> {
     pub fn new(prev: OutputStreamBuffer<S>) -> Self {
-        let mut stream = CCtx::create();
+        let mut stream = ZSTD_createCStream().expect("ZSTD_createCStream error");
         // `ZSTD_createCStream` uses the default compression level.
-        stream
-            .init(zstd::DEFAULT_COMPRESSION_LEVEL)
-            .expect("ZSTD_createCStream error");
+        let result = ZSTD_initCStream(&mut stream, ZSTD_CLEVEL_DEFAULT);
+        assert!(!ERR_isError(result), "ZSTD_initCStream error");
         Self {
             prev,
             stream: Some(stream),
@@ -41,19 +45,32 @@ impl<S: StreamEntity> StreamEntity for ZstdSink<S> {
             .stream
             .as_mut()
             .ok_or_else(|| IoError::Other("ZSTD_compressStream".to_string()))?;
-        let mut input = InBuffer::around(ptr);
-        loop {
+        let mut input_position = 0;
+        while input_position < ptr.len() {
+            let input_before = input_position;
             let output_position = {
                 let (buffer, _) = self.prev.write_buffer_range();
-                let mut output = OutBuffer::around(buffer);
-                stream
-                    .compress_stream(&mut output, &mut input)
-                    .map_err(|_| IoError::Other("ZSTD_compressStream".to_string()))?;
-                output.pos()
+                let mut output_position = 0;
+                let result = ZSTD_compressStream(
+                    stream,
+                    buffer,
+                    &mut output_position,
+                    ptr,
+                    &mut input_position,
+                );
+                if ERR_isError(result) {
+                    return Err(IoError::Other(format!(
+                        "ZSTD_compressStream: {}",
+                        ERR_getErrorName(result)
+                    )));
+                }
+                output_position
             };
             self.prev.flush_count(output_position)?;
-            if input.pos() == ptr.len() {
-                break;
+            if input_position == input_before && output_position == 0 {
+                return Err(IoError::Other(
+                    "ZSTD_compressStream: no progress".to_string(),
+                ));
             }
         }
         Ok(())
@@ -66,11 +83,15 @@ impl<S: StreamEntity> StreamEntity for ZstdSink<S> {
         loop {
             let (remaining, output_position) = {
                 let (buffer, _) = self.prev.write_buffer_range();
-                let mut output = OutBuffer::around(buffer);
-                let remaining = stream
-                    .end_stream(&mut output)
-                    .map_err(|_| IoError::Other("ZSTD_endStream".to_string()))?;
-                (remaining, output.pos())
+                let mut output_position = 0;
+                let remaining = ZSTD_endStream(stream, buffer, &mut output_position);
+                if ERR_isError(remaining) {
+                    return Err(IoError::Other(format!(
+                        "ZSTD_endStream: {}",
+                        ERR_getErrorName(remaining)
+                    )));
+                }
+                (remaining, output_position)
             };
             self.prev.flush_count(output_position)?;
             if remaining == 0 {
@@ -102,8 +123,11 @@ impl<S: StreamEntity> StreamEntity for ZstdSink<S> {
 
 pub struct ZstdSource<S: StreamEntity> {
     prev: InputStreamBuffer<S>,
-    stream: Option<DCtx<'static>>,
+    stream: Option<Box<ZSTD_DStream>>,
     eos: bool,
+    compressed_chunk: Vec<u8>,
+    pending_begin: usize,
+    pending_end: usize,
 }
 
 impl<S: StreamEntity> std::fmt::Debug for ZstdSource<S> {
@@ -112,6 +136,7 @@ impl<S: StreamEntity> std::fmt::Debug for ZstdSource<S> {
             .debug_struct("ZstdSource")
             .field("closed", &self.stream.is_none())
             .field("eos", &self.eos)
+            .field("pending", &(self.pending_end - self.pending_begin))
             .finish_non_exhaustive()
     }
 }
@@ -122,14 +147,22 @@ impl<S: StreamEntity> ZstdSource<S> {
             prev,
             stream: Some(Self::init()?),
             eos: false,
+            compressed_chunk: Vec::new(),
+            pending_begin: 0,
+            pending_end: 0,
         })
     }
 
-    fn init() -> IoResult<DCtx<'static>> {
-        let mut stream = DCtx::create();
-        stream
-            .init()
-            .map_err(|error| IoError::Other(format!("ZSTD_initDStream: {error}")))?;
+    fn init() -> IoResult<Box<ZSTD_DStream>> {
+        let mut stream =
+            ZSTD_createDStream().ok_or_else(|| IoError::Other("ZSTD_createDStream".to_string()))?;
+        let result = ZSTD_initDStream(&mut stream);
+        if ERR_isError(result) {
+            return Err(IoError::Other(format!(
+                "ZSTD_initDStream: {}",
+                ERR_getErrorName(result)
+            )));
+        }
         Ok(stream)
     }
 }
@@ -143,29 +176,56 @@ impl<S: StreamEntity> StreamEntity for ZstdSource<S> {
         let mut output_position = 0;
 
         while output_position < ptr.len() {
-            if self.prev.begin == self.prev.end && !self.prev.fetch()? {
-                self.eos = true;
-                break;
+            if self.pending_begin < self.pending_end {
+                let count =
+                    (ptr.len() - output_position).min(self.pending_end - self.pending_begin);
+                ptr[output_position..output_position + count].copy_from_slice(
+                    &stream.historyBuffer[self.pending_begin..self.pending_begin + count],
+                );
+                self.pending_begin += count;
+                output_position += count;
+                continue;
             }
 
-            let output_before = output_position;
-            let consumed = {
-                let input_slice = &self.prev.buf[self.prev.begin..self.prev.end];
-                let mut input = InBuffer::around(input_slice);
-                let mut output = OutBuffer::around_pos(ptr, output_position);
-                stream
-                    .decompress_stream(&mut output, &mut input)
-                    .map_err(|error| IoError::Other(format!("ZSTD_decompressStream: {error}")))?;
-                output_position = output.pos();
-                input.pos()
-            };
-            self.prev.begin += consumed;
-
-            if consumed == 0 && output_position == output_before && output_position < ptr.len() {
-                return Err(IoError::Other(
-                    "ZSTD_decompressStream: no progress".to_string(),
-                ));
+            let expected = ZSTD_nextSrcSizeToDecompress(stream);
+            if expected == 0 {
+                if self.prev.begin == self.prev.end && !self.prev.fetch()? {
+                    self.eos = true;
+                    break;
+                }
+                let result = ZSTD_resetDStream(stream);
+                if ERR_isError(result) {
+                    return Err(IoError::Other(format!(
+                        "ZSTD_resetDStream: {}",
+                        ERR_getErrorName(result)
+                    )));
+                }
+                continue;
             }
+
+            self.compressed_chunk.clear();
+            while self.compressed_chunk.len() < expected {
+                if self.prev.begin == self.prev.end && !self.prev.fetch()? {
+                    self.eos = true;
+                    return Ok(output_position);
+                }
+                let count =
+                    (expected - self.compressed_chunk.len()).min(self.prev.end - self.prev.begin);
+                self.compressed_chunk
+                    .extend_from_slice(&self.prev.buf[self.prev.begin..self.prev.begin + count]);
+                self.prev.begin += count;
+            }
+
+            let produced_len = ZSTD_decompressContinue_into_history(stream, &self.compressed_chunk)
+                .map_err(|error| {
+                    IoError::Other(format!(
+                        "ZSTD_decompressContinue: {}",
+                        ERR_getErrorName(error)
+                    ))
+                })?
+                .len();
+            self.pending_end = stream.historyBuffer.len();
+            self.pending_begin = self.pending_end - produced_len;
         }
         Ok(output_position)
     }
@@ -181,6 +241,9 @@ impl<S: StreamEntity> StreamEntity for ZstdSource<S> {
         self.prev.rewind()?;
         self.stream = Some(Self::init()?);
         self.eos = false;
+        self.compressed_chunk.clear();
+        self.pending_begin = 0;
+        self.pending_end = 0;
         Ok(())
     }
 
@@ -202,34 +265,25 @@ impl<S: StreamEntity> StreamEntity for ZstdSource<S> {
 }
 
 pub fn zstd_decompress(src: &[u8], dst: &mut [u8]) -> IoResult<usize> {
-    let mut stream = DCtx::create();
-    stream
-        .init()
-        .map_err(|error| IoError::Other(format!("Failed decompressing zstd stream: {error}")))?;
-    let mut input = InBuffer::around(src);
-    let mut output = OutBuffer::around(dst);
-    let mut last_return = 1;
+    let result = ZSTD_decompress(dst, src);
+    if ERR_isError(result) {
+        return Err(IoError::Other(format!(
+            "Failed decompressing zstd stream: {}",
+            ERR_getErrorName(result)
+        )));
+    }
+    Ok(result)
+}
 
-    while input.pos() < src.len() {
-        let input_before = input.pos();
-        let output_before = output.pos();
-        last_return = stream
-            .decompress_stream(&mut output, &mut input)
-            .map_err(|error| {
-                IoError::Other(format!("Failed decompressing zstd stream: {error}"))
-            })?;
-        if input.pos() == input_before && output.pos() == output_before {
-            return Err(IoError::Other(
-                "Failed decompressing zstd stream: output buffer too small".to_string(),
-            ));
-        }
-    }
-    if last_return != 0 {
-        return Err(IoError::Other(
-            "Failed decompressing zstd stream".to_string(),
-        ));
-    }
-    Ok(output.pos())
+#[cfg(test)]
+pub(crate) fn zstd_compress_for_test(src: &[u8]) -> Vec<u8> {
+    use zstd_pure_rs::prelude::{ZSTD_compress, ZSTD_compressBound};
+
+    let mut dst = vec![0; ZSTD_compressBound(src.len())];
+    let result = ZSTD_compress(&mut dst, src, ZSTD_CLEVEL_DEFAULT);
+    assert!(!ERR_isError(result), "{}", ERR_getErrorName(result));
+    dst.truncate(result);
+    dst
 }
 
 pub fn zstd_decompress_file(src: &mut StdFile, dst: &mut [u8]) -> IoResult<usize> {
@@ -245,7 +299,7 @@ mod tests {
     use super::*;
 
     fn compressed(bytes: &[u8]) -> Vec<u8> {
-        zstd::stream::encode_all(bytes, 0).unwrap()
+        zstd_compress_for_test(bytes)
     }
 
     #[test]
@@ -265,7 +319,8 @@ mod tests {
         assert_eq!(zstd_decompress(CPP_FRAME, &mut whole).unwrap(), PLAIN.len());
         assert_eq!(whole, PLAIN);
 
-        let input = InputStreamBuffer::new(VecStream::from_vec(CPP_FRAME.to_vec()), 0);
+        let input =
+            InputStreamBuffer::with_buffer_size(VecStream::from_vec(CPP_FRAME.to_vec()), 0, 3);
         let mut source = ZstdSource::new(input).unwrap();
         let mut streamed = Vec::new();
         let mut chunk = [0; 7];
@@ -381,6 +436,10 @@ mod tests {
             decoded.extend_from_slice(&chunk[..count]);
         }
         assert_eq!(decoded, plain);
+        let stream = source.stream.as_ref().unwrap();
+        assert!(stream.stream_in_buffer.is_empty());
+        assert!(stream.stream_out_buffer.is_empty());
+        assert!(source.compressed_chunk.capacity() < plain.len());
     }
 
     #[test]
@@ -399,10 +458,11 @@ mod tests {
         sink.write(b"tail").unwrap();
         sink.close().unwrap();
         sink.close().unwrap();
-        assert_eq!(
-            zstd::stream::decode_all(std::fs::read(&path).unwrap().as_slice()).unwrap(),
-            [first, b"tail".to_vec()].concat()
-        );
+        let expected = [first, b"tail".to_vec()].concat();
+        let mut decoded = vec![0; expected.len()];
+        let count = zstd_decompress(&std::fs::read(&path).unwrap(), &mut decoded).unwrap();
+        decoded.truncate(count);
+        assert_eq!(decoded, expected);
         assert!(sink.write(b"closed").is_err());
         std::fs::remove_file(path).unwrap();
     }

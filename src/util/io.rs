@@ -18,6 +18,8 @@ pub use temp_file::{TempFile, TempFileData, TempFileHandler, TEMP_FILE_HANDLER};
 pub mod output_file;
 pub use output_file::{decompress, decompress_file, Compressor, OutputFile};
 pub mod zstd_stream;
+#[cfg(test)]
+pub(crate) use zstd_stream::zstd_compress_for_test;
 pub use zstd_stream::{zstd_decompress, zstd_decompress_file, ZstdSink, ZstdSource};
 pub mod compressed_stream;
 pub use compressed_stream::{zlib_decompress, zlib_decompress_file, ZlibSink, ZlibSource};
@@ -414,7 +416,7 @@ mod tests {
         let n = zlib_decompress(&compressed, &mut out).unwrap();
         assert_eq!(&out[..n], b"xyz");
 
-        let compressed = zstd::stream::encode_all(&b"zstd-data"[..], 0).unwrap();
+        let compressed = zstd_compress_for_test(b"zstd-data");
         let n = decompress(&compressed, &mut out, Compressor::Zstd).unwrap();
         assert_eq!(&out[..n], b"zstd-data");
         let n = zstd_decompress(&compressed, &mut out).unwrap();
@@ -814,11 +816,7 @@ mod tests {
         input.read_raw(&mut buf).unwrap();
         assert_eq!(&buf, b"gzip-data");
 
-        std::fs::write(
-            &path,
-            zstd::stream::encode_all(&b"zstd-data"[..], 0).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&path, zstd_compress_for_test(b"zstd-data")).unwrap();
         let mut input = InputFile::new(&name, 0).unwrap();
         let mut buf = [0u8; 9];
         input.read_raw(&mut buf).unwrap();

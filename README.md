@@ -53,9 +53,10 @@ This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 
 ### Prerequisites
 
-- Rust 1.70+
+- Rust 1.85+
 - Default native Rust build: no CMake or C++ toolchain required
 - Default native build: SQLite is bundled through `rusqlite`; no system SQLite package is required
+- Zstandard compression/decompression uses the pure-Rust `zstd-pure-rs` backend; no native zstd library is required
 - Optional non-Windows FFI test build: CMake 2.6+, a C++ compiler, zlib, SQLite3, and pthreads. The system SQLite dependency belongs to the vendored C++ compatibility build.
 
 For the optional FFI build on Ubuntu/Debian:

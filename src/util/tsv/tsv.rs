@@ -79,7 +79,7 @@ mod tests {
         std::fs::write(&gzip_path, gzip.finish().unwrap()).unwrap();
 
         let zstd_path = temp_path("zstd");
-        std::fs::write(&zstd_path, zstd::stream::encode_all(&input[..], 0).unwrap()).unwrap();
+        std::fs::write(&zstd_path, crate::util::io::zstd_compress_for_test(input)).unwrap();
 
         assert_eq!(count_lines(gzip_path.to_str().unwrap()).unwrap(), 3);
         assert_eq!(count_lines(zstd_path.to_str().unwrap()).unwrap(), 3);

@@ -21,7 +21,7 @@ memmap2 = "0.9"
 nalgebra = "0.32.6"
 rayon = "1"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
-zstd = "0.13"
+zstd-pure-rs = "0.1.2"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["resource"] }
