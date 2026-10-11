@@ -143,31 +143,6 @@ pub fn file_size(name: &str) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-pub fn total_ram() -> f64 {
-    #[cfg(target_os = "linux")]
-    {
-        let meminfo = match fs::read_to_string("/proc/meminfo") {
-            Ok(s) => s,
-            Err(_) => return 0.0,
-        };
-        for line in meminfo.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let kb = rest
-                    .split_whitespace()
-                    .next()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                return kb * 1024.0 / 1e9;
-            }
-        }
-        0.0
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0.0
-    }
-}
-
 /// Open `filename` as an owning, read-only memory map.
 ///
 /// The map owns its platform mapping and releases it on drop.

@@ -101,7 +101,7 @@ fn cpp_mouse_snapshot_has_expected_shape() {
 }
 
 #[test]
-fn cpp_mouse_snapshot_pins_known_scoring_divergence_rows() {
+fn cpp_mouse_snapshot_pins_historical_scoring_regression_rows() {
     let rows = rows();
     for expected in [
         [

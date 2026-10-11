@@ -1,42 +1,25 @@
-//! Platform reference vectors for DIAMOND's C-runtime RNG compatibility path.
+//! Cross-platform reference vectors for DIAMOND's deterministic RNG.
 //!
-//! The actual assertions run in a spawned copy of this test binary so their
-//! calls to process-global `srand`/`rand` cannot perturb another test. Vectors
-//! are hardcoded only for GNU libc. Linux musl is verified live against its
-//! target C++ runtime by the separate oracle; macOS libc and the Windows CRT
-//! remain deliberately unverified rather than guessed.
-
-#[path = "../src/util/compat_rng.rs"]
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-mod compat_rng;
+//! The assertions run in a spawned copy of this test binary so their calls to
+//! the process-global generator cannot perturb another test. The algorithm,
+//! range, and vectors are target-independent.
 
 use std::process::Command;
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 use diamond::basic::value::AMINO_ACID_COUNT;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 use diamond::data::fasta::read_fasta_amino_acid;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 use diamond::masking::tantan::TantanMasker;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 use diamond::stats::matrices::BLOSUM62;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 use diamond::stats::pvalues::pvalues;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 use diamond::stats::sls_alignment_evaluer::AlignmentEvaluer;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 use diamond::stats::sls_basic::AlignmentEvaluerParametersWithErrors;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 use diamond::tantan::LambdaCalculator;
+use diamond::util::compat_rng;
 
 const CHILD_ENV: &str = "DIAMOND_COMPAT_RNG_VECTOR_CHILD";
 const CHILD_TEST: &str = "compat_rng_reference_vector_child";
 
 #[test]
-#[cfg_attr(
-    not(all(target_os = "linux", target_env = "gnu")),
-    ignore = "no authoritative C rand vectors captured for this target"
-)]
 fn compat_rng_reference_vectors_in_isolated_subprocess() {
     for repetition in 0..3 {
         let output = Command::new(std::env::current_exe().unwrap())
@@ -59,9 +42,9 @@ fn compat_rng_reference_vectors_in_isolated_subprocess() {
 fn compat_rng_reference_vector_child() {
     assert_eq!(std::env::var_os(CHILD_ENV).as_deref(), Some("1".as_ref()));
 
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        // Verified against the GNU libc implementation on the Linux CI host.
+        // Frozen from the upstream GNU libc sequence, now implemented as a
+        // target-independent Rust algorithm.
         assert_vector(
             1,
             [
@@ -93,7 +76,7 @@ fn compat_rng_reference_vector_child() {
         // intentionally share the process-global C runtime RNG state. The
         // standard-normal and TANTAN values were captured independently from
         // the pinned C++ sources on this GNU/Linux target.
-        compat_rng::c_srand(12_345);
+        compat_rng::seed(12_345);
         let normals = std::array::from_fn::<_, 8, _>(|_| pvalues::standard_normal());
         assert_f64_snapshot(
             &normals,
@@ -111,7 +94,7 @@ fn compat_rng_reference_vector_child() {
             "standard_normal",
         );
 
-        compat_rng::c_srand(1);
+        compat_rng::seed(1);
         let mut lambda = LambdaCalculator::new();
         lambda.calculate_flat_i8(&BLOSUM62.scores, AMINO_ACID_COUNT, 20);
         assert_f64_snapshot(
@@ -181,7 +164,7 @@ fn compat_rng_reference_vector_child() {
         // The production masking shape computes the RNG-dependent likelihood
         // matrix once, before dispatching immutable masker state to workers.
         // Exercise that boundary rather than racing C's process-global RNG.
-        compat_rng::c_srand(1);
+        compat_rng::seed(1);
         let masker = std::sync::Arc::new(TantanMasker::new(&BLOSUM62, 0.9));
         let input = read_fasta_amino_acid(
             b">repeat\nPPTPPTPPTPPTPPTPPTPPTPPTPPTPPTPPTPPTPPTPPT\n".as_slice(),
@@ -206,12 +189,8 @@ fn compat_rng_reference_vector_child() {
             assert_eq!(handle.join().unwrap(), expected);
         }
     }
-
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    panic!("no authoritative C rand vectors captured for this target");
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn assert_f64_snapshot(actual: &[f64], expected_bits: &[u64], tolerance: f64, label: &str) {
     assert_eq!(actual.len(), expected_bits.len(), "{label} length");
     for (index, (&actual, &bits)) in actual.iter().zip(expected_bits).enumerate() {
@@ -223,7 +202,6 @@ fn assert_f64_snapshot(actual: &[f64], expected_bits: &[u64], tolerance: f64, la
     }
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn parameters_with_errors() -> AlignmentEvaluerParametersWithErrors {
     AlignmentEvaluerParametersWithErrors {
         d_lambda: 0.267,
@@ -253,9 +231,11 @@ fn parameters_with_errors() -> AlignmentEvaluerParametersWithErrors {
     }
 }
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn assert_vector<const N: usize>(seed: u32, expected: [i32; N]) {
-    compat_rng::c_srand(seed);
-    let actual = std::array::from_fn(|_| compat_rng::c_rand());
-    assert_eq!(actual, expected, "C rand vector changed for seed {seed}");
+    compat_rng::seed(seed);
+    let actual = std::array::from_fn(|_| compat_rng::next_i31());
+    assert_eq!(
+        actual, expected,
+        "deterministic RNG vector changed for seed {seed}"
+    );
 }

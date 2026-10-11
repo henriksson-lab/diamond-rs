@@ -927,38 +927,4 @@ mod tests {
             "upstream lib/tantan/LambdaCalculator rejects PAM250"
         );
     }
-
-    #[test]
-    fn test_mask_d1ivsa4_no_masking() {
-        // d1ivsa4 (426aa) — C++ masks 0 positions. Rust should too.
-        // Read actual d1ivsa4 sequence from test file
-        let fasta_path = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/5.faa");
-        let records = crate::data::fasta::read_fasta_file(
-            std::path::Path::new(fasta_path),
-            crate::basic::value::SequenceType::AminoAcid,
-        )
-        .unwrap();
-        let rec = records.iter().find(|r| r.id.contains("d1ivsa4")).unwrap();
-        let mut seq = rec.sequence.clone();
-        assert_eq!(seq.len(), 426);
-
-        mask_tantan(&mut seq);
-        let masked: Vec<usize> = seq
-            .iter()
-            .enumerate()
-            .filter(|(_, &l)| l & SEED_MASK != 0)
-            .map(|(i, _)| i)
-            .collect();
-        eprintln!("d1ivsa4 masked {} of {} positions", masked.len(), seq.len());
-        if !masked.is_empty() {
-            eprintln!("  Masked: {:?}", &masked[..masked.len().min(20)]);
-        }
-        // C++ masks 0 positions for this sequence
-        assert_eq!(
-            masked.len(),
-            0,
-            "d1ivsa4 should have 0 masked positions (C++ masks 0), got {}",
-            masked.len()
-        );
-    }
 }

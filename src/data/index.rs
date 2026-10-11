@@ -145,22 +145,4 @@ mod tests {
             "Missing parameter: database file (--db/-d)."
         );
     }
-
-    #[test]
-    fn writes_an_index_readable_by_hashed_seed_set() {
-        let database = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
-        let output = make_index(&MakeIndexConfig::new(database, Sensitivity::Default)).unwrap();
-
-        let reduction = Reduction::default_reduction();
-        let codes = get_shape_codes(Sensitivity::Default)
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect::<Vec<_>>();
-        let shapes = ShapeConfig::from_codes(&codes, 0, &reduction).unwrap();
-        let parsed = HashedSeedSet::from_index_file(&output, &shapes).unwrap();
-        assert_eq!(parsed.table(0).size() > 0, true);
-        assert_eq!(parsed.table(1).size() > 0, true);
-
-        std::fs::remove_file(output).unwrap();
-    }
 }

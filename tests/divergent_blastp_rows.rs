@@ -1,4 +1,4 @@
-//! Tests for blastp rows where Rust output diverges from C++.
+//! Historical blastp scoring-parity regression probes.
 //!
 //! Inputs (kept outside the repo because they're large):
 //!   - `/tmp/bench_queries.faa`  — 500 mouse proteins from `uniprot.fa`
@@ -7,11 +7,15 @@
 //! Reference output (snapshot of C++ DIAMOND on the same inputs):
 //!   - `tests/data/cpp_blastp_mouse_500q.tsv`
 //!
-//! As of the snapshot date, Rust produced 6242 alignment rows matching C++
+//! At the original snapshot checkpoint, Rust produced 6242 alignment rows matching C++
 //! on 6105 of them (97.8%). The remaining 137 rows share the same query/
 //! subject coordinates and identity counts but report different
 //! evalue/bitscore values — suggesting a scoring (not alignment-path)
 //! divergence, likely in CBS bias accumulation.
+//!
+//! Later search/scoring matrices pass exactly, but this particular mouse
+//! fixture was not retained and has not been rerun against the current binary.
+//! It is therefore an open validation gap, not evidence of a current failure.
 //!
 //! These tests are `#[ignore]` by default because they require the
 //! benchmark `.dmnd` and query FASTA files at fixed `/tmp/` paths. Run
@@ -21,9 +25,10 @@
 //! cargo test --release --test divergent_blastp_rows -- --ignored --nocapture
 //! ```
 //!
-//! Each test asserts that Rust's bitscore/evalue for one specific
-//! (qseqid, sseqid) pair matches the C++ snapshot. Tests will fail today
-//! and pass once the underlying scoring divergence is resolved.
+//! Each test asserts that Rust's bitscore/evalue for one formerly divergent
+//! (qseqid, sseqid) pair matches the C++ snapshot. Reconstructing the fixtures
+//! and running these tests will determine whether the historical defect is
+//! closed for this corpus too.
 
 use std::collections::HashMap;
 use std::fs;
@@ -110,8 +115,8 @@ fn assert_row_matches(
     );
 }
 
-/// Each #[test] below pins one (query, subject) pair where Rust currently
-/// diverges from C++. The tests share a one-shot run of Rust blastp; we
+/// Each #[test] below pins one (query, subject) pair that diverged at the
+/// original checkpoint. The tests share a one-shot run of Rust blastp; we
 /// use `std::sync::OnceLock` so it executes at most once even when
 /// `--test-threads=8`.
 static RUST_OUTPUT: std::sync::OnceLock<HashMap<(String, String), Vec<String>>> =
@@ -144,8 +149,8 @@ macro_rules! divergent_row_test {
 }
 
 // Self-blast Chd5: identical sequence, no mismatches, no gaps — yet the
-// bitscore diverges (Rust 3572 vs C++ 3624, ~52 bits). Almost certainly a
-// CBS accumulation difference since the raw alignment path is trivial.
+// bitscore diverged (Rust 3572 vs C++ 3624, ~52 bits). This originally pointed
+// to a CBS accumulation difference because the raw alignment path is trivial.
 divergent_row_test!(chd5_self_blast, "Chd5", "Chd5");
 
 // Chd5 vs Chd1/Chd1l/Chd2/Chd3/Chd4 family — all share the same coords
@@ -169,11 +174,9 @@ divergent_row_test!(ttn_self, "Ttn", "Ttn");
 divergent_row_test!(obscn_self, "Obscn", "Obscn");
 
 /// Summary test: enumerates ALL pairs where Rust diverges from C++ and
-/// prints them. Always asserts the divergence count is <= 137 (the
-/// known-bad count at the snapshot date) — so this test will start
-/// FAILING in the GOOD direction if a fix reduces divergence below that
-/// threshold (prompting an update to lower the bound) or in the BAD
-/// direction if a regression widens it.
+/// prints them. It rejects any regression above the historical 137-row count
+/// and requires zero current differences. Keep both assertions so a rebuilt
+/// fixture gives an unambiguous pass/fail result.
 #[test]
 #[ignore = "requires bench data at /tmp/bench_*; run with --ignored"]
 fn count_divergent_rows_against_cpp_snapshot() {

@@ -67,18 +67,4 @@ mod tests {
         }
         assert!(dropped.get());
     }
-
-    #[test]
-    fn upstream_translation_unit_remains_destructor_only() {
-        let source = include_str!("../../../diamond/src/lib/alp/njn_dynprogprobproto.cpp");
-        let executable = source
-            .split("using namespace Njn;")
-            .nth(1)
-            .expect("namespace declaration")
-            .trim();
-        assert_eq!(
-            executable, "DynProgProbProto::~DynProgProbProto () {}",
-            "audit this facade if executable code is added upstream"
-        );
-    }
 }

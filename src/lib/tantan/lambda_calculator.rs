@@ -4,7 +4,7 @@
 //! intentionally separate from `masking::lambda`, which mirrors the unrelated
 //! standalone helper in `diamond/src/masking/lambda.cpp`.
 
-const RAND_MAX_F64: f64 = libc::RAND_MAX as f64;
+const RAND_MAX_F64: f64 = crate::util::compat_rng::RAND_MAX as f64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LambdaCalculator {
@@ -231,7 +231,7 @@ fn find_upper_bound(matrix: &[Vec<i32>]) -> Option<f64> {
 
 fn random_between(lower: f64, upper: f64) -> f64 {
     // The source uses C `rand()` and intentionally does not seed it here.
-    lower + (upper - lower) * f64::from(crate::util::compat_rng::c_rand()) / RAND_MAX_F64
+    lower + (upper - lower) * f64::from(crate::util::compat_rng::next_i31()) / RAND_MAX_F64
 }
 
 fn check_lambda(

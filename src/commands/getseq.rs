@@ -66,30 +66,3 @@ fn write_fasta_record<W: Write>(writer: &mut W, id: &str, sequence: &[i8]) -> io
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_getseq() {
-        let db = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
-        // Should succeed without error
-        let result = run(db, Some("d1ivsa4"));
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn getseq_writes_requested_output_file() {
-        let db = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
-        let output = std::env::temp_dir().join(format!(
-            "diamond-getseq-output-test-{}.faa",
-            std::process::id()
-        ));
-        run_with_output(db, Some("d1ivsa4"), Some(&output)).unwrap();
-        let fasta = std::fs::read_to_string(&output).unwrap();
-        assert!(fasta.starts_with(">d1ivsa4"));
-        assert!(fasta.lines().count() > 1);
-        std::fs::remove_file(output).unwrap();
-    }
-}

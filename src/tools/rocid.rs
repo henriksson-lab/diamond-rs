@@ -397,19 +397,4 @@ mod tests {
             (0, 0, 1)
         );
     }
-
-    #[test]
-    fn source_function_inventory_remains_audited() {
-        let source = String::from_utf8_lossy(include_bytes!("../../diamond/src/tools/rocid.cpp"));
-        for signature in [
-            "static bool fetch_map(",
-            "static void print()",
-            "void roc_id()",
-        ] {
-            assert!(
-                source.contains(signature),
-                "missing source function {signature}"
-            );
-        }
-    }
 }

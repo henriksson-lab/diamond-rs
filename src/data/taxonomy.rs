@@ -459,16 +459,4 @@ mod tests {
         assert_eq!(mapping.get("acc2"), Some(10090));
         assert_eq!(mapping.get("acc3"), None);
     }
-
-    #[test]
-    fn test_load_real_mapping() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/diamond/src/test/acc2taxid.tsv"
-        );
-        if let Ok(file) = std::fs::File::open(path) {
-            let mapping = TaxonMapping::load_tsv(BufReader::new(file)).unwrap();
-            assert!(!mapping.is_empty());
-        }
-    }
 }

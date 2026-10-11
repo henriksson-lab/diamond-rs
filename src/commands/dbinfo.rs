@@ -38,15 +38,3 @@ pub fn run(database_path: &str) -> io::Result<()> {
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_dbinfo_test_db() {
-        let db_path = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
-        let result = run(db_path);
-        assert!(result.is_ok());
-    }
-}

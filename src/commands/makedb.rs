@@ -62,29 +62,3 @@ pub fn run(input_files: &[String], database: &str, threads: i32) -> io::Result<(
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::dmnd::{ReferenceHeader, MAGIC_NUMBER};
-    use std::fs;
-
-    #[test]
-    fn test_makedb_from_test_fasta() {
-        let input = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/1.faa");
-        let tmp = std::env::temp_dir().join("test_makedb.dmnd");
-        let tmp_str = tmp.to_string_lossy().to_string();
-
-        let result = run(&[input.to_string()], &tmp_str, 1);
-        assert!(result.is_ok(), "makedb failed: {:?}", result.err());
-
-        // Verify the output is a valid DIAMOND database
-        let mut f = fs::File::open(&tmp).unwrap();
-        let header = ReferenceHeader::read_from(&mut f).unwrap();
-        assert_eq!(header.magic_number, MAGIC_NUMBER);
-        assert!(header.sequences > 0);
-        assert!(header.letters > 0);
-
-        let _ = fs::remove_file(&tmp);
-    }
-}

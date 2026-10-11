@@ -29,7 +29,7 @@ pub fn get_current_rss() -> usize {
         {
             return 0;
         }
-        return info.resident_size;
+        return usize::try_from(info.resident_size).unwrap_or(usize::MAX);
     }
 
     #[cfg(windows)]

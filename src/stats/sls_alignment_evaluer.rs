@@ -551,7 +551,7 @@ impl AlignmentEvaluer {
         get_current_time(&mut current_time_1);
         self.d_params.d_params_flag = false;
         let array_dim = 20usize;
-        crate::util::compat_rng::c_srand(12345);
+        crate::util::compat_rng::seed(12345);
 
         self.d_params.lambda = parameters_.d_lambda;
         self.d_params.lambda_error = parameters_.d_lambda_error;

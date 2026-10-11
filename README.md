@@ -9,7 +9,7 @@ DIAMOND is a high-performance sequence aligner for protein and translated DNA se
 * 2026-10-05: More fixes
 * 2026-09-30: More optimization. portability work
 * 2026-09-28: Ondisk blastp mode, but also faster inmem mode (not in original). Parity on broader datasets
-* 2006-09-27: Closing the gaps in translation, optimization. Some more work left
+* 2026-09-27: Closing the gaps in translation, optimization. Some more work left
 * 2026-08-01: CI added. Full translation is blocked until BLAST is translated
 * 2026-07-07: New audit; state to be checked
 
@@ -40,14 +40,22 @@ But:
 
 This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 
-- **CLI**: `blastp` and `blastx` run natively in Rust by default; C++ FFI fallback is only built for non-Windows conformance testing with `--features ffi`
-- **Native Rust commands**: `blastp`, `blastx`, `makedb`, `dbinfo`, `getseq`, `version`, `help`
+- **CLI**: Native Rust routes cover `blastp`, `blastx`, `makedb`, `dbinfo`, `getseq`, `makeidx`, `cluster`, `linclust`, `deepclust`, `merge-daa`, `view`, `test`, `version`, and help
+- **Validated parity**: The final 2026-10-06 matrix passed 164/164 tested search-sensitivity, scoring, clustering, and DAA producer/viewer cases against upstream DIAMOND 2.1.24. This is bounded evidence, not a claim that every DIAMOND option is translated or bug-free.
 - **Parallel**: Seed search uses rayon for multi-threaded processing
 - **SIMD**: SSE4.1/AVX2 dynamic-programming kernels and runtime-selected AVX-512 search workers on supported x86-64 hosts
 - **Portability target**: Native Linux, macOS, and Windows support; platform-specific low-level code must use each target's ABI and remain covered by CI
 - **Library API**: Core types, scoring matrices, DP kernels, FASTA parsing, and seed search
-- **Tests**: More than 1,600 passing library tests plus CLI and integration suites, including the C++ regression inventory and native-vs-FFI equivalence
-- **NCBI BLAST taxonomy reader**: SQLite-backed parent lookup (`taxonomy4blast.sqlite3`), scientific names (`names.dmp`), and ranks (`nodes.dmp`) are implemented natively. They are covered by synthetic fixtures and an ignored external-data gate against current NCBI artifacts, an NCBI `makeblastdb` volume, and byte-exact upstream taxonomy-field output. This reader is not yet wired into native `blastp`/`blastx`; taxonomy-aware search output fields (`staxids`, `sscinames`, `slineages`, `sskingdoms`, `skingdoms`, and `sphylums`) remain compatibility-backend paths.
+- **Tests**: More than 1,600 self-contained Rust library tests plus CLI and integration suites; source-text audits and tests requiring an adjacent upstream checkout have been removed
+- **Deterministic statistics**: ALP and TANTAN use a specified Rust implementation of the established GNU 31-word additive RNG sequence, with the same output and `RAND_MAX` on every platform
+- **NCBI BLAST taxonomy reader**: SQLite-backed parent lookup (`taxonomy4blast.sqlite3`), scientific names (`names.dmp`), and ranks (`nodes.dmp`) are implemented natively. They are covered by synthetic fixtures and an ignored external-data gate against current NCBI artifacts, an NCBI `makeblastdb` volume, and byte-exact upstream taxonomy-field output. This reader is not yet wired into native `blastp`/`blastx`; the default packaged binary therefore does not support taxonomy-aware search output fields (`staxids`, `sscinames`, `slineages`, `sskingdoms`, `skingdoms`, and `sphylums`).
+
+### Known limits
+
+- The exact-parity matrix covers the cases recorded in `VALIDATION_RESULTS.md`; `makeidx`, persistent-index consumption, nontrivial `merge-daa`, `getseq`, several search options/output fields, multi-file input, and compressed-input combinations still need upstream comparison. See `GAPS.md`.
+- Multi-query `json-flat` output intentionally reproduces upstream DIAMOND 2.1.24's missing separators. The resulting byte stream is not valid JSON. This inherited behavior is retained for exact parity and covered by regression evidence.
+- Native macOS and Windows CI/runtime evidence remains a release gate, particularly for RSS units and memory-limit spill decisions.
+- The optional C++ `ffi`/`--legacy` adapter is only a diagnostic for a source checkout containing the adjacent upstream `diamond/` tree. It is disabled by default, is not used by routine CI or benchmarks, and cannot be built from the packaged crate because that large source tree is intentionally excluded.
 
 ## Building
 
@@ -57,7 +65,7 @@ This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 - Default native Rust build: no CMake or C++ toolchain required
 - Default native build: SQLite is bundled through `rusqlite`; no system SQLite package is required
 - Zstandard compression/decompression uses the pure-Rust `zstd-pure-rs` backend; no native zstd library is required
-- Optional non-Windows FFI test build: CMake 2.6+, a C++ compiler, zlib, SQLite3, and pthreads. The system SQLite dependency belongs to the vendored C++ compatibility build.
+- Optional source-checkout-only, non-Windows FFI diagnostic: CMake 2.6+, a C++ compiler, zlib, SQLite3, and pthreads. The system SQLite dependency belongs to the adjacent upstream C++ compatibility build.
 
 For the optional FFI build on Ubuntu/Debian:
 ```bash
@@ -72,21 +80,23 @@ cargo build --release
 # Host-optimized benchmark build (matches upstream's -march=native build)
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 
-# Build the non-Windows C++ FFI backend for conformance testing
+# From a repository checkout containing diamond/: build the non-Windows
+# C++ diagnostic backend. This does not work from a packaged crate.
 cargo build --features ffi
 ```
 
 ### Test
 
 ```bash
-# Run all tests (single-threaded for FFI safety)
-cargo test --release -- --test-threads=1
+# Run the self-contained Rust test suite
+cargo test --release
 
-# Run tests that compare against the vendored C++ FFI backend
+# From a repository checkout containing diamond/: exercise the diagnostic C++
+# adapter. Routine parity comparisons use the external validation harness.
 cargo test --release --features ffi -- --test-threads=1
 
-# Run just the 20 regression tests
-cargo run --release --features ffi -- test
+# Run the native regression command
+cargo run --release -- test
 ```
 
 ## CLI Usage
@@ -491,8 +501,9 @@ or one thread for a hardware-counter profiling run. See
 The bundled quick fixture, human real-sequence fixture, and both AMR fixtures
 currently have byte-identical C++ and Rust output. Every harness run checks
 parity, exits nonzero on a mismatch, and retains its raw outputs and unified
-diff. When built on a non-Windows target with `--features ffi`, the `--legacy`
-flag falls back to C++ FFI for conformance testing.
+diff. In a non-Windows source checkout that also contains the adjacent
+upstream `diamond/` tree, `--features ffi` enables the `--legacy` diagnostic
+fallback. Packaged builds do not contain that tree.
 
 ## Architecture
 
@@ -506,8 +517,8 @@ src/
   search/     - Seed extraction, hash join, hit buffer
   align/      - HSP, Match, target culling
   output/     - Output formats: tabular, pairwise, XML, SAM, PAF
-  commands/   - CLI commands (dbinfo, makedb, blastp)
-  cluster/    - Clustering types
+  commands/   - Native CLI commands, including search, database, view, and clustering
+  cluster/    - cluster, linclust, and deepclust workflows
   config.rs   - CLI definition with clap
 ```
 

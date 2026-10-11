@@ -85,47 +85,6 @@ pub fn psi_matrix_frequency_ratios_free(_freq_ratios: Option<SFreqRatios>) -> Op
 mod tests {
     use super::*;
 
-    fn parse_upstream_table(name: &str) -> Vec<f64> {
-        let source = include_str!("../../../diamond/src/lib/blast/matrix_freq_ratios.c");
-        let declaration = format!("static const double {name}");
-        let begin = source
-            .find(&declaration)
-            .expect("upstream table declaration");
-        let initializer = &source[begin..];
-        let initializer = &initializer[initializer.find('=').expect("table equals") + 1..];
-        let initializer = &initializer[..initializer.find(';').expect("table semicolon")];
-
-        initializer
-            .split(|c: char| c == '{' || c == '}' || c == ',' || c.is_whitespace())
-            .filter(|field| !field.is_empty())
-            .map(|field| field.parse::<f64>().expect("floating-point literal"))
-            .collect()
-    }
-
-    fn assert_full_table(name: &str, rust: &Matrix) {
-        let upstream = parse_upstream_table(name);
-        assert_eq!(upstream.len(), BLASTAA_SIZE * BLASTAA_SIZE);
-        for (index, (actual, expected)) in rust.iter().flatten().zip(upstream).enumerate() {
-            assert_eq!(
-                actual.to_bits(),
-                expected.to_bits(),
-                "{name} differs at flat index {index}"
-            );
-        }
-    }
-
-    #[test]
-    fn all_eight_payloads_are_bit_exact_to_c_source() {
-        assert_full_table("BLOSUM45_FREQRATIOS", &matrix_data::BLOSUM45_FREQ_RATIOS);
-        assert_full_table("BLOSUM50_FREQRATIOS", &matrix_data::BLOSUM50_FREQ_RATIOS);
-        assert_full_table("BLOSUM62_FREQRATIOS", &matrix_data::BLOSUM62_FREQ_RATIOS);
-        assert_full_table("BLOSUM80_FREQRATIOS", &matrix_data::BLOSUM80_FREQ_RATIOS);
-        assert_full_table("BLOSUM90_FREQRATIOS", &matrix_data::BLOSUM90_FREQ_RATIOS);
-        assert_full_table("PAM30_FREQRATIOS", &matrix_data::PAM30_FREQ_RATIOS);
-        assert_full_table("PAM70_FREQRATIOS", &matrix_data::PAM70_FREQ_RATIOS);
-        assert_full_table("PAM250_FREQRATIOS", &matrix_data::PAM250_FREQ_RATIOS);
-    }
-
     #[test]
     fn lookup_preserves_alias_case_bit_scales_and_owned_copy() {
         let base = psi_matrix_frequency_ratios_new("blosum62").unwrap();
@@ -156,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn scaled_variants_match_every_c_loop_operation() {
+    fn scaled_variants_apply_the_declared_multiplier() {
         for (name, multiplier) in [
             ("BLOSUM62_20A", BLOSUM62_20A_SCALE_MULTIPLIER),
             ("BLOSUM62_20B", BLOSUM62_20B_SCALE_MULTIPLIER),

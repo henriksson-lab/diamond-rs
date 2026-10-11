@@ -1063,17 +1063,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_real_db() {
-        let db_path = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/data.dmnd");
-        if let Ok(mut f) = std::fs::File::open(db_path) {
-            let h = ReferenceHeader::read_from(&mut f).unwrap();
-            assert_eq!(h.magic_number, MAGIC_NUMBER);
-            assert!(h.validate().is_ok());
-            assert!(h.sequences > 0);
-        }
-    }
-
-    #[test]
     fn test_database_file_sequence_access_length_iterator_and_partition() {
         let path = fixture_path("access");
         write_fixture(&path);

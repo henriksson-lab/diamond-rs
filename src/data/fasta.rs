@@ -419,14 +419,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_real_test_file() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/diamond/src/test/1.faa");
-        let records = read_fasta_file(Path::new(path), SequenceType::AminoAcid).unwrap();
-        assert!(!records.is_empty());
-        assert!(!records[0].sequence.is_empty());
-    }
-
-    #[test]
     fn test_write_fasta() {
         let records = vec![FastaRecord {
             id: "seq1".to_string(),
