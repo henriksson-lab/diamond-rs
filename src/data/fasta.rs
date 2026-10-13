@@ -104,8 +104,52 @@ pub fn read_fasta_nucleotide<R: Read>(reader: R) -> io::Result<Vec<FastaRecord>>
 
 /// Read FASTA records from a file path.
 pub fn read_fasta_file(path: &Path, seq_type: SequenceType) -> io::Result<Vec<FastaRecord>> {
-    use std::io::Seek;
-    let mut file = std::fs::File::open(path)?;
+    let mut records = Vec::new();
+    for_each_fasta_file(path, seq_type, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+/// Read a FASTA/FASTQ file one record at a time.
+///
+/// Unlike [`read_fasta_file`], this keeps only the parser's current record in
+/// memory.  `makedb` uses it to reproduce `FastaFile::load_seqs`' bounded
+/// block lifetime instead of retaining the complete decoded input.
+pub fn for_each_fasta_file<F>(path: &Path, seq_type: SequenceType, f: F) -> io::Result<()>
+where
+    F: FnMut(FastaRecord) -> io::Result<()>,
+{
+    let file = std::fs::File::open(path)?;
+    for_each_fasta_autodetect(file, path, seq_type, f)
+}
+
+#[cfg(test)]
+fn read_fasta_autodetect<R: Read>(
+    reader: R,
+    path: &Path,
+    seq_type: SequenceType,
+) -> io::Result<Vec<FastaRecord>> {
+    let mut records = Vec::new();
+    for_each_fasta_autodetect(reader, path, seq_type, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+fn for_each_fasta_autodetect<R, F>(
+    reader: R,
+    path: &Path,
+    seq_type: SequenceType,
+    f: F,
+) -> io::Result<()>
+where
+    R: Read,
+    F: FnMut(FastaRecord) -> io::Result<()>,
+{
+    let mut reader = BufReader::new(reader);
 
     // C++ `detect_compressor` (`diamond/src/util/io/input_file.cpp:52-61`)
     // sniffs the gzip magic `\x1F\x8B` from the first two bytes of the file,
@@ -113,18 +157,14 @@ pub fn read_fasta_file(path: &Path, seq_type: SequenceType) -> io::Result<Vec<Fa
     // `query.fasta` (no `.gz`) would decompress fine in C++ but used to be
     // read as binary garbage here. Peek the first two bytes to detect gzip
     // magic before falling back to the extension check.
-    let mut magic = [0u8; 2];
-    let is_gzip = match file.read_exact(&mut magic) {
-        Ok(()) => {
-            // Rewind so the actual reader sees the whole file.
-            file.seek(std::io::SeekFrom::Start(0))?;
-            magic == [0x1F, 0x8B]
-        }
-        Err(_) => {
-            // File shorter than 2 bytes — fall back to extension check.
-            file.seek(std::io::SeekFrom::Start(0))?;
-            path.extension().is_some_and(|ext| ext == "gz")
-        }
+    // `fill_buf` leaves the prefix unconsumed, unlike the previous read+seek
+    // implementation. This is the same forward-only boundary as upstream and
+    // permits pipes, FIFOs, and `/dev/stdin`.
+    let prefix = reader.fill_buf()?;
+    let is_gzip = if prefix.len() >= 2 {
+        prefix[..2] == [0x1F, 0x8B]
+    } else {
+        path.extension().is_some_and(|ext| ext == "gz")
     };
 
     // Use `MultiGzDecoder` so concatenated gzip members (e.g.
@@ -132,15 +172,33 @@ pub fn read_fasta_file(path: &Path, seq_type: SequenceType) -> io::Result<Vec<Fa
     // member — `GzDecoder` stops at the first member's EOF and silently
     // truncates the rest. C++ uses zlib which decompresses all members by
     // default.
-    let reader: Box<dyn Read> = if is_gzip {
-        Box::new(flate2::read::MultiGzDecoder::new(file))
+    if is_gzip {
+        let decoder = flate2::read::MultiGzDecoder::new(reader);
+        match seq_type {
+            SequenceType::AminoAcid => for_each_fasta_with_encoding(
+                decoder,
+                &CharRepresentation::new(AMINO_ACID_ALPHABET, MASK_LETTER, b"UO-"),
+                f,
+            ),
+            SequenceType::Nucleotide => for_each_fasta_with_encoding(
+                decoder,
+                &CharRepresentation::new(NUCLEOTIDE_ALPHABET, 4, b"MRWSYKVHDBX"),
+                f,
+            ),
+        }
     } else {
-        Box::new(file)
-    };
-
-    match seq_type {
-        SequenceType::AminoAcid => read_fasta_amino_acid(reader),
-        SequenceType::Nucleotide => read_fasta_nucleotide(reader),
+        match seq_type {
+            SequenceType::AminoAcid => for_each_fasta_with_encoding(
+                reader,
+                &CharRepresentation::new(AMINO_ACID_ALPHABET, MASK_LETTER, b"UO-"),
+                f,
+            ),
+            SequenceType::Nucleotide => for_each_fasta_with_encoding(
+                reader,
+                &CharRepresentation::new(NUCLEOTIDE_ALPHABET, 4, b"MRWSYKVHDBX"),
+                f,
+            ),
+        }
     }
 }
 
@@ -148,8 +206,24 @@ fn read_fasta_with_encoding<R: Read>(
     reader: R,
     encoding: &CharRepresentation,
 ) -> io::Result<Vec<FastaRecord>> {
-    let mut buf_reader = BufReader::new(reader);
     let mut records = Vec::new();
+    for_each_fasta_with_encoding(reader, encoding, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+
+fn for_each_fasta_with_encoding<R, F>(
+    reader: R,
+    encoding: &CharRepresentation,
+    mut f: F,
+) -> io::Result<()>
+where
+    R: Read,
+    F: FnMut(FastaRecord) -> io::Result<()>,
+{
+    let mut buf_reader = BufReader::new(reader);
     {
         let buf = buf_reader.fill_buf()?;
         if buf.is_empty() {
@@ -174,13 +248,12 @@ fn read_fasta_with_encoding<R: Read>(
                         })?,
                     );
                 }
-                records.push(FastaRecord {
+                f(FastaRecord {
                     id: id.to_string(),
                     sequence,
-                });
-                Ok(())
+                })
             })?;
-            return Ok(records);
+            return Ok(());
         }
         if buf.first().copied() != Some(b'@') {
             return Err(io::Error::new(
@@ -194,6 +267,10 @@ fn read_fasta_with_encoding<R: Read>(
     let mut current_seq: Vec<Letter> = Vec::new();
     let mut is_fastq = false;
     let mut fastq_state = 0u8; // 0=header, 1=seq, 2=plus, 3=qual
+                               // The collecting parser used `records.is_empty()` here.  Keep the same
+                               // parser state explicitly now that records are delivered through a
+                               // callback instead of retained in a Vec.
+    let mut emitted_record = false;
 
     for line in buf_reader.lines() {
         let line = line?;
@@ -206,10 +283,11 @@ fn read_fasta_with_encoding<R: Read>(
         if !is_fastq && line.starts_with('>') {
             // FASTA header
             if let Some(id) = current_id.take() {
-                records.push(FastaRecord {
+                f(FastaRecord {
                     id,
                     sequence: std::mem::take(&mut current_seq),
-                });
+                })?;
+                emitted_record = true;
             }
             // Parse ID: take everything after '>' up to first delimiter
             // Delimiters match C++: whitespace + \x01 (SOH, used in NCBI FASTA)
@@ -221,15 +299,16 @@ fn read_fasta_with_encoding<R: Read>(
                 .to_string();
             current_id = Some(id);
         } else if line.starts_with('@')
-            && (records.is_empty() && current_id.is_none() || fastq_state == 0)
+            && (!emitted_record && current_id.is_none() || fastq_state == 0)
         {
             // FASTQ header
             is_fastq = true;
             if let Some(id) = current_id.take() {
-                records.push(FastaRecord {
+                f(FastaRecord {
                     id,
                     sequence: std::mem::take(&mut current_seq),
-                });
+                })?;
+                emitted_record = true;
             }
             let header = &line[1..];
             let id = header.split_whitespace().next().unwrap_or("").to_string();
@@ -278,13 +357,13 @@ fn read_fasta_with_encoding<R: Read>(
 
     // Push last record
     if let Some(id) = current_id {
-        records.push(FastaRecord {
+        f(FastaRecord {
             id,
             sequence: current_seq,
-        });
+        })?;
     }
 
-    Ok(records)
+    Ok(())
 }
 
 /// Write FASTA records to a writer.
@@ -310,6 +389,38 @@ pub fn write_fasta<W: io::Write>(
 mod tests {
     use super::*;
     use crate::basic::value::AMINO_ACID_ALPHABET;
+
+    struct NonSeekable<R>(R);
+
+    impl<R: Read> Read for NonSeekable<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    #[test]
+    fn autodetect_reads_plain_nonseekable_input_without_consuming_prefix() {
+        let input = NonSeekable(std::io::Cursor::new(b">pipe\nARND\n"));
+        let records =
+            read_fasta_autodetect(input, Path::new("/dev/stdin"), SequenceType::AminoAcid).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "pipe");
+        assert_eq!(records[0].sequence, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn autodetect_reads_gzip_nonseekable_input_without_consuming_magic() {
+        use std::io::Write;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), Default::default());
+        encoder.write_all(b">pipe-gz\nCQEG\n").unwrap();
+        let input = NonSeekable(std::io::Cursor::new(encoder.finish().unwrap()));
+        let records =
+            read_fasta_autodetect(input, Path::new("/dev/stdin"), SequenceType::AminoAcid).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "pipe-gz");
+        assert_eq!(records[0].sequence, vec![4, 5, 6, 7]);
+    }
 
     #[test]
     fn test_read_fasta_simple() {

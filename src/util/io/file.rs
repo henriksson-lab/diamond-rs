@@ -264,7 +264,7 @@ mod tests {
         std::env::temp_dir().join(format!(
             "diamond-rs-file-{test}-{}-{}.tmp",
             std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
+            crate::util::test_path_component()
         ))
     }
 

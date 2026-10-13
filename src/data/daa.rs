@@ -642,7 +642,7 @@ impl<'a> Iterator for DaaMatchIterator<'a> {
             return None;
         }
 
-        let raw = match DaaRawMatch::read(&mut self.it) {
+        let raw = match read_raw_match(&mut self.it) {
             Ok(raw) => raw,
             Err(e) => return Some(Err(e)),
         };
@@ -663,7 +663,10 @@ impl<'a> Iterator for DaaMatchIterator<'a> {
         let mut hsp = Hsp::with_backtraced(true);
         hsp.score = raw.score as i32;
         hsp.subject_range = Interval::new(raw.subject_begin as i32, raw.subject_begin as i32);
-        hsp.transcript = PackedTranscript::from_bytes(&raw.transcript);
+        // `raw.transcript` borrows the query-record buffer, so this is the
+        // only transcript allocation. The previous DaaRawMatch path first
+        // grew a Vec byte-by-byte and then copied it again here.
+        hsp.transcript = PackedTranscript::from_bytes(raw.transcript);
 
         if self.file.mode() == AlignMode::BLASTX as u32 {
             hsp.frame = if (raw.flag & (1 << 6)) == 0 {
@@ -688,16 +691,10 @@ impl<'a> Iterator for DaaMatchIterator<'a> {
 
         let subject_len = self.file.ref_len_at(self.subject_id as usize);
         let subject_name = self.file.ref_name(self.subject_id as usize).to_string();
-        let mut parsed = DaaMatch {
-            hsp,
-            hsp_num: self.hsp_num,
-            hit_num: self.hit_num,
-            subject_id: self.subject_id,
-            subject_len,
-            subject_name,
-        };
-        let mut context = parsed.context(self.parent);
-        if let Err(e) = context.parse(
+        if let Err(e) = hsp.parse_with_query(
+            &self.parent.context,
+            self.parent.query_len() as i32,
+            &[],
             true,
             true,
             self.file.mode() == AlignMode::BLASTX as u32,
@@ -705,13 +702,18 @@ impl<'a> Iterator for DaaMatchIterator<'a> {
         ) {
             return Some(Err(e));
         }
-        parsed.hsp = context.hsp();
-        parsed.hsp.evalue = self.score_matrix.evalue(
-            parsed.hsp.score,
-            self.parent.context[0].len() as u32,
-            parsed.subject_len,
-        );
-        parsed.hsp.bit_score = self.score_matrix.bitscore(parsed.hsp.score as f64);
+        hsp.evalue =
+            self.score_matrix
+                .evalue(hsp.score, self.parent.context[0].len() as u32, subject_len);
+        hsp.bit_score = self.score_matrix.bitscore(hsp.score as f64);
+        let parsed = DaaMatch {
+            hsp,
+            hsp_num: self.hsp_num,
+            hit_num: self.hit_num,
+            subject_id: self.subject_id,
+            subject_len,
+            subject_name,
+        };
         Some(Ok(parsed))
     }
 }
@@ -727,28 +729,42 @@ pub struct DaaRawMatch {
     pub transcript: Vec<u8>,
 }
 
+struct DaaRawMatchRef<'a> {
+    subject_id: u32,
+    flag: u8,
+    score: u32,
+    query_begin: u32,
+    subject_begin: u32,
+    transcript: &'a [u8],
+}
+
+fn read_raw_match<'a>(it: &mut BinaryBufferIterator<'a>) -> Result<DaaRawMatchRef<'a>, String> {
+    let subject_id = it.read::<u32>()?;
+    let flag = it.read::<u8>()?;
+    let score = it.read_packed_u32(flag & 3)?;
+    let query_begin = it.read_packed_u32((flag >> 2) & 3)?;
+    let subject_begin = it.read_packed_u32((flag >> 4) & 3)?;
+    let transcript = it.read_until_inclusive(PackedOperation::terminator().code)?;
+    Ok(DaaRawMatchRef {
+        subject_id,
+        flag,
+        score,
+        query_begin,
+        subject_begin,
+        transcript,
+    })
+}
+
 impl DaaRawMatch {
     pub fn read(it: &mut BinaryBufferIterator<'_>) -> Result<Self, String> {
-        let subject_id = it.read::<u32>()?;
-        let flag = it.read::<u8>()?;
-        let score = it.read_packed_u32(flag & 3)?;
-        let query_begin = it.read_packed_u32((flag >> 2) & 3)?;
-        let subject_begin = it.read_packed_u32((flag >> 4) & 3)?;
-        let mut transcript = Vec::new();
-        loop {
-            let c = it.read::<u8>()?;
-            transcript.push(c);
-            if c == PackedOperation::terminator().code {
-                break;
-            }
-        }
+        let raw = read_raw_match(it)?;
         Ok(Self {
-            subject_id,
-            flag,
-            score,
-            query_begin,
-            subject_begin,
-            transcript,
+            subject_id: raw.subject_id,
+            flag: raw.flag,
+            score: raw.score,
+            query_begin: raw.query_begin,
+            subject_begin: raw.subject_begin,
+            transcript: raw.transcript.to_vec(),
         })
     }
 }
@@ -777,6 +793,10 @@ pub struct DaaViewConfig {
     pub max_target_seqs: i64,
     pub toppercent: Option<f64>,
     pub forward_only: bool,
+    /// Stored as the unsigned conversion used by C++ when an `int64_t`
+    /// offset is added to the unsigned ordinal id.
+    pub qnum_offset: u64,
+    pub snum_offset: u64,
 }
 
 impl Default for DaaViewConfig {
@@ -785,6 +805,8 @@ impl Default for DaaViewConfig {
             max_target_seqs: 25,
             toppercent: None,
             forward_only: false,
+            qnum_offset: 0,
+            snum_offset: 0,
         }
     }
 }
@@ -818,10 +840,12 @@ pub fn view_query_daa(
         r.query_source(),
         r.input_sequence_type(),
     );
-    let matches = r.begin(file, score_matrix).collect::<Result<Vec<_>, _>>()?;
-    let top_score = matches.first().map(|m| m.hsp.score).unwrap_or(0);
+    let mut matches = r.begin(file, score_matrix);
+    let first = matches.next().transpose()?;
+    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
 
-    for m in matches {
+    for m in first.into_iter().map(Ok).chain(matches) {
+        let m = m?;
         if m.hsp.frame > 2 && cfg.forward_only {
             continue;
         }
@@ -862,11 +886,36 @@ pub fn view_query_tabular(
         .map_err(|e| e.to_string())?;
     }
 
-    let matches = r.begin(file, score_matrix).collect::<Result<Vec<_>, _>>()?;
-    let top_score = matches.first().map(|m| m.hsp.score).unwrap_or(0);
+    // C++ keeps one reusable Match iterator and streams records. Preserve that
+    // boundary: retaining every decoded HSP adds allocations and copies that
+    // the upstream viewer never performs. Only the first score is needed for
+    // output-range filtering.
+    let mut matches = r.begin(file, score_matrix);
+    let first = matches.next().transpose()?;
+    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
     let mut json_records_written = 0usize;
+    // C++ reuses one Match/HspContext while advancing the DAA iterator. Keep
+    // the query frames and query title owned once per query record rather than
+    // cloning them, the target title, and the packed transcript for every row.
+    let mut context = HspContext::new(
+        Hsp::new(),
+        r.query_num as u32,
+        0,
+        r.context.to_vec(),
+        r.query_len() as i32,
+        &r.query_name,
+        0,
+        0,
+        "",
+        0,
+        0,
+        Vec::new(),
+        0.0,
+        0.0,
+    );
 
-    for m in matches {
+    for m in first.into_iter().map(Ok).chain(matches) {
+        let m = m?;
         if m.hsp.frame > 2 && cfg.forward_only {
             continue;
         }
@@ -879,7 +928,13 @@ pub fn view_query_tabular(
         ) {
             break;
         }
-        let context = m.context(r);
+        context.hsp = m.hsp;
+        context.subject_oid = m.subject_id as u64;
+        context.subject_len = m.subject_len as i32;
+        context.target_title.clear();
+        context.target_title.push_str(&m.subject_name);
+        context.hit_num = m.hit_num;
+        context.hsp_num = m.hsp_num;
         if format.is_json {
             write_tabular_context_row_json(
                 out,
@@ -888,8 +943,8 @@ pub fn view_query_tabular(
                 &format.fields,
                 file.mode() == 3,
                 false,
-                0,
-                0,
+                cfg.qnum_offset,
+                cfg.snum_offset,
                 &[],
                 None,
                 "",
@@ -898,8 +953,16 @@ pub fn view_query_tabular(
             .map_err(|e| e.to_string())?;
             json_records_written += 1;
         } else {
-            write_tabular_context_row(out, &context, &format.fields, file.mode() == 3, false, 0, 0)
-                .map_err(|e| e.to_string())?;
+            write_tabular_context_row(
+                out,
+                &context,
+                &format.fields,
+                file.mode() == 3,
+                false,
+                cfg.qnum_offset,
+                cfg.snum_offset,
+            )
+            .map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -914,10 +977,12 @@ pub fn view_query_paf(
     cfg: &DaaViewConfig,
 ) -> Result<(), String> {
     paf::print_query_intro(out, &r.query_name, false).map_err(|e| e.to_string())?;
-    let matches = r.begin(file, score_matrix).collect::<Result<Vec<_>, _>>()?;
-    let top_score = matches.first().map(|m| m.hsp.score).unwrap_or(0);
+    let mut matches = r.begin(file, score_matrix);
+    let first = matches.next().transpose()?;
+    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
 
-    for m in matches {
+    for m in first.into_iter().map(Ok).chain(matches) {
+        let m = m?;
         if m.hsp.frame > 2 && cfg.forward_only {
             continue;
         }
@@ -946,10 +1011,12 @@ pub fn view_query_sam(
     sam_qlen_field: bool,
 ) -> Result<(), String> {
     sam::print_query_intro(out, &r.query_name, false).map_err(|e| e.to_string())?;
-    let matches = r.begin(file, score_matrix).collect::<Result<Vec<_>, _>>()?;
-    let top_score = matches.first().map(|m| m.hsp.score).unwrap_or(0);
+    let mut matches = r.begin(file, score_matrix);
+    let first = matches.next().transpose()?;
+    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
 
-    for m in matches {
+    for m in first.into_iter().map(Ok).chain(matches) {
+        let m = m?;
         if m.hsp.frame > 2 && cfg.forward_only {
             continue;
         }
@@ -979,10 +1046,12 @@ pub fn view_query_pairwise(
 ) -> Result<(), String> {
     pairwise::print_query_intro(out, &r.query_name, r.query_len() as i32, false)
         .map_err(|e| e.to_string())?;
-    let matches = r.begin(file, score_matrix).collect::<Result<Vec<_>, _>>()?;
-    let top_score = matches.first().map(|m| m.hsp.score).unwrap_or(0);
+    let mut matches = r.begin(file, score_matrix);
+    let first = matches.next().transpose()?;
+    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
 
-    for m in matches {
+    for m in first.into_iter().map(Ok).chain(matches) {
+        let m = m?;
         if m.hsp.frame > 2 && cfg.forward_only {
             continue;
         }
@@ -1013,10 +1082,12 @@ pub fn view_query_xml(
 ) -> Result<(), String> {
     xml::print_query_intro(out, r.query_num as u64, &r.query_name, r.query_len() as i32)
         .map_err(|e| e.to_string())?;
-    let matches = r.begin(file, score_matrix).collect::<Result<Vec<_>, _>>()?;
-    let top_score = matches.first().map(|m| m.hsp.score).unwrap_or(0);
+    let mut matches = r.begin(file, score_matrix);
+    let first = matches.next().transpose()?;
+    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
 
-    for m in matches {
+    for m in first.into_iter().map(Ok).chain(matches) {
+        let m = m?;
         if m.hsp.frame > 2 && cfg.forward_only {
             continue;
         }
@@ -1052,10 +1123,15 @@ pub fn view_query_null(
     score_matrix: &ScoreMatrix,
     cfg: &DaaViewConfig,
 ) -> Result<(), String> {
-    let matches = r.begin(file, score_matrix).collect::<Result<Vec<_>, _>>()?;
-    let top_score = matches.first().map(|m| m.hsp.score).unwrap_or(0);
+    // C++ advances one `DAA_query_record::Match_iterator`; the null formatter
+    // does not retain decoded matches.  Keeping the whole query in a Vec here
+    // made a nominally no-output pass allocate and copy every HSP.
+    let mut matches = r.begin(file, score_matrix);
+    let first = matches.next().transpose()?;
+    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
 
-    for m in matches {
+    for m in first.into_iter().map(Ok).chain(matches) {
+        let m = m?;
         if m.hsp.frame > 2 && cfg.forward_only {
             continue;
         }
@@ -1080,10 +1156,12 @@ pub fn view_query_edge(
     score_matrix: &ScoreMatrix,
     cfg: &DaaViewConfig,
 ) -> Result<(), String> {
-    let matches = r.begin(file, score_matrix).collect::<Result<Vec<_>, _>>()?;
-    let top_score = matches.first().map(|m| m.hsp.score).unwrap_or(0);
+    let mut matches = r.begin(file, score_matrix);
+    let first = matches.next().transpose()?;
+    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
 
-    for m in matches {
+    for m in first.into_iter().map(Ok).chain(matches) {
+        let m = m?;
         if m.hsp.frame > 2 && cfg.forward_only {
             continue;
         }
@@ -1561,7 +1639,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "diamond_rs_daa_file_{}_{}.daa",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            crate::util::test_path_component()
         ));
         std::fs::write(&path, &bytes).unwrap();
 
@@ -1917,6 +1995,8 @@ mod tests {
                 max_target_seqs: 1,
                 toppercent: None,
                 forward_only: false,
+                qnum_offset: 0,
+                snum_offset: 0,
             },
         )
         .unwrap();

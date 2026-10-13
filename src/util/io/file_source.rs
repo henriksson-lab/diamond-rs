@@ -17,15 +17,21 @@ impl FileSource {
     /// C++ `FileSource(const string&)`.
     pub fn new(file_name: &str) -> IoResult<Self> {
         let is_stdin = file_name.is_empty() || file_name == "-";
-        let stdin_name = if cfg!(windows) {
-            "CONIN$"
+        let file = if is_stdin {
+            #[cfg(windows)]
+            {
+                super::duplicate_standard_handle(
+                    windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+                )
+                .map_err(|_| IoError::FileOpen(file_name.to_string()))?
+            }
+            #[cfg(not(windows))]
+            {
+                StdFile::open("/dev/stdin").map_err(|_| IoError::FileOpen(file_name.to_string()))?
+            }
         } else {
-            "/dev/stdin"
+            StdFile::open(file_name).map_err(|_| IoError::FileOpen(file_name.to_string()))?
         };
-        let open_name = if is_stdin { stdin_name } else { file_name };
-
-        let file =
-            StdFile::open(open_name).map_err(|_| IoError::FileOpen(file_name.to_string()))?;
         let seekable = !is_stdin && file.metadata().map(|meta| meta.is_file()).unwrap_or(false);
         Ok(Self {
             file: Some(file),
@@ -151,7 +157,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "diamond-rs-file-source-{name}-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
+            crate::util::test_path_component()
         ));
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, bytes).unwrap();

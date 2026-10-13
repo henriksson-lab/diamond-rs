@@ -227,7 +227,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "diamond-rs-temp-file-{name}-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
+            crate::util::test_path_component()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
@@ -244,12 +244,16 @@ mod tests {
         std::fs::remove_file(&linked.name).unwrap();
 
         let unlinked = TempFile::init_in(true, &dir, false).unwrap();
+        #[cfg(not(unix))]
+        let unlinked_name = unlinked.name.clone();
         #[cfg(unix)]
         {
             assert!(unlinked.unlinked);
             assert!(!Path::new(&unlinked.name).exists());
         }
         drop(unlinked);
+        #[cfg(not(unix))]
+        std::fs::remove_file(unlinked_name).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -257,6 +261,8 @@ mod tests {
     fn temp_file_data_constructor_keeps_unlinked_descriptor_usable() {
         let dir = test_dir("descriptor");
         let data = TempFile::init_in(true, &dir, false).unwrap();
+        #[cfg(not(unix))]
+        let name = data.name.clone();
         let mut temp = TempFile::from_temp_file_data(&data).unwrap();
         drop(data);
         temp.write_raw(b"abc").unwrap();
@@ -266,6 +272,8 @@ mod tests {
         temp.file().unwrap().read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"abc");
         temp.close().unwrap();
+        #[cfg(not(unix))]
+        std::fs::remove_file(name).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 

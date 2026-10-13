@@ -516,7 +516,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "diamond-align-pairs-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            crate::util::test_path_component()
         ));
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1usize.to_ne_bytes());

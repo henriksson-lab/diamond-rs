@@ -11,7 +11,8 @@ use crate::basic::shape_config::ShapeConfig;
 use crate::basic::value::SequenceType;
 use crate::config::Sensitivity;
 use crate::data::block::Block;
-use crate::data::dmnd_reader::read_dmnd;
+use crate::data::dmnd::ReferenceHeader;
+use crate::data::dmnd_reader::for_each_dmnd_record;
 use crate::data::seed_set::{HashedSeedSet, Table, SEED_INDEX_MAGIC_NUMBER, SEED_INDEX_VERSION};
 use crate::search::sensitivity::{get_shape_codes, get_traits, soft_masking_algo};
 
@@ -25,6 +26,9 @@ pub struct MakeIndexConfig {
     pub sensitivity: Sensitivity,
     pub shape_mask: Vec<String>,
     pub shapes: u32,
+    /// Zero selects the platform's available parallelism, matching the CLI's
+    /// upstream default.
+    pub threads: usize,
 }
 
 impl MakeIndexConfig {
@@ -34,6 +38,7 @@ impl MakeIndexConfig {
             sensitivity,
             shape_mask: Vec::new(),
             shapes: 0,
+            threads: 0,
         }
     }
 }
@@ -83,7 +88,11 @@ pub fn make_index(config: &MakeIndexConfig) -> io::Result<PathBuf> {
     }
 
     let database_path = resolve_database_path(&config.database);
-    let (header, records) = read_dmnd(&database_path)?;
+    let mut header_file = File::open(&database_path)?;
+    let header = ReferenceHeader::read_from(&mut header_file)?;
+    header
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if header.letters > MAX_INDEX_LETTERS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -104,23 +113,36 @@ pub fn make_index(config: &MakeIndexConfig) -> io::Result<PathBuf> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     let mut block = Block::new();
-    for (oid, record) in records.iter().enumerate() {
+    for_each_dmnd_record(&database_path, |oid, id, sequence| {
+        // DMND stores encoded letters as raw bytes. `Letter` is `i8`, so this
+        // is a same-size, alignment-one borrowed view valid for the callback.
+        let sequence =
+            unsafe { std::slice::from_raw_parts(sequence.as_ptr().cast::<i8>(), sequence.len()) };
         block
             .push_back(
-                &record.sequence,
-                Some(&record.id),
+                sequence,
+                Some(id),
                 None,
                 oid as u64,
                 SequenceType::AminoAcid,
                 0,
                 false,
             )
-            .map_err(io::Error::other)?;
-    }
+            .map(|_| ())
+            .map_err(io::Error::other)
+    })?;
 
     let traits = get_traits(config.sensitivity);
     let soft_masking = soft_masking_algo(&traits, "", false, false)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let threads = if config.threads == 0 {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    } else {
+        config.threads
+    };
+    block.soft_mask_with_threads(soft_masking, threads);
     let index = HashedSeedSet::from_block(&mut block, None, 0.0, soft_masking, &shapes, &reduction)
         .map_err(io::Error::other)?;
 

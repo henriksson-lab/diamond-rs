@@ -331,37 +331,7 @@ impl Masking {
     }
 
     fn mask_motifs(&self, seq: &mut [Letter], block_id: usize, table: &mut MaskingTable) -> usize {
-        use crate::basic::sequence::Sequence;
-        use crate::util::kmer::KmerIterator;
-
-        if seq.len() < MOTIF_LEN {
-            return 0;
-        }
-        let motif_table = motifs::init_motif_table();
-        let mut ranges = Vec::<(usize, usize)>::new();
-        let mut iter = KmerIterator::<MOTIF_LEN>::new(Sequence::new(seq));
-        while iter.good() {
-            if motif_table.contains_kmer(iter.get()) {
-                let begin = iter.offset_from_start() as usize;
-                let end = begin + MOTIF_LEN;
-                if let Some(last) = ranges.last_mut().filter(|last| begin <= last.1) {
-                    last.1 = last.1.max(end);
-                } else {
-                    ranges.push((begin, end));
-                }
-            }
-            iter.increment();
-        }
-        let covered = ranges.iter().map(|(begin, end)| end - begin).sum();
-        if covered * 2 >= seq.len() {
-            return 0;
-        }
-        for (begin, end) in ranges {
-            if end - begin <= self.config.max_motif_len {
-                table.add(block_id, begin as i32, end as i32, seq);
-            }
-        }
-        covered
+        mask_motifs_into_table(seq, block_id, table, self.config.max_motif_len)
     }
 
     pub fn mask_bit(&self, seq: &mut [Letter]) {
@@ -415,6 +385,59 @@ pub fn mask_seqs(
 }
 
 pub const MOTIF_LEN: usize = 8;
+
+/// Apply DIAMOND's motif soft mask and retain the original letters in
+/// `table`. This is shared with `Block::soft_mask`, whose upstream counterpart
+/// calls the same `Masking::operator()` path before seed enumeration.
+pub(crate) fn mask_motifs_into_table(
+    seq: &mut [Letter],
+    block_id: usize,
+    table: &mut MaskingTable,
+    max_motif_len: usize,
+) -> usize {
+    let (ranges, covered) = motif_mask_ranges(seq, max_motif_len);
+    for (begin, end) in ranges {
+        table.add(block_id, begin as i32, end as i32, seq);
+    }
+    covered
+}
+
+/// Compute the ranges retained by upstream motif masking without modifying
+/// the sequence. Keeping discovery separate from application lets callers
+/// parallelize independent sequences while applying the masking table in a
+/// deterministic block order afterward.
+pub(crate) fn motif_mask_ranges(
+    seq: &[Letter],
+    max_motif_len: usize,
+) -> (Vec<(usize, usize)>, usize) {
+    use crate::basic::sequence::Sequence;
+    use crate::util::kmer::KmerIterator;
+
+    if seq.len() < MOTIF_LEN {
+        return (Vec::new(), 0);
+    }
+    let motif_table = motifs::init_motif_table();
+    let mut ranges = Vec::<(usize, usize)>::new();
+    let mut iter = KmerIterator::<MOTIF_LEN>::new(Sequence::new(seq));
+    while iter.good() {
+        if motif_table.contains_kmer(iter.get()) {
+            let begin = iter.offset_from_start() as usize;
+            let end = begin + MOTIF_LEN;
+            if let Some(last) = ranges.last_mut().filter(|last| begin <= last.1) {
+                last.1 = last.1.max(end);
+            } else {
+                ranges.push((begin, end));
+            }
+        }
+        iter.increment_identity();
+    }
+    let covered = ranges.iter().map(|(begin, end)| end - begin).sum();
+    if covered * 2 >= seq.len() {
+        return (Vec::new(), 0);
+    }
+    ranges.retain(|(begin, end)| end - begin <= max_motif_len);
+    (ranges, covered)
+}
 
 /// Soft-mask a sequence position by setting the high bit.
 #[inline]

@@ -2,11 +2,11 @@ use std::io::{self, Write};
 
 use crate::align::hsp::HspContext;
 use crate::basic::packed_transcript::EditOperation;
-use crate::basic::value::{TaxId, AMINO_ACID_ALPHABET, LETTER_MASK};
+use crate::basic::value::{TaxId, AMINO_ACID_ALPHABET, LETTER_MASK, NUCLEOTIDE_ALPHABET};
 use crate::data::taxonomy::TaxonomyTree;
 use crate::dp::swipe::HspValues;
 use crate::util::escape_sequences::{EscapeSequences, XML};
-use crate::util::sequence::{FASTA_HEADER_SEP, ID_DELIMITERS};
+use crate::util::sequence::FASTA_HEADER_SEP;
 
 /// Matches C++ `format_double(x)`.
 ///
@@ -586,16 +586,9 @@ impl FieldId {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "qseqid" => Some(Self::QSeqId),
-            "qgi" => Some(Self::QGi),
-            "qacc" => Some(Self::QAcc),
-            "qaccver" => Some(Self::QAccVer),
             "qlen" => Some(Self::QLen),
             "sseqid" => Some(Self::SSeqId),
             "sallseqid" => Some(Self::SAllSeqId),
-            "sgi" => Some(Self::SGi),
-            "sacc" => Some(Self::SAcc),
-            "saccver" => Some(Self::SAccVer),
-            "sallacc" => Some(Self::SAllacc),
             "slen" => Some(Self::SLen),
             "qstart" => Some(Self::QStart),
             "qend" => Some(Self::QEnd),
@@ -621,8 +614,6 @@ impl FieldId {
             "sskingdoms" => Some(Self::SSKingdoms),
             "stitle" => Some(Self::STitle),
             "salltitles" => Some(Self::SAllTitles),
-            "sstrand" => Some(Self::SStrand),
-            "qcovs" => Some(Self::QCovS),
             "qcovhsp" => Some(Self::QCovHsp),
             "qtitle" => Some(Self::QTitle),
             "full_sseq" => Some(Self::FullSSeq),
@@ -641,18 +632,14 @@ impl FieldId {
             "full_qseq_mate" => Some(Self::FullQSeqMate),
             "qseq_translated" => Some(Self::QSeqTranslated),
             "hspnum" => Some(Self::HspNum),
-            // C++ `blast_tab_format.cpp:104-105` registers these as
-            // `normalized_bitscore` and `normalized_nident`. Accept both
-            // the C++ name and the prior Rust-only `nident_normalized` spelling
-            // (so existing scripts keep working) and add `normalized_bitscore`
-            // which was missing from `from_name` entirely.
-            "normalized_nident" | "nident_normalized" => Some(Self::NormalizedNident),
+            // C++ `blast_tab_format.cpp` registers exactly these spellings.
+            // Do not accept BLAST aliases absent from upstream DIAMOND: its
+            // CLI reports them as invalid output fields.
+            "normalized_nident" => Some(Self::NormalizedNident),
             "normalized_bitscore" => Some(Self::NormalizedBitscore),
             "approx_pident" => Some(Self::ApproxPIdent),
             "corrected_bitscore" => Some(Self::CorrectedBitScore),
             "slineages" => Some(Self::SLineages),
-            "reserved1" => Some(Self::Reserved1),
-            "reserved2" => Some(Self::Reserved2),
             _ => None,
         }
     }
@@ -1464,15 +1451,16 @@ pub fn print_title_escaped(
         // present, regardless of position. Picking the earliest-position
         // delimiter (the obvious thing) would tokenize a multi-seqid header
         // like `"sp|A >sp|B\x01sp|C"` into 3 pieces instead of C++'s 2.
-        let mut split_at = rest.len();
-        let mut sep_len = 0usize;
-        for sep in FASTA_HEADER_SEP {
-            if let Some(i) = rest.find(sep) {
-                split_at = i;
-                sep_len = sep.len();
-                break;
-            }
-        }
+        let bytes = rest.as_bytes();
+        let (split_at, sep_len) = if let Some(i) = bytes.iter().position(|&byte| byte == 1) {
+            // Delimiter priority, rather than earliest position, is upstream
+            // `StringDelimiters::scan` behavior.
+            (i, FASTA_HEADER_SEP[0].len())
+        } else if let Some(i) = bytes.windows(2).position(|pair| pair == b" >") {
+            (i, FASTA_HEADER_SEP[1].len())
+        } else {
+            (rest.len(), 0)
+        };
         let s = &rest[..split_at];
         if n > 0 {
             out.push_str(separator);
@@ -1483,9 +1471,15 @@ pub fn print_title_escaped(
         let value = if full_titles {
             s
         } else {
-            s.split(|c: char| ID_DELIMITERS.contains(c))
-                .next()
-                .unwrap_or("")
+            // Every ID delimiter is ASCII. Scanning bytes avoids constructing
+            // a `StrSearcher` for every output row while retaining a valid
+            // UTF-8 boundary for any non-ASCII title text.
+            let end = s
+                .as_bytes()
+                .iter()
+                .position(|byte| matches!(*byte, b' ' | 1 | 7 | 8 | 9 | 10 | 11 | 12 | 13))
+                .unwrap_or(s.len());
+            &s[..end]
         };
         if let Some(esc) = escape_sequences {
             out.push_str(&esc.escape_string(value));
@@ -1680,7 +1674,7 @@ pub fn print_full_qseq_mate(mate_seq: Option<&[crate::basic::value::Letter]>) ->
     };
     let mut out = String::new();
     for &letter in mate_seq {
-        out.push(AMINO_ACID_ALPHABET[(letter & LETTER_MASK) as usize] as char);
+        out.push(NUCLEOTIDE_ALPHABET[(letter & LETTER_MASK) as usize] as char);
     }
     out
 }
@@ -1854,8 +1848,11 @@ pub fn write_tabular_context_row<W: Write>(
                     )?;
                 }
             }
-            FieldId::QNum => write!(writer, "{}", r.query_oid + qnum_offset)?,
-            FieldId::SNum => write!(writer, "{}", r.subject_oid + snum_offset)?,
+            // `OId` is uint64_t upstream while the configured offsets are
+            // int64_t. C++ therefore converts the offset to uint64_t and the
+            // addition is modulo 2^64, including for negative offsets.
+            FieldId::QNum => write!(writer, "{}", r.query_oid.wrapping_add(qnum_offset))?,
+            FieldId::SNum => write!(writer, "{}", r.subject_oid.wrapping_add(snum_offset))?,
             FieldId::SCovHsp => write!(writer, "{}", format_double(r.scovhsp()))?,
             FieldId::FullQSeq => {
                 for &letter in r.query_index(r.hsp.frame) {
@@ -2403,6 +2400,37 @@ pub fn write_tabular_row<W: Write>(
     query_len: i32,
     subject_len: i32,
 ) -> std::io::Result<()> {
+    write_tabular_row_with_query_info(
+        writer,
+        query_id,
+        subject_id,
+        hsp,
+        fields,
+        query_len,
+        subject_len,
+        None,
+        &[],
+        None,
+    )
+}
+
+/// Write the compact native search row with source-query information that is
+/// not part of the HSP. Translated paired-end search uses this for the mate
+/// sequence, just as upstream obtains it from the adjacent source sequence in
+/// `Block::seq_info`.
+#[allow(clippy::too_many_arguments)]
+pub fn write_tabular_row_with_query_info<W: Write>(
+    writer: &mut W,
+    query_id: &str,
+    subject_id: &str,
+    hsp: &Hsp,
+    fields: &[FieldId],
+    query_len: i32,
+    subject_len: i32,
+    mate_sequence: Option<&[crate::basic::value::Letter]>,
+    subject_taxids: &[TaxId],
+    taxonomy: Option<&TaxonomyTree>,
+) -> std::io::Result<()> {
     for (i, field) in fields.iter().enumerate() {
         if i > 0 {
             write!(writer, "\t")?;
@@ -2450,6 +2478,59 @@ pub fn write_tabular_row<W: Write>(
                 };
                 write!(writer, "{}", format_double(cov))?;
             }
+            FieldId::FullQSeqMate => write!(writer, "{}", print_full_qseq_mate(mate_sequence))?,
+            FieldId::STaxIds => write!(writer, "{}", print_staxids(subject_taxids, false))?,
+            FieldId::SSciNames => {
+                if let Some(tree) = taxonomy {
+                    write!(
+                        writer,
+                        "{}",
+                        print_taxon_names(subject_taxids.iter().copied(), tree, false)
+                    )?;
+                } else {
+                    write!(writer, "N/A")?;
+                }
+            }
+            FieldId::SSKingdoms => {
+                if let Some(tree) = taxonomy {
+                    write!(
+                        writer,
+                        "{}",
+                        print_rank_taxon_names(subject_taxids, tree, "superkingdom", false)
+                    )?;
+                } else {
+                    write!(writer, "N/A")?;
+                }
+            }
+            FieldId::SKingdoms => {
+                if let Some(tree) = taxonomy {
+                    write!(
+                        writer,
+                        "{}",
+                        print_rank_taxon_names(subject_taxids, tree, "kingdom", false)
+                    )?;
+                } else {
+                    write!(writer, "N/A")?;
+                }
+            }
+            FieldId::SPhylums => {
+                if let Some(tree) = taxonomy {
+                    write!(
+                        writer,
+                        "{}",
+                        print_rank_taxon_names(subject_taxids, tree, "phylum", false)
+                    )?;
+                } else {
+                    write!(writer, "N/A")?;
+                }
+            }
+            FieldId::SLineages => {
+                if let Some(tree) = taxonomy {
+                    write!(writer, "{}", print_lineage(subject_taxids, tree, false))?;
+                } else {
+                    write!(writer, "N/A")?;
+                }
+            }
             _ => write!(writer, "N/A")?,
         }
     }
@@ -2489,6 +2570,41 @@ mod tests {
     }
 
     #[test]
+    fn compact_translated_row_prints_paired_mate_sequence() {
+        let hsp = Hsp {
+            score: 10,
+            evalue: 1.0,
+            bit_score: 5.0,
+            query_range: (0, 3),
+            subject_range: (0, 1),
+            query_source_range: (0, 3),
+            subject_source_range: (0, 1),
+            frame: 1,
+            length: 1,
+            identities: 1,
+            mismatches: 0,
+            positives: 1,
+            gap_openings: 0,
+            gaps: 0,
+        };
+        let mut output = Vec::new();
+        write_tabular_row_with_query_info(
+            &mut output,
+            "read/1",
+            "subject",
+            &hsp,
+            &[FieldId::QSeqId, FieldId::FullQSeqMate],
+            3,
+            1,
+            Some(&[0, 1, 2, 3]),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "read/1\tACGT\n");
+    }
+
+    #[test]
     fn test_format_code_parse() {
         assert_eq!(FormatCode::parse("0"), Some(FormatCode::Pairwise));
         assert_eq!(FormatCode::parse("6"), Some(FormatCode::Tabular));
@@ -2505,6 +2621,22 @@ mod tests {
         assert_eq!(FieldId::from_name("sseqid"), Some(FieldId::SSeqId));
         assert_eq!(FieldId::from_name("evalue"), Some(FieldId::EValue));
         assert_eq!(FieldId::from_name("bitscore"), Some(FieldId::BitScore));
+        for unsupported_upstream_name in [
+            "qgi",
+            "qacc",
+            "qaccver",
+            "sgi",
+            "sacc",
+            "saccver",
+            "sallacc",
+            "sstrand",
+            "qcovs",
+            "nident_normalized",
+            "reserved1",
+            "reserved2",
+        ] {
+            assert_eq!(FieldId::from_name(unsupported_upstream_name), None);
+        }
         assert_eq!(FieldId::from_name("unknown"), None);
         assert_eq!(FieldId::Count as u32, 77);
         assert_eq!(FieldId::Count.output_field(), None);
@@ -3118,7 +3250,7 @@ mod tests {
         assert_eq!(print_full_qqual(""), "*");
         assert_eq!(print_full_qqual("abcdef"), "abcdef");
         assert_eq!(print_full_qseq_mate(None), "*");
-        assert_eq!(print_full_qseq_mate(Some(&[0, 1, 2, 3])), "ARND");
+        assert_eq!(print_full_qseq_mate(Some(&[0, 1, 2, 3])), "ACGT");
     }
 
     #[test]
@@ -3297,7 +3429,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "query\tbcd\tabcdef\tARN\t9\n"
+            "query\tbcd\tabcdef\tACG\t9\n"
         );
 
         let mut empty = Vec::new();

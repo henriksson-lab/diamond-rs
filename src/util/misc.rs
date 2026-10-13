@@ -535,7 +535,8 @@ mod tests {
         assert_eq!(round_up(10u32, 3), 12);
         assert_eq!(round_down_const::<8>(31), 24);
         assert_eq!(round_up_const::<8>(31), 32);
-        assert_eq!(extract_dir("/tmp/x"), "/tmp");
+        let native_path = format!("tmp{}x", crate::util::system::PATH_SEPARATOR);
+        assert_eq!(extract_dir(&native_path), "tmp");
         assert_eq!(to_upper_case("aBc"), "ABC");
         assert_eq!(to_lower_case("aBc"), "abc");
     }

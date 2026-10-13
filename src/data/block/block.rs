@@ -9,6 +9,7 @@ use crate::masking::{mask_sequence, MaskingAlgo, MaskingTable};
 use crate::output::format::OutputFlags;
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::sequence::{all_seqids, find_orfs, seqid, translate as translate_sequence};
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AlignModeBlock {
@@ -248,6 +249,15 @@ impl Block {
         }
         if self.soft_masking_table.blank() {
             for block_id in 0..self.seqs.len() {
+                if algo == MaskingAlgo::Motif {
+                    crate::masking::mask_motifs_into_table(
+                        self.seqs.get_mut(block_id),
+                        block_id,
+                        &mut self.soft_masking_table,
+                        crate::masking::MaskingConfig::default().max_motif_len,
+                    );
+                    continue;
+                }
                 let before = self.seqs.get(block_id).to_vec();
                 mask_sequence(self.seqs.get_mut(block_id), algo);
                 let after = self.seqs.get(block_id).to_vec();
@@ -273,6 +283,45 @@ impl Block {
             }
         } else {
             self.soft_masking_table.apply(&mut self.seqs);
+        }
+        self.soft_masked = true;
+    }
+
+    /// Upstream `mask_seqs` distributes independent sequence IDs across
+    /// `config.threads_`. Discover motif ranges in parallel, then apply them
+    /// in block order so the translated masking table stays deterministic.
+    pub fn soft_mask_with_threads(&mut self, algo: MaskingAlgo, threads: usize) {
+        if threads <= 1 || algo != MaskingAlgo::Motif || !self.soft_masking_table.blank() {
+            self.soft_mask(algo);
+            return;
+        }
+        if self.soft_masked {
+            return;
+        }
+
+        let max_motif_len = crate::masking::MaskingConfig::default().max_motif_len;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("failed to build motif-masking worker pool");
+        let ranges: Vec<Vec<(usize, usize)>> = pool.install(|| {
+            (0..self.seqs.len())
+                .into_par_iter()
+                .map(|block_id| {
+                    crate::masking::motif_mask_ranges(self.seqs.get(block_id), max_motif_len).0
+                })
+                .collect()
+        });
+
+        for (block_id, block_ranges) in ranges.into_iter().enumerate() {
+            for (begin, end) in block_ranges {
+                self.soft_masking_table.add(
+                    block_id,
+                    begin as i32,
+                    end as i32,
+                    self.seqs.get_mut(block_id),
+                );
+            }
         }
         self.soft_masked = true;
     }
@@ -642,6 +691,67 @@ mod tests {
         b.set_raw_bytes(123);
         assert_eq!(b.raw_bytes(), 123);
         assert!(b.mem_size() > 0);
+    }
+
+    #[test]
+    fn motif_soft_mask_uses_masking_table_and_restores_letters() {
+        // FRKYTAFT at position 8 covers less than half of this sequence, so
+        // upstream motif masking records and hard-masks exactly this span.
+        let mut sequence = vec![0; 32];
+        sequence[8..16].copy_from_slice(&[13, 1, 11, 18, 16, 0, 13, 16]);
+        let original = sequence.clone();
+        let mut block = Block::new();
+        block
+            .push_back(
+                &sequence,
+                Some("motif"),
+                None,
+                0,
+                SequenceType::AminoAcid,
+                0,
+                false,
+            )
+            .unwrap();
+
+        block.soft_mask(MaskingAlgo::Motif);
+        assert_eq!(block.soft_masked_letters(), 8);
+        assert_eq!(&block.seqs().get(0)[8..16], &[MASK_LETTER; 8]);
+
+        block.remove_soft_masking(0, false);
+        assert_eq!(block.seqs().get(0), original);
+    }
+
+    #[test]
+    fn threaded_motif_soft_mask_matches_serial_block_order() {
+        let motif = [13, 1, 11, 18, 16, 0, 13, 16];
+        let mut serial = Block::new();
+        let mut threaded = Block::new();
+        for oid in 0..32 {
+            let mut sequence = vec![0; 64 + oid % 5];
+            sequence[8..16].copy_from_slice(&motif);
+            for block in [&mut serial, &mut threaded] {
+                block
+                    .push_back(
+                        &sequence,
+                        Some("motif"),
+                        None,
+                        oid as u64,
+                        SequenceType::AminoAcid,
+                        0,
+                        false,
+                    )
+                    .unwrap();
+            }
+        }
+
+        serial.soft_mask(MaskingAlgo::Motif);
+        threaded.soft_mask_with_threads(MaskingAlgo::Motif, 4);
+        assert_eq!(threaded.seqs, serial.seqs);
+        assert_eq!(threaded.soft_masking_table, serial.soft_masking_table);
+
+        serial.remove_soft_masking(0, false);
+        threaded.remove_soft_masking(0, false);
+        assert_eq!(threaded.seqs, serial.seqs);
     }
 
     #[test]

@@ -5,6 +5,7 @@ use crate::basic::value::TaxId;
 use crate::data::blastdb::taxdmp::read_nodes_dmp;
 use crate::util::io::{Deserializer, IoResult, Serializer, StreamEntity};
 use std::collections::BTreeSet;
+use std::io::{self, Write};
 
 /// Stable on-disk taxonomic rank values used by DIAMOND databases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -276,6 +277,20 @@ impl TaxonomyNodes {
         }
         for &rank in &self.rank {
             out.write_raw(&[rank as u8])?;
+        }
+        Ok(())
+    }
+
+    /// Write the exact `TaxonomyNodes::save` database representation to a
+    /// standard Rust writer. New databases always contain the rank byte for
+    /// every parent entry (database build >= 131).
+    pub fn write_to<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        out.write_all(&(self.parent.len() as u32).to_le_bytes())?;
+        for &parent in &self.parent {
+            out.write_all(&parent.to_le_bytes())?;
+        }
+        for &rank in &self.rank {
+            out.write_all(&[rank as u8])?;
         }
         Ok(())
     }

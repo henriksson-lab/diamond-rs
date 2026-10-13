@@ -266,7 +266,17 @@ pub fn prepare_seed_join_partitioned_min_query_len(
         min_query_len,
         sketch_size,
     );
-    let reference = build_search_seed_array(ref_seqs, shape, reduction, seedp_bits, 0, sketch_size);
+    // Upstream's ostensibly query-specific option is read from global config
+    // by every seed enumeration, including reference enumeration. Preserve
+    // that observable behavior for exact parity.
+    let reference = build_search_seed_array(
+        ref_seqs,
+        shape,
+        reduction,
+        seedp_bits,
+        min_query_len,
+        sketch_size,
+    );
     prepare_seed_join_from_arrays(
         query_seqs,
         shape,
@@ -324,7 +334,7 @@ pub fn prepare_seed_join_partition_range_min_query_len(
             reduction,
             seedp_bits,
             sketch_size,
-            0,
+            min_query_len,
             partition_begin,
             partition_end,
         )
@@ -335,11 +345,116 @@ pub fn prepare_seed_join_partition_range_min_query_len(
             reduction,
             seedp_bits,
             0.0,
-            0,
+            min_query_len,
             partition_begin,
             partition_end,
         )
     };
+    prepare_seed_join_from_arrays(
+        query_seqs,
+        shape,
+        reduction,
+        complexity_cut,
+        query,
+        reference,
+    )
+}
+
+/// Build one upstream index chunk from the shape histograms computed before
+/// the chunk loop.
+///
+/// C++ constructs `SeedHistogram` once per query/reference block and then
+/// uses those counts to give `BuildCallback` its exact output ranges.  The
+/// native one-thread path previously counted every seed again inside every
+/// chunk before making the fill pass.  Besides doing different work from the
+/// source, that added four complete enumeration passes for the common
+/// four-chunk search.  This entry point follows the upstream order: one
+/// histogram pass, followed by one fill pass for each chunk.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_seed_join_partition_range_from_counts_min_query_len(
+    query_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: usize,
+    partition_begin: usize,
+    partition_end: usize,
+    query_counts: &[usize],
+    reference_counts: &[usize],
+) -> PreparedSeedJoin {
+    let seedp_bits = DEFAULT_SEEDP_BITS;
+    let query = SeedArray::build_partition_range_from_counts_reuse(
+        query_seqs,
+        shape,
+        reduction,
+        seedp_bits,
+        min_query_len,
+        partition_begin,
+        partition_end,
+        query_counts,
+        Vec::new(),
+    );
+    let reference = SeedArray::build_partition_range_from_counts_reuse(
+        ref_seqs,
+        shape,
+        reduction,
+        seedp_bits,
+        min_query_len,
+        partition_begin,
+        partition_end,
+        reference_counts,
+        Vec::new(),
+    );
+    prepare_seed_join_from_arrays(
+        query_seqs,
+        shape,
+        reduction,
+        complexity_cut,
+        query,
+        reference,
+    )
+}
+
+/// Multithreaded counterpart of the precomputed-count path. Worker-local
+/// counts retain upstream's sequence partition, allowing the fill to write
+/// directly into stable, disjoint partition ranges.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_seed_join_partition_range_from_worker_counts_min_query_len(
+    query_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: usize,
+    partition_begin: usize,
+    partition_end: usize,
+    query_counts: &super::seed_array::WorkerPartitionCounts,
+    reference_counts: &super::seed_array::WorkerPartitionCounts,
+) -> PreparedSeedJoin {
+    let seedp_bits = DEFAULT_SEEDP_BITS;
+    let query = SeedArray::build_partition_range_from_worker_counts_reuse(
+        query_seqs,
+        shape,
+        reduction,
+        seedp_bits,
+        min_query_len,
+        partition_begin,
+        partition_end,
+        query_counts,
+        Vec::new(),
+    );
+    let reference = SeedArray::build_partition_range_from_worker_counts_reuse(
+        ref_seqs,
+        shape,
+        reduction,
+        seedp_bits,
+        min_query_len,
+        partition_begin,
+        partition_end,
+        reference_counts,
+        Vec::new(),
+    );
     prepare_seed_join_from_arrays(
         query_seqs,
         shape,
@@ -480,8 +595,14 @@ pub fn collect_low_complexity_positions_partitioned_min_query_len(
         min_query_len,
         sketch_size,
     );
-    let mut ref_sa =
-        build_search_seed_array(ref_seqs, shape, reduction, seedp_bits, 0, sketch_size);
+    let mut ref_sa = build_search_seed_array(
+        ref_seqs,
+        shape,
+        reduction,
+        seedp_bits,
+        min_query_len,
+        sketch_size,
+    );
     let num_partitions = query_sa.num_partitions();
     let query_offsets = query_sa.seq_offsets().to_vec();
 
@@ -673,8 +794,8 @@ where
 }
 
 /// Streaming stage-1 join. Matching-key cross products are evaluated through
-/// the fingerprint kernel and delivered to `map_batch` in q-major batches of
-/// at most 32; no `Vec<SeedMatch>` proportional to q_count*r_count is built.
+/// the fingerprint kernel and delivered to `map_batch` in q-major batches;
+/// no `Vec<SeedMatch>` proportional to q_count*r_count is built.
 pub fn map_seed_matches_partitioned_streaming_hamming_min_query_len<T, F>(
     query_seqs: &[&[Letter]],
     query_fingerprint_seqs: &[&[Letter]],
@@ -781,6 +902,7 @@ where
         hamming_filter_id,
         partition_batch_size,
         false,
+        0.0,
         false,
         map_batch,
         consume,
@@ -801,6 +923,7 @@ pub fn visit_prepared_seed_matches_streaming_hamming_mode<T, F, C>(
     hamming_filter_id: u32,
     partition_batch_size: usize,
     linear_stage1_query: bool,
+    min_length_ratio: f64,
     self_search: bool,
     map_batch: F,
     consume: C,
@@ -810,9 +933,70 @@ where
     F: Fn(&[SeedMatch], &mut Vec<T>) -> usize + Sync,
     C: FnMut(Vec<Vec<T>>) + Send,
 {
+    visit_prepared_seed_hits_streaming_hamming_mode(
+        query_fingerprint_seqs,
+        ref_fingerprint_seqs,
+        exact_stage1_sets,
+        prepared,
+        hamming_filter_id,
+        partition_batch_size,
+        linear_stage1_query,
+        min_length_ratio,
+        self_search,
+        |query, target_indices, target_locs, target_subjects, partition, output| {
+            let matches: Vec<_> = target_indices
+                .iter()
+                .map(|&target_index| {
+                    let target_index = target_index as usize;
+                    let target = target_locs[target_index];
+                    SeedMatch {
+                        query_id: query.0,
+                        query_pos: query.1,
+                        ref_id: target.0,
+                        ref_pos: target.1,
+                        seed: (target_subjects[target_index] << DEFAULT_SEEDP_BITS)
+                            | partition as PackedSeed,
+                        shape_id: 0,
+                    }
+                })
+                .collect();
+            map_batch(&matches, output)
+        },
+        consume,
+    )
+}
+
+/// Compact form of [`visit_prepared_seed_matches_streaming_hamming_mode`].
+/// The callback receives one query, the target indices retained by the
+/// Hamming hit field, the original target-location array, and the absolute
+/// seed partition used by left-most filtering. This is upstream's borrowed
+/// `HitField`/`search_query_offset` boundary: survivors are not copied into a
+/// second per-hit representation before stage 2.
+#[allow(clippy::too_many_arguments)]
+pub fn visit_prepared_seed_hits_streaming_hamming_mode<T, F, C>(
+    query_fingerprint_seqs: &[&[Letter]],
+    ref_fingerprint_seqs: &[&[Letter]],
+    exact_stage1_sets: Option<(
+        &crate::data::sequence_set::SequenceSet,
+        &crate::data::sequence_set::SequenceSet,
+    )>,
+    prepared: PreparedSeedJoin,
+    hamming_filter_id: u32,
+    partition_batch_size: usize,
+    linear_stage1_query: bool,
+    min_length_ratio: f64,
+    self_search: bool,
+    map_batch: F,
+    consume: C,
+) -> usize
+where
+    T: Send,
+    F: Fn((u32, u32), &[u32], &[(u32, u32)], &[u64], u32, &mut Vec<T>) -> usize + Sync,
+    C: FnMut(Vec<Vec<T>>) + Send,
+{
     macro_rules! dispatch {
         ($kernel:expr) => {
-            return visit_prepared_seed_matches_streaming_hamming_for::<{ $kernel }, T, F, C>(
+            return visit_prepared_seed_hits_streaming_hamming_for::<{ $kernel }, T, F, C>(
                 query_fingerprint_seqs,
                 ref_fingerprint_seqs,
                 exact_stage1_sets,
@@ -820,6 +1004,7 @@ where
                 hamming_filter_id,
                 partition_batch_size,
                 linear_stage1_query,
+                min_length_ratio,
                 self_search,
                 map_batch,
                 consume,
@@ -829,9 +1014,11 @@ where
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        if std::arch::is_x86_feature_detected!("avx512bw") {
-            dispatch!(crate::search::hamming_filter::FP_AVX512BW);
-        }
+        // The upstream production dispatcher selects the complete
+        // `ARCH_AVX2::stage1` worker on this path. Do not independently
+        // upgrade only the fingerprint sub-kernel to AVX-512: mixing ISA
+        // namespaces is not the translated execution path and can also
+        // trigger an AVX-512 frequency transition before AVX2 stage 2.
         if std::arch::is_x86_feature_detected!("avx2") {
             dispatch!(crate::search::hamming_filter::FP_AVX2);
         }
@@ -846,7 +1033,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn visit_prepared_seed_matches_streaming_hamming_for<const HAMMING_KERNEL: u8, T, F, C>(
+fn visit_prepared_seed_hits_streaming_hamming_for<const HAMMING_KERNEL: u8, T, F, C>(
     query_fingerprint_seqs: &[&[Letter]],
     ref_fingerprint_seqs: &[&[Letter]],
     exact_stage1_sets: Option<(
@@ -857,13 +1044,14 @@ fn visit_prepared_seed_matches_streaming_hamming_for<const HAMMING_KERNEL: u8, T
     hamming_filter_id: u32,
     partition_batch_size: usize,
     linear_stage1_query: bool,
+    min_length_ratio: f64,
     self_search: bool,
     map_batch: F,
     mut consume: C,
 ) -> usize
 where
     T: Send,
-    F: Fn(&[SeedMatch], &mut Vec<T>) -> usize + Sync,
+    F: Fn((u32, u32), &[u32], &[(u32, u32)], &[u64], u32, &mut Vec<T>) -> usize + Sync,
     C: FnMut(Vec<Vec<T>>) + Send,
 {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -872,13 +1060,14 @@ where
     struct VisitScratch {
         query_locs: Vec<(u32, u32)>,
         target_locs: Vec<(u32, u32)>,
+        query_absolute: Vec<u32>,
+        target_absolute: Vec<u32>,
         query_packed: Vec<crate::search::kmer_ranking::PackedLocId>,
         target_packed: Vec<crate::search::kmer_ranking::PackedLocId>,
         target_subjects: Vec<u64>,
-        batch: Vec<SeedMatch>,
+        batch: Vec<u32>,
     }
 
-    let seedp_bits = DEFAULT_SEEDP_BITS;
     let PreparedSeedJoin {
         query: query_sa,
         reference: ref_sa,
@@ -890,6 +1079,17 @@ where
     let ref_offsets = ref_sa.seq_offsets().to_vec();
     let query_locator = super::seed_array::SeqOffsetLocator::new(&query_offsets);
     let ref_locator = super::seed_array::SeqOffsetLocator::new(&ref_offsets);
+    // C++ constructs KmerRanking once in search_shape and passes the same
+    // immutable object to every partition WorkSet. Building it inside each
+    // joined seed bucket multiplied the query-length scan by the number of
+    // buckets, which is especially costly in clustering's 15-shape
+    // Linclust40 round.
+    let exact_stage1_ranking = if linear_stage1_query {
+        exact_stage1_sets
+            .map(|(query_set, _)| crate::search::kmer_ranking::KmerRanking::from_queries(query_set))
+    } else {
+        None
+    };
 
     let raw_count = AtomicUsize::new(0);
     // Aggregate once per partition, rather than once per hit, so exposing the
@@ -919,6 +1119,8 @@ where
         let VisitScratch {
             query_locs,
             target_locs,
+            query_absolute,
+            target_absolute,
             query_packed,
             target_packed,
             target_subjects,
@@ -936,25 +1138,30 @@ where
             } else {
                 block.q_count as usize * block.r_count as usize
             };
+            let absolute_hamming =
+                !linear_stage1_query && !self_search && exact_stage1_sets.is_some();
             query_locs.clear();
-            query_locs.extend(
-                (block.q_start..block.q_start + block.q_count)
-                    .map(|index| query_locator.decode(query_part[index as usize])),
-            );
+            query_absolute.clear();
+            if absolute_hamming {
+                query_absolute.extend(
+                    (block.q_start..block.q_start + block.q_count)
+                        .map(|index| query_part[index as usize].loc),
+                );
+            } else {
+                query_locs.extend(
+                    (block.q_start..block.q_start + block.q_count)
+                        .map(|index| query_locator.decode(query_part[index as usize])),
+                );
+            }
             target_locs.clear();
+            target_absolute.clear();
             target_subjects.clear();
             for index in block.r_start..block.r_start + block.r_count {
                 let entry = ref_part[index as usize];
                 let target = ref_locator.decode(entry);
-                // SeedEntry locations omit SequenceSet's perimeter and record
-                // delimiters. Convert once per distinct target, then reuse the
-                // absolute backing position across the whole query cross
-                // product just as upstream's PackedLoc does.
-                let subject = entry.loc as u64
-                    + target.0 as u64
-                    + crate::data::sequence_set::LetterStringSet::PERIMETER_PADDING as u64;
                 target_locs.push(target);
-                target_subjects.push(subject);
+                target_absolute.push(entry.loc);
+                target_subjects.push(entry.loc as u64);
             }
             batch.clear();
             let mut last_query = None;
@@ -983,28 +1190,26 @@ where
                 }
                 partition_hamming_count += 1;
                 if last_query.is_some() && last_query != Some(query) && !batch.is_empty() {
-                    partition_ungapped_count += map_batch(&batch, &mut output);
+                    partition_ungapped_count += map_batch(
+                        last_query.expect("nonempty stage-1 batch has a query"),
+                        batch,
+                        target_locs,
+                        target_subjects,
+                        partition as u32,
+                        &mut output,
+                    );
                     batch.clear();
                 }
                 last_query = Some(query);
-                // This streaming-only field packs the absolute subject
-                // position above the partition bits. The downstream
-                // left-most filter needs both but never needs the original
-                // seed key; retaining PackedSeed's layout avoids growing
-                // the 32-byte transient match record.
-                let seed = (target_subjects[target_index] << seedp_bits) | partition as PackedSeed;
-                batch.push(SeedMatch {
-                    query_id: query.0,
-                    query_pos: query.1,
-                    ref_id: target.0,
-                    ref_pos: target.1,
-                    seed,
-                    shape_id: 0,
-                });
-                if batch.len() == 32 {
-                    partition_ungapped_count += map_batch(&batch, &mut output);
-                    batch.clear();
-                }
+                // `target_index` is bounded by this joined block's u32
+                // `r_count`; retain upstream's compact target-index width.
+                debug_assert!(u32::try_from(target_index).is_ok());
+                batch.push(target_index as u32);
+                // Upstream's `search_query_offset` receives all passing
+                // targets for this query in the 1024-target tile, then its
+                // stage-2 worker performs the internal SIMD-width chunking.
+                // Keep that boundary instead of repeatedly re-entering stage
+                // 2 for every 32 Hamming survivors.
             };
             if (linear_stage1_query || self_search) && exact_stage1_sets.is_some() {
                 let (query_set, target_set) = exact_stage1_sets.unwrap();
@@ -1022,9 +1227,9 @@ where
                         id,
                     )
                 }));
-                let ranking = crate::search::kmer_ranking::KmerRanking::from_queries(query_set);
                 let dispatch = crate::search::hamming::Stage1DispatchConfig {
                     lin_stage1_query: linear_stage1_query,
+                    min_length_ratio,
                     self_search,
                     ..Default::default()
                 };
@@ -1034,7 +1239,7 @@ where
                     // basic/config.cpp default `--tile-size`.
                     1024,
                     hamming_filter_id,
-                    linear_stage1_query.then_some(&ranking),
+                    exact_stage1_ranking.as_ref(),
                     |hits: &mut crate::search::hamming::HitField,
                      query_begin: usize,
                      target_begin: usize,
@@ -1065,6 +1270,29 @@ where
                     &dispatch,
                 )
                 .expect("translated stage1 dispatch must support clustering mode");
+            } else if absolute_hamming {
+                let (query_set, target_set) =
+                    exact_stage1_sets.expect("absolute Hamming has backing sets");
+                let mut cached_query = None;
+                let mut cached_query_local = (0, 0);
+                crate::search::hamming_filter::visit_hamming_group_absolute_for::<HAMMING_KERNEL, _>(
+                    query_absolute,
+                    target_absolute,
+                    query_set,
+                    target_set,
+                    hamming_filter_id,
+                    |query_absolute, _target_absolute, target_index| {
+                        if cached_query != Some(query_absolute) {
+                            cached_query_local =
+                                query_locator.decode(super::seed_array::SeedEntry {
+                                    key: 0,
+                                    loc: query_absolute,
+                                });
+                            cached_query = Some(query_absolute);
+                        }
+                        visit_match(cached_query_local, target_locs[target_index], target_index);
+                    },
+                );
             } else if self_search && !linear_stage1_query {
                 crate::search::hamming_filter::visit_hamming_self_group_for::<HAMMING_KERNEL, _>(
                     &target_locs,
@@ -1083,7 +1311,14 @@ where
                 );
             }
             if !batch.is_empty() {
-                partition_ungapped_count += map_batch(&batch, &mut output);
+                partition_ungapped_count += map_batch(
+                    last_query.expect("nonempty stage-1 batch has a query"),
+                    batch,
+                    target_locs,
+                    target_subjects,
+                    partition as u32,
+                    &mut output,
+                );
             }
         }
         raw_count.fetch_add(partition_raw_count, Ordering::Relaxed);
@@ -1244,7 +1479,7 @@ where
             min_query_len,
         );
         let ref_counts =
-            SeedArray::count_partitions(ref_seqs, shape, reduction, seedp_bits, 0.0, 0);
+            SeedArray::count_partitions(ref_seqs, shape, reduction, seedp_bits, 0.0, min_query_len);
         let mut query_data = Vec::new();
         let mut ref_data = Vec::new();
         for chunk in 0..INDEX_CHUNKS {
@@ -1269,7 +1504,7 @@ where
                 shape,
                 reduction,
                 seedp_bits,
-                0,
+                min_query_len,
                 partition_begin,
                 partition_end,
                 &ref_counts,
@@ -1336,7 +1571,14 @@ where
         0.0,
         min_query_len,
     );
-    let ref_sa = SeedArray::build_with_complexity_cut(ref_seqs, shape, reduction, seedp_bits, 0.0);
+    let ref_sa = SeedArray::build_with_complexity_cut_and_min_query_len(
+        ref_seqs,
+        shape,
+        reduction,
+        seedp_bits,
+        0.0,
+        min_query_len,
+    );
 
     let num_partitions = query_sa.num_partitions();
 
@@ -1690,9 +1932,13 @@ mod tests {
 
         let short_query: Vec<Letter> = vec![0, 1, 2, 3];
         let long_query: Vec<Letter> = (0..20).map(|i| (i % 20) as Letter).collect();
+        // Upstream reads the ostensibly query-specific option from global
+        // configuration during every seed enumeration, so it also excludes
+        // reference sequences below the threshold.
+        let short_ref = short_query.clone();
         let ref_seq = long_query.clone();
         let query_seqs: Vec<&[Letter]> = vec![&short_query, &long_query];
-        let ref_seqs: Vec<&[Letter]> = vec![&ref_seq];
+        let ref_seqs: Vec<&[Letter]> = vec![&short_ref, &ref_seq];
 
         let all = find_seed_matches_partitioned_filtered_min_query_len(
             &query_seqs,
@@ -1704,6 +1950,7 @@ mod tests {
             0,
         );
         assert!(all.iter().any(|m| m.query_id == 0));
+        assert!(all.iter().any(|m| m.ref_id == 0));
 
         let filtered = find_seed_matches_partitioned_filtered_min_query_len(
             &query_seqs,
@@ -1715,7 +1962,9 @@ mod tests {
             10,
         );
         assert!(!filtered.iter().any(|m| m.query_id == 0));
+        assert!(!filtered.iter().any(|m| m.ref_id == 0));
         assert!(filtered.iter().any(|m| m.query_id == 1));
+        assert!(filtered.iter().any(|m| m.ref_id == 1));
     }
 
     #[test]

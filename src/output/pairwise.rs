@@ -5,6 +5,12 @@ use crate::basic::translate::{Strand, TranslatedPosition};
 use crate::basic::value::{Letter, AMINO_ACID_ALPHABET, LETTER_MASK};
 use crate::stats::score_matrix::ScoreMatrix;
 
+#[inline(always)]
+fn write_ascii_char<W: Write>(writer: &mut W, c: char) -> io::Result<()> {
+    debug_assert!(c.is_ascii());
+    writer.write_all(&[c as u8])
+}
+
 /// Data for a pairwise alignment display.
 pub struct PairwiseData<'a> {
     pub subject_id: &'a str,
@@ -225,7 +231,7 @@ pub fn print_match_context<W: Write>(
             if !qi.good() {
                 break;
             }
-            write!(writer, "{}", qi.query_char())?;
+            write_ascii_char(writer, qi.query_char())?;
             qi.advance();
         }
         write!(
@@ -239,17 +245,17 @@ pub fn print_match_context<W: Write>(
         )?;
         writeln!(writer)?;
 
-        for _ in 0..digits + 9 {
-            write!(writer, " ")?;
-        }
+        const INDENT: &[u8; 32] = b"                                ";
+        let indent = digits + 9;
+        debug_assert!(indent <= INDENT.len());
+        writer.write_all(&INDENT[..indent])?;
         for _ in 0..WIDTH {
             if !mi.good() {
                 break;
             }
-            write!(
+            write_ascii_char(
                 writer,
-                "{}",
-                mi.midline_char(score_matrix.score(mi.query(), mi.subject()))
+                mi.midline_char(score_matrix.score(mi.query(), mi.subject())),
             )?;
             mi.advance();
         }
@@ -265,7 +271,7 @@ pub fn print_match_context<W: Write>(
             if !si.good() {
                 break;
             }
-            write!(writer, "{}", si.subject_char())?;
+            write_ascii_char(writer, si.subject_char())?;
             si.advance();
         }
         writeln!(writer, " {}", si.subject_pos())?;

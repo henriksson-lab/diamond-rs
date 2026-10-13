@@ -420,6 +420,47 @@ unsafe fn standard_profile_i8(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+unsafe fn standard_profile_i16(
+    low: &[i8; 1024],
+    high: &[i8; 1024],
+    bias: i8,
+    subject: &[i16; 16],
+) -> [arch::__m256i; 32] {
+    // `ScoreVector<int16_t>::ScoreVector(unsigned, Register)` keeps the
+    // subject letters in 16-bit lanes, uses their low bytes as two pshufb
+    // indices, then clears each result's high byte before removing the
+    // unsigned score-matrix bias.  Keeping this as the same vector operation
+    // avoids rebuilding every profile row with 16 scalar indexed loads.
+    let subject = arch::_mm256_loadu_si256(subject.as_ptr().cast());
+    let high_mask = arch::_mm256_slli_epi16(
+        arch::_mm256_and_si256(subject, arch::_mm256_set1_epi8(16)),
+        3,
+    );
+    let low_index = arch::_mm256_or_si256(subject, high_mask);
+    let high_index = arch::_mm256_or_si256(
+        subject,
+        arch::_mm256_xor_si256(high_mask, arch::_mm256_set1_epi8(i8::MIN)),
+    );
+    let byte_mask = arch::_mm256_set1_epi16(255);
+    let bias = arch::_mm256_set1_epi16(bias as i16);
+    let mut profile = [arch::_mm256_setzero_si256(); 32];
+    for (query_letter, slot) in profile[..AMINO_ACID_COUNT].iter_mut().enumerate() {
+        let lo = arch::_mm256_loadu_si256(low.as_ptr().add(query_letter * 32).cast());
+        let hi = arch::_mm256_loadu_si256(high.as_ptr().add(query_letter * 32).cast());
+        let unsigned = arch::_mm256_and_si256(
+            arch::_mm256_or_si256(
+                arch::_mm256_shuffle_epi8(lo, low_index),
+                arch::_mm256_shuffle_epi8(hi, high_index),
+            ),
+            byte_mask,
+        );
+        *slot = arch::_mm256_subs_epi16(unsigned, bias);
+    }
+    profile
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
 unsafe fn full_i8_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool, const STANDARD_ONLY: bool>(
     query: &[Letter],
     targets: &[TraceTarget<'_>],
@@ -566,35 +607,43 @@ unsafe fn full_i16_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool, const STAN
         .max()
         .unwrap_or(0);
     for column in 0..columns {
-        let mut subject = [0usize; LANES];
+        let mut subject = [0i16; LANES];
         let mut live_add = [i16::MIN; LANES];
         let mut live = [false; LANES];
         for lane in 0..targets.len() {
             if let Some(&letter) = targets[lane].subject.get(column) {
-                subject[lane] = (letter & LETTER_MASK) as usize;
+                subject[lane] = (letter & LETTER_MASK) as i16;
                 live_add[lane] = 0;
                 live[lane] = true;
             }
         }
         let live_mask = arch::_mm256_loadu_si256(live_add.as_ptr().cast());
-        let mut profile = [zero; 32];
-        for (ql, slot) in profile[..AMINO_ACID_COUNT].iter_mut().enumerate() {
-            let mut scores = [0i16; LANES];
-            for lane in 0..targets.len() {
-                if !live[lane] {
-                    continue;
+        let profile = if STANDARD_ONLY {
+            standard_profile_i16(
+                matrix.matrix8u_low(),
+                matrix.matrix8u_high(),
+                matrix.bias(),
+                &subject,
+            )
+        } else {
+            let mut profile = [zero; 32];
+            for (ql, slot) in profile[..AMINO_ACID_COUNT].iter_mut().enumerate() {
+                let mut scores = [0i16; LANES];
+                for lane in 0..targets.len() {
+                    if !live[lane] {
+                        continue;
+                    }
+                    let sl = subject[lane] as usize;
+                    scores[lane] = if let Some(adjusted) = targets[lane].matrix {
+                        adjusted.scores[sl * 32 + ql] as i16
+                    } else {
+                        matrix.matrix16()[ql * 32 + sl]
+                    };
                 }
-                let sl = subject[lane];
-                scores[lane] = if STANDARD_ONLY {
-                    matrix.matrix16()[ql * 32 + sl]
-                } else if let Some(adjusted) = targets[lane].matrix {
-                    adjusted.scores[sl * 32 + ql] as i16
-                } else {
-                    matrix.matrix16()[ql * 32 + sl]
-                };
+                *slot = arch::_mm256_loadu_si256(scores.as_ptr().cast());
             }
-            *slot = arch::_mm256_loadu_si256(scores.as_ptr().cast());
-        }
+            profile
+        };
         let mut diagonal = scratch.score16[0];
         scratch.score16[0] = zero;
         scratch.hgap16[0] = zero;
@@ -944,36 +993,44 @@ unsafe fn endpoint_i16_impl<
     let mut best_col = [0usize; LANES];
     let mut best_row = [0i32; LANES];
     for column in 0..g.columns {
-        let mut subject = [0usize; LANES];
+        let mut subject = [0i16; LANES];
         let mut live_add = [i16::MIN; LANES];
         let mut live = [false; LANES];
         for lane in 0..targets.len() {
             let pos = g.subject_start[lane] + column as i32;
             if pos >= 0 && pos < targets[lane].subject.len() as i32 {
-                subject[lane] = (targets[lane].subject[pos as usize] & LETTER_MASK) as usize;
+                subject[lane] = (targets[lane].subject[pos as usize] & LETTER_MASK) as i16;
                 live_add[lane] = 0;
                 live[lane] = true;
             }
         }
         let live_mask = arch::_mm256_loadu_si256(live_add.as_ptr().cast());
-        let mut profile = [zero; 32];
-        for (ql, slot) in profile[..AMINO_ACID_COUNT].iter_mut().enumerate() {
-            let mut scores = [0i16; LANES];
-            for lane in 0..targets.len() {
-                if !live[lane] {
-                    continue;
+        let profile = if STANDARD_ONLY {
+            standard_profile_i16(
+                matrix.matrix8u_low(),
+                matrix.matrix8u_high(),
+                matrix.bias(),
+                &subject,
+            )
+        } else {
+            let mut profile = [zero; 32];
+            for (ql, slot) in profile[..AMINO_ACID_COUNT].iter_mut().enumerate() {
+                let mut scores = [0i16; LANES];
+                for lane in 0..targets.len() {
+                    if !live[lane] {
+                        continue;
+                    }
+                    let sl = subject[lane] as usize;
+                    scores[lane] = if let Some(adjusted) = targets[lane].matrix {
+                        adjusted.scores[sl * 32 + ql] as i16
+                    } else {
+                        matrix.matrix16()[ql * 32 + sl]
+                    };
                 }
-                let sl = subject[lane];
-                scores[lane] = if STANDARD_ONLY {
-                    matrix.matrix16()[ql * 32 + sl]
-                } else if let Some(adjusted) = targets[lane].matrix {
-                    adjusted.scores[sl * 32 + ql] as i16
-                } else {
-                    matrix.matrix16()[ql * 32 + sl]
-                };
+                *slot = arch::_mm256_loadu_si256(scores.as_ptr().cast());
             }
-            *slot = arch::_mm256_loadu_si256(scores.as_ptr().cast());
-        }
+            profile
+        };
         let moving_i0 = g.i0 + column as i32;
         let query_begin = moving_i0.max(0);
         let query_end = (g.i1 + column as i32).min(query.len() as i32 - 1) + 1;

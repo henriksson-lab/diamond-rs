@@ -5,7 +5,7 @@ use crate::basic::value::Letter;
 use crate::data::seed_histogram::SeedPartitionRange;
 use crate::search::hamming::match_positions;
 use crate::search::left_most::Context;
-use crate::search::sse_dist::{reduced_match, seed_mask};
+use crate::search::sse_dist::{reduced_match, reduced_match_padded, seed_mask, seed_mask_padded};
 use crate::util::sequence;
 
 #[allow(clippy::too_many_arguments)]
@@ -49,8 +49,29 @@ pub fn left_most_filter_with_range_backed(
     let q = &query[q_base..q_base + window];
     let s = &subject[s_base..s_base + window];
 
-    let match_mask = reduced_match(q, s, window as i32, context.reduction);
-    let query_seed_mask = !seed_mask(q, window as i32);
+    // C++ operates on pointers into delimiter-padded SequenceSet storage and
+    // therefore loads the last partial 16-byte SIMD block in full before
+    // masking its unused lanes. Use the same path whenever the backing slices
+    // contain that block; retain the bounded implementation for a genuine
+    // end-of-buffer edge.
+    let padded_window = window.div_ceil(16) * 16;
+    let (match_mask, query_seed_mask) =
+        if query.len() - q_base >= padded_window && subject.len() - s_base >= padded_window {
+            (
+                reduced_match_padded(
+                    &query[q_base..q_base + padded_window],
+                    &subject[s_base..s_base + padded_window],
+                    window as i32,
+                    context.reduction,
+                ),
+                !seed_mask_padded(&query[q_base..q_base + padded_window], window as i32),
+            )
+        } else {
+            (
+                reduced_match(q, s, window as i32, context.reduction),
+                !seed_mask(q, window as i32),
+            )
+        };
 
     let len_left = window_left as u32 + seed_len as u32 - 1;
     let match_mask_left = (((1u64 << len_left) - 1) & match_mask) as u32;

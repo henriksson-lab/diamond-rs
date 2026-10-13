@@ -80,12 +80,18 @@ if [[ ${SKIP_BUILD:-0} != 1 ]]; then
     echo "Building Rust release binary..." >&2
     benchmark_rustflags=${RUSTFLAGS:-}
     if [[ -z "$benchmark_rustflags" ]]; then
-        # Match the vendored C++ release build's native-CPU policy. Individual
-        # kernels still perform their own runtime feature dispatch.
-        benchmark_rustflags='-C target-cpu=native'
+        benchmark_arch=$(uname -m)
+        if [[ "$benchmark_arch" == x86_64 ]]; then
+            # Upstream's sustained search workers are instantiated in its
+            # AVX2 namespace. Keep general Rust code at the same ISA ceiling;
+            # individually dispatched kernels can still select AVX-512.
+            benchmark_rustflags='-C target-cpu=x86-64-v3'
+        else
+            benchmark_rustflags='-C target-cpu=native'
+        fi
     fi
     RUSTFLAGS="$benchmark_rustflags" cargo build \
-        --manifest-path "$repo_dir/Cargo.toml" --release --offline
+        --manifest-path "$repo_dir/Cargo.toml" --release --offline --locked
     if [[ ! -x "$cpp_bin" ]]; then
         echo "Building vendored C++ release binary..." >&2
         cmake -S "$repo_dir/diamond" -B "$repo_dir/diamond/build" \

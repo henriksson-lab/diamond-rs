@@ -5,13 +5,32 @@ use std::time::Instant;
 use crate::basic::value::SequenceType;
 use crate::data::db_builder;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MakedbOptions {
+    pub taxonmap: Option<String>,
+    pub taxonnodes: Option<String>,
+    pub taxonnames: Option<String>,
+    pub no_parse_seqids: bool,
+}
+
 /// Run the makedb command — build a DIAMOND database from FASTA file(s).
 pub fn run(input_files: &[String], database: &str, threads: i32) -> io::Result<()> {
+    run_with_options(input_files, database, threads, &MakedbOptions::default())
+}
+
+pub fn run_with_options(
+    input_files: &[String],
+    database: &str,
+    threads: i32,
+    options: &MakedbOptions,
+) -> io::Result<()> {
     let start = Instant::now();
 
-    // C++ rejects multiple `--in` values with "Too many arguments provided
-    // for option --in." (`diamond/src/data/dmnd/dmnd.cpp:261-262`). Rust used
-    // to silently concatenate; mirror C++.
+    // C++ rejects multiple values in the effective `--in` occurrence with
+    // "Too many arguments provided for option --in."
+    // (`diamond/src/data/dmnd/dmnd.cpp:261-262`). The CLI parser separately
+    // mirrors upstream assignment semantics where a repeated occurrence
+    // replaces the earlier one.
     if input_files.len() > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -50,7 +69,17 @@ pub fn run(input_files: &[String], database: &str, threads: i32) -> io::Result<(
     eprintln!("Database file: {}", db_path);
     eprintln!("Input files: {}", input_files.join(", "));
 
-    let stats = db_builder::build_db(&input_refs, &db_path, SequenceType::AminoAcid)?;
+    let stats = db_builder::build_db_with_options(
+        &input_refs,
+        &db_path,
+        SequenceType::AminoAcid,
+        &db_builder::BuildOptions {
+            taxonmap: options.taxonmap.clone(),
+            taxonnodes: options.taxonnodes.clone(),
+            taxonnames: options.taxonnames.clone(),
+            no_parse_seqids: options.no_parse_seqids,
+        },
+    )?;
 
     let elapsed = start.elapsed();
     eprintln!(

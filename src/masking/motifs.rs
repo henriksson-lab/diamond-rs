@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::OnceLock;
 
 use crate::basic::sequence::Sequence;
@@ -12,16 +13,46 @@ pub const MOTIF_LEN: usize = motif_data::MOTIF_LEN;
 /// Rust equivalent of C++ `motif_table`.
 pub static MOTIF_TABLE: OnceLock<MotifTable> = OnceLock::new();
 
+/// Upstream's `Kmer<K>::Hash` delegates directly to `std::hash<uint64_t>`.
+/// On the supported libstdc++ baseline that is the encoded k-mer itself, not
+/// a keyed general-purpose hash. Keep this hasher local to the exact-key motif
+/// table; the table never accepts arbitrary byte strings.
+#[derive(Debug, Default)]
+struct KmerHasher(u64);
+
+impl Hasher for KmerHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        debug_assert_eq!(bytes.len(), size_of::<u64>());
+        let mut value = [0u8; size_of::<u64>()];
+        value.copy_from_slice(bytes);
+        self.0 = u64::from_ne_bytes(value);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+type KmerBuildHasher = BuildHasherDefault<KmerHasher>;
+
 /// A motif table for identifying known low-complexity patterns.
 #[derive(Debug)]
 pub struct MotifTable {
-    table: HashSet<Kmer<MOTIF_LEN>>,
+    table: HashSet<Kmer<MOTIF_LEN>, KmerBuildHasher>,
 }
 
 impl MotifTable {
     /// Initialize the motif table from the built-in motif data.
     pub fn new() -> Self {
-        let mut table = HashSet::with_capacity(motif_data::MOTIFS.len());
+        let mut table =
+            HashSet::with_capacity_and_hasher(motif_data::MOTIFS.len(), KmerBuildHasher::default());
         for &motif in motif_data::MOTIFS {
             // Every source entry is an eight-byte ASCII amino-acid string.
             table.insert(Kmer::from_ascii(std::str::from_utf8(motif).unwrap()));
@@ -54,7 +85,7 @@ impl MotifTable {
             if self.contains_kmer(iterator.get()) {
                 positions.push(iterator.offset_from_start() as usize);
             }
-            iterator.increment();
+            iterator.increment_identity();
         }
 
         positions
@@ -152,7 +183,7 @@ pub fn mask_motifs(seq: &mut [Letter]) -> Vec<MotifMaskEntry> {
             let start = iterator.offset_from_start() as usize;
             push_merged(&mut hits, start, start + MOTIF_LEN);
         }
-        iterator.increment();
+        iterator.increment_identity();
     }
 
     let total: usize = hits.iter().map(|(a, b)| b - a).sum();
@@ -242,6 +273,17 @@ fn apply_seed_mask_extension(seq: &mut [Letter], begin: usize, end: usize, templ
 mod tests {
     use super::*;
     use crate::basic::value::{AMINO_ACID_ALPHABET, LETTER_MASK};
+    use std::hash::{BuildHasher, Hash};
+
+    #[test]
+    fn motif_kmer_hash_is_the_upstream_encoded_u64() {
+        let kmer = Kmer::<MOTIF_LEN> {
+            code: 0x0123_4567_89ab_cdef,
+        };
+        let mut hasher = KmerBuildHasher::default().build_hasher();
+        kmer.hash(&mut hasher);
+        assert_eq!(hasher.finish(), kmer.code);
+    }
 
     #[test]
     fn test_motif_table_init() {

@@ -72,20 +72,21 @@ pub mod prelude {
 /// Run DIAMOND with command-line arguments through the C++ FFI implementation.
 ///
 /// The FFI backend is intended for non-Windows conformance testing and is only
-/// available when the crate is built with `--features ffi`.
+/// available when a source checkout containing the adjacent upstream
+/// `diamond/` tree is built with `--features ffi`.
 ///
 /// # Example
 /// ```rust,no_run,ignore
 /// let code = diamond::run(&["diamond", "version"]);
 /// assert_eq!(code, 0);
 /// ```
-#[cfg(all(feature = "ffi", not(windows)))]
+#[cfg(all(feature = "ffi", diamond_ffi_available, not(windows)))]
 pub fn run(args: &[&str]) -> i32 {
     crate::ffi::run(args)
 }
 
 /// Fallback when the C++ FFI backend is not compiled.
-#[cfg(not(all(feature = "ffi", not(windows))))]
+#[cfg(not(all(feature = "ffi", diamond_ffi_available, not(windows))))]
 pub fn run(_args: &[&str]) -> i32 {
     eprintln!("C++ FFI backend is not available in this build.");
     1

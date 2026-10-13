@@ -1,8 +1,14 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+
+use rayon::prelude::*;
 
 use crate::util::data_structures::{DoubleArray, FlatIndex};
 use crate::util::hash::murmur_hash_u64;
+use crate::util::io::{IoError, IoResult, TempFileData};
 
 pub mod greedy_vertex_cover;
 
@@ -860,17 +866,21 @@ pub fn hash_table_join<T>(
     if r.n == 0 || s.n == 0 {
         return;
     }
-    let n = next_pow2_usize((r.n as f64 * JOIN_HT_FACTOR) as usize);
+    let n = next_pow2_usize((r.n as f64 * JOIN_HT_FACTOR).ceil() as usize);
     let key = ExtractBits::new(T::Key::try_from(n).unwrap(), shift);
     let mut table = vec![(T::Key::from(0), RelPtr::default()); n];
     let mut r_slots = Vec::with_capacity(r.n);
     for item in r.data {
-        let k = key.get(item.key());
-        let mut p = k.try_into().unwrap();
+        let item_key = item.key();
+        let mut p = key.get(item_key).try_into().unwrap();
         let mut wrapped = false;
         loop {
-            if table[p].0 == k || table[p].1 == RelPtr::default() {
-                table[p].0 = k;
+            // C++ HashTable uses ExtractBits only to choose the initial
+            // bucket; Entry::key retains and compares the complete seed key.
+            // Storing the extracted bucket here merged unrelated 32-bit keys
+            // that collided in the same table slot.
+            if table[p].0 == item_key || table[p].1 == RelPtr::default() {
+                table[p].0 = item_key;
                 table[p].1.r += 1;
                 r_slots.push(p);
                 break;
@@ -885,14 +895,14 @@ pub fn hash_table_join<T>(
     }
     let mut s_hits = Vec::new();
     for item in s.data {
-        let k = key.get(item.key());
-        let mut p = k.try_into().unwrap();
+        let item_key = item.key();
+        let mut p = key.get(item_key).try_into().unwrap();
         let mut wrapped = false;
         loop {
             if table[p].1 == RelPtr::default() {
                 break;
             }
-            if table[p].0 == k {
+            if table[p].0 == item_key {
                 table[p].1.s += 1;
                 s_hits.push((p, item.value()));
                 break;
@@ -997,7 +1007,7 @@ pub fn hash_join_into<T>(
     let mut tmp_r = DoubleArray::new();
     let mut tmp_s = DoubleArray::new();
     if r.n < JOIN_SPLIT_SIZE || key_bits < JOIN_SPLIT_KEY_LEN {
-        if next_pow2_usize((r.n as f64 * JOIN_HT_FACTOR) as usize) < (1usize << key_bits) {
+        if next_pow2_usize((r.n as f64 * JOIN_HT_FACTOR).ceil() as usize) < (1usize << key_bits) {
             hash_table_join(r, s, shift, &mut tmp_r, &mut tmp_s);
         } else {
             table_join(r, s, total_bits, shift, &mut tmp_r, &mut tmp_s);
@@ -1349,131 +1359,335 @@ pub fn alloc_size_string_u32_pair(x: &(String, u32)) -> usize {
     4 + std::mem::size_of::<String>() + x.0.len()
 }
 
+/// On-disk representation used by DIAMOND's `ExternalSorter`.
+///
+/// Integer fields use the same little-endian representation as C++
+/// `Serializer::operator<<`, and strings are NUL terminated.  The trait is
+/// This is public only so additional translated sorter value types can define
+/// their field codec. Callers should not depend on spill-run files, which are
+/// deleted as they are consumed.
+pub trait ExternalSortField: Sized {
+    fn external_alloc_size(&self) -> usize;
+    fn write_external<W: Write>(&self, out: &mut W) -> std::io::Result<()>;
+    fn read_external<R: Read>(input: &mut R, eof_allowed: bool) -> std::io::Result<Option<Self>>;
+}
+
+macro_rules! external_sort_integer {
+    ($($type:ty),+ $(,)?) => {$ (
+        impl ExternalSortField for $type {
+            fn external_alloc_size(&self) -> usize {
+                std::mem::size_of::<Self>()
+            }
+
+            fn write_external<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
+                out.write_all(&self.to_le_bytes())
+            }
+
+            fn read_external<R: Read>(
+                input: &mut R,
+                eof_allowed: bool,
+            ) -> std::io::Result<Option<Self>> {
+                let mut bytes = [0u8; std::mem::size_of::<Self>()];
+                let mut read = 0;
+                while read < bytes.len() {
+                    match input.read(&mut bytes[read..])? {
+                        0 if read == 0 && eof_allowed => return Ok(None),
+                        0 => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "truncated external-sort run",
+                            ));
+                        }
+                        n => read += n,
+                    }
+                }
+                Ok(Some(Self::from_le_bytes(bytes)))
+            }
+        }
+    )+ };
+}
+
+external_sort_integer!(i32, u32, i64, u64, usize);
+
+impl ExternalSortField for String {
+    fn external_alloc_size(&self) -> usize {
+        // Upstream `alloc_size(pair<string, uint32_t>)` accounts for the
+        // string allocation plus its fixed-width companion.  At field level,
+        // account for the string object's resident storage and payload.
+        std::mem::size_of::<String>() + self.len()
+    }
+
+    fn write_external<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
+        out.write_all(self.as_bytes())?;
+        out.write_all(&[0])
+    }
+
+    fn read_external<R: Read>(input: &mut R, eof_allowed: bool) -> std::io::Result<Option<Self>> {
+        let mut bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match input.read(&mut byte)? {
+                0 if bytes.is_empty() && eof_allowed => return Ok(None),
+                0 => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "unterminated string in external-sort run",
+                    ));
+                }
+                _ if byte[0] == 0 => {
+                    return String::from_utf8(bytes).map(Some).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    });
+                }
+                _ => bytes.push(byte[0]),
+            }
+        }
+    }
+}
+
+/// Values which can be placed in an [`ExternalSorter`].
+pub trait ExternalSortValue: Sized {
+    fn external_alloc_size(&self) -> usize;
+    fn write_external<W: Write>(&self, out: &mut W) -> std::io::Result<()>;
+    fn read_external<R: Read>(input: &mut R) -> std::io::Result<Option<Self>>;
+}
+
+impl<T: ExternalSortField> ExternalSortValue for T {
+    fn external_alloc_size(&self) -> usize {
+        ExternalSortField::external_alloc_size(self)
+    }
+
+    fn write_external<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
+        ExternalSortField::write_external(self, out)
+    }
+
+    fn read_external<R: Read>(input: &mut R) -> std::io::Result<Option<Self>> {
+        ExternalSortField::read_external(input, true)
+    }
+}
+
+macro_rules! external_sort_pair {
+    ($first:ty, $second:ty, $alloc:expr) => {
+        impl ExternalSortValue for ($first, $second) {
+            fn external_alloc_size(&self) -> usize {
+                ($alloc)(self)
+            }
+
+            fn write_external<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
+                ExternalSortField::write_external(&self.0, out)?;
+                ExternalSortField::write_external(&self.1, out)
+            }
+
+            fn read_external<R: Read>(input: &mut R) -> std::io::Result<Option<Self>> {
+                let Some(first) = <$first as ExternalSortField>::read_external(input, true)? else {
+                    return Ok(None);
+                };
+                let second = <$second as ExternalSortField>::read_external(input, false)?
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "truncated pair in external-sort run",
+                        )
+                    })?;
+                Ok(Some((first, second)))
+            }
+        }
+    };
+}
+
+// These are the three concrete pair instantiations in taxonomy-enabled
+// `makedb`.  Upstream's generic `alloc_size` counts only sizeof(Type) for
+// them, even for the string pairs; reproduce that threshold exactly rather
+// than silently choosing a different spill boundary.
+external_sort_pair!(String, u64, |_: &(String, u64)| std::mem::size_of::<(
+    String,
+    u64,
+)>());
+external_sort_pair!(String, i32, |_: &(String, i32)| std::mem::size_of::<(
+    String,
+    i32,
+)>());
+external_sort_pair!(u64, i32, |_: &(u64, i32)| std::mem::size_of::<(u64, i32,)>(
+));
+
+// This otherwise-unused specialization mirrors the sole pair overload in
+// external_sort.h and keeps the translated primitive generally testable.
+external_sort_pair!(String, u32, |value: &(String, u32)| {
+    4 + std::mem::size_of::<String>() + value.0.len()
+});
+
 pub fn external_sorter_default_cmp<Type: Ord>(a: &Type, b: &Type) -> bool {
     a < b
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ExternalSorter<Type, Cmp = fn(&Type, &Type) -> bool> {
     cmp: Cmp,
     count: usize,
     size: usize,
-    files: Vec<Vec<Type>>,
+    bucket_size: usize,
+    temp_dir: PathBuf,
+    files: Vec<ExternalSortRun>,
     buf: Vec<Type>,
-    queue: Vec<Option<Type>>,
-    heads: Vec<usize>,
+    queue: Vec<ExternalSortEntry<Type>>,
+}
+
+#[derive(Debug)]
+struct ExternalSortRun {
+    path: PathBuf,
+    input: Option<BufReader<File>>,
+}
+
+impl Drop for ExternalSortRun {
+    fn drop(&mut self) {
+        self.input = None;
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug)]
+struct ExternalSortEntry<Type> {
+    bucket: usize,
+    value: Type,
 }
 
 impl<Type> Default for ExternalSorter<Type, fn(&Type, &Type) -> bool>
 where
-    Type: Clone + Ord,
+    Type: ExternalSortValue + Ord + Sync,
 {
     fn default() -> Self {
-        Self {
-            cmp: external_sorter_default_cmp::<Type>,
-            count: 0,
-            size: 0,
-            files: Vec::new(),
-            buf: Vec::new(),
-            queue: Vec::new(),
-            heads: Vec::new(),
-        }
+        Self::new(external_sorter_default_cmp::<Type>)
     }
 }
 
 impl<Type, Cmp> ExternalSorter<Type, Cmp>
 where
-    Type: Clone,
-    Cmp: Copy + Fn(&Type, &Type) -> bool,
+    Type: ExternalSortValue + Sync,
+    Cmp: Copy + Fn(&Type, &Type) -> bool + Sync,
 {
     pub const BUCKET_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
     pub fn new(cmp: Cmp) -> Self {
+        Self::with_bucket_size_in(cmp, Self::BUCKET_SIZE, std::env::temp_dir())
+    }
+
+    pub fn with_bucket_size(cmp: Cmp, bucket_size: usize) -> Self {
+        Self::with_bucket_size_in(cmp, bucket_size, std::env::temp_dir())
+    }
+
+    pub fn with_bucket_size_in(cmp: Cmp, bucket_size: usize, temp_dir: impl AsRef<Path>) -> Self {
         Self {
             cmp,
             count: 0,
             size: 0,
+            bucket_size,
+            temp_dir: temp_dir.as_ref().to_path_buf(),
             files: Vec::new(),
             buf: Vec::new(),
             queue: Vec::new(),
-            heads: Vec::new(),
         }
     }
 
     pub fn push(&mut self, x: Type) {
+        self.try_push(x).expect("external-sort spill failed");
+    }
+
+    pub fn try_push(&mut self, x: Type) -> IoResult<()> {
         self.count += 1;
-        self.size += alloc_size(&x);
+        self.size += x.external_alloc_size();
         self.buf.push(x);
-        if self.size > Self::BUCKET_SIZE {
-            self.flush();
+        if self.size > self.bucket_size {
+            self.flush()?;
         }
+        Ok(())
     }
 
     pub fn init_read(&mut self) {
-        self.flush();
+        self.try_init_read().expect("external-sort read failed");
+    }
+
+    pub fn try_init_read(&mut self) -> IoResult<()> {
+        self.flush()?;
         self.queue.clear();
-        self.heads = vec![0; self.files.len()];
         for i in 0..self.files.len() {
-            let entry = self.get_entry(i);
-            self.queue.push(entry);
+            if let Some(value) = self.get_entry(i)? {
+                self.heap_push(ExternalSortEntry { bucket: i, value });
+            }
         }
+        Ok(())
     }
 
     pub fn good(&self) -> bool {
-        self.queue.iter().any(|x| x.is_some())
+        !self.queue.is_empty()
     }
 
     pub fn current(&self) -> Option<&Type> {
-        self.queue_index()
-            .and_then(|i| self.queue.get(i).and_then(|x| x.as_ref()))
+        self.queue.first().map(|entry| &entry.value)
     }
 
     pub fn increment(&mut self) {
-        let Some(b) = self.queue_index() else {
-            return;
+        self.try_increment().expect("external-sort read failed");
+    }
+
+    pub fn try_increment(&mut self) -> IoResult<()> {
+        let Some(entry) = self.heap_pop() else {
+            return Ok(());
         };
-        self.queue[b] = self.get_entry(b);
+        if let Some(value) = self.get_entry(entry.bucket)? {
+            self.heap_push(ExternalSortEntry {
+                bucket: entry.bucket,
+                value,
+            });
+        }
+        Ok(())
     }
 
     pub fn count(&self) -> usize {
         self.count
     }
 
-    fn queue_index(&self) -> Option<usize> {
-        let mut out: Option<usize> = None;
-        for i in 0..self.queue.len() {
-            if self.queue[i].is_none() {
-                continue;
-            }
-            if let Some(j) = out {
-                if (self.cmp)(
-                    self.queue[i].as_ref().unwrap(),
-                    self.queue[j].as_ref().unwrap(),
-                ) {
-                    out = Some(i);
-                }
-            } else {
-                out = Some(i);
-            }
-        }
-        out
+    pub fn run_count(&self) -> usize {
+        self.files.len()
     }
 
-    fn get_entry(&mut self, bucket: usize) -> Option<Type> {
-        if self.heads[bucket] == self.files[bucket].len() {
-            return None;
-        }
-        let out = self.files[bucket][self.heads[bucket]].clone();
-        self.heads[bucket] += 1;
-        Some(out)
+    fn io_error(context: &str, error: std::io::Error) -> IoError {
+        IoError::Other(format!("{context}: {error}"))
     }
 
-    fn flush(&mut self) {
+    fn get_entry(&mut self, bucket: usize) -> IoResult<Option<Type>> {
+        let input = self.files[bucket]
+            .input
+            .as_mut()
+            .expect("external-sort run read after exhaustion");
+        match Type::read_external(input)
+            .map_err(|error| Self::io_error("error reading external-sort run", error))?
+        {
+            Some(value) => Ok(Some(value)),
+            None => {
+                self.files[bucket].input = None;
+                std::fs::remove_file(&self.files[bucket].path).map_err(|error| {
+                    Self::io_error("error deleting consumed external-sort run", error)
+                })?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> IoResult<()> {
         if self.buf.is_empty() {
-            return;
+            return Ok(());
         }
-        let mut idx: Vec<usize> = (0..self.buf.len()).collect();
-        idx.sort_by(|&x, &y| {
+        // C++ materializes one uint32_t per buffered value and sorts that
+        // index with ips4o::parallel. Keep both the 4-byte ownership and the
+        // parallel unstable-sort boundary: usize would add roughly 256 MiB at
+        // the production 2 GiB taxonomy spill threshold on a 64-bit host.
+        let count = u32::try_from(self.buf.len()).map_err(|_| {
+            IoError::Other("external-sort run exceeds the uint32 index range".to_owned())
+        })?;
+        let mut idx: Vec<u32> = (0..count).collect();
+        idx.par_sort_unstable_by(|&x, &y| {
+            let x = x as usize;
+            let y = y as usize;
             if (self.cmp)(&self.buf[x], &self.buf[y]) {
                 Ordering::Less
             } else if (self.cmp)(&self.buf[y], &self.buf[x]) {
@@ -1482,10 +1696,78 @@ where
                 Ordering::Equal
             }
         });
-        let bucket = idx.into_iter().map(|i| self.buf[i].clone()).collect();
-        self.files.push(bucket);
+
+        let data = TempFileData::init_in(false, &self.temp_dir, true)?;
+        let path = PathBuf::from(&data.name);
+        drop(data);
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|error| Self::io_error("error opening external-sort run", error))?;
+        let write_result = (|| -> std::io::Result<()> {
+            let mut out = BufWriter::with_capacity(1 << 20, file);
+            for i in idx {
+                self.buf[i as usize].write_external(&mut out)?;
+            }
+            out.flush()
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&path);
+            return Err(Self::io_error("error writing external-sort run", error));
+        }
+        let input = File::open(&path)
+            .map(BufReader::new)
+            .map_err(|error| Self::io_error("error reopening external-sort run", error))?;
+        self.files.push(ExternalSortRun {
+            path,
+            input: Some(input),
+        });
         self.buf.clear();
         self.size = 0;
+        Ok(())
+    }
+
+    fn heap_push(&mut self, entry: ExternalSortEntry<Type>) {
+        self.queue.push(entry);
+        let mut child = self.queue.len() - 1;
+        while child != 0 {
+            let parent = (child - 1) / 2;
+            if !(self.cmp)(&self.queue[child].value, &self.queue[parent].value) {
+                break;
+            }
+            self.queue.swap(child, parent);
+            child = parent;
+        }
+    }
+
+    fn heap_pop(&mut self) -> Option<ExternalSortEntry<Type>> {
+        let last = self.queue.pop()?;
+        if self.queue.is_empty() {
+            return Some(last);
+        }
+        let out = std::mem::replace(&mut self.queue[0], last);
+        let mut parent = 0;
+        loop {
+            let left = parent * 2 + 1;
+            if left >= self.queue.len() {
+                break;
+            }
+            let right = left + 1;
+            let child = if right < self.queue.len()
+                && (self.cmp)(&self.queue[right].value, &self.queue[left].value)
+            {
+                right
+            } else {
+                left
+            };
+            if !(self.cmp)(&self.queue[child].value, &self.queue[parent].value) {
+                break;
+            }
+            self.queue.swap(parent, child);
+            parent = child;
+        }
+        Some(out)
     }
 }
 
@@ -1875,6 +2157,10 @@ mod tests {
             Item { key: 2, value: 20 },
             Item { key: 1, value: 11 },
             Item { key: 4, value: 40 },
+            // With five R records the join table has eight slots, so key 9
+            // hashes to the same initial bucket as key 1. It must not be
+            // merged into key 1's joined group.
+            Item { key: 9, value: 90 },
         ];
         let s = [
             Item { key: 1, value: 100 },
@@ -1963,6 +2249,111 @@ mod tests {
             4 + std::mem::size_of::<String>() + 3
         );
         assert_eq!(alloc_size(&7u32), std::mem::size_of::<u32>());
+    }
+
+    #[test]
+    fn external_sorter_spills_multiple_runs_and_merges_exactly() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "diamond-rs-external-sort-{}-{}",
+            std::process::id(),
+            crate::util::test_path_component()
+        ));
+        std::fs::create_dir(&temp_dir).unwrap();
+        let input = [
+            ("zeta".to_string(), 9u64),
+            ("alpha".to_string(), 7),
+            ("alpha".to_string(), 2),
+            ("gamma".to_string(), 1),
+            ("beta".to_string(), 8),
+            ("delta".to_string(), 4),
+        ];
+        let mut expected = input.clone().to_vec();
+        expected.sort();
+
+        // Every string pair is larger than this limit, forcing one physical
+        // run per item and exercising the k-way merge rather than an in-memory
+        // facsimile of it.
+        let mut sorter =
+            ExternalSorter::with_bucket_size_in(external_sorter_default_cmp, 1, &temp_dir);
+        for value in input {
+            sorter.try_push(value).unwrap();
+        }
+        assert_eq!(sorter.run_count(), expected.len());
+        assert!(sorter.buf.is_empty());
+        let paths: Vec<_> = sorter.files.iter().map(|run| run.path.clone()).collect();
+        assert!(paths.iter().all(|path| path.is_file()));
+
+        sorter.try_init_read().unwrap();
+        let mut actual = Vec::new();
+        while let Some(value) = sorter.current().cloned() {
+            actual.push(value);
+            sorter.try_increment().unwrap();
+        }
+        assert_eq!(actual, expected);
+        assert!(paths.iter().all(|path| !path.exists()));
+        drop(sorter);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn external_sorter_supports_taxonomy_pair_types_and_descending_order() {
+        fn collect<T, C>(sorter: &mut ExternalSorter<T, C>) -> Vec<T>
+        where
+            T: ExternalSortValue + Clone + Sync,
+            C: Copy + Fn(&T, &T) -> bool + Sync,
+        {
+            sorter.try_init_read().unwrap();
+            let mut out = Vec::new();
+            while let Some(value) = sorter.current().cloned() {
+                out.push(value);
+                sorter.try_increment().unwrap();
+            }
+            out
+        }
+
+        let mut acc_tax =
+            ExternalSorter::with_bucket_size(|a: &(String, i32), b: &(String, i32)| a > b, 1);
+        acc_tax.try_push(("A".into(), -1)).unwrap();
+        acc_tax.try_push(("C".into(), 3)).unwrap();
+        acc_tax.try_push(("B".into(), 2)).unwrap();
+        assert_eq!(
+            collect(&mut acc_tax),
+            vec![("C".into(), 3), ("B".into(), 2), ("A".into(), -1)]
+        );
+
+        let mut oid_tax: ExternalSorter<(u64, i32)> = ExternalSorter::default();
+        oid_tax.try_push((u64::MAX, i32::MIN)).unwrap();
+        oid_tax.try_push((0, i32::MAX)).unwrap();
+        assert_eq!(
+            collect(&mut oid_tax),
+            vec![(0, i32::MAX), (u64::MAX, i32::MIN)]
+        );
+
+        let accession_oid = ("long-accession".to_string(), 1u64);
+        assert_eq!(
+            ExternalSortValue::external_alloc_size(&accession_oid),
+            std::mem::size_of::<(String, u64)>()
+        );
+        let legacy_specialization = ("long-accession".to_string(), 1u32);
+        assert_eq!(
+            ExternalSortValue::external_alloc_size(&legacy_specialization),
+            4 + std::mem::size_of::<String>() + legacy_specialization.0.len()
+        );
+    }
+
+    #[test]
+    fn external_sorter_drop_removes_unconsumed_runs() {
+        let mut sorter = ExternalSorter::with_bucket_size(
+            external_sorter_default_cmp::<i32>,
+            std::mem::size_of::<i32>(),
+        );
+        sorter.try_push(2).unwrap();
+        sorter.try_push(1).unwrap();
+        assert_eq!(sorter.run_count(), 1);
+        let path = sorter.files[0].path.clone();
+        assert!(path.is_file());
+        drop(sorter);
+        assert!(!path.exists());
     }
 
     #[test]

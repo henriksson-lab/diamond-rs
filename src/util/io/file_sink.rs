@@ -59,15 +59,25 @@ impl FileSink {
             }
         }
 
-        let stdout_name = if cfg!(windows) {
-            "CONOUT$"
+        let file = if is_stdout {
+            #[cfg(windows)]
+            {
+                super::duplicate_standard_handle(
+                    windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+                )
+                .map_err(|_| IoError::FileOpen(file_name.to_string()))?
+            }
+            #[cfg(not(windows))]
+            {
+                options
+                    .open("/dev/stdout")
+                    .map_err(|_| IoError::FileOpen(file_name.to_string()))?
+            }
         } else {
-            "/dev/stdout"
+            options
+                .open(file_name)
+                .map_err(|_| IoError::FileOpen(file_name.to_string()))?
         };
-        let open_name = if is_stdout { stdout_name } else { file_name };
-        let file = options
-            .open(open_name)
-            .map_err(|_| IoError::FileOpen(file_name.to_string()))?;
         Ok(Self {
             file: Some(file),
             file_name: file_name.to_string(),
@@ -106,8 +116,8 @@ impl FileSink {
 impl StreamEntity for FileSink {
     fn close(&mut self) -> IoResult<()> {
         // The C++ implementation deliberately leaves the process stdout stream
-        // open. Our `/dev/stdout`/`CONOUT$` handle follows the same observable
-        // behavior by remaining usable after close.
+        // open. Our duplicate of the inherited standard handle follows the
+        // same observable behavior by remaining usable after close.
         if !self.is_stdout {
             self.file.take();
         }
@@ -204,7 +214,7 @@ mod tests {
         std::env::temp_dir().join(format!(
             "diamond-rs-file-sink-{name}-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
+            crate::util::test_path_component()
         ))
     }
 

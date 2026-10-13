@@ -842,6 +842,11 @@ mod tests {
             .unwrap_err()
             .starts_with("Failed to prepare statement:"));
 
+        // Windows does not allow deleting a database while read-only SQLite
+        // connections still hold file handles. Explicitly end those lifetimes
+        // before the common cleanup below.
+        drop(wrong_schema);
+        drop(corrupt);
         std::fs::remove_file(populated_path).unwrap();
         std::fs::remove_file(empty_path).unwrap();
         std::fs::remove_file(wrong_schema_path).unwrap();

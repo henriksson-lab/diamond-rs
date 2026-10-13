@@ -924,32 +924,51 @@ impl HspContext {
         query_translated: bool,
         score_matrix: &ScoreMatrix,
     ) -> Result<&mut Self, String> {
-        if self.hsp.seed_only || (!need_transcript && !view_command) {
-            self.hsp.query_source_range = TranslatedPosition::absolute_interval(
-                TranslatedPosition::new(
-                    self.hsp.query_range.begin,
-                    Frame::from_index(self.hsp.frame),
-                ),
-                TranslatedPosition::new(
-                    self.hsp.query_range.end,
-                    Frame::from_index(self.hsp.frame),
-                ),
-                self.query_source_len,
+        self.hsp.parse_with_query(
+            &self.query,
+            self.query_source_len,
+            &self.subject_seq,
+            need_transcript,
+            view_command,
+            query_translated,
+            score_matrix,
+        )?;
+        Ok(self)
+    }
+}
+
+impl Hsp {
+    /// Parse transcript-derived fields using borrowed query data.
+    ///
+    /// This is the same operation as C++ `HspContext::parse`, split onto the
+    /// HSP so DAA iteration need not allocate and clone a temporary context
+    /// merely to parse a record.
+    pub fn parse_with_query(
+        &mut self,
+        query: &[Vec<Letter>],
+        query_source_len: i32,
+        subject_seq: &[Letter],
+        need_transcript: bool,
+        view_command: bool,
+        query_translated: bool,
+        score_matrix: &ScoreMatrix,
+    ) -> Result<&mut Self, String> {
+        if self.seed_only || (!need_transcript && !view_command) {
+            self.query_source_range = TranslatedPosition::absolute_interval(
+                TranslatedPosition::new(self.query_range.begin, Frame::from_index(self.frame)),
+                TranslatedPosition::new(self.query_range.end, Frame::from_index(self.frame)),
+                query_source_len,
                 query_translated,
             );
-            self.hsp.subject_source_range = self.hsp.subject_range;
-            if !self.hsp.seed_only && !self.subject_seq.is_empty() {
-                self.hsp.approx_id = self
-                    .hsp
-                    .approx_id_percent(self.query_index(self.hsp.frame), &self.subject_seq);
+            self.subject_source_range = self.subject_range;
+            if !self.seed_only && !subject_seq.is_empty() {
+                self.approx_id = self.approx_id_percent(&query[self.frame as usize], subject_seq);
             }
             return Ok(self);
         }
 
-        let begin_query_pos = TranslatedPosition::new(
-            self.hsp.query_range.begin,
-            Frame::from_index(self.hsp.frame),
-        );
+        let begin_query_pos =
+            TranslatedPosition::new(self.query_range.begin, Frame::from_index(self.frame));
         let mut length = 0;
         let mut identities = 0;
         let mut mismatches = 0;
@@ -957,15 +976,15 @@ impl HspContext {
         let mut positives = 0;
         let mut gaps = 0;
         let mut d = 0u32;
-        let mut it = self.hsp.begin();
+        let mut it = self.begin();
 
         while it.good() {
             let query_pos = it.query_pos;
             length += 1;
             let frame = query_pos.frame.index() as usize;
-            if frame >= self.query.len()
+            if frame >= query.len()
                 || query_pos.translated < 0
-                || query_pos.translated as usize >= self.query[frame].len()
+                || query_pos.translated as usize >= query[frame].len()
             {
                 return Err("Query sequence index out of bounds.".to_string());
             }
@@ -977,7 +996,7 @@ impl HspContext {
                 }
                 EditOperation::Substitution => {
                     mismatches += 1;
-                    let q = self.query[frame][query_pos.translated as usize];
+                    let q = query[frame][query_pos.translated as usize];
                     let s = it.letter();
                     if score_matrix.score(q, s) > 0 {
                         positives += 1;
@@ -998,25 +1017,23 @@ impl HspContext {
 
         let query_pos = it.query_pos;
         let subject_pos = it.subject_pos;
-        self.hsp.length = length;
-        self.hsp.identities = identities;
-        self.hsp.mismatches = mismatches;
-        self.hsp.gap_openings = gap_openings;
-        self.hsp.positives = positives;
-        self.hsp.gaps = gaps;
-        self.hsp.query_range.end = query_pos.translated;
-        self.hsp.subject_range.end = subject_pos;
-        self.hsp.subject_source_range = self.hsp.subject_range;
-        self.hsp.query_source_range = TranslatedPosition::absolute_interval(
+        self.length = length;
+        self.identities = identities;
+        self.mismatches = mismatches;
+        self.gap_openings = gap_openings;
+        self.positives = positives;
+        self.gaps = gaps;
+        self.query_range.end = query_pos.translated;
+        self.subject_range.end = subject_pos;
+        self.subject_source_range = self.subject_range;
+        self.query_source_range = TranslatedPosition::absolute_interval(
             begin_query_pos,
             query_pos,
-            self.query_source_len,
+            query_source_len,
             query_translated,
         );
-        if !self.subject_seq.is_empty() {
-            self.hsp.approx_id = self
-                .hsp
-                .approx_id_percent(self.query_index(self.hsp.frame), &self.subject_seq);
+        if !subject_seq.is_empty() {
+            self.approx_id = self.approx_id_percent(&query[self.frame as usize], subject_seq);
         }
 
         Ok(self)

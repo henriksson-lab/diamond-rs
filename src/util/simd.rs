@@ -157,7 +157,7 @@ pub fn transpose(data: &[&[i8]], n: usize, out: &mut [i8], width: usize) {
 }
 
 #[inline]
-#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn bit_reverse(value: usize, bits: u32) -> usize {
     value.reverse_bits() >> (usize::BITS - bits)
 }
@@ -411,14 +411,11 @@ unsafe fn transpose_16_neon(data: &[&[i8]], n: usize, out: &mut [i8]) {
         }
     }
     for column in 0..8 {
-        let low = vcombine_s8(
-            vget_low_s8(rows[bit_reverse(column, 3)]),
-            vget_low_s8(rows[bit_reverse(column, 3) + 8]),
-        );
-        let high = vcombine_s8(
-            vget_high_s8(rows[bit_reverse(column, 3)]),
-            vget_high_s8(rows[bit_reverse(column, 3) + 8]),
-        );
+        // Unlike the x86 unpack cascade, NEON's vtrn stages leave these
+        // eight column groups in natural order. Applying the x86 bit-reverse
+        // store map here produced 0,4,2,6,1,5,3,7 on AArch64.
+        let low = vcombine_s8(vget_low_s8(rows[column]), vget_low_s8(rows[column + 8]));
+        let high = vcombine_s8(vget_high_s8(rows[column]), vget_high_s8(rows[column + 8]));
         vst1q_s8(out.as_mut_ptr().add(column * 16), low);
         vst1q_s8(out.as_mut_ptr().add((column + 8) * 16), high);
     }

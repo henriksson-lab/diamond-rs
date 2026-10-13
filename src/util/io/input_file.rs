@@ -367,7 +367,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "diamond-rs-input-file-{name}-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
+            crate::util::test_path_component()
         ));
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, bytes).unwrap();
@@ -435,10 +435,12 @@ mod tests {
     #[test]
     fn temp_and_output_constructors_rewind_and_set_public_state() {
         let mut temp = TempFile::new(true).unwrap();
+        #[cfg(not(unix))]
+        let temp_name = temp.file_name().to_string();
         temp.write_raw(b"temp").unwrap();
         let mut from_temp = InputFile::from_temp_file(&mut temp, 0, Compressor::None).unwrap();
         assert!(from_temp.temp_file);
-        assert!(from_temp.unlinked);
+        assert_eq!(from_temp.unlinked, cfg!(unix));
         let mut bytes = [0; 4];
         from_temp.read_raw(&mut bytes).unwrap();
         assert_eq!(&bytes, b"temp");
@@ -452,8 +454,14 @@ mod tests {
         let mut bytes = [0; 6];
         from_output.read_raw(&mut bytes).unwrap();
         assert_eq!(&bytes, b"output");
+        from_output.close().unwrap();
         output.close().unwrap();
         std::fs::remove_file(path).unwrap();
+
+        from_temp.close().unwrap();
+        temp.close().unwrap();
+        #[cfg(not(unix))]
+        std::fs::remove_file(temp_name).unwrap();
     }
 
     #[test]

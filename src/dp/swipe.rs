@@ -1288,6 +1288,7 @@ fn dispatch_swipe_with_scratch(
             1 => 16,
             _ => 1,
         };
+
         for chunk in subject_begin.chunks(lane_width) {
             let mut lane_targets = [&subject_begin[0]; 32];
             let mut lane_count = 0usize;

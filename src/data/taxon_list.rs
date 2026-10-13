@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, Read};
+use std::io::{BufRead, Read, Write};
 
 use crate::basic::value::{OId, TaxId};
 use crate::data::compact_array::CompactArray;
-use crate::util::algo::{join_sorted_lists, write_varuint32};
+use crate::util::algo::{join_sorted_lists, write_varuint32, ExternalSorter};
+use crate::util::io::TextInputFile;
 use crate::util::sequence::{get_accession, AccessionParsing};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +87,120 @@ impl TaxonList {
             accession_stats: acc_stats,
         })
     }
+
+    /// Streaming counterpart of C++ `TaxonList::build`. Both sides of the
+    /// accession join and the resulting OID relation use `ExternalSorter`, so
+    /// taxonomy-enabled `makedb` does not retain the accession tables in RAM.
+    pub fn write_from_file<W: Write>(
+        acc2oid: &mut ExternalSorter<(String, OId)>,
+        mapping_path: &str,
+        seqs: OId,
+        no_parse_seqids: bool,
+        output: &mut W,
+    ) -> Result<TaxonListWrite, String> {
+        let mut acc2taxid = ExternalSorter::<(String, TaxId)>::default();
+        let acc_stats = load_mapping_path(&mut acc2taxid, mapping_path, no_parse_seqids)?;
+        let entries_in_accession_to_taxid_file = acc2taxid.count();
+        let accessions_in_database = acc2oid.count();
+
+        acc2taxid
+            .try_init_read()
+            .map_err(|error| error.to_string())?;
+        acc2oid.try_init_read().map_err(|error| error.to_string())?;
+        let mut oid2taxid = ExternalSorter::<(OId, TaxId)>::default();
+        let mut acc_matched = 0usize;
+
+        // Exact state transitions of `SortedListJoiner`: duplicate accessions
+        // in the database fan out to all matching OIDs, while a duplicate key
+        // in the (sorted) mapping relation is rejected.
+        advance_to_matching_accession(acc2oid, &mut acc2taxid)?;
+        while acc2oid.good() && acc2taxid.good() {
+            let db_row = acc2oid.current().unwrap().clone();
+            let map_row = acc2taxid.current().unwrap().clone();
+            oid2taxid
+                .try_push((db_row.1, map_row.1))
+                .map_err(|error| error.to_string())?;
+            acc_matched += 1;
+
+            acc2oid.try_increment().map_err(|error| error.to_string())?;
+            if !acc2oid.good() {
+                break;
+            }
+            if acc2oid.current().unwrap().0 == map_row.0 {
+                continue;
+            }
+            acc2taxid
+                .try_increment()
+                .map_err(|error| error.to_string())?;
+            if !acc2taxid.good() {
+                break;
+            }
+            if acc2taxid.current().unwrap().0 == db_row.0 {
+                return Err(format!("Duplicate keys: {}", db_row.0));
+            }
+            advance_to_matching_accession(acc2oid, &mut acc2taxid)?;
+        }
+
+        oid2taxid
+            .try_init_read()
+            .map_err(|error| error.to_string())?;
+        let mut encoded = Vec::new();
+        let mut bytes_written = 0u64;
+        let mut mapped_seqs = 0usize;
+        for oid in 0..seqs {
+            let mut tax_ids = BTreeSet::new();
+            while oid2taxid.good() && oid2taxid.current().unwrap().0 == oid {
+                tax_ids.insert(oid2taxid.current().unwrap().1);
+                oid2taxid
+                    .try_increment()
+                    .map_err(|error| error.to_string())?;
+            }
+            tax_ids.remove(&0);
+            encoded.clear();
+            serialize_taxid_set(&tax_ids, &mut encoded);
+            output
+                .write_all(&encoded)
+                .map_err(|error| error.to_string())?;
+            bytes_written += encoded.len() as u64;
+            if !tax_ids.is_empty() {
+                mapped_seqs += 1;
+            }
+        }
+
+        Ok(TaxonListWrite {
+            bytes_written,
+            stats: TaxonListStats {
+                accessions_in_database,
+                entries_in_accession_to_taxid_file,
+                database_accessions_mapped_to_taxid: acc_matched,
+                database_sequences_mapped_to_taxid: mapped_seqs,
+            },
+            accession_stats: acc_stats,
+        })
+    }
+}
+
+fn advance_to_matching_accession(
+    acc2oid: &mut ExternalSorter<(String, OId)>,
+    acc2taxid: &mut ExternalSorter<(String, TaxId)>,
+) -> Result<(), String> {
+    while acc2oid.good() && acc2taxid.good() {
+        match acc2oid
+            .current()
+            .unwrap()
+            .0
+            .cmp(&acc2taxid.current().unwrap().0)
+        {
+            std::cmp::Ordering::Less => {
+                acc2oid.try_increment().map_err(|error| error.to_string())?
+            }
+            std::cmp::Ordering::Greater => acc2taxid
+                .try_increment()
+                .map_err(|error| error.to_string())?,
+            std::cmp::Ordering::Equal => break,
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -99,6 +214,13 @@ pub struct TaxonListStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaxonListBuild {
     pub taxon_list: TaxonList,
+    pub stats: TaxonListStats,
+    pub accession_stats: AccessionParsing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaxonListWrite {
+    pub bytes_written: u64,
     pub stats: TaxonListStats,
     pub accession_stats: AccessionParsing,
 }
@@ -184,6 +306,62 @@ pub fn load_mapping_file<R: BufRead>(
     }
     rows.sort();
     Ok((rows, stats))
+}
+
+fn load_mapping_path(
+    sorter: &mut ExternalSorter<(String, TaxId)>,
+    mapping_path: &str,
+    no_parse_seqids: bool,
+) -> Result<AccessionParsing, String> {
+    let mut input =
+        TextInputFile::from_file_name_default(mapping_path).map_err(|error| error.to_string())?;
+    input.getline().map_err(|error| error.to_string())?;
+    let format = mapping_file_format(&input.line)?;
+    let mut stats = AccessionParsing::default();
+    let mut last = String::new();
+
+    while !input.eof() {
+        input.getline().map_err(|error| error.to_string())?;
+        if input.line.is_empty() {
+            break;
+        }
+        let fields: Vec<&str> = input.line.split('\t').collect();
+        let (mut accession, taxid) = if format == 0 {
+            if fields.len() < 3 {
+                return Err(format!("Malformed input in line {}", input.line_count));
+            }
+            (fields[1].to_string(), fields[2])
+        } else {
+            if fields.len() < 2 {
+                return Err(format!("Malformed input in line {}", input.line_count));
+            }
+            (fields[0].to_string(), fields[1])
+        };
+        if accession.is_empty() {
+            return Err(format!(
+                "Empty accession field in line {}",
+                input.line_count
+            ));
+        }
+        let taxid = taxid
+            .trim_start_matches(|c: char| c.is_ascii_whitespace())
+            .parse::<TaxId>()
+            .map_err(|_| format!("Malformed input in line {}", input.line_count))?;
+        if !no_parse_seqids {
+            if let Some(i) = accession.find(":PDB=") {
+                accession.truncate(i);
+                stats.pdb_suffix += 1;
+            }
+            accession = get_accession(&accession, &mut stats);
+        }
+        if accession != last {
+            sorter
+                .try_push((accession.clone(), taxid))
+                .map_err(|error| error.to_string())?;
+        }
+        last = accession;
+    }
+    Ok(stats)
 }
 
 pub fn serialize_taxid_set(tax_ids: &BTreeSet<TaxId>, out: &mut Vec<u8>) {

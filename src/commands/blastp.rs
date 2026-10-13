@@ -7,17 +7,23 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIter
 use crate::align::hsp::Match;
 use crate::align::target::{extend as extend_targets, GappedScoreConfig};
 use crate::align::ungapped::UngappedStageConfig;
+use crate::basic::packed_loc::PackedLoc;
 use crate::basic::reduction::Reduction;
-use crate::basic::seed::{seed_partition, seedp_count, seedp_mask};
+use crate::basic::seed::{seedp_count, seedp_mask};
 use crate::basic::shape::Shape;
+use crate::basic::shape_config::ShapeConfig;
 use crate::basic::statistics::Statistics;
-use crate::basic::value::{Letter, SequenceType};
+use crate::basic::value::{Letter, SequenceType, TaxId, LETTER_MASK};
 use crate::chaining::HammingExtConfig;
 use crate::config::Sensitivity;
+use crate::data::blastdb::blastdb::BlastDB;
+use crate::data::blastdb::volume::SequenceFileFlags;
 use crate::data::block::Block;
+use crate::data::dmnd::{DatabaseFile, DatabaseOpenOptions};
 use crate::data::fasta;
 use crate::data::seed_histogram::SeedPartitionRange;
 use crate::data::sequence_set::SequenceSet;
+use crate::data::taxonomy::{Rank, TaxonomyNode, TaxonomyTree};
 use crate::dp::swipe::{Flags, HspValues};
 use crate::masking::{MaskingAlgo, MaskingMode};
 use crate::output::daa::daa_write::{
@@ -29,7 +35,6 @@ use crate::search::hit::Hit;
 use crate::search::hit_buffer::{CompactHit, HitBuffer, HitBufferMode};
 use crate::search::left_most::Context as LeftMostContext;
 use crate::search::left_most_unclipped::left_most_filter_with_range_backed;
-use crate::search::seed_match::SeedMatch;
 use crate::search::{parallel, sensitivity};
 use crate::stats::cbs::CbsMode;
 use crate::stats::score_matrix::{CutoffTable2D, ScoreMatrix};
@@ -45,6 +50,16 @@ fn stage2_query_bounds(query_len: usize, seed_pos: usize) -> (usize, usize) {
     )
 }
 
+/// C++ sequence equality for the self-hit predicate ignores the internal
+/// masking annotation bits and compares the biological residue codes.
+fn same_sequence(left: &[Letter], right: &[Letter]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(&left, &right)| left & LETTER_MASK == right & LETTER_MASK)
+}
+
 #[derive(Clone, Copy)]
 struct StoredHit {
     subject: u64,
@@ -53,13 +68,124 @@ struct StoredHit {
     score: u16,
 }
 
+struct TargetIndexedState {
+    query: Block,
+    shapes: ShapeConfig,
+    seeds: crate::data::seed_set::HashedSeedSet,
+}
+
+#[inline]
+fn packed_locs_from_bytes(bytes: &[u8]) -> &[PackedLoc] {
+    let elem_size = std::mem::size_of::<PackedLoc>();
+    assert_eq!(elem_size, 5);
+    assert_eq!(std::mem::align_of::<PackedLoc>(), 1);
+    assert_eq!(bytes.len() % elem_size, 0);
+    // SAFETY: `PackedLoc` is `repr(C, packed)`, has alignment one, and is
+    // exactly the `high: u8` plus native-endian `low: u32` representation
+    // written into DoubleArray by `HashJoinValue::write_ne_bytes`. Every bit
+    // pattern is valid for those integer fields and the returned slice cannot
+    // outlive the borrowed DoubleArray range.
+    unsafe {
+        std::slice::from_raw_parts(bytes.as_ptr().cast::<PackedLoc>(), bytes.len() / elem_size)
+    }
+}
+
+/// Adapt the source-faithful `DoubleArray<PackedLoc>` join result to the
+/// native stage-1 worker. Each callback still contains exactly one joined
+/// seed partition. Borrow one natural joined-key group in place, run the
+/// translated tiled Hamming kernel, and pass its hit indices together with
+/// the original target locations to the query-major ungapped worker. This is
+/// the same borrowed boundary as upstream `JoinIterator`/`search_query_offset`.
+fn map_target_indexed_partition<F>(
+    query_hits: &crate::util::data_structures::DoubleArray,
+    target_hits: &crate::util::data_structures::DoubleArray,
+    absolute_partition: u32,
+    query_seqs: &SequenceSet,
+    target_seqs: &SequenceSet,
+    hamming_filter_id: u32,
+    mut map_matches: F,
+) -> (Vec<StoredHit>, usize)
+where
+    F: FnMut((u32, u32), &[u32], usize, &[PackedLoc], u32, &mut Vec<StoredHit>),
+{
+    const PACKED_LOC_SIZE: usize = 5;
+    let mut query = query_hits.begin_with_elem_size(PACKED_LOC_SIZE);
+    let mut target = target_hits.begin_with_elem_size(PACKED_LOC_SIZE);
+    let mut output = Vec::new();
+    let mut raw_count = 0usize;
+
+    while query.good() && target.good() {
+        let query_bytes = query.range_bytes(PACKED_LOC_SIZE);
+        let target_bytes = target.range_bytes(PACKED_LOC_SIZE);
+        raw_count = raw_count
+            .saturating_add((query.count() as usize).saturating_mul(target.count() as usize));
+        let query_locs = packed_locs_from_bytes(query_bytes);
+        let target_locs = packed_locs_from_bytes(target_bytes);
+        crate::search::hamming::stage1(
+            query_locs,
+            target_locs,
+            query_seqs,
+            target_seqs,
+            1024,
+            hamming_filter_id,
+            |hits, query_begin, target_begin, queries, targets| {
+                for local_query in 0..hits.query_count() {
+                    let query_position = queries[query_begin + local_query].as_u64() as usize;
+                    let (query_id, query_pos) = query_seqs.local_position(query_position);
+                    let target_indices = hits.hits(local_query);
+                    if !target_indices.is_empty() {
+                        map_matches(
+                            (query_id as u32, query_pos as u32),
+                            target_indices,
+                            target_begin,
+                            targets,
+                            absolute_partition,
+                            &mut output,
+                        );
+                    }
+                }
+            },
+        );
+        query.increment(PACKED_LOC_SIZE);
+        target.increment(PACKED_LOC_SIZE);
+    }
+    debug_assert_eq!(query.good(), target.good());
+    (output, raw_count)
+}
+
 type UngappedKernel = fn(&[Letter], &[&[Letter]], usize, &ScoreMatrix, &mut [i32]);
 
-type PartitionFilter = for<'a> unsafe fn(
-    &[SeedMatch],
+type SubjectIndexPartitionFilter = for<'a> unsafe fn(
+    (u32, u32),
+    &[u32],
+    &[u64],
+    u32,
     &mut Vec<StoredHit>,
     &SequenceSet,
-    &Block,
+    &SequenceSet,
+    &[i32],
+    &ScoreMatrix,
+    &Shape,
+    &LeftMostContext<'a>,
+    bool,
+    bool,
+    bool,
+    bool,
+    usize,
+    u32,
+    usize,
+    UngappedKernel,
+) -> usize;
+
+type BorrowedPartitionFilter = for<'a> unsafe fn(
+    (u32, u32),
+    &[u32],
+    usize,
+    &[PackedLoc],
+    u32,
+    &mut Vec<StoredHit>,
+    &SequenceSet,
+    &SequenceSet,
     &[i32],
     &ScoreMatrix,
     &Shape,
@@ -127,8 +253,89 @@ fn run_ungapped_kernel<const KERNEL: u8>(
 /// the requested ceiling, then permanently switches to DIAMOND's compressed
 /// temporary-bin format. The ceiling is necessarily soft: loaded input,
 /// indices, allocator bookkeeping, and one active disk bin are irreducible.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct PackedRetainedHit {
+    query: u32,
+    subject: PackedLoc,
+    seed_offset: u32,
+    score: u16,
+}
+
+struct PackedHitBins {
+    bins: Vec<Vec<PackedRetainedHit>>,
+    key_partition: Vec<u32>,
+}
+
+impl PackedHitBins {
+    fn new(key_partition: Vec<u32>, memory_limit: Option<u64>) -> Self {
+        const UPSTREAM_BIN_RESERVE_BYTES: u64 = 1 << 30;
+        let bin_count = key_partition.len().max(1) as u64;
+        let reserve_bytes = memory_limit
+            .map(|limit| (limit / bin_count).min(UPSTREAM_BIN_RESERVE_BYTES))
+            .unwrap_or(0);
+        let reserve_hits = (reserve_bytes / std::mem::size_of::<PackedRetainedHit>() as u64)
+            .min(usize::MAX as u64) as usize;
+        Self {
+            bins: (0..key_partition.len())
+                .map(|_| Vec::with_capacity(reserve_hits))
+                .collect(),
+            key_partition,
+        }
+    }
+
+    fn bin(&self, query: u32) -> Option<usize> {
+        self.key_partition.iter().position(|&end| query < end)
+    }
+
+    fn push(&mut self, hit: StoredHit) {
+        if let Some(bin) = self.bin(hit.query_id) {
+            self.bins[bin].push(PackedRetainedHit {
+                query: hit.query_id,
+                subject: PackedLoc::new(hit.subject),
+                seed_offset: hit.seed_offset,
+                score: hit.score,
+            });
+        }
+    }
+
+    fn total_hits(&self) -> usize {
+        self.bins.iter().map(Vec::len).sum()
+    }
+
+    fn take_grouped_bin(&mut self, bin: usize) -> (Vec<Vec<CompactHit>>, u32, u32) {
+        let begin = if bin == 0 {
+            0
+        } else {
+            self.key_partition[bin - 1]
+        };
+        let end = self.key_partition[bin];
+        let packed = std::mem::take(&mut self.bins[bin]);
+        let mut counts = vec![0usize; end.saturating_sub(begin) as usize];
+        for hit in &packed {
+            let query = hit.query;
+            if let Some(count) = counts.get_mut(query.saturating_sub(begin) as usize) {
+                *count += 1;
+            }
+        }
+        let mut grouped: Vec<Vec<CompactHit>> =
+            counts.into_iter().map(Vec::with_capacity).collect();
+        for hit in packed {
+            let query = hit.query;
+            if let Some(query_hits) = grouped.get_mut(query.saturating_sub(begin) as usize) {
+                query_hits.push(CompactHit {
+                    subject: hit.subject.as_u64(),
+                    seed_offset: hit.seed_offset,
+                    score: hit.score,
+                });
+            }
+        }
+        (grouped, begin, end)
+    }
+}
+
 struct AdaptiveHitStore {
-    memory: Option<Vec<Vec<CompactHit>>>,
+    memory: Option<PackedHitBins>,
     disk: Option<HitBuffer>,
     memory_limit: Option<u64>,
     tmpdir: PathBuf,
@@ -149,8 +356,9 @@ impl AdaptiveHitStore {
         memory_limit: Option<u64>,
         tmpdir: PathBuf,
     ) -> Self {
+        let key_partition = Self::key_partition(query_count, query_bins, query_group_size);
         Self {
-            memory: Some((0..query_count).map(|_| Vec::new()).collect()),
+            memory: Some(PackedHitBins::new(key_partition, memory_limit)),
             disk: None,
             memory_limit,
             tmpdir,
@@ -161,6 +369,28 @@ impl AdaptiveHitStore {
             bytes_since_rss_check: 0,
             rss_checked_once: false,
         }
+    }
+
+    fn key_partition(query_count: usize, query_bins: usize, query_group_size: usize) -> Vec<u32> {
+        let query_end = query_count.max(1).min(u32::MAX as usize) as u32;
+        let query_group_size = query_group_size.max(1);
+        let group_count = query_count.div_ceil(query_group_size).max(1);
+        let num_bins = group_count.clamp(1, query_bins.max(1));
+        let mut key_partition = Vec::with_capacity(num_bins);
+        for bin in 1..=num_bins {
+            let end_group = (bin * group_count).div_ceil(num_bins);
+            let end = end_group
+                .saturating_mul(query_group_size)
+                .max(1)
+                .min(query_end as usize) as u32;
+            if key_partition.last().copied() != Some(end) {
+                key_partition.push(end);
+            }
+        }
+        if key_partition.last().copied() != Some(query_end) {
+            key_partition.push(query_end);
+        }
+        key_partition
     }
 
     fn ingest_partitions(&mut self, partitions: Vec<Vec<StoredHit>>) -> io::Result<usize> {
@@ -187,13 +417,7 @@ impl AdaptiveHitStore {
         if let Some(memory) = self.memory.as_mut() {
             for partition in partitions {
                 for hit in partition {
-                    if let Some(query_hits) = memory.get_mut(hit.query_id as usize) {
-                        query_hits.push(CompactHit {
-                            subject: hit.subject,
-                            seed_offset: hit.seed_offset,
-                            score: hit.score,
-                        });
-                    }
+                    memory.push(hit);
                 }
             }
         } else {
@@ -206,29 +430,13 @@ impl AdaptiveHitStore {
         if self.disk.is_some() {
             return Ok(());
         }
-        let query_end = self.query_count.max(1).min(u32::MAX as usize) as u32;
         // Match upstream's sensitivity-specific query-bin count (16 for most
         // modes, 64 for ultra-sensitive). Each bin is decoded as a unit during
         // alignment, so retaining the default-mode count in ultra-sensitive
         // searches multiplies the live decoded-hit footprint by about four.
-        let group_count = self.query_count.div_ceil(self.query_group_size).max(1);
-        let num_bins = group_count.clamp(1, self.query_bins.max(1));
-        let mut key_partition = Vec::with_capacity(num_bins);
-        for bin in 1..=num_bins {
-            // A translated query's six contexts must be decoded together so
-            // extension can rank and cull targets globally, as upstream does.
-            let end_group = (bin * group_count).div_ceil(num_bins);
-            let end = end_group
-                .saturating_mul(self.query_group_size)
-                .max(1)
-                .min(query_end as usize) as u32;
-            if key_partition.last().copied() != Some(end) {
-                key_partition.push(end);
-            }
-        }
-        if key_partition.last().copied() != Some(query_end) {
-            key_partition.push(query_end);
-        }
+        let query_end = self.query_count.max(1).min(u32::MAX as usize) as u32;
+        let key_partition =
+            Self::key_partition(self.query_count, self.query_bins, self.query_group_size);
         let mut disk = HitBuffer::with_limits(
             key_partition,
             &self.tmpdir,
@@ -240,17 +448,21 @@ impl AdaptiveHitStore {
         )
         .map_err(io::Error::other)?;
 
-        let memory = self.memory.take().unwrap_or_default();
-        let migrated_hits = memory.iter().map(Vec::len).sum::<usize>();
-        for (query, hits) in memory.into_iter().enumerate() {
-            for hit in hits {
-                disk.append_disk_hit(Hit::with_score(
-                    query as u32,
-                    hit.subject,
-                    hit.seed_offset,
-                    hit.score,
-                ))
-                .map_err(io::Error::other)?;
+        let mut memory = self.memory.take().expect("memory hit store missing");
+        let migrated_hits = memory.total_hits();
+        for bin in 0..memory.bins.len() {
+            let (grouped, begin, _) = memory.take_grouped_bin(bin);
+            for (offset, hits) in grouped.into_iter().enumerate() {
+                let query = begin as usize + offset;
+                for hit in hits {
+                    disk.append_disk_hit(Hit::with_score(
+                        query as u32,
+                        hit.subject,
+                        hit.seed_offset,
+                        hit.score,
+                    ))
+                    .map_err(io::Error::other)?;
+                }
             }
         }
         disk.take_error().map_err(io::Error::other)?;
@@ -287,16 +499,15 @@ impl AdaptiveHitStore {
     }
 }
 
-/// Consume one stage-1 partition and retain only candidates that pass the
-/// ungapped window filter.  This is deliberately partition-local: retaining
-/// all Hamming survivors was the multi-gigabyte RSS bottleneck on repetitive
-/// real databases.
 #[inline(always)]
-fn filter_partition_to_hits(
-    matches: &[SeedMatch],
+fn filter_subject_indices_partition_to_hits(
+    query: (u32, u32),
+    target_indices: &[u32],
+    target_subjects: &[u64],
+    absolute_partition: u32,
     out: &mut Vec<StoredHit>,
     queries: &SequenceSet,
-    db_block: &Block,
+    targets: &SequenceSet,
     cutoffs: &[i32],
     score_matrix: &ScoreMatrix,
     shape: &Shape,
@@ -310,13 +521,25 @@ fn filter_partition_to_hits(
     ungapped_lane_count: usize,
     ungapped_kernel: UngappedKernel,
 ) -> usize {
+    let candidates = BorrowedStage1Subjects {
+        indices: target_indices,
+        subjects: target_subjects,
+    };
     macro_rules! run {
         ($first:literal, $chunked:literal, $range:literal, $skip:literal) => {
-            filter_partition_to_hits_impl::<$first, $chunked, $range, $skip>(
-                matches,
+            filter_query_candidates_impl::<
+                BorrowedStage1Subjects<'_>,
+                $first,
+                $chunked,
+                $range,
+                $skip,
+            >(
+                query,
+                &candidates,
+                absolute_partition,
                 out,
                 queries,
-                db_block,
+                targets,
                 cutoffs,
                 score_matrix,
                 shape,
@@ -343,11 +566,14 @@ fn filter_partition_to_hits(
 }
 
 #[inline]
-unsafe fn filter_partition_to_hits_baseline(
-    matches: &[SeedMatch],
+unsafe fn filter_subject_indices_partition_to_hits_baseline(
+    query: (u32, u32),
+    target_indices: &[u32],
+    target_subjects: &[u64],
+    absolute_partition: u32,
     out: &mut Vec<StoredHit>,
     queries: &SequenceSet,
-    db_block: &Block,
+    targets: &SequenceSet,
     cutoffs: &[i32],
     score_matrix: &ScoreMatrix,
     shape: &Shape,
@@ -361,11 +587,14 @@ unsafe fn filter_partition_to_hits_baseline(
     ungapped_lane_count: usize,
     ungapped_kernel: UngappedKernel,
 ) -> usize {
-    filter_partition_to_hits(
-        matches,
+    filter_subject_indices_partition_to_hits(
+        query,
+        target_indices,
+        target_subjects,
+        absolute_partition,
         out,
         queries,
-        db_block,
+        targets,
         cutoffs,
         score_matrix,
         shape,
@@ -382,12 +611,15 @@ unsafe fn filter_partition_to_hits_baseline(
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl")]
-unsafe fn filter_partition_to_hits_avx512(
-    matches: &[SeedMatch],
+#[target_feature(enable = "avx2")]
+unsafe fn filter_subject_indices_partition_to_hits_avx2(
+    query: (u32, u32),
+    target_indices: &[u32],
+    target_subjects: &[u64],
+    absolute_partition: u32,
     out: &mut Vec<StoredHit>,
     queries: &SequenceSet,
-    db_block: &Block,
+    targets: &SequenceSet,
     cutoffs: &[i32],
     score_matrix: &ScoreMatrix,
     shape: &Shape,
@@ -401,11 +633,14 @@ unsafe fn filter_partition_to_hits_avx512(
     ungapped_lane_count: usize,
     ungapped_kernel: UngappedKernel,
 ) -> usize {
-    filter_partition_to_hits(
-        matches,
+    filter_subject_indices_partition_to_hits(
+        query,
+        target_indices,
+        target_subjects,
+        absolute_partition,
         out,
         queries,
-        db_block,
+        targets,
         cutoffs,
         score_matrix,
         shape,
@@ -422,16 +657,222 @@ unsafe fn filter_partition_to_hits_avx512(
 }
 
 #[inline(always)]
-fn filter_partition_to_hits_impl<
+fn filter_borrowed_partition_to_hits(
+    query: (u32, u32),
+    target_indices: &[u32],
+    target_begin: usize,
+    target_locations: &[PackedLoc],
+    absolute_partition: u32,
+    out: &mut Vec<StoredHit>,
+    queries: &SequenceSet,
+    targets: &SequenceSet,
+    cutoffs: &[i32],
+    score_matrix: &ScoreMatrix,
+    shape: &Shape,
+    left_most_context: &LeftMostContext<'_>,
+    first_shape: bool,
+    chunked: bool,
+    use_left_most_range: bool,
+    skip_left_most: bool,
+    index_chunks: usize,
+    min_identities: u32,
+    ungapped_lane_count: usize,
+    ungapped_kernel: UngappedKernel,
+) -> usize {
+    let candidates = BorrowedStage1Targets {
+        indices: target_indices,
+        target_begin,
+        targets: target_locations,
+    };
+    macro_rules! run {
+        ($first:literal, $chunked:literal, $range:literal, $skip:literal) => {
+            filter_query_candidates_impl::<
+                BorrowedStage1Targets<'_>,
+                $first,
+                $chunked,
+                $range,
+                $skip,
+            >(
+                query,
+                &candidates,
+                absolute_partition,
+                out,
+                queries,
+                targets,
+                cutoffs,
+                score_matrix,
+                shape,
+                left_most_context,
+                index_chunks,
+                min_identities,
+                ungapped_lane_count,
+                ungapped_kernel,
+            )
+        };
+    }
+    if skip_left_most {
+        return run!(false, false, false, true);
+    }
+    match (first_shape, chunked, use_left_most_range) {
+        (true, true, true) => run!(true, true, true, false),
+        (false, true, true) => run!(false, true, true, false),
+        (true, true, false) => run!(true, true, false, false),
+        (false, true, false) => run!(false, true, false, false),
+        (true, false, false) => run!(true, false, false, false),
+        (false, false, false) => run!(false, false, false, false),
+        (_, false, true) => unreachable!("left-most range without index chunks"),
+    }
+}
+
+#[inline]
+unsafe fn filter_borrowed_partition_to_hits_baseline(
+    query: (u32, u32),
+    target_indices: &[u32],
+    target_begin: usize,
+    target_locations: &[PackedLoc],
+    absolute_partition: u32,
+    out: &mut Vec<StoredHit>,
+    queries: &SequenceSet,
+    targets: &SequenceSet,
+    cutoffs: &[i32],
+    score_matrix: &ScoreMatrix,
+    shape: &Shape,
+    left_most_context: &LeftMostContext<'_>,
+    first_shape: bool,
+    chunked: bool,
+    use_left_most_range: bool,
+    skip_left_most: bool,
+    index_chunks: usize,
+    min_identities: u32,
+    ungapped_lane_count: usize,
+    ungapped_kernel: UngappedKernel,
+) -> usize {
+    filter_borrowed_partition_to_hits(
+        query,
+        target_indices,
+        target_begin,
+        target_locations,
+        absolute_partition,
+        out,
+        queries,
+        targets,
+        cutoffs,
+        score_matrix,
+        shape,
+        left_most_context,
+        first_shape,
+        chunked,
+        use_left_most_range,
+        skip_left_most,
+        index_chunks,
+        min_identities,
+        ungapped_lane_count,
+        ungapped_kernel,
+    )
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_borrowed_partition_to_hits_avx2(
+    query: (u32, u32),
+    target_indices: &[u32],
+    target_begin: usize,
+    target_locations: &[PackedLoc],
+    absolute_partition: u32,
+    out: &mut Vec<StoredHit>,
+    queries: &SequenceSet,
+    targets: &SequenceSet,
+    cutoffs: &[i32],
+    score_matrix: &ScoreMatrix,
+    shape: &Shape,
+    left_most_context: &LeftMostContext<'_>,
+    first_shape: bool,
+    chunked: bool,
+    use_left_most_range: bool,
+    skip_left_most: bool,
+    index_chunks: usize,
+    min_identities: u32,
+    ungapped_lane_count: usize,
+    ungapped_kernel: UngappedKernel,
+) -> usize {
+    filter_borrowed_partition_to_hits(
+        query,
+        target_indices,
+        target_begin,
+        target_locations,
+        absolute_partition,
+        out,
+        queries,
+        targets,
+        cutoffs,
+        score_matrix,
+        shape,
+        left_most_context,
+        first_shape,
+        chunked,
+        use_left_most_range,
+        skip_left_most,
+        index_chunks,
+        min_identities,
+        ungapped_lane_count,
+        ungapped_kernel,
+    )
+}
+
+trait Stage2Subject {
+    fn len(&self) -> usize;
+    fn absolute_subject(&self, index: usize) -> u64;
+}
+
+struct BorrowedStage1Subjects<'a> {
+    indices: &'a [u32],
+    subjects: &'a [u64],
+}
+
+impl Stage2Subject for BorrowedStage1Subjects<'_> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    #[inline(always)]
+    fn absolute_subject(&self, index: usize) -> u64 {
+        self.subjects[self.indices[index] as usize]
+    }
+}
+
+struct BorrowedStage1Targets<'a> {
+    indices: &'a [u32],
+    target_begin: usize,
+    targets: &'a [PackedLoc],
+}
+
+impl Stage2Subject for BorrowedStage1Targets<'_> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    #[inline(always)]
+    fn absolute_subject(&self, index: usize) -> u64 {
+        self.targets[self.target_begin + self.indices[index] as usize].as_u64()
+    }
+}
+
+#[inline(always)]
+fn filter_query_candidates_impl<
+    C: Stage2Subject + ?Sized,
     const FIRST_SHAPE: bool,
     const CHUNKED: bool,
     const USE_LEFT_MOST_RANGE: bool,
     const SKIP_LEFT_MOST: bool,
 >(
-    matches: &[SeedMatch],
+    query_location: (u32, u32),
+    candidates: &C,
+    absolute_partition: u32,
     out: &mut Vec<StoredHit>,
     queries: &SequenceSet,
-    db_block: &Block,
+    targets: &SequenceSet,
     cutoffs: &[i32],
     score_matrix: &ScoreMatrix,
     shape: &Shape,
@@ -441,150 +882,123 @@ fn filter_partition_to_hits_impl<
     ungapped_lane_count: usize,
     ungapped_kernel: UngappedKernel,
 ) -> usize {
-    let ref_seq_data = db_block.seqs().data();
+    let ref_seq_data = targets.data();
     let mut ungapped_count = 0usize;
-    // Every callback belongs to one seed partition. C++ exposes the enclosing
-    // index-chunk range through `current_range`; deriving it for every passing
-    // hit introduced two integer divisions in the hottest left-most loop.
     let current_range = if USE_LEFT_MOST_RANGE {
-        matches.first().map(|hit| {
-            let partitions = seedp_count(10) as usize;
-            let chunk_size = partitions.div_ceil(index_chunks);
-            let partition = seed_partition(hit.seed, seedp_mask(10)) as usize;
-            let begin = (partition / chunk_size) * chunk_size;
-            let end = (begin + chunk_size).min(partitions);
-            SeedPartitionRange::with_bounds(begin as u32, end as u32)
-        })
+        let partitions = seedp_count(10) as usize;
+        let chunk_size = partitions.div_ceil(index_chunks);
+        let begin = (absolute_partition as usize / chunk_size) * chunk_size;
+        let end = (begin + chunk_size).min(partitions);
+        Some(SeedPartitionRange::with_bounds(begin as u32, end as u32))
     } else {
         None
     };
-    let mut group_begin = 0usize;
-    while group_begin < matches.len() {
-        let query_id = matches[group_begin].query_id as usize;
-        let q_pos = matches[group_begin].query_pos as usize;
-        let mut group_end = group_begin + 1;
-        while group_end < matches.len()
-            && matches[group_end].query_id as usize == query_id
-            && matches[group_end].query_pos as usize == q_pos
-        {
-            group_end += 1;
-        }
-        if query_id >= queries.len() {
-            group_begin = group_end;
-            continue;
-        }
-        let query = queries.get(query_id);
-        let (q_start, q_end) = stage2_query_bounds(query.len(), q_pos);
-        let window_left = q_pos - q_start;
-        let window_clipped = q_end - q_start;
-        let query_window = &query[q_start..q_end];
-        let cutoff = cutoffs[query_id];
-        let interval_mod = (q_pos % 32) as i32;
-        let interval_overhang = (window_left as i32 - interval_mod).max(0) as usize;
-        let left_q_start = q_start + interval_overhang;
-        let left_seed_offset = window_left.saturating_sub(interval_overhang);
-        if left_q_start >= q_end {
-            group_begin = group_end;
-            continue;
-        }
-        let left_len = q_end - left_q_start;
+    let query_id = query_location.0 as usize;
+    let q_pos = query_location.1 as usize;
+    if query_id >= queries.len() {
+        return 0;
+    }
+    let query = queries.get(query_id);
+    let (q_start, q_end) = stage2_query_bounds(query.len(), q_pos);
+    let window_left = q_pos - q_start;
+    let window_clipped = q_end - q_start;
+    let query_window = &query[q_start..q_end];
+    let cutoff = cutoffs[query_id];
+    let interval_mod = (q_pos % 32) as i32;
+    let interval_overhang = (window_left as i32 - interval_mod).max(0) as usize;
+    let left_q_start = q_start + interval_overhang;
+    let left_seed_offset = window_left.saturating_sub(interval_overhang);
+    if left_q_start >= q_end {
+        return 0;
+    }
+    let left_len = q_end - left_q_start;
 
-        for chunk in matches[group_begin..group_end].chunks(ungapped_lane_count) {
-            let mut subject_starts = [0isize; 32];
-            for (start, hit) in subject_starts.iter_mut().zip(chunk) {
-                // The streaming join carries upstream's absolute PackedLoc in
-                // the high bits and its seed partition in the low 10 bits.
-                // Avoid a random limits-array lookup for every cross-product
-                // survivor merely to reconstruct the position we just decoded.
-                *start = (hit.seed >> 10) as isize - window_left as isize;
+    for chunk_begin in (0..candidates.len()).step_by(ungapped_lane_count) {
+        let chunk_len = ungapped_lane_count.min(candidates.len() - chunk_begin);
+        let mut subject_starts = [0isize; 32];
+        for (local_index, start) in subject_starts[..chunk_len].iter_mut().enumerate() {
+            *start = candidates.absolute_subject(chunk_begin + local_index) as isize
+                - window_left as isize;
+        }
+        let subject_storage;
+        let mut subject_windows = [&[][..]; 32];
+        if subject_starts[..chunk_len].iter().all(|&start| start >= 0) {
+            for (window, &start) in subject_windows.iter_mut().zip(&subject_starts) {
+                *window = &ref_seq_data[start as usize..];
             }
-            let subject_storage;
-            let mut subject_windows = [&[][..]; 32];
-            if subject_starts[..chunk.len()]
+        } else {
+            subject_storage = subject_starts[..chunk_len]
                 .iter()
-                .all(|&start| start >= 0)
-            {
-                for (window, &start) in subject_windows.iter_mut().zip(&subject_starts) {
-                    *window = &ref_seq_data[start as usize..];
-                }
-            } else {
-                subject_storage = subject_starts[..chunk.len()]
-                    .iter()
-                    .map(|&start| {
-                        (0..window_clipped)
-                            .map(|n| {
-                                let pos = start + n as isize;
-                                if pos < 0 {
-                                    crate::basic::value::DELIMITER_LETTER
-                                } else {
-                                    ref_seq_data
-                                        .get(pos as usize)
-                                        .copied()
-                                        .unwrap_or(crate::basic::value::DELIMITER_LETTER)
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                for (window, storage) in subject_windows.iter_mut().zip(&subject_storage) {
-                    *window = storage;
-                }
+                .map(|&start| {
+                    (0..window_clipped)
+                        .map(|n| {
+                            let pos = start + n as isize;
+                            if pos < 0 {
+                                crate::basic::value::DELIMITER_LETTER
+                            } else {
+                                ref_seq_data
+                                    .get(pos as usize)
+                                    .copied()
+                                    .unwrap_or(crate::basic::value::DELIMITER_LETTER)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            for (window, storage) in subject_windows.iter_mut().zip(&subject_storage) {
+                *window = storage;
             }
-            let mut scores = [i32::MAX; 32];
-            if cutoff != 0 {
-                ungapped_kernel(
-                    query_window,
-                    &subject_windows[..chunk.len()],
-                    window_clipped,
-                    score_matrix,
-                    &mut scores[..chunk.len()],
+        }
+        let mut scores = [i32::MAX; 32];
+        if cutoff != 0 {
+            ungapped_kernel(
+                query_window,
+                &subject_windows[..chunk_len],
+                window_clipped,
+                score_matrix,
+                &mut scores[..chunk_len],
+            );
+        }
+        for (hit_index, &score) in scores[..chunk_len].iter().enumerate() {
+            if score <= cutoff {
+                continue;
+            }
+            ungapped_count += 1;
+            let subject = (subject_starts[hit_index] + window_left as isize) as usize;
+            let left_subject_start =
+                subject as isize - window_left as isize + interval_overhang as isize;
+            if !SKIP_LEFT_MOST {
+                let keep = left_most_filter_with_range_backed(
+                    queries.data(),
+                    queries.position(query_id, left_q_start),
+                    left_len,
+                    ref_seq_data,
+                    left_subject_start as usize,
+                    left_seed_offset as i32,
+                    shape.length,
+                    left_most_context,
+                    FIRST_SHAPE,
+                    shape,
+                    cutoff,
+                    CHUNKED,
+                    min_identities,
+                    current_range,
                 );
-            }
-            for (hit_index, (hit, &score)) in chunk.iter().zip(&scores).enumerate() {
-                if score <= cutoff {
+                if !keep {
                     continue;
                 }
-                ungapped_count += 1;
-                // `subject_starts` already contains this absolute location
-                // minus `window_left`. Avoid repeating the offsets lookup for
-                // every survivor in the hottest stage-1 loop.
-                let subject = (subject_starts[hit_index] + window_left as isize) as usize;
-                let left_subject_start =
-                    subject as isize - window_left as isize + interval_overhang as isize;
-                if !SKIP_LEFT_MOST {
-                    let keep = left_most_filter_with_range_backed(
-                        queries.data(),
-                        queries.position(query_id, left_q_start),
-                        left_len,
-                        ref_seq_data,
-                        left_subject_start as usize,
-                        left_seed_offset as i32,
-                        shape.length,
-                        left_most_context,
-                        FIRST_SHAPE,
-                        shape,
-                        cutoff,
-                        CHUNKED,
-                        min_identities,
-                        current_range,
-                    );
-                    if !keep {
-                        continue;
-                    }
-                }
-                out.push(StoredHit {
-                    subject: subject as u64,
-                    query_id: hit.query_id,
-                    seed_offset: hit.query_pos,
-                    score: if score == i32::MAX {
-                        u16::MAX
-                    } else {
-                        score.min(u16::MAX as i32) as u16
-                    },
-                });
             }
+            out.push(StoredHit {
+                subject: subject as u64,
+                query_id: query_location.0,
+                seed_offset: query_location.1,
+                score: if score == i32::MAX {
+                    u16::MAX
+                } else {
+                    score.min(u16::MAX as i32) as u16
+                },
+            });
         }
-        group_begin = group_end;
     }
     ungapped_count
 }
@@ -697,6 +1111,8 @@ pub struct BlastpConfig {
     pub memory_limit: Option<u64>,
     /// Directory for spill files; an empty path uses the OS temporary directory.
     pub tmpdir: PathBuf,
+    /// Consume the persistent `<database>.seed_idx` built by `makeidx`.
+    pub target_indexed: bool,
     /// Internal blastx layout. When present, every source query contributes
     /// six consecutive protein records (one per translated context).
     pub translated_query_layout: Option<TranslatedQueryLayout>,
@@ -710,6 +1126,10 @@ pub struct TranslatedQuerySource {
     /// translated protein contexts are owned separately by the extension
     /// groups, so this is the only stored source-DNA copy.
     pub sequence: Vec<Letter>,
+    /// Adjacent source-query ordinal for synchronized two-file blastx input.
+    /// Storing an index instead of a second sequence keeps the mate relation
+    /// zero-copy, matching upstream's shared source-sequence block.
+    pub mate_index: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -721,6 +1141,7 @@ struct TranslatedExtensionGroup<'a> {
     id: String,
     dna_len: i32,
     source_sequence: &'a [Letter],
+    mate_sequence: Option<&'a [Letter]>,
     frames: Vec<Vec<Letter>>,
 }
 
@@ -732,6 +1153,243 @@ enum QueryOutput {
 struct NativeDaaDictionary {
     sequence_count: u64,
     refs: Vec<(String, u32)>,
+}
+
+struct NativeDatabaseMetadata {
+    subject_taxids: Vec<Vec<TaxId>>,
+    taxonomy: Option<TaxonomyTree>,
+}
+
+fn is_blast_database(path: &str) -> bool {
+    let path = Path::new(path);
+    let mut pin = path.as_os_str().to_owned();
+    pin.push(".pin");
+    let mut pal = path.as_os_str().to_owned();
+    pal.push(".pal");
+    path.extension().is_some_and(|extension| extension == "pal")
+        || PathBuf::from(pin).exists()
+        || PathBuf::from(pal).exists()
+}
+
+fn requested_taxonomy_flags(outfmt: &[String]) -> SequenceFileFlags {
+    let mut flags = SequenceFileFlags::NONE;
+    for field in outfmt
+        .iter()
+        .skip(1)
+        .filter_map(|name| FieldId::from_name(name))
+    {
+        match field {
+            FieldId::STaxIds => flags |= SequenceFileFlags::TAXON_MAPPING,
+            FieldId::SSciNames => {
+                flags |=
+                    SequenceFileFlags::TAXON_MAPPING | SequenceFileFlags::TAXON_SCIENTIFIC_NAMES;
+            }
+            FieldId::SLineages => {
+                flags |= SequenceFileFlags::TAXON_MAPPING
+                    | SequenceFileFlags::TAXON_NODES
+                    | SequenceFileFlags::TAXON_SCIENTIFIC_NAMES;
+            }
+            FieldId::SSKingdoms | FieldId::SKingdoms | FieldId::SPhylums => {
+                flags |= SequenceFileFlags::TAXON_MAPPING
+                    | SequenceFileFlags::TAXON_NODES
+                    | SequenceFileFlags::TAXON_RANKS
+                    | SequenceFileFlags::TAXON_SCIENTIFIC_NAMES;
+            }
+            _ => {}
+        }
+    }
+    flags
+}
+
+fn load_blast_database(
+    path: &str,
+    taxonomy_flags: SequenceFileFlags,
+) -> io::Result<(Vec<fasta::FastaRecord>, NativeDatabaseMetadata)> {
+    let flags = SequenceFileFlags::SEQS | SequenceFileFlags::TITLES | taxonomy_flags;
+    let mut database = BlastDB::new(path, flags).map_err(io::Error::other)?;
+    let sequence_count = database.sequence_count() as usize;
+    let mut records = Vec::with_capacity(sequence_count);
+    let mut subject_taxids = Vec::with_capacity(sequence_count);
+    for oid in 0..sequence_count {
+        let mut sequence = Vec::new();
+        database
+            .seq_data(oid, &mut sequence)
+            .map_err(io::Error::other)?;
+        let id = database
+            .seqid(oid as u64, true, true)
+            .map_err(io::Error::other)?;
+        records.push(fasta::FastaRecord { id, sequence });
+        subject_taxids.push(database.taxids(oid));
+    }
+
+    let needs_tree = taxonomy_flags.contains(SequenceFileFlags::TAXON_SCIENTIFIC_NAMES)
+        || taxonomy_flags.contains(SequenceFileFlags::TAXON_NODES)
+        || taxonomy_flags.contains(SequenceFileFlags::TAXON_RANKS);
+    let taxonomy = if needs_tree {
+        let mut tree = TaxonomyTree::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for taxids in &subject_taxids {
+            for &assigned_taxid in taxids {
+                let mut taxid = assigned_taxid;
+                while taxid > 0 && seen.insert(taxid) {
+                    let parent = if taxonomy_flags.contains(SequenceFileFlags::TAXON_NODES) {
+                        database.get_parent(taxid)
+                    } else {
+                        0
+                    };
+                    let rank = if taxonomy_flags.contains(SequenceFileFlags::TAXON_RANKS) {
+                        usize::try_from(database.rank(taxid))
+                            .ok()
+                            .and_then(Rank::from_index)
+                            .map_or_else(String::new, |rank| rank.name().to_owned())
+                    } else {
+                        String::new()
+                    };
+                    let name = if taxonomy_flags.contains(SequenceFileFlags::TAXON_SCIENTIFIC_NAMES)
+                    {
+                        database.taxon_scientific_name(taxid)
+                    } else {
+                        taxid.to_string()
+                    };
+                    tree.add_node(TaxonomyNode {
+                        taxid,
+                        parent,
+                        rank,
+                        name,
+                    });
+                    if !taxonomy_flags.contains(SequenceFileFlags::TAXON_NODES)
+                        || taxid == 1
+                        || parent == taxid
+                    {
+                        break;
+                    }
+                    taxid = parent;
+                }
+            }
+        }
+        Some(tree)
+    } else {
+        None
+    };
+    Ok((
+        records,
+        NativeDatabaseMetadata {
+            subject_taxids,
+            taxonomy,
+        },
+    ))
+}
+
+/// Open a native DIAMOND database with exactly the taxonomy components the
+/// selected output fields require.  Upstream `DatabaseFile` validates and
+/// loads these components at construction time; doing the same here avoids
+/// both silently blank taxonomy columns and loading the usually-large nodes
+/// and names arrays for ordinary searches.
+fn load_dmnd_database(
+    path: &Path,
+    taxonomy_flags: SequenceFileFlags,
+) -> io::Result<(
+    crate::data::dmnd::ReferenceHeader,
+    Vec<fasta::FastaRecord>,
+    NativeDatabaseMetadata,
+)> {
+    let needs_mapping = taxonomy_flags.contains(SequenceFileFlags::TAXON_MAPPING);
+    let needs_nodes = taxonomy_flags.contains(SequenceFileFlags::TAXON_NODES)
+        || taxonomy_flags.contains(SequenceFileFlags::TAXON_RANKS);
+    let needs_names = taxonomy_flags.contains(SequenceFileFlags::TAXON_SCIENTIFIC_NAMES);
+    let mut database = DatabaseFile::open_with_options(
+        path,
+        DatabaseOpenOptions {
+            load_taxon_mapping: needs_mapping,
+            load_taxon_nodes: needs_nodes,
+            load_taxon_scientific_names: needs_names,
+            ..DatabaseOpenOptions::default()
+        },
+    )
+    .map_err(io::Error::other)?;
+
+    // Ranks were added to the native node payload at build 131.  C++ rejects
+    // an older database as soon as an output field requests rank lookup.
+    if taxonomy_flags.contains(SequenceFileFlags::TAXON_RANKS) && database.ref_header.build < 131 {
+        return Err(io::Error::other(
+            "Options require taxonomy information included in the database. Please use the respective options to build this information into the database when running diamond makedb: taxonomy ranks information (database needs to be built with diamond version >= 0.9.30",
+        ));
+    }
+
+    let header = database.ref_header.clone();
+    let sequence_count = database.sequence_count() as usize;
+    let mut records = Vec::with_capacity(sequence_count);
+    let mut subject_taxids = Vec::with_capacity(sequence_count);
+    database.init_seq_access();
+    for oid in 0..sequence_count {
+        let (sequence, id) = database
+            .read_seq()
+            .map_err(io::Error::other)?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Unexpected end of DIAMOND database",
+                )
+            })?;
+        records.push(fasta::FastaRecord { id, sequence });
+        subject_taxids.push(if needs_mapping {
+            database.taxids(oid).map_err(io::Error::other)?
+        } else {
+            Vec::new()
+        });
+    }
+
+    let taxonomy = if needs_nodes || needs_names {
+        let mut tree = TaxonomyTree::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for taxids in &subject_taxids {
+            for &assigned_taxid in taxids {
+                let mut taxid = assigned_taxid;
+                while taxid > 0 && seen.insert(taxid) {
+                    let parent = if needs_nodes {
+                        database.get_parent(taxid).map_err(io::Error::other)?
+                    } else {
+                        0
+                    };
+                    let rank = if taxonomy_flags.contains(SequenceFileFlags::TAXON_RANKS) {
+                        usize::try_from(database.rank(taxid).map_err(io::Error::other)?)
+                            .ok()
+                            .and_then(Rank::from_index)
+                            .map_or_else(String::new, |rank| rank.name().to_owned())
+                    } else {
+                        String::new()
+                    };
+                    let name = if needs_names {
+                        database.taxon_scientific_name(taxid)
+                    } else {
+                        taxid.to_string()
+                    };
+                    tree.add_node(TaxonomyNode {
+                        taxid,
+                        parent,
+                        rank,
+                        name,
+                    });
+                    if !needs_nodes || taxid == 1 || parent == taxid {
+                        break;
+                    }
+                    taxid = parent;
+                }
+            }
+        }
+        Some(tree)
+    } else {
+        None
+    };
+
+    Ok((
+        header,
+        records,
+        NativeDatabaseMetadata {
+            subject_taxids,
+            taxonomy,
+        },
+    ))
 }
 
 impl DaaSequenceFile for NativeDaaDictionary {
@@ -817,7 +1475,47 @@ struct ExtensionWorkerScratch {
 /// 6. Filter by e-value and output
 pub fn run(config: &BlastpConfig) -> io::Result<()> {
     run_impl(
-        config, None, None, None, None, false, false, false, false, 0.0, false, None,
+        config,
+        None,
+        None,
+        None,
+        None,
+        MaskingAlgo::None,
+        false,
+        false,
+        false,
+        0.0,
+        false,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Run the native search with already translated query records.
+///
+/// `blastx` owns these records and transfers them directly, matching the
+/// upstream in-process query-block handoff without serializing and reparsing
+/// an intermediate FASTA file.
+pub fn run_with_query_records(
+    config: &BlastpConfig,
+    query_records: Vec<fasta::FastaRecord>,
+) -> io::Result<()> {
+    run_impl(
+        config,
+        None,
+        Some(query_records),
+        None,
+        None,
+        MaskingAlgo::None,
+        false,
+        false,
+        false,
+        0.0,
+        false,
+        None,
+        None,
+        None,
     )
 }
 
@@ -844,7 +1542,7 @@ fn restore_extension_queries(records: &mut [fasta::FastaRecord], restored: &Sequ
 pub fn run_edges_in_memory(
     config: &BlastpConfig,
     database: Vec<fasta::FastaRecord>,
-    queries: Vec<fasta::FastaRecord>,
+    queries: Option<Vec<fasta::FastaRecord>>,
     approx_min_id: f64,
     linear_stage1_query: bool,
     linear_stage1_target: bool,
@@ -852,21 +1550,26 @@ pub fn run_edges_in_memory(
     query_or_target_cover: f64,
     mutual_cover: bool,
     hamming_ext: HammingExtConfig,
+    soft_tantan_masker: Option<&crate::masking::tantan::TantanMasker>,
+    soft_masking_override: MaskingAlgo,
+    extension_mode_override: Option<sensitivity::ExtensionMode>,
 ) -> io::Result<Vec<InMemorySearchEdge>> {
     let edges = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     run_impl(
         config,
         Some(database),
-        Some(queries),
+        queries,
         Some(edges.clone()),
         Some(approx_min_id),
-        true,
+        soft_masking_override,
         linear_stage1_query,
         linear_stage1_target,
         self_search,
         query_or_target_cover,
         mutual_cover,
         Some(hamming_ext),
+        soft_tantan_masker,
+        extension_mode_override,
     )?;
     let result = edges.lock().unwrap().clone();
     Ok(result)
@@ -878,15 +1581,37 @@ fn run_impl(
     query_records_override: Option<Vec<fasta::FastaRecord>>,
     edge_output: Option<std::sync::Arc<std::sync::Mutex<Vec<InMemorySearchEdge>>>>,
     approx_min_id_override: Option<f64>,
-    soft_tantan_override: bool,
+    soft_masking_override: MaskingAlgo,
     linear_stage1_query: bool,
     linear_stage1_target: bool,
     self_search: bool,
     query_or_target_cover: f64,
     mutual_cover: bool,
     hamming_ext: Option<HammingExtConfig>,
+    soft_tantan_masker: Option<&crate::masking::tantan::TantanMasker>,
+    extension_mode_override: Option<sensitivity::ExtensionMode>,
 ) -> io::Result<()> {
     let start = Instant::now();
+    // Upstream linear self-search aliases target to query instead of loading
+    // or copying a second block. `run_edges_in_memory` signals that exact mode
+    // by supplying the database records without a separate query vector.
+    let shared_self_records = database_records.is_some()
+        && query_records_override.is_none()
+        && edge_output.is_some()
+        && self_search;
+    // `Search::Config` derives this once from equal query/subject coverage
+    // and stage sensitivity. It selects the mutual-coverage stage-1 kernels,
+    // not merely length sorting, so carry it through the native seed worker.
+    let min_length_ratio =
+        if config.query_cover >= 50.0 && config.query_cover == config.subject_cover {
+            if linear_stage1_query && config.sensitivity < Sensitivity::Linclust40 {
+                (config.query_cover / 100.0 + 0.05).min(0.92)
+            } else {
+                (config.query_cover / 100.0 - 0.05).max(0.0)
+            }
+        } else {
+            0.0
+        };
 
     // Honor `--threads N`. Previously the value was parsed but ignored, so
     // rayon fell back to its global pool (= `RAYON_NUM_THREADS` env or core
@@ -908,7 +1633,16 @@ fn run_impl(
     // as FASTA), but `--db nr.fasta` was resolving to `nr.dmnd` in Rust because
     // `with_extension("dmnd")` REPLACES rather than appends. Fix: only consult
     // a `<db>.dmnd` companion when the given path doesn't exist.
+    let taxonomy_flags = requested_taxonomy_flags(&config.outfmt);
+    let taxonomy_requested = taxonomy_flags.contains(SequenceFileFlags::TAXON_MAPPING);
+    let mut database_metadata = None;
     let (mut db_records, _db_from_dmnd) = if let Some(records) = database_records {
+        if taxonomy_requested {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "taxonomy output is not available for in-memory clustering search",
+            ));
+        }
         (records, false)
     } else {
         let db_path = Path::new(&config.database);
@@ -931,14 +1665,43 @@ fn run_impl(
             std::path::PathBuf::from(p)
         };
 
-        if dmnd_path.exists() {
-            let (header, records) = crate::data::dmnd_reader::read_dmnd(&dmnd_path)?;
+        if is_blast_database(&config.database) {
+            if config.target_indexed {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--target-indexed is not compatible with BLAST databases.",
+                ));
+            }
+            let (records, metadata) = load_blast_database(&config.database, taxonomy_flags)?;
+            eprintln!(
+                "Database: {} sequences (NCBI BLAST database)",
+                records.len()
+            );
+            database_metadata = Some(metadata);
+            (records, false)
+        } else if dmnd_path.exists() {
+            // Keep ordinary search on the lean sequence-only reader.  An
+            // empty `Vec<TaxId>` per subject would cost 24 bytes per database
+            // sequence even when no taxonomy column was requested.
+            let (header, records) = if taxonomy_requested {
+                let (header, records, metadata) = load_dmnd_database(&dmnd_path, taxonomy_flags)?;
+                database_metadata = Some(metadata);
+                (header, records)
+            } else {
+                crate::data::dmnd_reader::read_dmnd(&dmnd_path)?
+            };
             eprintln!(
                 "Database: {} sequences, {} letters (DMND)",
                 header.sequences, header.letters
             );
             (records, true)
         } else {
+            if taxonomy_requested {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "taxonomy output requires a database containing taxonomy metadata",
+                ));
+            }
             let fasta_path = if db_path.extension().is_none() {
                 db_path.with_extension("faa")
             } else {
@@ -965,7 +1728,9 @@ fn run_impl(
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     // Load query sequences
-    let mut query_records = if let Some(records) = query_records_override {
+    let mut query_records = if shared_self_records {
+        Vec::new()
+    } else if let Some(records) = query_records_override {
         records
     } else {
         let mut records = Vec::new();
@@ -977,7 +1742,14 @@ fn run_impl(
         }
         records
     };
-    eprintln!("Queries: {} sequences", query_records.len());
+    eprintln!(
+        "Queries: {} sequences",
+        if shared_self_records {
+            db_records.len()
+        } else {
+            query_records.len()
+        }
+    );
 
     // Upstream derives a minimum length ratio when the two coverage cutoffs
     // are equal and at least 50%, then length-sorts both sides before search
@@ -986,7 +1758,10 @@ fn run_impl(
     // output.  Retain the original ordinal as the tie breaker: C++ sorts
     // `pair<length, BlockId>` with `greater`, so equal-length records appear
     // in descending input order as well.
-    if config.query_cover >= 50.0 && config.query_cover == config.subject_cover {
+    if !shared_self_records
+        && config.query_cover >= 50.0
+        && config.query_cover == config.subject_cover
+    {
         let sort_by_cpp_length_order = |records: &mut Vec<fasta::FastaRecord>| {
             let mut indexed: Vec<_> = records.drain(..).enumerate().collect();
             indexed.sort_unstable_by(|(left_id, left), (right_id, right)| {
@@ -998,12 +1773,35 @@ fn run_impl(
             });
             records.extend(indexed.into_iter().map(|(_, record)| record));
         };
+        // The clustering backend has already applied the upstream
+        // `Block::length_sort` order before passing an aliased self-search
+        // block. Sorting that block again here reverses equal-length groups
+        // and invalidates its local-to-database OID mapping.
         // blastx contexts are deliberately consecutive: the spill bins and
         // extension stage consume all six as one source query.
-        if config.translated_query_layout.is_none() {
+        if !shared_self_records && config.translated_query_layout.is_none() {
             sort_by_cpp_length_order(&mut query_records);
         }
-        sort_by_cpp_length_order(&mut db_records);
+        if let Some(metadata) = database_metadata.as_mut() {
+            let mut indexed: Vec<_> = db_records
+                .drain(..)
+                .zip(metadata.subject_taxids.drain(..))
+                .enumerate()
+                .collect();
+            indexed.sort_unstable_by(|(left_id, (left, _)), (right_id, (right, _))| {
+                right
+                    .sequence
+                    .len()
+                    .cmp(&left.sequence.len())
+                    .then_with(|| right_id.cmp(left_id))
+            });
+            for (_, (record, taxids)) in indexed {
+                db_records.push(record);
+                metadata.subject_taxids.push(taxids);
+            }
+        } else {
+            sort_by_cpp_length_order(&mut db_records);
+        }
     }
 
     use crate::basic::value::{MASK_LETTER, SEED_MASK};
@@ -1034,7 +1832,9 @@ fn run_impl(
                 crate::masking::remove_bit_mask(&mut record.sequence);
                 tantan_masker.mask(&mut record.sequence);
             };
-            if query_records
+            if shared_self_records {
+                // The database mutation above is the query mutation too.
+            } else if query_records
                 .iter()
                 .any(|record| record.sequence.len() > LONG_QUERY_RESIDUES)
             {
@@ -1048,10 +1848,16 @@ fn run_impl(
             }
         }
         MaskingMode::BlastSeg => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "native blastp does not implement --masking seg; use --legacy",
-            ));
+            // Run::Config maps BLAST SEG hard masking to targets only.
+            db_records.par_iter_mut().for_each(|record| {
+                crate::masking::remove_bit_mask(&mut record.sequence);
+                crate::masking::mask_sequence(&mut record.sequence, MaskingAlgo::Seg);
+            });
+            if !shared_self_records {
+                query_records
+                    .par_iter_mut()
+                    .for_each(|record| crate::masking::remove_bit_mask(&mut record.sequence));
+            }
         }
     }
 
@@ -1078,19 +1884,33 @@ fn run_impl(
         db_records
             .par_iter_mut()
             .for_each(|r| hard_mask(&mut r.sequence));
-        query_records
-            .par_iter_mut()
-            .for_each(|r| hard_mask(&mut r.sequence));
+        if !shared_self_records {
+            query_records
+                .par_iter_mut()
+                .for_each(|r| hard_mask(&mut r.sequence));
+        }
     }
 
     // Keep compact, alignment-ready sequence storage before motif masking.
-    // This duplicates only the residue bytes (a few MB in the benchmark), and
-    // lets partition-local stage 2 run while the record copies remain masked
-    // for seed enumeration.  It replaces the former multi-GB pair retention.
-    let mut stage2_queries: Vec<Vec<Letter>> = query_records
-        .iter()
-        .map(|record| record.sequence.clone())
-        .collect();
+    // Build the final contiguous SequenceSet directly: a Vec<Vec<Letter>>
+    // intermediary adds one allocation and 24 bytes of metadata per query
+    // context, which is material for six-frame translated searches.
+    let query_source = if shared_self_records {
+        &db_records
+    } else {
+        &query_records
+    };
+    let mut stage2_query_set = SequenceSet::new();
+    stage2_query_set.reserve_capacity(
+        query_source.len(),
+        query_source
+            .iter()
+            .map(|record| record.sequence.len())
+            .sum(),
+    );
+    for record in query_source {
+        stage2_query_set.push(&record.sequence);
+    }
     let mut db_block = Block::new();
     for (idx, record) in db_records.iter().enumerate() {
         db_block
@@ -1108,33 +1928,91 @@ fn run_impl(
 
     // Clustering config sets hard query/target masking to 0 but adds TANTAN
     // to Search::Config::soft_masking. Apply it only to seed-enumeration
-    // records: `db_block` and `stage2_queries` above deliberately retain the
+    // records: `db_block` and `stage2_query_set` above deliberately retain the
     // original residues for ungapped/gapped extension.
-    let mut tantan_query_spans = vec![Vec::<(usize, usize)>::new(); query_records.len()];
-    if soft_tantan_override {
-        let tantan_masker =
-            crate::masking::tantan::TantanMasker::from_score_matrix(&score_matrix, 0.9);
-        db_records.par_iter_mut().for_each(|record| {
-            let ranges = tantan_masker.mask_ranges(&mut record.sequence);
-            let (front, back) = ranges.as_slices();
-            for &(begin, end) in front.iter().chain(back) {
-                record.sequence[begin as usize..end as usize]
-                    .fill(crate::basic::value::MASK_LETTER);
-            }
-        });
-        query_records
-            .par_iter_mut()
-            .zip(tantan_query_spans.par_iter_mut())
-            .for_each(|(record, spans)| {
+    let mut soft_query_spans = if soft_masking_override != MaskingAlgo::None {
+        vec![Vec::<(usize, usize)>::new(); stage2_query_set.len()]
+    } else {
+        Vec::new()
+    };
+    if soft_masking_override == MaskingAlgo::Tantan {
+        // Upstream constructs its score-matrix-derived `Masking` singleton
+        // once before entering the cascaded rounds. Ordinary searches retain
+        // the local construction, while clustering supplies that command-wide
+        // state so PAM matrices do not repeat the expensive lambda solve in
+        // every round.
+        let owned_tantan_masker = soft_tantan_masker
+            .is_none()
+            .then(|| crate::masking::tantan::TantanMasker::from_score_matrix(&score_matrix, 0.9));
+        let tantan_masker = soft_tantan_masker
+            .or(owned_tantan_masker.as_ref())
+            .expect("soft masking requires a TANTAN masker");
+        if shared_self_records {
+            db_records
+                .par_iter_mut()
+                .zip(soft_query_spans.par_iter_mut())
+                .for_each(|(record, spans)| {
+                    let ranges = tantan_masker.mask_ranges(&mut record.sequence);
+                    let (front, back) = ranges.as_slices();
+                    for &(begin, end) in front.iter().chain(back) {
+                        let begin = begin as usize;
+                        let end = end as usize;
+                        spans.push((begin, end));
+                        record.sequence[begin..end].fill(crate::basic::value::MASK_LETTER);
+                    }
+                });
+        } else {
+            db_records.par_iter_mut().for_each(|record| {
                 let ranges = tantan_masker.mask_ranges(&mut record.sequence);
                 let (front, back) = ranges.as_slices();
                 for &(begin, end) in front.iter().chain(back) {
-                    let begin = begin as usize;
-                    let end = end as usize;
-                    spans.push((begin, end));
-                    record.sequence[begin..end].fill(crate::basic::value::MASK_LETTER);
+                    record.sequence[begin as usize..end as usize]
+                        .fill(crate::basic::value::MASK_LETTER);
                 }
             });
+            query_records
+                .par_iter_mut()
+                .zip(soft_query_spans.par_iter_mut())
+                .for_each(|(record, spans)| {
+                    let ranges = tantan_masker.mask_ranges(&mut record.sequence);
+                    let (front, back) = ranges.as_slices();
+                    for &(begin, end) in front.iter().chain(back) {
+                        let begin = begin as usize;
+                        let end = end as usize;
+                        spans.push((begin, end));
+                        record.sequence[begin..end].fill(crate::basic::value::MASK_LETTER);
+                    }
+                });
+        }
+    } else if soft_masking_override == MaskingAlgo::Seg {
+        let mask_record = |record: &mut fasta::FastaRecord, spans: &mut Vec<(usize, usize)>| {
+            let encoded = record
+                .sequence
+                .iter()
+                .map(|&letter| (letter & LETTER_MASK) as u8)
+                .collect::<Vec<_>>();
+            for (begin, end) in crate::masking::blast_seg::seq_buffer_seg(&encoded, 0, None) {
+                let begin = begin as usize;
+                let end = end as usize + 1;
+                spans.push((begin, end));
+                record.sequence[begin..end].fill(MASK_LETTER);
+            }
+        };
+        if shared_self_records {
+            db_records
+                .par_iter_mut()
+                .zip(soft_query_spans.par_iter_mut())
+                .for_each(|(record, spans)| mask_record(record, spans));
+        } else {
+            db_records.par_iter_mut().for_each(|record| {
+                let mut ignored = Vec::new();
+                mask_record(record, &mut ignored);
+            });
+            query_records
+                .par_iter_mut()
+                .zip(soft_query_spans.par_iter_mut())
+                .for_each(|(record, spans)| mask_record(record, spans));
+        }
     }
 
     // Motif masking — ports C++ `Block::soft_mask(MOTIF)` invoked from
@@ -1164,10 +2042,14 @@ fn run_impl(
         vec![Vec::new(); db_records.len()]
     };
     let query_motif_saves: Vec<Vec<crate::masking::motifs::MotifMaskEntry>> = if use_motif_masking {
-        query_records
-            .par_iter_mut()
-            .map(|r| crate::masking::motifs::mask_motifs(&mut r.sequence))
-            .collect()
+        if shared_self_records {
+            Vec::new()
+        } else {
+            query_records
+                .par_iter_mut()
+                .map(|r| crate::masking::motifs::mask_motifs(&mut r.sequence))
+                .collect()
+        }
     } else {
         vec![Vec::new(); query_records.len()]
     };
@@ -1189,12 +2071,103 @@ fn run_impl(
             .join(",")
     );
 
+    // Upstream target-indexed mode changes the seed encoding itself: both
+    // sides use Murmur-hashed spaced seeds, while the persistent hash tables
+    // filter the one-pass query enumeration. Reuse the source-mirrored stage0
+    // implementation for that path instead of accepting the flag while still
+    // running the ordinary spaced-factor arrays.
+    let mut target_indexed_state = if config.target_indexed {
+        let shape_codes = shape_codes
+            .iter()
+            .map(|code| (*code).to_owned())
+            .collect::<Vec<_>>();
+        let shape_config = ShapeConfig::from_codes(&shape_codes, 0, &reduction)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let mut query = Block::new();
+        for (oid, record) in query_records.iter().enumerate() {
+            query
+                .push_back(
+                    stage2_query_set.get(oid),
+                    Some(&record.id),
+                    None,
+                    oid as u64,
+                    SequenceType::AminoAcid,
+                    0,
+                    false,
+                )
+                .map_err(io::Error::other)?;
+        }
+        let histogram_cfg = crate::data::flags::EnumCfg {
+            partition: None,
+            shape_begin: 0,
+            shape_end: shape_config.count(),
+            code: crate::data::flags::SeedEncoding::Hashed,
+            skip: None,
+            filter_masked_seeds: false,
+            mask_seeds: false,
+            seed_cut: 0.0,
+            soft_masking,
+            minimizer_window: 0,
+            filter_low_complexity_seeds: false,
+            mask_low_complexity_seeds: false,
+            sketch_size: 0,
+        };
+        let histogram = crate::data::seed_histogram::SeedHistogram::from_block(
+            &mut db_block,
+            false,
+            &crate::data::flags::NO_FILTER,
+            &histogram_cfg,
+            10,
+            rayon::current_num_threads().max(1) as u32,
+            &shape_config,
+            &reduction,
+            0,
+            1,
+        )
+        .map_err(io::Error::other)?;
+        *db_block.hst() = histogram;
+
+        let database_path = {
+            let given = Path::new(&config.database);
+            if given.exists() {
+                given.to_path_buf()
+            } else {
+                let mut path = given.as_os_str().to_owned();
+                path.push(".dmnd");
+                PathBuf::from(path)
+            }
+        };
+        let index_path = {
+            let mut path = database_path.as_os_str().to_owned();
+            path.push(".seed_idx");
+            PathBuf::from(path)
+        };
+        let seeds =
+            crate::data::seed_set::HashedSeedSet::from_index_file(&index_path, &shape_config)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        eprintln!("Loaded persistent seed index: {}", index_path.display());
+        Some(TargetIndexedState {
+            query,
+            shapes: shape_config,
+            seeds,
+        })
+    } else {
+        None
+    };
+
     // Build partitioned seed arrays and join for each shape (parallel)
     let db_seqs: Vec<&[Letter]> = db_records.iter().map(|r| r.sequence.as_slice()).collect();
-    let query_seqs: Vec<&[Letter]> = query_records
-        .iter()
-        .map(|r| r.sequence.as_slice())
-        .collect();
+    let query_seqs: Vec<&[Letter]> = if shared_self_records {
+        db_records
+            .iter()
+            .map(|record| record.sequence.as_slice())
+            .collect()
+    } else {
+        query_records
+            .iter()
+            .map(|record| record.sequence.as_slice())
+            .collect()
+    };
     // Per-sensitivity seed filters matching C++ DIAMOND:
     //   - `seed_cut * ln(2) * shape.weight` is the entropy floor for
     //     `seed_is_complex` (search/setup.cpp).
@@ -1215,9 +2188,9 @@ fn run_impl(
     } else {
         0
     };
-    let ungapped_cutoffs: Vec<i32> = stage2_queries
-        .iter()
-        .map(|query| {
+    let ungapped_cutoffs: Vec<i32> = (0..stage2_query_set.len())
+        .map(|query_id| {
+            let query = stage2_query_set.get(query_id);
             crate::search::stage2::ungapped_cutoff(
                 query.len() as i32,
                 ungapped_evalue,
@@ -1234,14 +2207,24 @@ fn run_impl(
     // then search those same prepared arrays, matching upstream stage0.
     let mut low_complexity_query_positions = Vec::new();
     let template_len = shapes.iter().map(|shape| shape.length).max().unwrap_or(0);
-    for (query, saved) in stage2_queries.iter_mut().zip(&query_motif_saves) {
-        crate::masking::motifs::restore_motifs(query, saved, template_len);
+    let query_motif_saves_for_restore = if shared_self_records {
+        &db_motif_saves
+    } else {
+        &query_motif_saves
+    };
+    for (query_id, saved) in query_motif_saves_for_restore.iter().enumerate() {
+        crate::masking::motifs::restore_motifs(
+            stage2_query_set.get_mut(query_id),
+            saved,
+            template_len,
+        );
     }
     // C++ MaskingTable::remove restores TANTAN-masked residues for extension,
     // then annotates every seed start whose template overlaps the restored
-    // range. Preserve the residues already stored in stage2_queries and apply
+    // range. Preserve the residues already stored in stage2_query_set and apply
     // precisely that left-extended SEED_MASK interval.
-    for (query, spans) in stage2_queries.iter_mut().zip(&tantan_query_spans) {
+    for (query_id, spans) in soft_query_spans.iter().enumerate() {
+        let query = stage2_query_set.get_mut(query_id);
         for &(begin, end) in spans {
             let mask_begin = begin.saturating_sub((template_len.max(1) - 1) as usize);
             for letter in &mut query[mask_begin..end] {
@@ -1249,16 +2232,6 @@ fn run_impl(
             }
         }
     }
-    let mut stage2_query_set = SequenceSet::new();
-    stage2_query_set.reserve_capacity(
-        stage2_queries.len(),
-        stage2_queries.iter().map(Vec::len).sum(),
-    );
-    for query in &stage2_queries {
-        stage2_query_set.push(query);
-    }
-    drop(stage2_queries);
-
     // Hamming fingerprints in upstream are loaded after motif masking has
     // been removed, directly from the original contiguous sequences. Use the
     // pre-motif stage-2 copies here as well: seed enumeration still consumes
@@ -1266,11 +2239,12 @@ fn run_impl(
     // needs a sparse restoration lookup for every candidate window. Query
     // SEED_MASK annotations are harmless because the fingerprint loader
     // strips LETTER_MASK from every byte.
-    let db_fingerprint_seqs: Vec<&[Letter]> = (0..db_block.seqs().len())
-        .map(|id| db_block.seqs().get(id))
-        .collect();
-
-    let chunked = traits.index_chunks > 1;
+    let effective_index_chunks = if config.target_indexed {
+        1
+    } else {
+        traits.index_chunks as usize
+    };
+    let chunked = effective_index_chunks > 1;
     let use_left_most_range = chunked;
     // Upstream stage2 skips this filter only for minimizer/sketch and linear
     // search modes; sensitivity itself is not a bypass. Keeping all hits for
@@ -1297,22 +2271,29 @@ fn run_impl(
     } else {
         (16, run_ungapped_kernel::<UNGAPPED_PORTABLE>)
     };
-    // Keep the globally conservative build free of AVX-512 in alignment while
-    // permitting the seed-filter worker to recover native-width vectorization.
-    // This dispatch is selected once per run; workers call the chosen function
-    // item directly, with no CPU-feature branch in the partition hot path.
+    // Upstream instantiates the complete stage-1 worker in its AVX2 namespace.
+    // Select that worker once per run so the partition hot path contains no
+    // CPU-feature branch.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    let partition_filter: PartitionFilter = if std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512bw")
-        && std::arch::is_x86_feature_detected!("avx512dq")
-        && std::arch::is_x86_feature_detected!("avx512vl")
-    {
-        filter_partition_to_hits_avx512
-    } else {
-        filter_partition_to_hits_baseline
-    };
+    let subject_index_partition_filter: SubjectIndexPartitionFilter =
+        if std::arch::is_x86_feature_detected!("avx2") {
+            filter_subject_indices_partition_to_hits_avx2
+        } else {
+            filter_subject_indices_partition_to_hits_baseline
+        };
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    let partition_filter: PartitionFilter = filter_partition_to_hits_baseline;
+    let subject_index_partition_filter: SubjectIndexPartitionFilter =
+        filter_subject_indices_partition_to_hits_baseline;
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let borrowed_partition_filter: BorrowedPartitionFilter =
+        if std::arch::is_x86_feature_detected!("avx2") {
+            filter_borrowed_partition_to_hits_avx2
+        } else {
+            filter_borrowed_partition_to_hits_baseline
+        };
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let borrowed_partition_filter: BorrowedPartitionFilter =
+        filter_borrowed_partition_to_hits_baseline;
     let mut hit_store = AdaptiveHitStore::new(
         stage2_query_set.len(),
         traits.query_bins as usize,
@@ -1333,6 +2314,31 @@ fn run_impl(
     let mut retained_hit_count = 0usize;
     let mut raw_seed_matches = 0usize;
     let mut current_left_most_matcher = PatternMatcher::new(&[]);
+    // Upstream constructs one worker×shape×partition SeedHistogram for the
+    // complete query/reference block, then reuses it for every index chunk.
+    // Keep worker sequence ranges in the histogram so parallel fills preserve
+    // the same stable record order without atomics.
+    let precomputed_worker_histograms = (target_indexed_state.is_none()
+        && rayon::current_num_threads() > 1
+        && traits.sketch_size <= 0)
+        .then(|| {
+            (
+                crate::search::seed_array::SeedArray::count_partitions_by_worker_all_shapes(
+                    &query_seqs,
+                    &shapes,
+                    &reduction,
+                    10,
+                    config.min_query_len,
+                ),
+                crate::search::seed_array::SeedArray::count_partitions_by_worker_all_shapes(
+                    &db_seqs,
+                    &shapes,
+                    &reduction,
+                    10,
+                    config.min_query_len,
+                ),
+            )
+        });
     for (shape_id, shape) in shapes.iter().enumerate() {
         let previous_left_most_matcher = current_left_most_matcher.clone();
         current_left_most_matcher.add_pattern(shape.mask);
@@ -1344,22 +2350,177 @@ fn run_impl(
             reduction: &reduction,
         };
         let complexity_cut = traits.seed_cut * std::f64::consts::LN_2 * shape.weight as f64;
+
+        if let Some(state) = target_indexed_state.as_mut() {
+            let mut stage0_config =
+                crate::search::stage0::SearchShapeConfig::new(&state.shapes, &reduction);
+            stage0_config.seedp_bits = 10;
+            stage0_config.index_chunks = 1;
+            stage0_config.threads = rayon::current_num_threads().max(1);
+            stage0_config.seed_encoding = crate::data::flags::SeedEncoding::Hashed;
+            stage0_config.seed_complexity_cut = complexity_cut;
+            stage0_config.soft_masking = soft_masking;
+            stage0_config.minimizer_window = traits.minimizer_window;
+            stage0_config.sketch_size = traits.sketch_size;
+            stage0_config.min_query_len = config.min_query_len as i32;
+            stage0_config.query_contexts = if config.translated_query_layout.is_some() {
+                6
+            } else {
+                1
+            };
+            stage0_config.target_seeds = Some(&state.seeds);
+
+            let indexed_report = crate::search::stage0::search_shape(
+                shape_id as u32,
+                &mut state.query,
+                &mut db_block,
+                &stage0_config,
+                |partition, query_stage0, target_stage0| {
+                    let (hits, raw) = map_target_indexed_partition(
+                        partition.query_seed_hits,
+                        partition.reference_seed_hits,
+                        partition.absolute_partition,
+                        query_stage0,
+                        target_stage0,
+                        hamming_filter_id,
+                        |query,
+                         target_indices,
+                         target_begin,
+                         target_locations,
+                         absolute_partition,
+                         out| {
+                            // SAFETY: the AVX2 function item is installed only
+                            // after the one-time feature check above.
+                            unsafe {
+                                borrowed_partition_filter(
+                                    query,
+                                    target_indices,
+                                    target_begin,
+                                    target_locations,
+                                    absolute_partition,
+                                    out,
+                                    query_stage0,
+                                    target_stage0,
+                                    &ungapped_cutoffs,
+                                    &score_matrix,
+                                    shape,
+                                    &left_most_context,
+                                    shape_id == 0,
+                                    false,
+                                    false,
+                                    skip_left_most,
+                                    1,
+                                    hamming_filter_id,
+                                    ungapped_lane_count,
+                                    ungapped_kernel,
+                                );
+                            }
+                        },
+                    );
+                    raw_seed_matches = raw_seed_matches.saturating_add(raw);
+                    retained_hit_count += hit_store
+                        .ingest_partitions(vec![hits])
+                        .map_err(|error| error.to_string())?;
+                    Ok(())
+                },
+            )
+            .map_err(io::Error::other)?;
+            eprintln!(
+                "Indexed seeds (shape {}): query={}, reference={}",
+                shape_id + 1,
+                indexed_report
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.query_seed_count)
+                    .sum::<usize>(),
+                indexed_report
+                    .chunks
+                    .iter()
+                    .map(|chunk| chunk.reference_seed_count)
+                    .sum::<usize>()
+            );
+            continue;
+        }
+
+        // Keep this borrow inside the ordinary seed-array branch. Persistent
+        // index search mutably reuses `db_block` while enumerating hashed
+        // seeds, whereas this fingerprint view is only needed by the native
+        // spaced-factor join below.
+        let db_fingerprint_seqs: Vec<&[Letter]> = (0..db_block.seqs().len())
+            .map(|id| db_block.seqs().get(id))
+            .collect();
+
         let partition_count = seedp_count(10) as usize;
         let index_chunks =
-            crate::util::algo::Partition::new(partition_count, traits.index_chunks as usize);
+            crate::util::algo::Partition::new(partition_count, effective_index_chunks);
+        // Upstream computes one histogram for the complete shape, then uses
+        // it to allocate/fill every index chunk.  Preserve that ordering in
+        // the one-thread non-sketch path; the generic builder otherwise
+        // performs a private count pass for every chunk.  Multithread and
+        // sketch construction retain their existing worker-local layouts.
+        let precomputed_counts = (rayon::current_num_threads() == 1 && traits.sketch_size <= 0)
+            .then(|| {
+                (
+                    crate::search::seed_array::SeedArray::count_partitions(
+                        &query_seqs,
+                        shape,
+                        &reduction,
+                        10,
+                        0.0,
+                        config.min_query_len,
+                    ),
+                    crate::search::seed_array::SeedArray::count_partitions(
+                        &db_seqs,
+                        shape,
+                        &reduction,
+                        10,
+                        0.0,
+                        config.min_query_len,
+                    ),
+                )
+            });
         let mut shape_raw_seed_matches = 0usize;
         for chunk in 0..index_chunks.parts {
-            let prepared = parallel::prepare_seed_join_partition_range_min_query_len(
-                &query_seqs,
-                &db_seqs,
-                shape,
-                &reduction,
-                complexity_cut,
-                config.min_query_len,
-                traits.sketch_size.max(0) as usize,
-                index_chunks.begin(chunk),
-                index_chunks.end(chunk),
-            );
+            let prepared =
+                if let Some((query_counts, reference_counts)) = &precomputed_worker_histograms {
+                    parallel::prepare_seed_join_partition_range_from_worker_counts_min_query_len(
+                        &query_seqs,
+                        &db_seqs,
+                        shape,
+                        &reduction,
+                        complexity_cut,
+                        config.min_query_len,
+                        index_chunks.begin(chunk),
+                        index_chunks.end(chunk),
+                        &query_counts[shape_id],
+                        &reference_counts[shape_id],
+                    )
+                } else if let Some((query_counts, reference_counts)) = &precomputed_counts {
+                    parallel::prepare_seed_join_partition_range_from_counts_min_query_len(
+                        &query_seqs,
+                        &db_seqs,
+                        shape,
+                        &reduction,
+                        complexity_cut,
+                        config.min_query_len,
+                        index_chunks.begin(chunk),
+                        index_chunks.end(chunk),
+                        query_counts,
+                        reference_counts,
+                    )
+                } else {
+                    parallel::prepare_seed_join_partition_range_min_query_len(
+                        &query_seqs,
+                        &db_seqs,
+                        shape,
+                        &reduction,
+                        complexity_cut,
+                        config.min_query_len,
+                        traits.sketch_size.max(0) as usize,
+                        index_chunks.begin(chunk),
+                        index_chunks.end(chunk),
+                    )
+                };
             for &(query_id, query_pos) in prepared.masked_positions() {
                 if query_id as usize >= stage2_query_set.len() {
                     continue;
@@ -1375,16 +2536,24 @@ fn run_impl(
             let query_fingerprint_seqs: Vec<&[Letter]> = (0..stage2_query_set.len())
                 .map(|id| stage2_query_set.get(id))
                 .collect();
-            let map_matches = |matches: &[SeedMatch], out: &mut Vec<StoredHit>| {
-                // SAFETY: the AVX-512 function item is installed only after the
-                // one-time feature checks above; the baseline item has no extra
+            let map_candidates = |query: (u32, u32),
+                                  target_indices: &[u32],
+                                  _target_locations: &[(u32, u32)],
+                                  target_subjects: &[u64],
+                                  absolute_partition: u32,
+                                  out: &mut Vec<StoredHit>| {
+                // SAFETY: the AVX2 function item is installed only after the
+                // one-time feature check above; the baseline item has no extra
                 // instruction-set requirements.
                 unsafe {
-                    partition_filter(
-                        matches,
+                    subject_index_partition_filter(
+                        query,
+                        target_indices,
+                        target_subjects,
+                        absolute_partition,
                         out,
                         &stage2_query_set,
-                        &db_block,
+                        db_block.seqs(),
                         &ungapped_cutoffs,
                         &score_matrix,
                         shape,
@@ -1393,7 +2562,7 @@ fn run_impl(
                         chunked,
                         use_left_most_range,
                         skip_left_most,
-                        traits.index_chunks as usize,
+                        effective_index_chunks,
                         hamming_filter_id,
                         ungapped_lane_count,
                         ungapped_kernel,
@@ -1402,7 +2571,7 @@ fn run_impl(
             };
             let chunk_raw_seed_matches = if config.memory_limit.is_none() {
                 let mut partitions = Vec::new();
-                let raw = parallel::visit_prepared_seed_matches_streaming_hamming_mode(
+                let raw = parallel::visit_prepared_seed_hits_streaming_hamming_mode(
                     &query_fingerprint_seqs,
                     &db_fingerprint_seqs,
                     Some((&stage2_query_set, db_block.seqs())),
@@ -1410,15 +2579,16 @@ fn run_impl(
                     hamming_filter_id,
                     usize::MAX,
                     linear_stage1_query,
+                    min_length_ratio,
                     self_search,
-                    map_matches,
+                    map_candidates,
                     |batch| partitions.extend(batch),
                 );
                 retained_hit_count += hit_store.ingest_partitions(partitions)?;
                 raw
             } else {
                 let mut spill_error = None;
-                let raw = parallel::visit_prepared_seed_matches_streaming_hamming_mode(
+                let raw = parallel::visit_prepared_seed_hits_streaming_hamming_mode(
                     &query_fingerprint_seqs,
                     &db_fingerprint_seqs,
                     Some((&stage2_query_set, db_block.seqs())),
@@ -1430,8 +2600,9 @@ fn run_impl(
                     // 1024-partition shape) for forced-disk RSS control.
                     rayon::current_num_threads().max(1) * 15,
                     linear_stage1_query,
+                    min_length_ratio,
                     self_search,
-                    map_matches,
+                    map_candidates,
                     |partitions| {
                         if spill_error.is_none() {
                             match hit_store.ingest_partitions(partitions) {
@@ -1477,31 +2648,47 @@ fn run_impl(
     for (record, saved) in db_records.iter_mut().zip(db_motif_saves.iter()) {
         crate::masking::motifs::restore_motifs(&mut record.sequence, saved, 0);
     }
-    for (record, saved) in query_records.iter_mut().zip(query_motif_saves.iter()) {
-        crate::masking::motifs::restore_motifs(&mut record.sequence, saved, template_len);
-    }
-    // C++ `Search::mask_seeds` sets the high bit on every query occurrence in
-    // a joined seed group rejected by the low-complexity test. Stage 2's
-    // left-most filter uses those bits to suppress alternative seed starts.
-    // The join workers return the compact (query id, position) list so we can
-    // apply it after releasing the immutable sequence views.
-    for (query_id, query_pos) in low_complexity_query_positions {
-        if let Some(letter) = query_records
-            .get_mut(query_id as usize)
-            .and_then(|record| record.sequence.get_mut(query_pos as usize))
-        {
-            *letter |= SEED_MASK;
+    if shared_self_records {
+        // The aliased upstream block becomes the extension-side query only
+        // after seed enumeration. Move its IDs and copy the already compact,
+        // restored stage-2 sequences; no second FastaRecord set exists during
+        // the peak seed-search phase.
+        query_records = db_records
+            .iter_mut()
+            .enumerate()
+            .map(|(query_id, record)| fasta::FastaRecord {
+                id: std::mem::take(&mut record.id),
+                sequence: stage2_query_set.get(query_id).to_vec(),
+            })
+            .collect();
+        for (query_id, query_pos) in low_complexity_query_positions {
+            if let Some(letter) = query_records
+                .get_mut(query_id as usize)
+                .and_then(|record| record.sequence.get_mut(query_pos as usize))
+            {
+                *letter |= SEED_MASK;
+            }
         }
-    }
+    } else {
+        for (record, saved) in query_records.iter_mut().zip(query_motif_saves.iter()) {
+            crate::masking::motifs::restore_motifs(&mut record.sequence, saved, template_len);
+        }
+        // C++ `Search::mask_seeds` sets the high bit on every query occurrence
+        // in a joined seed group rejected by the low-complexity test.
+        for (query_id, query_pos) in low_complexity_query_positions {
+            if let Some(letter) = query_records
+                .get_mut(query_id as usize)
+                .and_then(|record| record.sequence.get_mut(query_pos as usize))
+            {
+                *letter |= SEED_MASK;
+            }
+        }
 
-    // `Block::remove_soft_masking` restores the same query storage that is later
-    // consumed by extension.  Seed enumeration above intentionally used the
-    // hard-masked `query_records`, while `stage2_query_set` tracked the restored
-    // residues plus the left-extended TANTAN/low-complexity SEED_MASK bits.
-    // Move that exact state back to the extension records before releasing the
-    // temporary SequenceSet; extending the stale hard-masked copy changes both
-    // the DP score and the coverage/approx-identity filters.
-    restore_extension_queries(&mut query_records, &stage2_query_set);
+        // `Block::remove_soft_masking` restores the same query storage that is
+        // later consumed by extension. Move that exact state back before
+        // releasing the temporary SequenceSet.
+        restore_extension_queries(&mut query_records, &stage2_query_set);
+    }
 
     // Release seed-enumeration record storage and the temporary query copy
     // before extension.
@@ -1539,6 +2726,10 @@ fn run_impl(
                 id: source.id.clone(),
                 dna_len: source.dna_len,
                 source_sequence: &source.sequence,
+                mate_sequence: source
+                    .mate_index
+                    .and_then(|index| layout.sources.get(index))
+                    .map(|mate| mate.sequence.as_slice()),
                 frames,
             });
         }
@@ -1653,11 +2844,13 @@ fn run_impl(
             xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
             ..UngappedStageConfig::default()
         };
-        let ext_mode = if linear_stage1_query || linear_stage1_target {
-            sensitivity::ExtensionMode::Full
-        } else {
-            sensitivity::default_ext_mode(config.sensitivity)
-        };
+        let ext_mode = extension_mode_override.unwrap_or_else(|| {
+            if linear_stage1_query || linear_stage1_target {
+                sensitivity::ExtensionMode::Full
+            } else {
+                sensitivity::default_ext_mode(config.sensitivity)
+            }
+        });
         let gapped_cfg = GappedScoreConfig {
             comp_based_stats_hauser: config.comp_based_stats.hauser(),
             comp_based_stats_matrix_adjust: config.comp_based_stats.matrix_adjust(),
@@ -1703,7 +2896,7 @@ fn run_impl(
         } else {
             std::slice::from_ref(&query_cbs)
         };
-        let matches = extend_targets(
+        let mut matches = extend_targets(
             query_idx as u32,
             &mut hits,
             std::slice::from_ref(query),
@@ -1735,6 +2928,16 @@ fn run_impl(
             GAPPED_FILTER_WINDOW,
             Option::<fn(u32, &crate::align::gapped_filter::SeedHitList) -> Vec<Match>>::None,
         );
+        if config.no_self_hits {
+            // Upstream applies this HSP filter after ranking/extension. Keep
+            // that placement: a discarded self target is not replaced by a
+            // lower-ranked target from beyond the output range.
+            matches.retain(|target| {
+                let target_id = target.target_block_id as usize;
+                !same_sequence(query, db_block.seqs().get(target_id))
+                    || db_ids.get(target_id) != query_rec.id.as_bytes()
+            });
+        }
         if let Some(edge_output) = &edge_output {
             let mut edges = edge_output.lock().unwrap();
             for target in &matches {
@@ -1815,7 +3018,15 @@ fn run_impl(
                     format!("invalid UTF-8 database title: {error}"),
                 )
             })?;
-            format::write_tabular_row(
+            let subject_taxids = database_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.subject_taxids.get(target_id))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let taxonomy = database_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.taxonomy.as_ref());
+            format::write_tabular_row_with_query_info(
                 &mut buf,
                 &query_rec.id,
                 target_title,
@@ -1823,6 +3034,9 @@ fn run_impl(
                 &fields,
                 query.len() as i32,
                 db_block.seqs().length(target_id) as i32,
+                None,
+                subject_taxids,
+                taxonomy,
             )?;
             rows += 1;
         }
@@ -1865,11 +3079,13 @@ fn run_impl(
                 xdrop: score_matrix.rawscore_int(config.ungapped_xdrop_bits),
                 ..UngappedStageConfig::default()
             };
-            let ext_mode = if linear_stage1_query || linear_stage1_target {
-                sensitivity::ExtensionMode::Full
-            } else {
-                sensitivity::default_ext_mode(config.sensitivity)
-            };
+            let ext_mode = extension_mode_override.unwrap_or_else(|| {
+                if linear_stage1_query || linear_stage1_target {
+                    sensitivity::ExtensionMode::Full
+                } else {
+                    sensitivity::default_ext_mode(config.sensitivity)
+                }
+            });
             let gapped_cfg = GappedScoreConfig {
                 query_contexts: 6,
                 query_translated: true,
@@ -1998,7 +3214,7 @@ fn run_impl(
                         format!("invalid UTF-8 database title: {error}"),
                     )
                 })?;
-                format::write_tabular_row(
+                format::write_tabular_row_with_query_info(
                     &mut buf,
                     &group.id,
                     target_title,
@@ -2006,6 +3222,15 @@ fn run_impl(
                     &fields,
                     group.dna_len,
                     db_block.seqs().length(target_id) as i32,
+                    group.mate_sequence,
+                    database_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.subject_taxids.get(target_id))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    database_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.taxonomy.as_ref()),
                 )?;
                 rows += 1;
             }
@@ -2187,8 +3412,19 @@ fn run_impl(
             Ok(())
         };
 
-        if let Some(hits_by_query) = hit_store.memory.as_ref() {
-            write_translated_range(0, groups, hits_by_query)?;
+        if let Some(mut memory) = hit_store.memory.take() {
+            for bin in 0..memory.bins.len() {
+                let (hits_by_context, begin, end) = memory.take_grouped_bin(bin);
+                let begin_idx = begin as usize;
+                let end_idx = (end as usize).min(groups.len() * 6);
+                debug_assert_eq!(begin_idx % 6, 0);
+                debug_assert_eq!(end_idx % 6, 0);
+                write_translated_range(
+                    begin_idx / 6,
+                    &groups[begin_idx / 6..end_idx / 6],
+                    &hits_by_context[..end_idx - begin_idx],
+                )?;
+            }
         } else {
             let disk = hit_store
                 .disk
@@ -2251,8 +3487,17 @@ fn run_impl(
                 disk.total_disk_size() as f64 / (1024.0 * 1024.0)
             );
         }
-    } else if let Some(hits_by_query) = hit_store.memory.as_ref() {
-        write_query_range(0, &query_records, hits_by_query)?;
+    } else if let Some(mut memory) = hit_store.memory.take() {
+        for bin in 0..memory.bins.len() {
+            let (hits_by_query, begin, end) = memory.take_grouped_bin(bin);
+            let begin_idx = begin as usize;
+            let end_idx = (end as usize).min(query_records.len());
+            write_query_range(
+                begin_idx,
+                &query_records[begin_idx..end_idx],
+                &hits_by_query[..end_idx - begin_idx],
+            )?;
+        }
     } else {
         let disk = hit_store
             .disk
@@ -2340,6 +3585,180 @@ fn run_impl(
 mod tests {
     use super::*;
     use crate::basic::value::{MASK_LETTER, SEED_MASK};
+
+    fn taxonomy_test_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "diamond-native-taxonomy-search-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn native_dmnd_taxonomy_metadata_reaches_all_supported_output_fields() {
+        let dir = taxonomy_test_dir();
+        std::fs::create_dir(&dir).unwrap();
+        let fasta = dir.join("subjects.faa");
+        let mapping = dir.join("mapping.tsv");
+        let nodes = dir.join("nodes.dmp");
+        let names = dir.join("names.dmp");
+        let dmnd = dir.join("subjects.dmnd");
+        std::fs::write(
+            &fasta,
+            b">sp|P00001.1|one >tr|P00002.1|two\nMKTAYIAK\n>UNMAPPED.1\nVLSPADKT\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &mapping,
+            b"accession.version\ttaxid\nP00001\t10\nP00002\t11\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &nodes,
+            b"1\t|\t1\t|\tno rank\t|\t\n2\t|\t1\t|\tsuperkingdom\t|\t\n3\t|\t2\t|\tkingdom\t|\t\n4\t|\t3\t|\tphylum\t|\t\n10\t|\t4\t|\tspecies\t|\t\n11\t|\t4\t|\tspecies\t|\t\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &names,
+            b"1\t|\troot\t|\t\t|\tscientific name\t|\n2\t|\tBacteria\t|\t\t|\tscientific name\t|\n3\t|\tTest kingdom\t|\t\t|\tscientific name\t|\n4\t|\tTest phylum\t|\t\t|\tscientific name\t|\n10\t|\tAlpha species\t|\t\t|\tscientific name\t|\n11\t|\tBeta species\t|\t\t|\tscientific name\t|\n",
+        )
+        .unwrap();
+        crate::data::db_builder::build_db_with_options(
+            &[fasta.to_str().unwrap()],
+            dmnd.to_str().unwrap(),
+            SequenceType::AminoAcid,
+            &crate::data::db_builder::BuildOptions {
+                taxonmap: Some(mapping.to_string_lossy().into_owned()),
+                taxonnodes: Some(nodes.to_string_lossy().into_owned()),
+                taxonnames: Some(names.to_string_lossy().into_owned()),
+                no_parse_seqids: false,
+            },
+        )
+        .unwrap();
+
+        let flags = requested_taxonomy_flags(&[
+            "6".into(),
+            "staxids".into(),
+            "sscinames".into(),
+            "sskingdoms".into(),
+            "skingdoms".into(),
+            "sphylums".into(),
+            "slineages".into(),
+        ]);
+        let (header, records, metadata) = load_dmnd_database(&dmnd, flags).unwrap();
+        assert_eq!(header.sequences, 2);
+        assert_eq!(records.len(), 2);
+        assert_eq!(metadata.subject_taxids, vec![vec![10, 11], vec![]]);
+        let tree = metadata.taxonomy.as_ref().unwrap();
+        assert_eq!(
+            format::print_staxids(&metadata.subject_taxids[0], false),
+            "10;11"
+        );
+        assert_eq!(
+            format::print_taxon_names(metadata.subject_taxids[0].iter().copied(), tree, false),
+            "Alpha species;Beta species"
+        );
+        assert_eq!(
+            format::print_rank_taxon_names(
+                &metadata.subject_taxids[0],
+                tree,
+                "superkingdom",
+                false
+            ),
+            "Bacteria"
+        );
+        assert_eq!(
+            format::print_rank_taxon_names(&metadata.subject_taxids[0], tree, "kingdom", false),
+            "Test kingdom"
+        );
+        assert_eq!(
+            format::print_rank_taxon_names(&metadata.subject_taxids[0], tree, "phylum", false),
+            "Test phylum"
+        );
+        assert_eq!(
+            format::print_lineage(&metadata.subject_taxids[0], tree, false),
+            "Bacteria; Test kingdom; Test phylum; Alpha species<>Bacteria; Test kingdom; Test phylum; Beta species"
+        );
+        assert_eq!(
+            format::print_staxids(&metadata.subject_taxids[1], false),
+            ""
+        );
+        assert_eq!(
+            format::print_taxon_names(metadata.subject_taxids[1].iter().copied(), tree, false),
+            "N/A"
+        );
+        assert_eq!(
+            format::print_lineage(&metadata.subject_taxids[1], tree, false),
+            "N/A"
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn packed_loc_double_array_ranges_are_borrowed_without_copying() {
+        let expected = [0x12_3456_789au64, 0x01_0203_0405u64];
+        // Start at an intentionally odd byte address. PackedLoc's alignment
+        // is one, just like a DoubleArray range following its u32 count.
+        let mut storage = vec![0xa5];
+        for value in expected {
+            storage.push((value >> 32) as u8);
+            storage.extend_from_slice(&(value as u32).to_ne_bytes());
+        }
+        let bytes = &storage[1..];
+        let locations = packed_locs_from_bytes(bytes);
+        assert_eq!(locations.as_ptr().cast::<u8>(), bytes.as_ptr());
+        assert_eq!(locations.len(), expected.len());
+        assert_eq!(locations[0].as_u64(), expected[0]);
+        assert_eq!(locations[1].as_u64(), expected[1]);
+    }
+
+    #[test]
+    fn borrowed_stage1_targets_preserve_tile_offsets_and_hit_order() {
+        let targets = [
+            PackedLoc::new(10),
+            PackedLoc::new(20),
+            PackedLoc::new(30),
+            PackedLoc::new(0x01_0000_0040),
+        ];
+        let borrowed = BorrowedStage1Targets {
+            indices: &[2, 0],
+            target_begin: 1,
+            targets: &targets,
+        };
+        assert_eq!(borrowed.len(), 2);
+        assert_eq!(borrowed.absolute_subject(0), 0x01_0000_0040);
+        assert_eq!(borrowed.absolute_subject(1), 20);
+    }
+
+    #[test]
+    fn borrowed_stage1_subjects_preserve_hit_field_order() {
+        let subjects = [10, 20, 30, 40];
+        let borrowed = BorrowedStage1Subjects {
+            indices: &[3, 1, 2],
+            subjects: &subjects,
+        };
+        assert_eq!(borrowed.len(), 3);
+        assert_eq!(borrowed.absolute_subject(0), 40);
+        assert_eq!(borrowed.absolute_subject(1), 20);
+        assert_eq!(borrowed.absolute_subject(2), 30);
+    }
+
+    #[test]
+    #[should_panic]
+    fn packed_loc_double_array_ranges_reject_partial_elements() {
+        let _ = packed_locs_from_bytes(&[0; 6]);
+    }
+
+    #[test]
+    fn self_hit_sequence_comparison_ignores_mask_annotations() {
+        assert!(same_sequence(&[1, 2, 3], &[1 | SEED_MASK, 2, 3]));
+        assert!(!same_sequence(&[1, 2, 3], &[1, 2, 4]));
+        assert!(!same_sequence(&[1, 2], &[1, 2, 3]));
+    }
 
     #[test]
     fn extension_queries_use_restored_soft_masking_state() {
@@ -2482,7 +3901,7 @@ mod tests {
                 score: 30,
             }]])
             .unwrap();
-        assert_eq!(store.memory.as_ref().unwrap()[0].len(), 1);
+        assert_eq!(store.memory.as_ref().unwrap().total_hits(), 1);
         assert!(store.disk.is_none());
 
         // Cross the ceiling only after a hit already resides in memory. The
@@ -2512,6 +3931,53 @@ mod tests {
         assert_eq!(store.disk.as_ref().unwrap().total_hits(), 3);
         drop(store);
         let _ = std::fs::remove_dir(tmpdir);
+    }
+
+    #[test]
+    fn packed_memory_bins_preserve_query_hit_order() {
+        assert_eq!(std::mem::size_of::<PackedRetainedHit>(), 15);
+        let mut store = AdaptiveHitStore::new(4, 2, 100, 1, None, PathBuf::new());
+        store
+            .ingest_partitions(vec![vec![
+                StoredHit {
+                    query_id: 3,
+                    subject: 30,
+                    seed_offset: 3,
+                    score: 13,
+                },
+                StoredHit {
+                    query_id: 0,
+                    subject: 10,
+                    seed_offset: 1,
+                    score: 11,
+                },
+                StoredHit {
+                    query_id: 3,
+                    subject: 31,
+                    seed_offset: 4,
+                    score: 14,
+                },
+                StoredHit {
+                    query_id: 1,
+                    subject: 20,
+                    seed_offset: 2,
+                    score: 12,
+                },
+            ]])
+            .unwrap();
+
+        let mut memory = store.memory.take().unwrap();
+        let (first, begin, end) = memory.take_grouped_bin(0);
+        assert_eq!((begin, end), (0, 2));
+        assert_eq!(first[0][0].subject, 10);
+        assert_eq!(first[1][0].subject, 20);
+        let (second, begin, end) = memory.take_grouped_bin(1);
+        assert_eq!((begin, end), (2, 4));
+        assert!(second[0].is_empty());
+        assert_eq!(
+            second[1].iter().map(|hit| hit.subject).collect::<Vec<_>>(),
+            vec![30, 31]
+        );
     }
 
     #[test]
@@ -2585,6 +4051,7 @@ mod tests {
             ungapped_xdrop_bits: 12.3,
             memory_limit: None,
             tmpdir: tmpdir.clone(),
+            target_indexed: false,
             translated_query_layout: None,
         })
         .unwrap();

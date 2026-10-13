@@ -1,11 +1,17 @@
+use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Write};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::io::{self, BufWriter, Write};
+use std::sync::{mpsc, Arc, Mutex};
 
+use crate::basic::consts::VERSION_STRING;
 use crate::data::daa::{
     finish_daa_from_file, init_daa, view_query_daa, view_query_edge, view_query_null,
     view_query_paf, view_query_pairwise, view_query_sam, view_query_tabular, view_query_xml,
     DaaFile, DaaQueryRecord, DaaViewConfig,
 };
+use crate::dp::swipe::HspValues;
 use crate::output::format::{print_tabular_footer, print_tabular_header, Header, TabularFormat};
 use crate::output::{pairwise, sam, xml};
 use crate::stats::score_matrix::ScoreMatrix;
@@ -23,20 +29,98 @@ pub struct ViewConfig {
     pub invocation: String,
     /// --header value (`simple` / `verbose` / unset).
     pub header: Vec<String>,
+    /// Worker count (`0` selects the host's available parallelism, as upstream).
+    pub threads: usize,
+    /// Unsigned representation of upstream's signed int64 ordinal offsets.
+    pub qnum_offset: u64,
+    pub snum_offset: u64,
+    /// Upstream console verbosity: 0=quiet, 1=normal, 2=verbose, 3=debug log.
+    pub verbosity: u8,
+}
+
+fn print_daa_metadata(daa: &DaaFile, score_matrix: &ScoreMatrix, verbosity: u8) {
+    if verbosity == 0 {
+        return;
+    }
+    // Upstream constructs `ScoreMatrix` from the archive's matrix name, gap
+    // penalties, and database size, then prints that derived object.  It does
+    // not echo the archived K/Lambda header fields directly.
+    eprintln!(
+        "Scoring parameters: (Matrix={} Lambda={} K={} Penalties={}/{})",
+        daa.score_matrix(),
+        score_matrix.lambda(),
+        score_matrix.k(),
+        score_matrix.gap_open(),
+        score_matrix.gap_extend()
+    );
+    if verbosity >= 2 {
+        eprintln!("Build version = {}", daa.diamond_build());
+    }
+    eprintln!("DB sequences = {}", daa.db_seqs());
+    eprintln!("DB sequences used = {}", daa.db_seqs_used());
+    eprintln!("DB letters = {}", daa.db_letters());
+}
+
+/// Print the messages produced when upstream constructs `Search::Config`
+/// inside `view_daa`.  This happens after the archive metadata has been
+/// printed, so keeping it here (rather than in the CLI wrapper) also preserves
+/// the observable ordering of verbose/debug output.
+fn print_view_selection(config: &ViewConfig, dp_fields: HspValues) {
+    if config.verbosity == 0 {
+        return;
+    }
+    if config.verbosity >= 3 {
+        eprintln!("Min length ratio: 0");
+    }
+    if let Some(top) = config.toppercent {
+        eprintln!("Percentage range of top alignment score to report hits: {top}");
+    } else if config.max_target_seqs == i64::MAX {
+        eprintln!("#Target sequences to report alignments for: unlimited");
+    } else {
+        eprintln!(
+            "#Target sequences to report alignments for: {}",
+            config.max_target_seqs
+        );
+    }
+    if config.verbosity >= 3 {
+        eprintln!("DP fields: {}", dp_fields.0);
+    }
+}
+
+fn view_threads(requested: usize) -> usize {
+    if requested == 0 {
+        std::thread::available_parallelism().map_or(1, usize::from)
+    } else {
+        requested
+    }
 }
 
 /// Parse the `--header` flag value (as a Vec<String> coming from CLI parsing).
-/// Mirrors C++ behavior: missing flag → `None`, `--header` with no value → `Simple`,
-/// `--header simple` → `Simple`, `--header verbose` → `Verbose`.
-fn parse_header_arg(header: &[String]) -> Header {
+/// Mirrors `TabularFormat::header_format(Config::blastp)`: missing flag means
+/// no header, bare `--header` means verbose, and an explicit value must be one
+/// of `0`, `simple`, or `verbose`.
+fn parse_header_arg(header: &[String]) -> io::Result<Header> {
     if header.is_empty() {
-        return Header::None;
+        return Ok(Header::None);
     }
-    let val = header[0].trim();
-    if val.is_empty() {
-        return Header::Simple;
+    if header.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid header format: {}", header.join(" ")),
+        ));
     }
-    Header::parse(val).unwrap_or(Header::Simple)
+    let value = header[0].trim();
+    if value.is_empty() {
+        return Ok(Header::Verbose);
+    }
+    Header::parse(value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Invalid value for string field: {value}. Permitted values: 0, simple, verbose"
+            ),
+        )
+    })
 }
 
 fn reject_unsupported_options(config: &ViewConfig) -> io::Result<()> {
@@ -47,6 +131,156 @@ fn reject_unsupported_options(config: &ViewConfig) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Upstream's empty output filename addresses the inherited stdout stream and
+/// leaves that process-global stream open. Owning a `Stdout` handle has the
+/// same lifetime behavior; the buffer is explicitly flushed by each command.
+fn open_output_writer(path: &str) -> io::Result<Box<dyn Write>> {
+    if path.is_empty() {
+        Ok(Box::new(BufWriter::new(io::stdout())))
+    } else {
+        Ok(Box::new(File::create(path)?))
+    }
+}
+
+/// DAA finalization rewrites header 2, so its stdout sink must retain seek
+/// support when stdout is redirected to a regular file. This matches C++'s
+/// `fdopen(STDOUT_FILENO, "wb")`: a pipe/terminal is accepted initially and
+/// reports the seek failure only when finalization attempts `fseek`.
+fn open_seekable_output(path: &str) -> io::Result<File> {
+    if !path.is_empty() {
+        return File::create(path);
+    }
+    #[cfg(windows)]
+    {
+        crate::util::io::duplicate_standard_handle(
+            windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        OpenOptions::new().write(true).open("/dev/stdout")
+    }
+}
+
+const VIEW_QUERY_BATCH_SIZE: usize = 32;
+
+type ViewQueryBuffer = (Vec<u8>, usize);
+
+fn read_view_batch(daa: &mut DaaFile) -> io::Result<(Option<Vec<ViewQueryBuffer>>, bool)> {
+    let mut batch = Vec::with_capacity(VIEW_QUERY_BATCH_SIZE);
+    let mut at_end = false;
+    for _ in 0..VIEW_QUERY_BATCH_SIZE {
+        match daa.read_query_buffer()? {
+            Some(query) => batch.push(query),
+            None => {
+                at_end = true;
+                break;
+            }
+        }
+    }
+    Ok(((!batch.is_empty()).then_some(batch), at_end))
+}
+
+/// Run the pinned `view_worker` boundary: 32 query records per task and at
+/// most `3 * threads` ordered tasks resident.  Each worker renders a whole
+/// task into one buffer, and the caller writes completed buffers in input
+/// order.  The mutable archive reader remains on this thread; workers use a
+/// second handle only for immutable header/reference metadata.
+fn run_ordered_view_workers<Render, WriteBuffer>(
+    daa: &mut DaaFile,
+    daa_path: &str,
+    requested_threads: usize,
+    render: Render,
+    mut write_buffer: WriteBuffer,
+) -> io::Result<()>
+where
+    Render: Fn(&DaaQueryRecord, &DaaFile, &mut Vec<u8>) -> Result<(), String> + Sync,
+    WriteBuffer: FnMut(&[u8]) -> io::Result<()>,
+{
+    let threads = view_threads(requested_threads);
+    let queue_limit = 3usize.saturating_mul(threads).max(1);
+    let worker_daa = DaaFile::open(daa_path)?;
+    let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Vec<ViewQueryBuffer>)>(queue_limit);
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let (result_tx, result_rx) = mpsc::channel::<(usize, Result<Vec<u8>, String>)>();
+
+    std::thread::scope(|scope| -> io::Result<()> {
+        for _ in 0..threads {
+            let job_rx = Arc::clone(&job_rx);
+            let result_tx = result_tx.clone();
+            let worker_daa = &worker_daa;
+            let render = &render;
+            scope.spawn(move || loop {
+                let job = match job_rx.lock() {
+                    Ok(rx) => rx.recv(),
+                    Err(_) => return,
+                };
+                let Ok((sequence, batch)) = job else {
+                    return;
+                };
+                let rendered = (|| {
+                    let mut output = Vec::new();
+                    for (buf, query_num) in batch {
+                        let record = DaaQueryRecord::from_buffer(worker_daa, &buf, query_num)?;
+                        render(&record, worker_daa, &mut output)?;
+                    }
+                    Ok(output)
+                })();
+                if result_tx.send((sequence, rendered)).is_err() {
+                    return;
+                }
+            });
+        }
+        drop(result_tx);
+
+        let mut pending = BTreeMap::new();
+        let mut next_submit = 0usize;
+        let mut next_write = 0usize;
+        let mut resident = 0usize;
+        let mut at_end = false;
+
+        let result = (|| -> io::Result<()> {
+            while resident > 0 || !at_end {
+                while resident < queue_limit && !at_end {
+                    let (batch, reached_end) = read_view_batch(daa)?;
+                    at_end = reached_end;
+                    match batch {
+                        Some(batch) => {
+                            job_tx.send((next_submit, batch)).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "view worker queue closed",
+                                )
+                            })?;
+                            next_submit += 1;
+                            resident += 1;
+                        }
+                        None => {}
+                    }
+                }
+                if resident == 0 {
+                    break;
+                }
+
+                let (sequence, rendered) = result_rx.recv().map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "view result queue closed")
+                })?;
+                pending.insert(sequence, rendered);
+                while let Some(rendered) = pending.remove(&next_write) {
+                    let output =
+                        rendered.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    write_buffer(&output)?;
+                    next_write += 1;
+                    resident -= 1;
+                }
+            }
+            Ok(())
+        })();
+        drop(job_tx);
+        result
+    })
 }
 
 /// Run the view command — show DAA file metadata.
@@ -103,29 +337,24 @@ pub fn run_daa(config: &ViewConfig) -> io::Result<()> {
         max_target_seqs: config.max_target_seqs,
         toppercent: config.toppercent,
         forward_only: config.forward_only,
+        qnum_offset: config.qnum_offset,
+        snum_offset: config.snum_offset,
     };
 
-    eprintln!(
-        "Scoring parameters: matrix={} gap_open={} gap_extend={}",
-        daa.score_matrix(),
-        daa.gap_open_penalty(),
-        daa.gap_extension_penalty()
-    );
-    eprintln!("Build version = {}", daa.diamond_build());
-    eprintln!("DB sequences = {}", daa.db_seqs());
-    eprintln!("DB sequences used = {}", daa.db_seqs_used());
-    eprintln!("DB letters = {}", daa.db_letters());
+    print_daa_metadata(&daa, &score_matrix, config.verbosity);
+    print_view_selection(config, HspValues::TRANSCRIPT);
 
-    let mut out = File::create(&config.output)?;
+    let mut out = open_seekable_output(&config.output)?;
     init_daa(&mut out)?;
-    while let Some((buf, query_num)) = daa.read_query_buffer()? {
-        let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut query_out = Vec::new();
-        view_query_daa(&r, &daa, &mut query_out, &score_matrix, &view_config)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        std::io::Write::write_all(&mut out, &query_out)?;
-    }
+    run_ordered_view_workers(
+        &mut daa,
+        &config.daa_file,
+        config.threads,
+        |record, worker_daa, query_out| {
+            view_query_daa(record, worker_daa, query_out, &score_matrix, &view_config)
+        },
+        |query_out| out.write_all(query_out),
+    )?;
     finish_daa_from_file(&mut out, &daa)
 }
 
@@ -163,48 +392,145 @@ pub fn run_tabular(config: &ViewConfig) -> io::Result<()> {
         max_target_seqs: config.max_target_seqs,
         toppercent: config.toppercent,
         forward_only: config.forward_only,
+        qnum_offset: config.qnum_offset,
+        snum_offset: config.snum_offset,
     };
 
-    eprintln!(
-        "Scoring parameters: matrix={} gap_open={} gap_extend={}",
-        daa.score_matrix(),
-        daa.gap_open_penalty(),
-        daa.gap_extension_penalty()
-    );
-    eprintln!("Build version = {}", daa.diamond_build());
-    eprintln!("DB sequences = {}", daa.db_seqs());
-    eprintln!("DB sequences used = {}", daa.db_seqs_used());
-    eprintln!("DB letters = {}", daa.db_letters());
+    print_daa_metadata(&daa, &score_matrix, config.verbosity);
+    print_view_selection(config, format.hsp_values);
 
-    let mut out = File::create(&config.output)?;
-    let header_mode = parse_header_arg(&config.header);
-    let header = print_tabular_header(&format.fields, header_mode, format.is_json, "", "")
-        .map_err(io::Error::other)?;
+    let mut out = open_output_writer(&config.output)?;
+    let header_mode = parse_header_arg(&config.header)?;
+    let header = print_tabular_header(
+        &format.fields,
+        header_mode,
+        format.is_json,
+        VERSION_STRING,
+        &config.invocation,
+    )
+    .map_err(io::Error::other)?;
     out.write_all(header.as_bytes())?;
-    while let Some((buf, query_num)) = daa.read_query_buffer()? {
-        let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
+    let threads = view_threads(config.threads);
+    if threads == 1 {
+        while let Some((buf, query_num)) = daa.read_query_buffer()? {
+            let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let mut query_out = Vec::new();
+            view_query_tabular(
+                &r,
+                &daa,
+                &mut query_out,
+                &score_matrix,
+                &format,
+                &view_config,
+                config.report_unaligned,
+            )
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut query_out = Vec::new();
-        view_query_tabular(
-            &r,
-            &daa,
-            &mut query_out,
-            &score_matrix,
-            &format,
-            &view_config,
-            config.report_unaligned,
-        )
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // Deliberately do not insert `format.query_separator` here.  Pinned
-        // upstream `view_daa` writes each per-query TextBuffer verbatim via
-        // `ViewWriter::operator()`; unlike the search join path, that writer
-        // never consults `OutputFormat::query_separator`.  Consequently its
-        // multi-query flat JSON omits commas at query boundaries.  Preserve
-        // those bytes until the upstream contract itself changes.
-        out.write_all(&query_out)?;
+            out.write_all(&query_out)?;
+        }
+        out.write_all(print_tabular_footer(format.is_json).as_bytes())?;
+        out.flush()?;
+        return Ok(());
     }
+
+    // Upstream renders through a bounded ordered worker queue. Keep at most
+    // one 32-record window resident, but refill slots as soon as their ordered
+    // output has been written instead of imposing a barrier between windows.
+    // A second DAA handle supplies immutable archive metadata to workers while
+    // the original handle advances the alignment-block reader.
+    const VIEW_BATCH_SIZE: usize = 32;
+    let worker_daa = DaaFile::open(&config.daa_file)?;
+    let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Vec<u8>, usize)>(VIEW_BATCH_SIZE);
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let (result_tx, result_rx) = mpsc::channel();
+
+    std::thread::scope(|scope| -> io::Result<()> {
+        for _ in 0..threads {
+            let job_rx = Arc::clone(&job_rx);
+            let result_tx = result_tx.clone();
+            let worker_daa = &worker_daa;
+            let score_matrix = &score_matrix;
+            let format = &format;
+            let view_config = &view_config;
+            scope.spawn(move || loop {
+                let job = match job_rx.lock() {
+                    Ok(rx) => rx.recv(),
+                    Err(_) => return,
+                };
+                let Ok((sequence, buf, query_num)) = job else {
+                    return;
+                };
+                let rendered = (|| {
+                    let r = DaaQueryRecord::from_buffer(worker_daa, &buf, query_num)?;
+                    let mut query_out = Vec::new();
+                    view_query_tabular(
+                        &r,
+                        worker_daa,
+                        &mut query_out,
+                        score_matrix,
+                        format,
+                        view_config,
+                        config.report_unaligned,
+                    )?;
+                    Ok::<_, String>(query_out)
+                })();
+                if result_tx.send((sequence, rendered)).is_err() {
+                    return;
+                }
+            });
+        }
+        drop(result_tx);
+
+        let mut pending = BTreeMap::new();
+        let mut next_submit = 0usize;
+        let mut next_write = 0usize;
+        let mut resident = 0usize;
+        let mut at_end = false;
+
+        // Always close the job queue before leaving the scope, including on
+        // malformed input or output failure. Otherwise scoped workers could
+        // remain blocked in `recv` while the scope waits to join them.
+        let result = (|| -> io::Result<()> {
+            while resident > 0 || !at_end {
+                while resident < VIEW_BATCH_SIZE && !at_end {
+                    match daa.read_query_buffer()? {
+                        Some((buf, query_num)) => {
+                            job_tx.send((next_submit, buf, query_num)).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "view worker queue closed",
+                                )
+                            })?;
+                            next_submit += 1;
+                            resident += 1;
+                        }
+                        None => at_end = true,
+                    }
+                }
+                if resident == 0 {
+                    break;
+                }
+
+                let (sequence, rendered) = result_rx.recv().map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "view result queue closed")
+                })?;
+                pending.insert(sequence, rendered);
+                while let Some(rendered) = pending.remove(&next_write) {
+                    let query_out =
+                        rendered.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    // Pinned upstream writes each ordered per-query buffer verbatim.
+                    out.write_all(&query_out)?;
+                    next_write += 1;
+                    resident -= 1;
+                }
+            }
+            Ok(())
+        })();
+        drop(job_tx);
+        result
+    })?;
     out.write_all(print_tabular_footer(format.is_json).as_bytes())?;
-    Ok(())
+    out.flush()
 }
 
 /// Matches the PAF-output branch of C++ `view_daa`.
@@ -224,29 +550,24 @@ pub fn run_paf(config: &ViewConfig) -> io::Result<()> {
         max_target_seqs: config.max_target_seqs,
         toppercent: config.toppercent,
         forward_only: config.forward_only,
+        qnum_offset: config.qnum_offset,
+        snum_offset: config.snum_offset,
     };
 
-    eprintln!(
-        "Scoring parameters: matrix={} gap_open={} gap_extend={}",
-        daa.score_matrix(),
-        daa.gap_open_penalty(),
-        daa.gap_extension_penalty()
-    );
-    eprintln!("Build version = {}", daa.diamond_build());
-    eprintln!("DB sequences = {}", daa.db_seqs());
-    eprintln!("DB sequences used = {}", daa.db_seqs_used());
-    eprintln!("DB letters = {}", daa.db_letters());
+    print_daa_metadata(&daa, &score_matrix, config.verbosity);
+    print_view_selection(config, HspValues::TRANSCRIPT);
 
-    let mut out = File::create(&config.output)?;
-    while let Some((buf, query_num)) = daa.read_query_buffer()? {
-        let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut query_out = Vec::new();
-        view_query_paf(&r, &daa, &mut query_out, &score_matrix, &view_config)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        out.write_all(&query_out)?;
-    }
-    Ok(())
+    let mut out = open_output_writer(&config.output)?;
+    run_ordered_view_workers(
+        &mut daa,
+        &config.daa_file,
+        config.threads,
+        |record, worker_daa, query_out| {
+            view_query_paf(record, worker_daa, query_out, &score_matrix, &view_config)
+        },
+        |query_out| out.write_all(query_out),
+    )?;
+    out.flush()
 }
 
 /// Matches the SAM-output branch of C++ `view_daa`.
@@ -266,37 +587,32 @@ pub fn run_sam(config: &ViewConfig) -> io::Result<()> {
         max_target_seqs: config.max_target_seqs,
         toppercent: config.toppercent,
         forward_only: config.forward_only,
+        qnum_offset: config.qnum_offset,
+        snum_offset: config.snum_offset,
     };
 
-    eprintln!(
-        "Scoring parameters: matrix={} gap_open={} gap_extend={}",
-        daa.score_matrix(),
-        daa.gap_open_penalty(),
-        daa.gap_extension_penalty()
-    );
-    eprintln!("Build version = {}", daa.diamond_build());
-    eprintln!("DB sequences = {}", daa.db_seqs());
-    eprintln!("DB sequences used = {}", daa.db_seqs_used());
-    eprintln!("DB letters = {}", daa.db_letters());
+    print_daa_metadata(&daa, &score_matrix, config.verbosity);
+    print_view_selection(config, HspValues::TRANSCRIPT);
 
-    let mut out = File::create(&config.output)?;
+    let mut out = open_output_writer(&config.output)?;
     sam::print_header(&mut out, daa.mode(), &config.invocation)?;
-    while let Some((buf, query_num)) = daa.read_query_buffer()? {
-        let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut query_out = Vec::new();
-        view_query_sam(
-            &r,
-            &daa,
-            &mut query_out,
-            &score_matrix,
-            &view_config,
-            config.sam_qlen_field,
-        )
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        out.write_all(&query_out)?;
-    }
-    Ok(())
+    run_ordered_view_workers(
+        &mut daa,
+        &config.daa_file,
+        config.threads,
+        |record, worker_daa, query_out| {
+            view_query_sam(
+                record,
+                worker_daa,
+                query_out,
+                &score_matrix,
+                &view_config,
+                config.sam_qlen_field,
+            )
+        },
+        |query_out| out.write_all(query_out),
+    )?;
+    out.flush()
 }
 
 /// Matches the pairwise-output branch of C++ `view_daa`.
@@ -316,31 +632,26 @@ pub fn run_pairwise(config: &ViewConfig) -> io::Result<()> {
         max_target_seqs: config.max_target_seqs,
         toppercent: config.toppercent,
         forward_only: config.forward_only,
+        qnum_offset: config.qnum_offset,
+        snum_offset: config.snum_offset,
     };
 
-    eprintln!(
-        "Scoring parameters: matrix={} gap_open={} gap_extend={}",
-        daa.score_matrix(),
-        daa.gap_open_penalty(),
-        daa.gap_extension_penalty()
-    );
-    eprintln!("Build version = {}", daa.diamond_build());
-    eprintln!("DB sequences = {}", daa.db_seqs());
-    eprintln!("DB sequences used = {}", daa.db_seqs_used());
-    eprintln!("DB letters = {}", daa.db_letters());
+    print_daa_metadata(&daa, &score_matrix, config.verbosity);
+    print_view_selection(config, HspValues::TRANSCRIPT);
 
-    let mut out = File::create(&config.output)?;
+    let mut out = open_output_writer(&config.output)?;
     pairwise::write_header(&mut out)?;
-    while let Some((buf, query_num)) = daa.read_query_buffer()? {
-        let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut query_out = Vec::new();
-        view_query_pairwise(&r, &daa, &mut query_out, &score_matrix, &view_config)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        out.write_all(&query_out)?;
-    }
+    run_ordered_view_workers(
+        &mut daa,
+        &config.daa_file,
+        config.threads,
+        |record, worker_daa, query_out| {
+            view_query_pairwise(record, worker_daa, query_out, &score_matrix, &view_config)
+        },
+        |query_out| out.write_all(query_out),
+    )?;
     pairwise::print_footer(&mut out)?;
-    Ok(())
+    out.flush()
 }
 
 /// Matches the XML-output branch of C++ `view_daa`.
@@ -360,20 +671,14 @@ pub fn run_xml(config: &ViewConfig) -> io::Result<()> {
         max_target_seqs: config.max_target_seqs,
         toppercent: config.toppercent,
         forward_only: config.forward_only,
+        qnum_offset: config.qnum_offset,
+        snum_offset: config.snum_offset,
     };
 
-    eprintln!(
-        "Scoring parameters: matrix={} gap_open={} gap_extend={}",
-        daa.score_matrix(),
-        daa.gap_open_penalty(),
-        daa.gap_extension_penalty()
-    );
-    eprintln!("Build version = {}", daa.diamond_build());
-    eprintln!("DB sequences = {}", daa.db_seqs());
-    eprintln!("DB sequences used = {}", daa.db_seqs_used());
-    eprintln!("DB letters = {}", daa.db_letters());
+    print_daa_metadata(&daa, &score_matrix, config.verbosity);
+    print_view_selection(config, HspValues::TRANSCRIPT);
 
-    let mut out = File::create(&config.output)?;
+    let mut out = open_output_writer(&config.output)?;
     if let Some((buf, query_num)) = daa.read_query_buffer()? {
         let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -392,14 +697,15 @@ pub fn run_xml(config: &ViewConfig) -> io::Result<()> {
         view_query_xml(&r, &daa, &mut query_out, &score_matrix, &view_config)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         out.write_all(&query_out)?;
-        while let Some((buf, query_num)) = daa.read_query_buffer()? {
-            let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let mut query_out = Vec::new();
-            view_query_xml(&r, &daa, &mut query_out, &score_matrix, &view_config)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            out.write_all(&query_out)?;
-        }
+        run_ordered_view_workers(
+            &mut daa,
+            &config.daa_file,
+            config.threads,
+            |record, worker_daa, query_out| {
+                view_query_xml(record, worker_daa, query_out, &score_matrix, &view_config)
+            },
+            |query_out| out.write_all(query_out),
+        )?;
     } else {
         xml::print_header(
             &mut out,
@@ -414,7 +720,7 @@ pub fn run_xml(config: &ViewConfig) -> io::Result<()> {
         )?;
     }
     xml::print_footer(&mut out)?;
-    Ok(())
+    out.flush()
 }
 
 /// Matches the null-output branch of C++ `view_daa`.
@@ -434,26 +740,21 @@ pub fn run_null(config: &ViewConfig) -> io::Result<()> {
         max_target_seqs: config.max_target_seqs,
         toppercent: config.toppercent,
         forward_only: config.forward_only,
+        qnum_offset: config.qnum_offset,
+        snum_offset: config.snum_offset,
     };
 
-    eprintln!(
-        "Scoring parameters: matrix={} gap_open={} gap_extend={}",
-        daa.score_matrix(),
-        daa.gap_open_penalty(),
-        daa.gap_extension_penalty()
-    );
-    eprintln!("Build version = {}", daa.diamond_build());
-    eprintln!("DB sequences = {}", daa.db_seqs());
-    eprintln!("DB sequences used = {}", daa.db_seqs_used());
-    eprintln!("DB letters = {}", daa.db_letters());
+    print_daa_metadata(&daa, &score_matrix, config.verbosity);
+    print_view_selection(config, HspValues::TRANSCRIPT);
 
-    let mut out = File::create(&config.output)?;
-    while let Some((buf, query_num)) = daa.read_query_buffer()? {
-        let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        view_query_null(&r, &daa, &score_matrix, &view_config)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    }
+    let mut out = open_output_writer(&config.output)?;
+    run_ordered_view_workers(
+        &mut daa,
+        &config.daa_file,
+        config.threads,
+        |record, worker_daa, _| view_query_null(record, worker_daa, &score_matrix, &view_config),
+        |_| Ok(()),
+    )?;
     out.flush()
 }
 
@@ -474,29 +775,24 @@ pub fn run_edge(config: &ViewConfig) -> io::Result<()> {
         max_target_seqs: config.max_target_seqs,
         toppercent: config.toppercent,
         forward_only: config.forward_only,
+        qnum_offset: config.qnum_offset,
+        snum_offset: config.snum_offset,
     };
 
-    eprintln!(
-        "Scoring parameters: matrix={} gap_open={} gap_extend={}",
-        daa.score_matrix(),
-        daa.gap_open_penalty(),
-        daa.gap_extension_penalty()
-    );
-    eprintln!("Build version = {}", daa.diamond_build());
-    eprintln!("DB sequences = {}", daa.db_seqs());
-    eprintln!("DB sequences used = {}", daa.db_seqs_used());
-    eprintln!("DB letters = {}", daa.db_letters());
+    print_daa_metadata(&daa, &score_matrix, config.verbosity);
+    print_view_selection(config, HspValues::COORDS);
 
-    let mut out = File::create(&config.output)?;
-    while let Some((buf, query_num)) = daa.read_query_buffer()? {
-        let r = DaaQueryRecord::from_buffer(&daa, &buf, query_num)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let mut query_out = Vec::new();
-        view_query_edge(&r, &daa, &mut query_out, &score_matrix, &view_config)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        out.write_all(&query_out)?;
-    }
-    Ok(())
+    let mut out = open_output_writer(&config.output)?;
+    run_ordered_view_workers(
+        &mut daa,
+        &config.daa_file,
+        config.threads,
+        |record, worker_daa, query_out| {
+            view_query_edge(record, worker_daa, query_out, &score_matrix, &view_config)
+        },
+        |query_out| out.write_all(query_out),
+    )?;
+    out.flush()
 }
 
 #[cfg(test)]
@@ -565,6 +861,10 @@ mod tests {
             sam_qlen_field: false,
             header: vec![],
             invocation: String::new(),
+            threads: 1,
+            qnum_offset: 0,
+            snum_offset: 0,
+            verbosity: 0,
         })
         .unwrap();
 
@@ -672,6 +972,8 @@ mod tests {
                 "length".to_string(),
                 "pident".to_string(),
                 "hspnum".to_string(),
+                "qnum".to_string(),
+                "snum".to_string(),
             ],
             max_target_seqs: 25,
             toppercent: None,
@@ -680,11 +982,20 @@ mod tests {
             sam_qlen_field: false,
             header: vec![],
             invocation: String::new(),
+            // Exercise the ordered parallel tabular path; the remaining
+            // format cases below retain the direct one-thread path.
+            threads: 4,
+            qnum_offset: (-1_i64) as u64,
+            snum_offset: 20,
+            verbosity: 0,
         })
         .unwrap();
 
         let out = std::fs::read_to_string(&output).unwrap();
-        assert_eq!(out, "query0\tref0\t30\t3\t100\t0\n");
+        assert_eq!(
+            out,
+            "query0\tref0\t30\t3\t100\t0\t18446744073709551615\t20\n"
+        );
 
         run_tabular(&ViewConfig {
             daa_file: input.to_string_lossy().to_string(),
@@ -694,6 +1005,8 @@ mod tests {
                 "qseqid".to_string(),
                 "sseqid".to_string(),
                 "score".to_string(),
+                "qnum".to_string(),
+                "snum".to_string(),
             ],
             max_target_seqs: 25,
             toppercent: None,
@@ -702,13 +1015,25 @@ mod tests {
             sam_qlen_field: false,
             header: vec![],
             invocation: String::new(),
+            threads: 1,
+            qnum_offset: 10,
+            snum_offset: (-2_i64) as u64,
+            verbosity: 0,
         })
         .unwrap();
 
         let out = std::fs::read_to_string(&output_json).unwrap();
         assert_eq!(
             out,
-            "[\n\t{\n\t\"qseqid\":\"query0\",\n\t\"sseqid\":\"ref0\",\n\t\"score\":30\n\t}\n]"
+            concat!(
+                "[\n\t{\n",
+                "\t\"qseqid\":\"query0\",\n",
+                "\t\"sseqid\":\"ref0\",\n",
+                "\t\"score\":30,\n",
+                "\t\"qnum\":10,\n",
+                "\t\"snum\":18446744073709551614\n",
+                "\t}\n]"
+            )
         );
 
         run_paf(&ViewConfig {
@@ -722,6 +1047,10 @@ mod tests {
             sam_qlen_field: false,
             header: vec![],
             invocation: String::new(),
+            threads: 1,
+            qnum_offset: 0,
+            snum_offset: 0,
+            verbosity: 0,
         })
         .unwrap();
 
@@ -740,6 +1069,10 @@ mod tests {
             sam_qlen_field: true,
             header: vec![],
             invocation: "diamond view -f sam".to_string(),
+            threads: 1,
+            qnum_offset: 0,
+            snum_offset: 0,
+            verbosity: 0,
         })
         .unwrap();
 
@@ -761,6 +1094,10 @@ mod tests {
             sam_qlen_field: false,
             header: vec![],
             invocation: String::new(),
+            threads: 1,
+            qnum_offset: 0,
+            snum_offset: 0,
+            verbosity: 0,
         })
         .unwrap();
 
@@ -783,6 +1120,10 @@ mod tests {
             sam_qlen_field: false,
             header: vec![],
             invocation: String::new(),
+            threads: 1,
+            qnum_offset: 0,
+            snum_offset: 0,
+            verbosity: 0,
         })
         .unwrap();
 
@@ -807,6 +1148,10 @@ mod tests {
             sam_qlen_field: false,
             header: vec![],
             invocation: String::new(),
+            threads: 1,
+            qnum_offset: 0,
+            snum_offset: 0,
+            verbosity: 0,
         })
         .unwrap();
 
@@ -823,6 +1168,10 @@ mod tests {
             sam_qlen_field: false,
             header: vec![],
             invocation: String::new(),
+            threads: 1,
+            qnum_offset: 0,
+            snum_offset: 0,
+            verbosity: 0,
         })
         .unwrap();
 
@@ -939,6 +1288,29 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Option is not permitted for this workflow: unal"
+        );
+    }
+
+    #[test]
+    fn test_view_header_modes_match_upstream_tabular_rules() {
+        assert_eq!(parse_header_arg(&[]).unwrap(), Header::None);
+        assert_eq!(parse_header_arg(&[String::new()]).unwrap(), Header::Verbose);
+        assert_eq!(
+            parse_header_arg(&["simple".to_string()]).unwrap(),
+            Header::Simple
+        );
+        assert_eq!(parse_header_arg(&["0".to_string()]).unwrap(), Header::None);
+        assert_eq!(
+            parse_header_arg(&["bad".to_string()])
+                .unwrap_err()
+                .to_string(),
+            "Invalid value for string field: bad. Permitted values: 0, simple, verbose"
+        );
+        assert_eq!(
+            parse_header_arg(&["simple".to_string(), "verbose".to_string()])
+                .unwrap_err()
+                .to_string(),
+            "Invalid header format: simple verbose"
         );
     }
 }

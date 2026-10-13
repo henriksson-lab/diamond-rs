@@ -433,7 +433,8 @@ mod tests {
         assert!(is_absolute_path("\\tmp\\x"));
         assert!(is_absolute_path("C:\\tmp\\x"));
         assert!(!is_absolute_path("tmp/x"));
-        assert_eq!(containing_directory("/tmp/x"), "/tmp");
+        let native_path = format!("tmp{PATH_SEPARATOR}x");
+        assert_eq!(containing_directory(&native_path), "tmp");
         assert_eq!(containing_directory("file.dmnd"), "file.dmnd");
         assert_eq!(last_component("/tmp/x/"), "x");
         assert_eq!(absolute_path("").1, "");

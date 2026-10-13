@@ -122,6 +122,20 @@ pub struct CentroidSearchConfig {
     pub lin_stage1_query: bool,
     pub chunk_size: f64,
     pub lowmem: i32,
+    pub approx_min_id: f64,
+    pub max_evalue: f64,
+    pub matrix: String,
+    pub gap_open: i32,
+    pub gap_extend: i32,
+    pub comp_based_stats: i32,
+    pub masking: crate::masking::MaskingMode,
+    pub soft_masking: crate::masking::MaskingAlgo,
+    pub motif_masking: String,
+    pub extension_mode: String,
+    pub hamming_ext: bool,
+    pub diag_filter_cov: Option<f64>,
+    pub diag_filter_id: Option<f64>,
+    pub threads: i32,
 }
 
 pub struct LengthSortedBlock<B> {
@@ -282,6 +296,20 @@ fn search_vs_centroids<B: CascadedWrapperBackend>(
         lin_stage1_query: false,
         chunk_size,
         lowmem,
+        approx_min_id: config.core.approx_min_id,
+        max_evalue: config.core.max_evalue,
+        matrix: config.core.matrix.clone(),
+        gap_open: config.core.gap_open,
+        gap_extend: config.core.gap_extend,
+        comp_based_stats: config.core.comp_based_stats,
+        masking: config.core.masking,
+        soft_masking: config.core.soft_masking,
+        motif_masking: config.core.motif_masking.clone(),
+        extension_mode: config.core.extension_mode.clone(),
+        hamming_ext: config.core.hamming_ext,
+        diag_filter_cov: config.core.diag_filter_cov,
+        diag_filter_id: config.core.diag_filter_id,
+        threads: config.core.threads,
     };
     let mut best = BestCentroid::new(sequence_count)?;
     backend.run_centroid_search(super_block, &search_config, &mut best)?;

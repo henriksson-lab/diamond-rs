@@ -38,7 +38,7 @@ if [[ ${SKIP_BUILD:-0} != 1 ]]; then
         fi
     fi
     RUSTFLAGS="$benchmark_rustflags" cargo build \
-        --manifest-path "$repo_dir/Cargo.toml" --release --offline
+        --manifest-path "$repo_dir/Cargo.toml" --release --offline --locked
     if [[ ! -x "$cpp_bin" ]]; then
         cmake -S "$repo_dir/diamond" -B "$repo_dir/diamond/build" \
             -DCMAKE_BUILD_TYPE=Release

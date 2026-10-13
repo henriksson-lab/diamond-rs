@@ -223,7 +223,11 @@ fn search_shape_with_seed_loc<SeedLoc, F>(
 ) -> Result<SearchShapeReport, String>
 where
     SeedLoc: Stage0SeedLocation,
-    F: FnMut(SearchShapePartition<'_>) -> Result<(), String>,
+    F: FnMut(
+        SearchShapePartition<'_>,
+        &crate::data::sequence_set::SequenceSet,
+        &crate::data::sequence_set::SequenceSet,
+    ) -> Result<(), String>,
 {
     if shape_id >= config.shapes.count() as u32 {
         return Err("Shape id out of range.".to_string());
@@ -401,18 +405,22 @@ where
         };
         let mut searched_partitions = 0usize;
         for relative_partition in 0..relative_count {
-            run_stage1(SearchShapePartition {
-                shape_id,
-                relative_partition,
-                absolute_partition: range.begin() + relative_partition as u32,
-                query_seed_hits: &query_hits[relative_partition],
-                reference_seed_hits: &reference_hits[relative_partition],
-                previous_shape_patterns: &patterns[..patterns.len() - 1],
-                shape_patterns: &patterns,
-                ungapped_raw_score: config.ungapped_raw_score,
-                seedp_mask: seedp_mask(config.seedp_bits),
-                kmer_ranking: ranking.as_ref(),
-            })?;
+            run_stage1(
+                SearchShapePartition {
+                    shape_id,
+                    relative_partition,
+                    absolute_partition: range.begin() + relative_partition as u32,
+                    query_seed_hits: &query_hits[relative_partition],
+                    reference_seed_hits: &reference_hits[relative_partition],
+                    previous_shape_patterns: &patterns[..patterns.len() - 1],
+                    shape_patterns: &patterns,
+                    ungapped_raw_score: config.ungapped_raw_score,
+                    seedp_mask: seedp_mask(config.seedp_bits),
+                    kmer_ranking: ranking.as_ref(),
+                },
+                query.seqs(),
+                reference.seqs(),
+            )?;
             searched_partitions += 1;
         }
         report.chunks.push(SearchShapeChunkReport {
@@ -437,7 +445,11 @@ pub fn search_shape<F>(
     mut run_stage1: F,
 ) -> Result<SearchShapeReport, String>
 where
-    F: FnMut(SearchShapePartition<'_>) -> Result<(), String>,
+    F: FnMut(
+        SearchShapePartition<'_>,
+        &crate::data::sequence_set::SequenceSet,
+        &crate::data::sequence_set::SequenceSet,
+    ) -> Result<(), String>,
 {
     if config.keep_target_id {
         search_shape_with_seed_loc::<PackedLocId, _>(
@@ -674,7 +686,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut joined_bytes = 0usize;
 
-        let report = search_shape(0, &mut query, &mut reference, &config, |partition| {
+        let report = search_shape(0, &mut query, &mut reference, &config, |partition, _, _| {
             seen.push((
                 partition.relative_partition,
                 partition.absolute_partition,
@@ -730,7 +742,7 @@ mod tests {
         config.kmer_ranking = true;
         let mut ranking_seen = false;
 
-        let report = search_shape(0, &mut query, &mut reference, &config, |partition| {
+        let report = search_shape(0, &mut query, &mut reference, &config, |partition, _, _| {
             let ranking = partition.kmer_ranking.unwrap();
             assert_eq!(ranking.rank.len(), 1);
             ranking_seen = true;
@@ -754,12 +766,12 @@ mod tests {
         let mut reference = block(&[0, 1, 2]);
         let mut config = SearchShapeConfig::new(&shapes, &reduction);
         assert_eq!(
-            search_shape(1, &mut query, &mut reference, &config, |_| Ok(())).unwrap_err(),
+            search_shape(1, &mut query, &mut reference, &config, |_, _, _| Ok(())).unwrap_err(),
             "Shape id out of range."
         );
         config.threads = 0;
         assert_eq!(
-            search_shape(0, &mut query, &mut reference, &config, |_| Ok(())).unwrap_err(),
+            search_shape(0, &mut query, &mut reference, &config, |_, _, _| Ok(())).unwrap_err(),
             "Stage 0 thread count must be positive."
         );
     }

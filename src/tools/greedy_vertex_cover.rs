@@ -341,7 +341,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "diamond-gvc-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            crate::util::test_path_component()
         ));
         fs::create_dir_all(&root).unwrap();
         let mut config = config();

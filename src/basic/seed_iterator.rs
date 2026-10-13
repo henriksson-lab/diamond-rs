@@ -169,6 +169,50 @@ fn cpp_sort_sketch_kmers(v: &mut [SketchKmer]) {
     cpp_sort_sketch_kmers_with_depth(v, depth);
 }
 
+/// Retain the same bottom-hash sketch as C++ `std::sort` followed by resize.
+///
+/// Most sequence sketches have a unique hash at the cutoff. In that case the
+/// selected set is completely determined by the cutoff hash, so avoid sorting
+/// hundreds of 24-byte records only to discard all but (normally) 21 of them.
+/// If an equal-hash group straddles the cutoff, the particular occurrences
+/// retained depend on libstdc++'s unstable permutation; use the exact sort
+/// above for that case. The retained fast-path records are sorted with the
+/// same routine so iterator order remains hash ordered.
+fn select_cpp_bottom_kmers(v: &mut Vec<SketchKmer>, n: usize) {
+    if n == 0 {
+        v.clear();
+        return;
+    }
+    if n >= v.len() {
+        cpp_sort_sketch_kmers(v);
+        return;
+    }
+
+    let mut hashes = Vec::with_capacity(v.len());
+    hashes.extend(v.iter().map(|kmer| kmer.hash));
+    let (_, cutoff, _) = hashes.select_nth_unstable(n - 1);
+    let cutoff = *cutoff;
+    let mut below = 0usize;
+    let mut equal = 0usize;
+    for kmer in v.iter() {
+        if kmer.hash < cutoff {
+            below += 1;
+        } else if kmer.hash == cutoff {
+            equal += 1;
+        }
+    }
+
+    if below < n && n < below + equal {
+        cpp_sort_sketch_kmers(v);
+        v.truncate(n);
+        return;
+    }
+
+    v.retain(|kmer| kmer.hash <= cutoff);
+    debug_assert_eq!(v.len(), n);
+    cpp_sort_sketch_kmers(v);
+}
+
 fn cpp_sort_sketch_kmers_with_depth(v: &mut [SketchKmer], depth: usize) {
     const THRESHOLD: usize = 16;
 
@@ -367,8 +411,7 @@ impl SketchIterator {
                 });
             }
         }
-        cpp_sort_sketch_kmers(&mut v);
-        v.truncate((n as usize).min(v.len()));
+        select_cpp_bottom_kmers(&mut v, n.max(0) as usize);
         Self { data: v, it: 0 }
     }
 
@@ -599,6 +642,44 @@ mod tests {
                 5, 27, 13, 15, 29, 0, 2, 6, 14, 30,
             ]
         );
+    }
+
+    #[test]
+    fn bottom_sketch_fast_path_matches_cpp_selected_set() {
+        let input = (0..257)
+            .map(|pos| SketchKmer {
+                seed: pos as u64 * 17,
+                hash: (pos as u64 * 97) ^ ((pos as u64) << 33),
+                pos,
+            })
+            .collect::<Vec<_>>();
+        let mut expected = input.clone();
+        cpp_sort_sketch_kmers(&mut expected);
+        expected.truncate(21);
+        let mut actual = input;
+        select_cpp_bottom_kmers(&mut actual, 21);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn bottom_sketch_cutoff_tie_uses_exact_cpp_permutation() {
+        let input = (0..64)
+            .map(|pos| SketchKmer {
+                seed: pos as u64,
+                hash: if (16..48).contains(&pos) {
+                    7
+                } else {
+                    pos as u64
+                },
+                pos,
+            })
+            .collect::<Vec<_>>();
+        let mut expected = input.clone();
+        cpp_sort_sketch_kmers(&mut expected);
+        expected.truncate(21);
+        let mut actual = input;
+        select_cpp_bottom_kmers(&mut actual, 21);
+        assert_eq!(actual, expected);
     }
 
     #[test]

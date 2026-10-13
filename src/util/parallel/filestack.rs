@@ -59,7 +59,7 @@ impl FileStack {
 
     /// C++ `FileStack::size()`.
     pub fn size(&self) -> Result<usize, String> {
-        self.with_lock(|| self.size_non_locked())
+        self.with_lock(|file| self.size_non_locked(file))
     }
 
     /// C++ `FileStack::pop(int64_t&)`, returning the popped value directly.
@@ -70,25 +70,25 @@ impl FileStack {
 
     /// C++ `FileStack::pop(int64_t&)` compatibility form.
     pub fn pop_i64_into(&self, value: &mut i64) -> Result<i64, String> {
-        self.with_lock(|| self.pop_non_locked_i64(value))
+        self.with_lock(|file| self.pop_non_locked_i64(file, value))
     }
 
     /// C++ `FileStack::pop(string&)`.
     pub fn pop_string(&self) -> Result<Option<String>, String> {
-        self.with_lock(|| self.pop_non_locked_string(false))
+        self.with_lock(|file| self.pop_non_locked_string(file, false))
     }
 
     /// C++ `FileStack::pop(string&, size_t&)`.
     pub fn pop_string_size(&self) -> Result<(Option<String>, usize), String> {
-        self.with_lock(|| {
-            let value = self.pop_non_locked_string(false)?;
-            Ok((value, self.size_non_locked()?))
+        self.with_lock(|file| {
+            let value = self.pop_non_locked_string(file, false)?;
+            Ok((value, self.size_non_locked(file)?))
         })
     }
 
     /// C++ `FileStack::top(int64_t&)`, returning the value directly.
     pub fn top_i64(&self) -> Result<i64, String> {
-        self.with_lock(|| match self.pop_non_locked_string(true)? {
+        self.with_lock(|file| match self.pop_non_locked_string(file, true)? {
             Some(value) => value.parse::<i64>().map_err(|e| e.to_string()),
             None => Ok(-1),
         })
@@ -102,50 +102,54 @@ impl FileStack {
 
     /// C++ `FileStack::top(string&)`.
     pub fn top_string(&self) -> Result<Option<String>, String> {
-        self.with_lock(|| self.pop_non_locked_string(true))
+        self.with_lock(|file| self.pop_non_locked_string(file, true))
     }
 
     /// C++ `FileStack::remove(const string&)`.
     pub fn remove(&self, line: &str) -> Result<(), String> {
-        self.with_lock(|| {
-            let data = std::fs::read_to_string(&self.file_name).map_err(|e| e.to_string())?;
+        self.with_lock(|file| {
+            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            let mut data = String::new();
+            file.read_to_string(&mut data).map_err(|e| e.to_string())?;
             let tokens = super::multiprocessing::split(&data, '\n');
             let mut output = String::new();
             for token in tokens.into_iter().filter(|token| token != line) {
                 output.push_str(&token);
                 output.push('\n');
             }
-            std::fs::write(&self.file_name, output).map_err(|e| e.to_string())
+            file.set_len(0).map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            file.write_all(output.as_bytes()).map_err(|e| e.to_string())
         })
     }
 
     /// C++ `FileStack::push(int64_t)`.
     pub fn push_i64(&self, value: i64) -> Result<i64, String> {
-        self.with_lock(|| self.push_non_locked_i64(value))
+        self.with_lock(|file| self.push_non_locked_i64(file, value))
     }
 
     /// C++ `FileStack::push(const string&)`.
     pub fn push_string(&self, value: &str) -> Result<i64, String> {
-        self.with_lock(|| self.push_exclusive(value))
+        self.with_lock(|file| self.push_non_locked_string(file, value))
     }
 
     /// C++ `FileStack::push(const string&, size_t&)`.
     pub fn push_string_size(&self, value: &str) -> Result<(i64, usize), String> {
-        self.with_lock(|| {
-            let written = self.push_exclusive(value)?;
-            Ok((written, self.size_non_locked()?))
+        self.with_lock(|file| {
+            let written = self.push_non_locked_string(file, value)?;
+            Ok((written, self.size_non_locked(file)?))
         })
     }
 
     /// C++ `FileStack::fetch_add(int64_t)`.
     pub fn fetch_add(&self, n: i64) -> Result<i64, String> {
-        self.with_lock(|| {
+        self.with_lock(|file| {
             let mut value = -1;
-            self.pop_non_locked_i64(&mut value)?;
+            self.pop_non_locked_i64(file, &mut value)?;
             if value == -1 {
                 value = 0;
             }
-            self.push_non_locked_i64(value + n)?;
+            self.push_non_locked_i64(file, value + n)?;
             Ok(value)
         })
     }
@@ -168,7 +172,12 @@ impl FileStack {
 
     /// C++ `FileStack::clear()`.
     pub fn clear(&self) -> Result<(), String> {
-        self.with_lock(|| std::fs::write(&self.file_name, []).map_err(|e| e.to_string()))
+        self.with_lock(|file| {
+            file.set_len(0).map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::Start(0))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
     }
 
     /// C++ `FileStack::seek(int64_t, int)`.
@@ -261,16 +270,18 @@ impl FileStack {
     /// Like the original, this assumes the caller already owns any required
     /// compound-operation lock.
     pub fn pop_exclusive(&self) -> Result<Option<String>, String> {
-        self.pop_non_locked_string(false)
+        let mut file = self.file.lock().map_err(|e| e.to_string())?;
+        self.pop_non_locked_string(&mut file, false)
     }
 
     /// C++ `FileStack::push_exclusive(const string&)`.
     pub fn push_exclusive(&self, value: &str) -> Result<i64, String> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.file_name)
-            .map_err(|e| e.to_string())?;
+        let mut file = self.file.lock().map_err(|e| e.to_string())?;
+        self.push_non_locked_string(&mut file, value)
+    }
+
+    fn push_non_locked_string(&self, file: &mut File, value: &str) -> Result<i64, String> {
+        file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
         file.write_all(value.as_bytes())
             .map_err(|e| e.to_string())?;
         let mut written = value.len() as i64;
@@ -282,14 +293,17 @@ impl FileStack {
     }
 
     /// C++ `FileStack::pop_non_locked(string&, bool, size_t&)`.
-    fn pop_non_locked_string(&self, keep: bool) -> Result<Option<String>, String> {
-        let data = std::fs::read(&self.file_name).map_err(|e| e.to_string())?;
-        if data.is_empty() {
+    fn pop_non_locked_string(&self, file: &mut File, keep: bool) -> Result<Option<String>, String> {
+        let size = file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? as usize;
+        if size == 0 {
             return Ok(None);
         }
 
-        let jump = data.len().saturating_sub(self.max_line_length);
-        let chunk = &data[jump..];
+        let jump = size.saturating_sub(self.max_line_length);
+        file.seek(SeekFrom::Start(jump as u64))
+            .map_err(|e| e.to_string())?;
+        let mut chunk = Vec::with_capacity(size - jump);
+        file.read_to_end(&mut chunk).map_err(|e| e.to_string())?;
         let mut begin = 0;
         let mut end = chunk.iter().rposition(|&byte| byte == b'\n').unwrap_or(0);
         if end > 0 {
@@ -306,20 +320,17 @@ impl FileStack {
         let value =
             String::from_utf8(chunk[begin..value_end].to_vec()).map_err(|e| e.to_string())?;
         if !keep {
-            end = data.len() - line_size;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&self.file_name)
-                .map_err(|e| e.to_string())?
-                .set_len(end as u64)
+            end = size - line_size;
+            file.set_len(end as u64).map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::Start(end as u64))
                 .map_err(|e| e.to_string())?;
         }
         Ok(Some(value))
     }
 
     /// C++ `FileStack::pop_non_locked(int64_t&)`.
-    fn pop_non_locked_i64(&self, value: &mut i64) -> Result<i64, String> {
-        match self.pop_non_locked_string(false)? {
+    fn pop_non_locked_i64(&self, file: &mut File, value: &mut i64) -> Result<i64, String> {
+        match self.pop_non_locked_string(file, false)? {
             Some(text) => {
                 *value = text.parse::<i64>().map_err(|e| e.to_string())?;
             }
@@ -329,27 +340,32 @@ impl FileStack {
     }
 
     /// C++ `FileStack::push_non_locked(int64_t)`.
-    fn push_non_locked_i64(&self, value: i64) -> Result<i64, String> {
-        self.push_exclusive(&value.to_string())
+    fn push_non_locked_i64(&self, file: &mut File, value: i64) -> Result<i64, String> {
+        self.push_non_locked_string(file, &value.to_string())
     }
 
-    fn size_non_locked(&self) -> Result<usize, String> {
-        let data = std::fs::read(&self.file_name).map_err(|e| e.to_string())?;
+    fn size_non_locked(&self, file: &mut File) -> Result<usize, String> {
+        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).map_err(|e| e.to_string())?;
         Ok(data.iter().filter(|&&byte| byte == b'\n').count())
     }
 
     /// C++ `lock`/`unlock`, expressed as a scoped operation so error paths
     /// cannot leave either lock held.
-    fn with_lock<T>(&self, operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    fn with_lock<T>(
+        &self,
+        operation: impl FnOnce(&mut File) -> Result<T, String>,
+    ) -> Result<T, String> {
         let _thread_lock = self.mtx.lock().map_err(|e| e.to_string())?;
-        let file = self.file.lock().map_err(|e| e.to_string())?;
+        let mut file = self.file.lock().map_err(|e| e.to_string())?;
         file.lock().map_err(|e| {
             format!(
                 "could not put lock on file {}: {e}",
                 self.file_name.display()
             )
         })?;
-        let result = operation();
+        let result = operation(&mut file);
         let unlock = file
             .unlock()
             .map_err(|e| format!("could not unlock file {}: {e}", self.file_name.display()));

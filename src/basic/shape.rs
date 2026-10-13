@@ -374,6 +374,41 @@ impl Shape {
         Some(s)
     }
 
+    /// Extract the production clustering seed directly from a pre-reduced
+    /// sequence, matching upstream's raw-iterator `set_seed_reduced` path.
+    ///
+    /// # Safety
+    /// `self` must be a weight-12 shape created by [`Shape::from_code`], the
+    /// active reduction must have size 10, and `seq` must point to at least
+    /// `self.length` readable letters.
+    #[inline(always)]
+    pub(crate) unsafe fn set_seed_reduced_12_unchecked(
+        &self,
+        seq: *const Letter,
+    ) -> Option<PackedSeed> {
+        debug_assert_eq!(self.weight, 12);
+        macro_rules! digit {
+            ($index:expr) => {{
+                // SAFETY: the caller proves that the full shape window is
+                // readable, while Shape::from_code bounds every position by
+                // `length` and records all twelve selected positions.
+                let position = unsafe { *self.positions.get_unchecked($index) as usize };
+                let letter = unsafe { *seq.add(position) } & LETTER_MASK;
+                if letter == MASK_LETTER {
+                    return None;
+                }
+                letter as u64
+            }};
+        }
+        let p0 = digit!(0) * 10 + digit!(1);
+        let p1 = digit!(2) * 10 + digit!(3);
+        let p2 = digit!(4) * 10 + digit!(5);
+        let p3 = digit!(6) * 10 + digit!(7);
+        let p4 = digit!(8) * 10 + digit!(9);
+        let p5 = digit!(10) * 10 + digit!(11);
+        Some(p0 * 10_000_000_000 + p1 * 100_000_000 + p2 * 1_000_000 + p3 * 10_000 + p4 * 100 + p5)
+    }
+
     /// Whether the pattern is contiguous (no gaps).
     pub fn contiguous(&self) -> bool {
         self.length == self.weight
@@ -481,6 +516,33 @@ mod tests {
                 let actual = unsafe { shape.seed_partition_unchecked(&sequence, &reduction, mask) };
                 assert_eq!(actual, expected);
             }
+        }
+    }
+
+    #[test]
+    fn unchecked_weight12_reduced_seed_matches_generic_randomized() {
+        let reduction = Reduction::default_reduction();
+        let shape = Shape::from_code("1101110101101111", &reduction);
+        assert_eq!(shape.weight, 12);
+        assert_eq!(reduction.size(), 10);
+        let mut state = 0x12_5eed_cafe_u64;
+        for case in 0..2_000 {
+            let prefix = case % 7;
+            let mut sequence = vec![0; prefix + shape.length as usize + case % 5];
+            for letter in &mut sequence {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *letter = ((state >> 32) % 10) as Letter;
+            }
+            if case % 9 == 0 {
+                let selected = shape.positions[case / 9 % shape.weight as usize] as usize;
+                sequence[prefix + selected] = MASK_LETTER;
+            }
+            let window = &sequence[prefix..prefix + shape.length as usize];
+            let expected = shape.set_seed_reduced(window, &reduction);
+            // SAFETY: `window` contains the complete shape and the assertions
+            // above establish the specialized shape/reduction invariants.
+            let actual = unsafe { shape.set_seed_reduced_12_unchecked(window.as_ptr()) };
+            assert_eq!(actual, expected, "case={case}");
         }
     }
 }

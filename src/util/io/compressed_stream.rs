@@ -370,7 +370,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "diamond-rs-zlib-stream-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("thread")
+            crate::util::test_path_component()
         ));
         let _ = std::fs::remove_file(&path);
         let name = path.to_string_lossy();

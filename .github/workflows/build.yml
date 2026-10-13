@@ -10,6 +10,34 @@ permissions:
   contents: read
 
 jobs:
+  package:
+    name: Verify packaged crate (Linux)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Select Rust
+        run: rustup default stable
+
+      # Build from Cargo's isolated package staging directory. This catches
+      # accidental compile-time dependencies on checkout-only files (notably
+      # the adjacent upstream C++ tree) that an ordinary workspace build can
+      # hide.
+      - name: Verify package contents build independently
+        run: cargo package --locked
+
+      - name: Test the isolated package contents
+        shell: bash
+        run: |
+          package_dir="$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'diamond-rs-*' -print -quit)"
+          test -n "$package_dir"
+          cargo test --locked --all-targets --manifest-path "$package_dir/Cargo.toml"
+
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -36,10 +64,10 @@ jobs:
         run: rustup default stable
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --locked --all-targets
 
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
 
   native-spill-conformance:
     name: Native delayed spill (${{ matrix.os }})
@@ -65,7 +93,7 @@ jobs:
         run: rustup default stable
 
       - name: Build release executable
-        run: cargo build --release --bin diamond
+        run: cargo build --locked --release --bin diamond
 
       # Git for Windows supplies the same bash/awk/coreutils surface used on
       # Linux and macOS. The driver calibrates from target-native RSS behavior;
@@ -104,10 +132,10 @@ jobs:
       # Execute the resulting static musl test binaries on the Ubuntu runner.
       # Keep the optional C++ oracle out of this portable production build.
       - name: Test
-        run: cargo test --target x86_64-unknown-linux-musl --all-targets
+        run: cargo test --locked --target x86_64-unknown-linux-musl --all-targets
 
       - name: Build release executable for spill conformance
-        run: cargo build --release --target x86_64-unknown-linux-musl --bin diamond
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl --bin diamond
 
       - name: Calibrate and test delayed spilling with musl
         env:
@@ -142,7 +170,7 @@ jobs:
         run: rustup default stable
 
       - name: Check
-        run: cargo check --target i686-unknown-linux-gnu --all-targets
+        run: cargo check --locked --target i686-unknown-linux-gnu --all-targets
 
   windows-32-bit:
     name: Check (Windows i686 MSVC)
@@ -165,4 +193,4 @@ jobs:
         run: rustup default stable
 
       - name: Check
-        run: cargo check --target i686-pc-windows-msvc --all-targets
+        run: cargo check --locked --target i686-pc-windows-msvc --all-targets

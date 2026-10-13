@@ -161,6 +161,21 @@ impl<'a> BinaryBufferIterator<'a> {
         Ok(&self.data[begin..self.ptr])
     }
 
+    /// Return bytes through the next `terminator`, advancing past it.
+    /// DAA transcripts are terminated byte strings; exposing the existing
+    /// backing slice lets their decoder allocate exactly once.
+    pub fn read_until_inclusive(&mut self, terminator: u8) -> Result<&'a [u8], String> {
+        let begin = self.ptr;
+        let Some(offset) = self.data[begin..self.end]
+            .iter()
+            .position(|&byte| byte == terminator)
+        else {
+            return Err("Unexpected end of file.".to_string());
+        };
+        self.ptr = begin + offset + 1;
+        Ok(&self.data[begin..self.ptr])
+    }
+
     pub fn remaining(&self) -> &'a [u8] {
         &self.data[self.ptr..self.end]
     }
@@ -223,6 +238,20 @@ mod tests {
         assert_eq!(it.read_string().unwrap(), "abc");
         assert_eq!(it.remaining(), &[] as &[u8]);
         assert!(!it.good());
+    }
+
+    #[test]
+    fn read_until_inclusive_borrows_and_advances() {
+        let buffer = BinaryBuffer::from_vec(vec![4, 5, 0, 9]);
+        let mut it = buffer.begin();
+        assert_eq!(it.read_until_inclusive(0).unwrap(), &[4, 5, 0]);
+        assert_eq!(it.read::<u8>().unwrap(), 9);
+
+        let buffer = BinaryBuffer::from_vec(vec![1, 2]);
+        assert_eq!(
+            buffer.begin().read_until_inclusive(0).unwrap_err(),
+            "Unexpected end of file."
+        );
     }
 
     #[test]

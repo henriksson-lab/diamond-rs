@@ -36,3 +36,21 @@ pub mod table;
 pub mod text_buffer;
 pub mod tsv;
 pub mod util;
+
+/// Filesystem-safe, deterministic discriminator for paths created by tests.
+///
+/// Rust names test threads after the fully qualified test path. Those names
+/// contain `::`, which is not a valid Windows filename component. Hashing the
+/// name also keeps paths comfortably below the legacy Windows path limit.
+#[cfg(test)]
+pub(crate) fn test_path_component() -> String {
+    use std::hash::{Hash, Hasher};
+
+    let thread = std::thread::current();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match thread.name() {
+        Some(name) => name.hash(&mut hasher),
+        None => format!("{:?}", thread.id()).hash(&mut hasher),
+    }
+    format!("{:016x}", hasher.finish())
+}

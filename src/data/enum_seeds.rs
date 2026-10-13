@@ -203,6 +203,42 @@ pub fn enum_seeds_hashed<F, const BITS: u64, Filter>(
     f.finish();
 }
 
+/// Hashed enumeration for the fixed configuration used to build a persistent
+/// seed index. The caller has already established that there is no skip set,
+/// query-length cutoff, seed filter, or seed-complexity masking. Keeping those
+/// invariants out of the inner loop lets this match upstream's specialized
+/// `HashedSeedSetCallback` instantiation without changing seed order or hash
+/// table insertion behavior.
+pub(crate) fn enum_seeds_hashed_unfiltered<F, const BITS: u64>(
+    seqs: &SequenceSet,
+    f: &mut F,
+    begin: u32,
+    end: u32,
+    shapes: &ShapeConfig,
+    reduction: &Reduction,
+) where
+    F: EnumSeedsCallback,
+{
+    for i in begin as usize..end as usize {
+        for shape_id in 0..shapes.count() {
+            let sh = shapes.get(shape_id as usize);
+            if seqs.length(i) < sh.length {
+                continue;
+            }
+            let len = seqs.length(i);
+            let seq = seqs.get(i).to_vec();
+            let mut it = HashedSeedIterator::<BITS>::new(&seq, len, sh, reduction);
+            while it.good() {
+                let key = it.get();
+                let j = it.seq_ptr(sh);
+                f.call(key, seqs.position(i, j), i, shape_id);
+                it.increment();
+            }
+        }
+    }
+    f.finish();
+}
+
 pub fn enum_seeds_contiguous<
     F,
     const L: usize,
@@ -531,6 +567,41 @@ mod tests {
         enum_seeds_hashed::<_, 4, _>(&mut seqs, &mut cb, 0, 1, &NO_FILTER, &c, &ctx);
         assert_eq!(cb.rows.len(), 1);
         assert_ne!(seqs.get(0)[0] & SEED_MASK, 0);
+    }
+
+    #[test]
+    fn test_hashed_unfiltered_specialization_matches_general_path() {
+        let reduction = Reduction::default_reduction();
+        let shapes =
+            ShapeConfig::from_codes(&["111".to_string(), "1011".to_string()], 0, &reduction)
+                .unwrap();
+        let ctx = EnumSeedsContext {
+            shapes: &shapes,
+            reduction: &reduction,
+            min_query_len: 0,
+            query_contexts: 1,
+        };
+        let mut seqs = SequenceSet::new();
+        seqs.push(&[0, 1]);
+        seqs.push(&[0, 1, 2, 3, 4, 5]);
+        seqs.push(&[5, 4, 3, 2, 1, 0, 6]);
+
+        let mut general = CollectSeeds::default();
+        enum_seeds_hashed::<_, 4, _>(
+            &mut seqs,
+            &mut general,
+            0,
+            3,
+            &NO_FILTER,
+            &cfg(None, SeedEncoding::Hashed, shapes.count()),
+            &ctx,
+        );
+
+        let mut specialized = CollectSeeds::default();
+        enum_seeds_hashed_unfiltered::<_, 4>(&seqs, &mut specialized, 0, 3, &shapes, &reduction);
+
+        assert_eq!(specialized.rows, general.rows);
+        assert_eq!(specialized.finished, general.finished);
     }
 
     #[test]

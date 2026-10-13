@@ -1,7 +1,7 @@
 use crate::basic::reduction::Reduction;
 use crate::basic::shape_config::ShapeConfig;
 use crate::data::block::Block;
-use crate::data::enum_seeds::{enum_seeds_block, EnumSeedsCallback};
+use crate::data::enum_seeds::{enum_seeds_block, enum_seeds_hashed_unfiltered, EnumSeedsCallback};
 use crate::data::flags::{EnumCfg, SeedEncoding, NO_FILTER};
 use crate::masking::MaskingAlgo;
 use crate::util::data_structures::{HashSet as DiamondHashSet, Identity, Modulo2};
@@ -124,13 +124,45 @@ impl HashedSeedSet {
             min_query_len: 0,
             query_contexts: 1,
         };
-        enum_seeds_block(seqs, &mut cb, &NO_FILTER, &cfg, &ctx)?;
+        if skip.is_none() {
+            seqs.soft_mask(soft_masking);
+            match reduction.bit_size() {
+                4 => enum_seeds_hashed_unfiltered::<_, 4>(
+                    seqs.seqs(),
+                    &mut cb[0],
+                    partition[0],
+                    partition[1],
+                    shapes,
+                    reduction,
+                ),
+                _ => return Err("Unsupported reduction.".to_string()),
+            }
+        } else {
+            enum_seeds_block(seqs, &mut cb, &NO_FILTER, &cfg, &ctx)?;
+        }
         let sizes: Vec<usize> = cb[0].data.iter().map(Table::load).collect();
-        cb[0].data = sizes
-            .iter()
-            .map(|&size| Table::new(next_pow2(size as f64 * HASH_TABLE_FACTOR)))
-            .collect();
-        enum_seeds_block(seqs, &mut cb, &NO_FILTER, &cfg, &ctx)?;
+        // Upstream clears the counting tables before allocating the final
+        // tables. Preserve that lifetime boundary so the allocator can reuse
+        // their storage instead of briefly retaining both generations.
+        cb[0].data.clear();
+        cb[0].data.extend(
+            sizes
+                .iter()
+                .map(|&size| Table::new(next_pow2(size as f64 * HASH_TABLE_FACTOR))),
+        );
+        if skip.is_none() {
+            seqs.soft_mask(soft_masking);
+            enum_seeds_hashed_unfiltered::<_, 4>(
+                seqs.seqs(),
+                &mut cb[0],
+                partition[0],
+                partition[1],
+                shapes,
+                reduction,
+            );
+        } else {
+            enum_seeds_block(seqs, &mut cb, &NO_FILTER, &cfg, &ctx)?;
+        }
         for table in &mut cb[0].data {
             table.finish();
         }

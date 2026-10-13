@@ -37,6 +37,48 @@ pub const MEGABYTES: usize = 1 << 20;
 pub const GIGABYTES: usize = 1 << 30;
 pub const KILOBYTES: usize = 1 << 10;
 
+/// Duplicate an inherited Windows standard handle into an owned `File`.
+///
+/// Opening `CONIN$`/`CONOUT$` addresses the console device rather than the
+/// process's inherited stream and therefore breaks pipes, redirection, and
+/// headless CI jobs. Duplicating the inherited handle matches Unix's
+/// `/dev/stdin` and `/dev/stdout` behavior while giving `FileSource` and
+/// `FileSink` an independently owned RAII handle.
+#[cfg(windows)]
+pub(crate) fn duplicate_standard_handle(which: u32) -> std::io::Result<StdFile> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{
+        DuplicateHandle, DUPLICATE_SAME_ACCESS, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::GetStdHandle;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: `GetStdHandle` returns a borrowed process handle. DuplicateHandle
+    // creates a distinct owned handle, which is transferred exactly once to
+    // `StdFile`; dropping the file cannot close the original standard stream.
+    unsafe {
+        let source = GetStdHandle(which);
+        if source.is_null() || source == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let process = GetCurrentProcess();
+        let mut duplicate = std::ptr::null_mut();
+        if DuplicateHandle(
+            process,
+            source,
+            process,
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(StdFile::from_raw_handle(duplicate))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IoError {
     UnsupportedOperation,
@@ -652,9 +694,13 @@ mod tests {
         assert!(!dir.is_empty());
 
         let mut tmp = TempFile::new(true).unwrap();
-        assert!(tmp.unlinked());
+        #[cfg(not(unix))]
+        let tmp_name = tmp.file_name().to_string();
+        assert_eq!(tmp.unlinked(), cfg!(unix));
         tmp.write_raw(b"x").unwrap();
         tmp.close().unwrap();
+        #[cfg(not(unix))]
+        std::fs::remove_file(tmp_name).unwrap();
     }
 
     #[test]
@@ -859,11 +905,13 @@ mod tests {
     #[test]
     fn test_input_file_from_unlinked_temp_file() {
         let mut tmp = TempFile::new(true).unwrap();
-        assert!(tmp.unlinked());
+        #[cfg(not(unix))]
+        let tmp_name = tmp.file_name().to_string();
+        assert_eq!(tmp.unlinked(), cfg!(unix));
         tmp.write_raw(b"hidden-temp").unwrap();
         let mut input = InputFile::from_temp_file(&mut tmp, 0, Compressor::None).unwrap();
         assert!(input.temp_file);
-        assert!(input.unlinked);
+        assert_eq!(input.unlinked, cfg!(unix));
         #[cfg(unix)]
         assert!(!std::path::Path::new(&input.file_name).exists());
         let mut buf = [0u8; 11];
@@ -871,6 +919,8 @@ mod tests {
         assert_eq!(&buf, b"hidden-temp");
         input.close().unwrap();
         tmp.close().unwrap();
+        #[cfg(not(unix))]
+        std::fs::remove_file(tmp_name).unwrap();
     }
 
     #[test]

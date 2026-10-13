@@ -43,19 +43,24 @@ This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 - **CLI**: Native Rust routes cover `blastp`, `blastx`, `makedb`, `dbinfo`, `getseq`, `makeidx`, `cluster`, `linclust`, `deepclust`, `merge-daa`, `view`, `test`, `version`, and help
 - **Validated parity**: The final 2026-10-06 matrix passed 164/164 tested search-sensitivity, scoring, clustering, and DAA producer/viewer cases against upstream DIAMOND 2.1.24. This is bounded evidence, not a claim that every DIAMOND option is translated or bug-free.
 - **Parallel**: Seed search uses rayon for multi-threaded processing
-- **SIMD**: SSE4.1/AVX2 dynamic-programming kernels and runtime-selected AVX-512 search workers on supported x86-64 hosts
+- **SIMD**: SSE4.1/AVX2 dynamic-programming and search kernels, plus translated and tested AVX-512 primitives; production stage-1 dispatch follows upstream's whole-worker ISA choice
 - **Portability target**: Native Linux, macOS, and Windows support; platform-specific low-level code must use each target's ABI and remain covered by CI
 - **Library API**: Core types, scoring matrices, DP kernels, FASTA parsing, and seed search
 - **Tests**: More than 1,600 self-contained Rust library tests plus CLI and integration suites; source-text audits and tests requiring an adjacent upstream checkout have been removed
 - **Deterministic statistics**: ALP and TANTAN use a specified Rust implementation of the established GNU 31-word additive RNG sequence, with the same output and `RAND_MAX` on every platform
-- **NCBI BLAST taxonomy reader**: SQLite-backed parent lookup (`taxonomy4blast.sqlite3`), scientific names (`names.dmp`), and ranks (`nodes.dmp`) are implemented natively. They are covered by synthetic fixtures and an ignored external-data gate against current NCBI artifacts, an NCBI `makeblastdb` volume, and byte-exact upstream taxonomy-field output. This reader is not yet wired into native `blastp`/`blastx`; the default packaged binary therefore does not support taxonomy-aware search output fields (`staxids`, `sscinames`, `slineages`, `sskingdoms`, `skingdoms`, and `sphylums`).
+- **Taxonomy infrastructure**: Native `makedb` writes upstream-exact accession mappings, nodes/ranks, and scientific names for `--taxonmap`/`--taxonnodes`/`--taxonnames`, using bounded external sorting. Native DMND `blastp` and `blastx` load that metadata and emit byte-exact `staxids`, `sscinames`, `slineages`, `sskingdoms`, `skingdoms`, and `sphylums` fields. NCBI BLAST-database search remains deliberately separate because pinned upstream crosses a documented undefined-behavior boundary there.
 
 ### Known limits
 
-- The exact-parity matrix covers the cases recorded in `VALIDATION_RESULTS.md`; `makeidx`, persistent-index consumption, nontrivial `merge-daa`, `getseq`, several search options/output fields, multi-file input, and compressed-input combinations still need upstream comparison. See `GAPS.md`.
+- The exact-parity matrix covers the cases recorded in `VALIDATION_RESULTS.md`.
+  Natural `makeidx`, `merge-daa`, `getseq`, and `dbinfo` comparisons now pass.
+  Native search also consumes persistent indexes, and the enumerated search
+  options/output fields, multi-file input, and compressed-input combinations
+  in `GAPS.md` now pass. Native DMND taxonomy construction/search also passes;
+  the explicitly listed advanced modes remain open.
 - Multi-query `json-flat` output intentionally reproduces upstream DIAMOND 2.1.24's missing separators. The resulting byte stream is not valid JSON. This inherited behavior is retained for exact parity and covered by regression evidence.
 - Native macOS and Windows CI/runtime evidence remains a release gate, particularly for RSS units and memory-limit spill decisions.
-- The optional C++ `ffi`/`--legacy` adapter is only a diagnostic for a source checkout containing the adjacent upstream `diamond/` tree. It is disabled by default, is not used by routine CI or benchmarks, and cannot be built from the packaged crate because that large source tree is intentionally excluded.
+- The optional C++ `ffi`/`--legacy` adapter is only a diagnostic for a source checkout containing the adjacent upstream `diamond/` tree. It is disabled by default and is not used by routine CI or benchmarks. In the packaged crate that large tree is intentionally excluded, so `--all-features` remains buildable but the adapter stays unavailable and `--legacy` reports that limitation.
 
 ## Building
 
@@ -81,7 +86,8 @@ cargo build --release
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 # From a repository checkout containing diamond/: build the non-Windows
-# C++ diagnostic backend. This does not work from a packaged crate.
+# C++ diagnostic backend. In a packaged crate the feature compiles as an
+# explicitly unavailable adapter because the upstream source tree is omitted.
 cargo build --features ffi
 ```
 
@@ -159,6 +165,161 @@ println!("E-value: {:.2e}, Bit score: {:.1}", evalue, bitscore);
 ## Benchmarks
 
 Original benchmark baseline: vendored upstream DIAMOND from `https://github.com/bbuchfink/diamond.git`, commit `1d162b4fefb5` (`v2.1.24-2-g1d162b4f-dirty`).
+
+### Current faithful-translation checkpoint (2026-10-12)
+
+The current optimization pass rotates across search, clustering, and DAA/view
+rather than tuning one command in isolation. Inputs below are natural,
+nonduplicated records or one contiguous genomic prefix. Runs were alternated
+and repeated where the table reports more than one run. `Speed` is C++ time
+divided by Rust time; `RSS ratio` is Rust divided by C++. Every reported output
+is byte-identical.
+
+| Workflow | Natural workload | Memory | Threads | Runs | C++ time | Rust time | Speed | C++ RSS | Rust RSS | RSS ratio | Parity |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| `blastx --mid-sensitive` | 1,000,000 contiguous *E. coli* nt vs 1,000 AMR proteins | 16G | 1 | 3 | 4.52 s | 3.47 s | 1.303x | 268,804 KiB | 188,920 KiB | 0.703x | PASS |
+| `blastx --mid-sensitive --min-orf 30` | same natural translated-search workload | 16G | 1 | 3 | 5.05 s | 4.34 s | 1.164x | 266,664 KiB | 188,568 KiB | 0.707x | PASS |
+| `blastx --mid-sensitive`, DAA output | same natural translated-search workload | 16G | 1 | 3 | 4.62 s | 3.62 s | 1.276x | 268,764 KiB | 188,564 KiB | 0.702x | PASS |
+| paired `blastx --mid-sensitive` | 5,000 natural SRR1703350 read pairs vs 7,000 AMR proteins; includes `full_qseq_mate` | 16G | 1 | 3 | 6.09 s | 5.64 s | 1.080x | 47,664 KiB | 49,716 KiB | 1.043x | PASS |
+| paired `blastx --mid-sensitive` | same paired workload | 16G | 4 | 3 | 2.64 s | 2.30 s | 1.148x | 62,824 KiB | 53,580 KiB | 0.853x | PASS |
+| `blastp --ultra-sensitive` | 300 distinct AMR queries vs 1,000 AMR proteins | 16G | 1 | 3 | 17.04 s | 15.88 s | 1.073x | 29,160 KiB | 20,944 KiB | 0.718x | PASS |
+| `blastp --very-sensitive` | 300 distinct AMR queries vs 1,000 AMR proteins | 16G | 1 | 3 | 3.99 s | 3.96 s | 1.008x | 25,252 KiB | 18,444 KiB | 0.730x | PASS |
+| `blastp --very-sensitive` | 1,200 disjoint AMR queries vs 1,000 AMR proteins | 16G | 4 | 3 | 4.60 s | 4.52 s | 1.018x | 50,188 KiB | 42,020 KiB | 0.837x | PASS |
+| `blastp --sensitive` | 2,000 disjoint AMR queries vs 4,000 AMR proteins | 0G | 4 | 3 | 27.36 s | 27.85 s | 0.982x | 94,120 KiB | 69,588 KiB | 0.739x | PASS |
+| `blastp --sensitive` | 2,000 disjoint AMR queries vs 4,000 AMR proteins | Rust 64M delayed spill | 4 | 3 | 27.59 s | 27.41 s | 1.007x | 92,716 KiB | 71,148 KiB | 0.767x | PASS |
+| `blastp --target-indexed -c1` | 300 natural AMR queries vs 7,000 targets | C++ `--hit-membuf`, Rust 16G | 1 | 3 | 4.30 s | 4.18 s | 1.029x | 58,848 KiB | 56,776 KiB | 0.965x | PASS |
+| `blastp --target-indexed -c1` | 300 natural AMR queries vs 7,000 targets | Rust 0G | 1 | 3 | 4.28 s | 4.34 s | 0.986x | 46,732 KiB | 46,404 KiB | 0.993x | PASS |
+| `cluster` | 4,000 distinct AMR proteins | n/a | 1 | 3 | 5.48 s | 5.36 s | 1.022x | 25,820 KiB | 18,632 KiB | 0.722x | PASS |
+| `cluster --cluster-steps faster_lin fast_lin default` | 4,000 distinct AMR proteins | n/a | 1 | 3 | 2.49 s | 2.29 s | 1.087x | 23,160 KiB | 17,304 KiB | 0.747x | PASS |
+| `cluster --mutual-cover 80` | 4,000 distinct AMR proteins | n/a | 1 | 3 | 7.19 s | 7.35 s | 0.978x | 23,156 KiB | 18,740 KiB | 0.809x | PASS |
+| `cluster --evalue 1e-20` | 4,000 distinct AMR proteins | n/a | 1 | 3 | 5.38 s | 5.29 s | 1.017x | 25,992 KiB | 17,816 KiB | 0.685x | PASS |
+| `cluster --matrix pam250` | 500 distinct AMR proteins | n/a | 1 | 3 | 1.93 s | 1.86 s | 1.038x | 28,112 KiB | 7,680 KiB | 0.273x | PASS |
+| `cluster` | 4,000 distinct AMR proteins | n/a | 4 | 3 | 3.03 s | 2.63 s | 1.152x | 80,184 KiB | 20,552 KiB | 0.256x | PASS |
+| `linclust` | 10,000 distinct AMR proteins | n/a | 1 | 3 | 2.93 s | 2.79 s | 1.050x | 35,932 KiB | 34,104 KiB | 0.949x | PASS |
+| `linclust` | 10,000 distinct AMR proteins | n/a | 4 | 3 | 1.37 s | 1.02 s | 1.343x | 59,588 KiB | 40,360 KiB | 0.677x | PASS |
+| `deepclust` | 4,000 distinct AMR proteins | n/a | 1 | 3 | 9.21 s | 8.90 s | 1.035x | 27,912 KiB | 17,152 KiB | 0.615x | PASS |
+| `makedb` | 574,627 natural Swiss-Prot records | n/a | 1 | 3 | 16.34 s | 15.83 s | 1.032x | 402,172 KiB | 350,720 KiB | 0.872x | PASS |
+| `makedb` | 89 MiB gzip, 574,627 natural Swiss-Prot records | n/a | default (40) | 3 | 6.38 s | 4.10 s | 1.556x | 552,272 KiB | 379,412 KiB | 0.687x | PASS |
+| `makedb --taxonmap` | 150,000 contiguous natural Swiss-Prot records and header-derived taxids | n/a | 1 | 3 | 4.39 s | 4.46 s | 0.984x | 126,172 KiB | 105,600 KiB | 0.837x | PASS |
+| `makeidx` | 150,000 distinct Swiss-Prot records, 129 MiB index | n/a | 1 | 3 | 8.93 s | 8.88 s | 1.006x | 394,972 KiB | 349,760 KiB | 0.886x | PASS |
+| `makeidx` | 150,000 distinct Swiss-Prot records, 129 MiB index | n/a | default (40) | 3 | 7.45 s | 7.61 s | 0.979x | 394,968 KiB | 347,236 KiB | 0.879x | PASS |
+| `getseq` | 280 MiB Swiss-Prot database, full 274 MiB FASTA | n/a | 1 | 3 | 3.48 s | 3.03 s | 1.149x | 137,740 KiB | 3,200 KiB | 0.023x | PASS |
+| `merge-daa` | two disjoint 1,500-query natural DAAs, 509 MiB merged output | n/a | 1 | 3 | 6.02 s | 4.50 s | 1.338x | 210,416 KiB | 9,656 KiB | 0.046x | PASS |
+| `view -f 0` | 23 MiB upstream DAA, 101 MiB pairwise output | n/a | 1 | 5 | 1.11 s | 1.04 s | 1.067x | 102,720 KiB | 5,120 KiB | 0.050x | PASS |
+| `view -f 6` | 509 MiB natural DAA, output to `/dev/null` | n/a | 1 | 3 | 0.70 s | 0.56 s | 1.250x | 111,416 KiB | 6,172 KiB | 0.055x | PASS |
+| `view -f 6` | 509 MiB natural DAA, output to `/dev/null` | n/a | 4 | 3 | 0.44 s | 0.27 s | 1.630x | 169,580 KiB | 14,144 KiB | 0.083x | PASS |
+| `view -f 6` | 509 MiB natural DAA, output to `/dev/null` | n/a | 40 (default) | 3 | 1.11 s | 0.81 s | 1.370x | 459,716 KiB | 41,728 KiB | 0.091x | PASS |
+| `view -f null` | 509 MiB natural DAA | n/a | 1 | 3 | 0.54 s | 0.26 s | 2.077x | 93,548 KiB | 29,348 KiB | 0.314x | PASS |
+| `view -f null` | 509 MiB natural DAA | n/a | 4 | 3 | 0.46 s | 0.21 s | 2.190x | 147,580 KiB | 30,544 KiB | 0.207x | PASS |
+| `view -f 103` (PAF) | 509 MiB natural DAA, output to `/dev/null` | n/a | 1 | 3 | 0.69 s | 0.41 s | 1.683x | 114,020 KiB | 33,592 KiB | 0.295x | PASS |
+| `view -f 103` (PAF) | 509 MiB natural DAA, output to `/dev/null` | n/a | 4 | 3 | 0.42 s | 0.21 s | 2.000x | 169,664 KiB | 40,340 KiB | 0.238x | PASS |
+
+The one-thread seed-array translation had counted every seed once per index
+chunk. Upstream builds one histogram per shape and performs only the chunk
+fill passes; restoring that boundary reduced the 250 kb translated-search
+case from 1.49 s to 0.93 s. A later shared hash-join fidelity fix restored
+full 32-bit seed equality instead of equating only extracted bucket bits. The
+current one-thread rows above are exact and faster than upstream.
+The latest stage-1 pass keeps upstream-style absolute locations through the
+Hamming filter and decodes record-local coordinates only for surviving hits.
+On the natural delayed-spill scout this is 5.0% faster with 1.4% lower RSS;
+cross-command controls also improve paired four-thread `blastx`, one-thread
+ultra-sensitive `blastp`, and `linclust`. A separate contiguous `blastx`
+control varied 1.4% in the other direction, below the material threshold.
+The subsequent multithread translation now computes upstream's complete
+worker-by-shape seed histogram once before the shape/chunk loop. Reusing its
+stable worker ranges removes three redundant count passes per chunk without
+changing seed order. Paired four-thread `blastx` improves from 3.04 to 2.30 s
+in exact Rust A/B runs, and the delayed-spill row reaches runtime parity while
+retaining substantially lower RSS.
+Pairwise view now writes alignment characters as bytes, matching upstream's
+text-buffer path instead of routing each character through generic formatting.
+Upstream has no corresponding memory-limit option and uses its normal
+temporary-file hit path in both target-indexed rows. Rust's default 16G row
+retains hits in memory; forcing `0G` removes about 18 MiB and now matches
+upstream RSS. The remaining default-memory excess is the intentional in-memory
+hit store; the current target-indexed runtime is at parity in both the default
+and forced-disk rows above.
+
+The utility/view rotation also used a 509 MiB DAA produced from 3,000 distinct
+AMRFinderPlus queries against 7,000 distinct targets with unlimited reporting
+(`-k 0`). Both viewers emitted the same 1,678,045 rows (458 MiB), SHA-256
+`cf0162c04c022c78f110c8f6b9f073f9253343ac032f60f935044d2314b72dd8`.
+This found and fixed a real CLI-boundary error where Rust interpreted `-k 0`
+as zero results instead of unlimited results. A separate native `blastp -k 0`
+check passes byte-for-byte at one and four threads. The original performance
+comparison accidentally contrasted upstream's default 40-worker ordered
+viewer with a serial Rust viewer because Rust ignored `--threads`. Rust now
+uses an ordered producer/consumer pipeline capped at 32 resident query records
+and keeps a direct streaming path for one thread. Three compute-focused
+alternating runs for each thread count are in the table above. Rust is faster
+at four threads and at the host default while using 0.083x and 0.091x upstream
+RSS, respectively. Complete file output remains byte-identical in all three
+modes.
+
+A controlled Rust-to-Rust follow-up restored upstream's reusable per-query
+match context: the previous implementation cloned all query frames, titles,
+and the packed transcript for every output row. Three alternating pairs on the
+same 509 MiB archive improved the median from 7.59 s to 6.99 s (1.086x) and
+reduced median RSS from 6,508 to 6,252 KiB, with the same output hash.
+
+The four-thread forced-disk sensitive row was the largest search offender.
+Restoring upstream's 1024-target Hamming tile and query-major stage-2 handoff
+first reduced Rust from 34.08 s to about 32.6 s. A subsequent profile showed
+that Rust mixed an AVX-512 fingerprint sub-kernel into a worker for which the
+upstream dispatcher selected `ARCH_AVX2`. Selecting the whole AVX2 stage-1
+path initially reduced the Rust median to 29.48 s. A later profile found that
+Rust materialized a 32-byte `SeedMatch` for every Hamming survivor, whereas
+upstream passes compact target indices directly from its hit field to the
+per-query stage-2 worker. Restoring that boundary first gave medians of 27.44 s
+upstream and 31.32 s Rust. A matched profile then exposed another literal
+translation mismatch: upstream loads the final partial left-most-filter block
+as a complete 16-byte SIMD vector from delimiter-padded sequence storage and
+masks the unused lanes, whereas Rust scalarized every partial tail. Restoring
+the full-block loads and fusing the SSSE3 reduction for the complete window
+gives current medians of 27.36 s upstream and 27.85 s Rust while Rust uses
+26.1% less RSS. All six outputs have SHA-256
+`18c53b2d8afc218482cd9836e778f530964ab3ee39c3f27f130a3bbbacca63ad`.
+
+The post-change clustering matrix separately passes 18/18 exact comparisons.
+On its realistic 500-protein rows, Rust ranges from 0.928x to 2.273x C++/Rust
+speed and uses 0.169x--0.396x upstream RSS. These are single-run scouting
+measurements, not stable benchmark claims; they establish that clustering is
+not the current worst offender.
+
+A larger clustering rotation subsequently exposed a scale-dependent
+translation error hidden by the 500-protein scout. Rust constructed the
+immutable query-length `KmerRanking` inside every joined seed bucket, whereas
+upstream constructs it once per shape and shares it across partition workers.
+On 4,000 distinct AMRFinderPlus proteins this made one-thread `cluster` take
+about 9.0 s. Restoring the upstream lifetime reduces the three-run Rust median
+to 6.00 s versus 5.56 s upstream; at four threads Rust is faster, 2.78 s versus
+2.95 s. All six outputs have the same SHA-256 and Rust uses less RSS in both
+rows. Natural `linclust` and `deepclust` controls are also byte-identical.
+A later faithful weight-12 seed extractor removes per-letter checked indexing;
+fresh complete medians are now 5.48/5.36 s upstream/Rust at one thread and
+3.03/2.63 s at four threads, with the exact same cluster output.
+
+The next rotation profiled `linclust`'s faster-mode sketch construction. Rust
+faithfully reproduced libstdc++'s unstable full sort because equal hashes at
+the bottom-N cutoff can select different seed positions, but sorting every
+candidate dominated the translated implementation even though only 21 are
+retained. Rust now finds the exact cutoff first, sorts only the retained set
+when the boundary is unambiguous, and falls back to the libstdc++-exact full
+sort whenever an equal-hash group straddles the cutoff. On 7,000 natural
+records this reduced Rust from 2.88 s to a 2.14 s median without changing raw
+or retained seed counts. The 10,000-record rows above use two disjoint natural
+AMR sets, have identical output SHA-256
+`a6ea9d7874b51508bc61a3cd5e2794bace72170facf76f01d8d918f64136b48c`,
+and provide the heavier single-thread acceptance workload.
+
+A later bounded one-thread pass revisited motif membership after the
+surrounding seed-path changes. Rust's keyed SipHash did not match upstream's
+direct hash of the encoded `u64` k-mer; a table-local identity hasher restores
+that boundary. Five paired Rust A/B runs retain the output hash above and
+improve the median from 2.90 to 2.86 seconds (1.4%) with flat RSS. Fresh
+whole-command medians against upstream are shown in the table. The small fix
+is retained, and the rotation moved on rather than extending it.
 
 ### Native-ABI reduction regression gate
 
@@ -242,10 +403,10 @@ workflow, so the apples-to-apples commands below use normal upstream `blastp`
 and Rust `blastp --memory-limit 0G`. Zero enters disk mode before stage 1.
 
 These are medians of alternating-order runs on independent, non-synthetic
-protein datasets. Both implementations were built for the host CPU. The C++
-build uses `-march=native`; the Rust benchmark build uses
-`-C target-cpu=native` but keeps general code at AVX2 on x86. Rust then
-runtime-selects its explicitly specialized AVX-512 search workers. This keeps
+protein datasets. The C++ build uses `-march=native`; the Rust benchmark
+harness uses `-C target-cpu=x86-64-v3` on x86-64. Translated AVX-512
+primitives remain directly tested, while production stage 1 selects the whole
+AVX2 worker chosen by the pinned upstream dispatcher. This keeps
 the long score/trace loops at the same AVX2 tier as upstream instead of letting
 LLVM's extended EVEX register allocation lower their sustained clock. Rust's
 release profile uses ThinLTO with one codegen unit. The same pinned CPUs were
@@ -409,6 +570,18 @@ byte-identical (SHA-256 `6ea16d64c71f833970aa8f045adbf0cd22a35c2706c69cebbc883f0
 | `--memory-limit 64M` | 1 | 3 | 20.10 s | 19.19 s | 1.047x | 54,024 KiB | 62,592 KiB | 1.159x | PASS |
 | `--memory-limit 64M` | 4 | 3 | 5.12 s | 5.85 s | 0.875x | 65,824 KiB | 66,996 KiB | 1.018x | PASS |
 
+A 2026-10-12 refresh used the same natural 2,000 by 4,000 workload at
+`--sensitive -p4`, with substantially more steady-state work than the earlier
+table. An intermediate checkpoint measured 27.53 s upstream versus 29.59 s
+Rust while Rust crossed the 64 MiB soft limit, spilled 1,594,528 retained hits,
+and read back 37.5 MiB of compressed data. The later stage-1 histogram and SIMD
+translation closed that gap: the current three-run medians are 27.59 s
+upstream and 27.41 s Rust at 92,716 and 71,148 KiB respectively. All outputs
+contain 41,556 rows and are byte-identical (SHA-256
+`18c53b2d8afc218482cd9836e778f530964ab3ee39c3f27f130a3bbbacca63ad`).
+Artifacts are under `.tmp/spill64-refresh/runs/` and
+`.tmp/blastx-histogram-reuse-20261012/`.
+
 ### Native blastx comparison
 
 The translated-search comparison uses one natural contiguous 250,000 nt
@@ -527,7 +700,7 @@ src/
 The DP kernels and search workers use `std::arch` intrinsics with runtime detection:
 - **SSE4.1**: 16-way parallel ungapped scoring
 - **AVX2**: 32-way parallel ungapped scoring
-- **AVX-512BW**: Specialized seed-search workers when the host supports them
+- **AVX-512BW**: Translated/tested seed-search primitives; production uses them only when the whole upstream-equivalent worker selects that ISA
 - **Scalar fallback**: Works on all platforms
 
 ## Citation

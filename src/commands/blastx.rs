@@ -1,4 +1,4 @@
-use std::io::{self, BufWriter, Write};
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -45,6 +45,7 @@ pub struct BlastxConfig {
     pub ungapped_xdrop_bits: f64,
     pub memory_limit: Option<u64>,
     pub tmpdir: PathBuf,
+    pub target_indexed: bool,
 }
 
 /// Run blastx — translated DNA search against protein database.
@@ -65,12 +66,11 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
         }
     };
 
-    // Load query DNA sequences
-    let mut dna_records = Vec::new();
-    for qf in &config.query_files {
-        let records = fasta::read_fasta_file(Path::new(qf), SequenceType::Nucleotide)?;
-        dna_records.extend(records);
-    }
+    // Upstream FastaFile round-robins two blastx inputs, producing
+    // R1[0], R2[0], R1[1], R2[1], ... and rejects unsynchronised files.
+    // This ordering is observable in output and is also what makes adjacent
+    // source-query ordinals mates for `full_qseq_mate`.
+    let (dna_records, paired) = load_query_records(&config.query_files)?;
     eprintln!("Queries: {} DNA sequences", dna_records.len());
 
     // Translate to protein in all 6 frames. Each frame becomes a private
@@ -97,6 +97,7 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
             id: dna_short.clone(),
             dna_len,
             sequence: dna_rec.sequence,
+            mate_index: paired.then_some(dna_index ^ 1),
         });
 
         for (frame_idx, frame_seq) in frames.iter().enumerate() {
@@ -159,58 +160,58 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
         ungapped_xdrop_bits: config.ungapped_xdrop_bits,
         memory_limit: config.memory_limit,
         tmpdir: config.tmpdir.clone(),
+        target_indexed: config.target_indexed,
         translated_query_layout: Some(TranslatedQueryLayout {
             sources: translated_sources,
         }),
     };
 
-    // The native blastp front end currently accepts FASTA paths, so use a
-    // temporary translated-query file for the internal handoff.
-    // Write translated sequences to a temporary handoff file and run blastp.
-    let temp_tag = format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let temp_dir = if config.tmpdir.as_os_str().is_empty() {
-        std::env::temp_dir()
-    } else {
-        config.tmpdir.clone()
-    };
-    let tmp_query = temp_dir.join(format!("diamond_blastx_query_{temp_tag}.faa"));
     let translated_frame_count = protein_records.len();
     eprintln!(
         "Translated {dna_query_count} DNA queries into {translated_frame_count} protein frames in {:.1}s",
         start.elapsed().as_secs_f64()
     );
-    {
-        let mut f = BufWriter::new(std::fs::File::create(&tmp_query)?);
-        for rec in &protein_records {
-            writeln!(f, ">{}", rec.id)?;
-            for chunk in rec.sequence.chunks(60) {
-                for &l in chunk {
-                    let idx = (l & 0x1F) as usize;
-                    if idx < crate::basic::value::AMINO_ACID_ALPHABET.len() {
-                        f.write_all(&[crate::basic::value::AMINO_ACID_ALPHABET[idx]])?;
-                    }
-                }
-                writeln!(f)?;
-            }
+    crate::commands::blastp::run_with_query_records(&blastp_config, protein_records)
+}
+
+fn load_query_records(paths: &[String]) -> io::Result<(Vec<FastaRecord>, bool)> {
+    match paths {
+        [] => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "blastx requires a query file",
+        )),
+        [path] => Ok((
+            fasta::read_fasta_file(Path::new(path), SequenceType::Nucleotide)?,
+            false,
+        )),
+        [left, right] => {
+            let left = fasta::read_fasta_file(Path::new(left), SequenceType::Nucleotide)?;
+            let right = fasta::read_fasta_file(Path::new(right), SequenceType::Nucleotide)?;
+            Ok((interleave_paired_records(left, right)?, true))
         }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "A maximum of 2 query files is supported in blastx mode.",
+        )),
     }
-    // The inner blastp reader owns the translated sequences from here. Do not
-    // retain a second in-memory copy throughout seeding and extension.
-    drop(protein_records);
+}
 
-    let mut bp_config = blastp_config;
-    bp_config.query_files = vec![tmp_query.to_string_lossy().to_string()];
-    let result = crate::commands::blastp::run(&bp_config);
-
-    let _ = std::fs::remove_file(&tmp_query);
-    result
+fn interleave_paired_records(
+    left: Vec<FastaRecord>,
+    right: Vec<FastaRecord>,
+) -> io::Result<Vec<FastaRecord>> {
+    if left.len() != right.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unequal number of sequences in paired read files.",
+        ));
+    }
+    let mut records = Vec::with_capacity(left.len().saturating_mul(2));
+    for (left, right) in left.into_iter().zip(right) {
+        records.push(left);
+        records.push(right);
+    }
+    Ok(records)
 }
 
 fn min_orf_len(run_len: u32, length: usize) -> u32 {
@@ -229,6 +230,38 @@ fn min_orf_len(run_len: u32, length: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(id: &str, base: Letter) -> FastaRecord {
+        FastaRecord {
+            id: id.to_owned(),
+            sequence: vec![base],
+        }
+    }
+
+    #[test]
+    fn paired_query_records_are_round_robin_interleaved_like_upstream() {
+        let records = interleave_paired_records(
+            vec![record("r1/1", 0), record("r2/1", 1)],
+            vec![record("r1/2", 2), record("r2/2", 3)],
+        )
+        .unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["r1/1", "r1/2", "r2/1", "r2/2"]
+        );
+    }
+
+    #[test]
+    fn paired_query_records_reject_unequal_counts_like_upstream() {
+        let error = interleave_paired_records(vec![record("r1/1", 0)], Vec::new()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Unequal number of sequences in paired read files."
+        );
+    }
 
     #[test]
     fn test_blastx_translation() {

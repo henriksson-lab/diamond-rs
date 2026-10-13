@@ -69,6 +69,43 @@ impl<'a, const K: usize> KmerIterator<'a, K, IdentityReduction> {
     pub fn new(seq: Sequence<'a>) -> Self {
         Self::with_reduction(seq, IdentityReduction)
     }
+
+    /// Advance an identity-reduced iterator with the alphabet size and k-mer
+    /// width visible as compile-time constants. This is the same operation as
+    /// `increment`, but mirrors the C++ template specialization closely enough
+    /// for LLVM to strength-reduce `% 20^(K-1)` instead of emitting a hardware
+    /// division through the runtime `mod_` field.
+    #[inline]
+    pub fn increment_identity(&mut self) -> &mut Self {
+        self.kmer.code %= const_power(TRUE_AA as u64, K - 1);
+        let mut n = K - 1;
+        loop {
+            self.ptr += 1;
+            if self.ptr == self.end {
+                return self;
+            }
+            let l = letter_mask(self.seq[self.ptr as usize]) as u64;
+            if l < TRUE_AA as u64 {
+                self.kmer.code = self.kmer.code * TRUE_AA as u64 + l;
+                n += 1;
+            } else {
+                self.kmer.code = 0;
+                n = 0;
+            }
+            if n >= K {
+                return self;
+            }
+        }
+    }
+}
+
+const fn const_power(base: u64, mut exponent: usize) -> u64 {
+    let mut result = 1;
+    while exponent != 0 {
+        result *= base;
+        exponent -= 1;
+    }
+    result
 }
 
 impl<'a, const K: usize, R> KmerIterator<'a, K, R>
@@ -170,6 +207,24 @@ mod tests {
         assert_eq!(it.offset_from_start(), 1);
         it.increment();
         assert!(!it.good());
+    }
+
+    #[test]
+    fn identity_specialization_matches_generic_iterator() {
+        let data = vec![0, 1, 2, 3, MASK_LETTER, 4, 5, 6, 7, 8, 9, 10, 11];
+        let seq = Sequence::new(&data);
+        let mut generic = KmerIterator::<3>::new(seq);
+        let mut specialized = KmerIterator::<3>::new(seq);
+        loop {
+            assert_eq!(specialized.good(), generic.good());
+            assert_eq!(specialized.get(), generic.get());
+            assert_eq!(specialized.offset_from_start(), generic.offset_from_start());
+            if !generic.good() {
+                break;
+            }
+            generic.increment();
+            specialized.increment_identity();
+        }
     }
 
     #[test]

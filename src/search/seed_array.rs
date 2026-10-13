@@ -20,9 +20,9 @@ use crate::search::seed_match::SeedMatch;
 pub struct SeedEntry {
     /// Seed key with low seedp_bits removed (the "offset" part).
     pub key: u32,
-    /// Global location in the sequence set, using unpadded cumulative sequence
-    /// lengths. This preserves `(seq_id, pos)` ordering while keeping each seed
-    /// entry at 8 bytes instead of 12.
+    /// Absolute location in the padded `SequenceSet` backing store. This is
+    /// upstream's pointer-relative location: records are separated by one
+    /// delimiter and the first record starts after the perimeter padding.
     pub loc: u32,
 }
 
@@ -33,10 +33,19 @@ pub struct SeedArray {
     data: Vec<SeedEntry>,
     /// offsets[p] = start index of partition p in data. Length = num_partitions + 1.
     offsets: Vec<usize>,
-    /// Sequence start offsets for decoding `SeedEntry::loc`.
+    /// Absolute sequence starts for decoding `SeedEntry::loc`.
     seq_offsets: Vec<u32>,
     /// Number of partition bits.
     pub seedp_bits: i32,
+}
+
+/// Upstream `SeedHistogram` counts for one shape, retaining the sequence
+/// partition that produced each count.  The worker dimension is required to
+/// derive disjoint fill cursors without atomics while preserving record order.
+pub struct WorkerPartitionCounts {
+    worker_counts: Vec<Vec<usize>>,
+    sequence_count: usize,
+    num_partitions: usize,
 }
 
 /// Match upstream `enum_seeds`: reduce a complete sequence once, then extract
@@ -53,15 +62,73 @@ fn reduce_seed_sequence_into(seq: &[Letter], reduction: &Reduction, out: &mut Ve
 impl SeedArray {
     fn sequence_offsets(seqs: &[&[Letter]]) -> Vec<u32> {
         let mut offsets = Vec::with_capacity(seqs.len() + 1);
-        let mut total = 0usize;
-        offsets.push(0);
+        let mut total = crate::data::sequence_set::LetterStringSet::PERIMETER_PADDING;
+        offsets.push(u32::try_from(total).expect("seed array compact location overflow"));
         for seq in seqs {
             total = total
-                .checked_add(seq.len())
+                .checked_add(seq.len() + 1)
                 .expect("sequence set length overflow");
             offsets.push(u32::try_from(total).expect("seed array compact location overflow"));
         }
         offsets
+    }
+
+    /// Compute the upstream block histogram for every shape in one traversal.
+    /// Reduction is shared across shapes for each record, matching
+    /// `SeedHistogram(... serial=false)` and its multi-shape `enum_seeds`.
+    pub fn count_partitions_by_worker_all_shapes(
+        seqs: &[&[Letter]],
+        shapes: &[Shape],
+        reduction: &Reduction,
+        seedp_bits: i32,
+        min_query_len: usize,
+    ) -> Vec<WorkerPartitionCounts> {
+        use rayon::prelude::*;
+
+        let num_partitions = seed::seedp_count(seedp_bits) as usize;
+        let mask = seed::seedp_mask(seedp_bits);
+        let worker_count = rayon::current_num_threads().min(seqs.len().max(1));
+        let worker_range = |worker: usize| {
+            let begin = worker * seqs.len() / worker_count;
+            let end = (worker + 1) * seqs.len() / worker_count;
+            begin..end
+        };
+        let by_worker: Vec<Vec<Vec<usize>>> = (0..worker_count)
+            .into_par_iter()
+            .map(|worker| {
+                let mut counts = vec![vec![0usize; num_partitions]; shapes.len()];
+                let mut reduced = Vec::new();
+                for seq in &seqs[worker_range(worker)] {
+                    reduce_seed_sequence_into(seq, reduction, &mut reduced);
+                    for (shape_id, shape) in shapes.iter().enumerate() {
+                        if seq.len() < min_query_len || seq.len() < shape.length as usize {
+                            continue;
+                        }
+                        let last = seq.len() - shape.length as usize;
+                        for pos in 0..=last {
+                            if let Some(value) = shape.set_seed_reduced(
+                                &reduced[pos..pos + shape.length as usize],
+                                reduction,
+                            ) {
+                                counts[shape_id][seed::seed_partition(value, mask) as usize] += 1;
+                            }
+                        }
+                    }
+                }
+                counts
+            })
+            .collect();
+
+        (0..shapes.len())
+            .map(|shape_id| WorkerPartitionCounts {
+                worker_counts: by_worker
+                    .iter()
+                    .map(|worker| worker[shape_id].clone())
+                    .collect(),
+                sequence_count: seqs.len(),
+                num_partitions,
+            })
+            .collect()
     }
 
     #[inline]
@@ -641,6 +708,7 @@ impl SeedArray {
         let num_partitions = seed::seedp_count(seedp_bits) as usize;
         let mask = seed::seedp_mask(seedp_bits);
         let shape_length = shape.length as usize;
+        let raw_weight12 = shape.weight == 12 && reduction.size() == 10;
         let mut counts = vec![0usize; num_partitions];
         let mut reduced = Vec::new();
         for seq in seqs {
@@ -661,10 +729,16 @@ impl SeedArray {
             };
             let last = slen - shape_length;
             for pos in 0..=last {
-                let window = &seed_seq[pos..pos + shape_length];
                 let seed = if complexity_cut > 0.0 {
+                    let window = &seed_seq[pos..pos + shape_length];
                     shape.set_seed_with_complexity(window, reduction, complexity_cut)
+                } else if raw_weight12 {
+                    // SAFETY: `slen >= shape_length`, `pos <= last`, and the
+                    // reduced buffer has exactly `slen` entries. Shape's
+                    // selected positions are all below `shape_length`.
+                    unsafe { shape.set_seed_reduced_12_unchecked(seed_seq.as_ptr().add(pos)) }
                 } else {
+                    let window = &seed_seq[pos..pos + shape_length];
                     shape.set_seed_reduced(window, reduction)
                 };
                 if let Some(seed) = seed {
@@ -692,6 +766,7 @@ impl SeedArray {
         debug_assert!(partition_end <= num_partitions);
         let mask = seed::seedp_mask(seedp_bits);
         let shape_length = shape.length as usize;
+        let raw_weight12 = shape.weight == 12 && reduction.size() == 10;
         let seq_offsets = Self::sequence_offsets(seqs);
 
         let mut offsets = vec![0usize; num_partitions + 1];
@@ -726,8 +801,16 @@ impl SeedArray {
             let last = slen - shape_length;
             let seq_offset = seq_offsets[seq_id];
             for pos in 0..=last {
-                let window = &reduced[pos..pos + shape_length];
-                if let Some(seed) = shape.set_seed_reduced(window, reduction) {
+                let seed = if raw_weight12 {
+                    // SAFETY: `slen >= shape_length`, `pos <= last`, and the
+                    // reduced buffer has exactly `slen` entries. Shape's
+                    // selected positions are all below `shape_length`.
+                    unsafe { shape.set_seed_reduced_12_unchecked(reduced.as_ptr().add(pos)) }
+                } else {
+                    let window = &reduced[pos..pos + shape_length];
+                    shape.set_seed_reduced(window, reduction)
+                };
+                if let Some(seed) = seed {
                     let partition = seed::seed_partition(seed, mask) as usize;
                     if partition < partition_begin || partition >= partition_end {
                         continue;
@@ -756,6 +839,138 @@ impl SeedArray {
         }
 
         SeedArray {
+            data,
+            offsets,
+            seq_offsets,
+            seedp_bits,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_partition_range_from_worker_counts_reuse(
+        seqs: &[&[Letter]],
+        shape: &Shape,
+        reduction: &Reduction,
+        seedp_bits: i32,
+        min_query_len: usize,
+        partition_begin: usize,
+        partition_end: usize,
+        histogram: &WorkerPartitionCounts,
+        mut data: Vec<SeedEntry>,
+    ) -> Self {
+        use rayon::prelude::*;
+
+        let num_partitions = seed::seedp_count(seedp_bits) as usize;
+        assert_eq!(histogram.sequence_count, seqs.len());
+        assert_eq!(histogram.num_partitions, num_partitions);
+        let worker_count = histogram.worker_counts.len();
+        assert_eq!(
+            worker_count,
+            rayon::current_num_threads().min(seqs.len().max(1)),
+            "seed histogram worker partition changed before fill"
+        );
+        let worker_range = |worker: usize| {
+            let begin = worker * seqs.len() / worker_count;
+            let end = (worker + 1) * seqs.len() / worker_count;
+            begin..end
+        };
+        let mask = seed::seedp_mask(seedp_bits);
+        let shape_length = shape.length as usize;
+        let raw_weight12 = shape.weight == 12 && reduction.size() == 10;
+        let seq_offsets = Self::sequence_offsets(seqs);
+
+        let mut totals = vec![0usize; num_partitions];
+        for worker in &histogram.worker_counts {
+            for (total, &count) in totals.iter_mut().zip(worker) {
+                *total = total
+                    .checked_add(count)
+                    .expect("seed array partition size overflow");
+            }
+        }
+        let mut offsets = vec![0usize; num_partitions + 1];
+        let mut total = 0usize;
+        for partition in 0..num_partitions {
+            if partition >= partition_begin && partition < partition_end {
+                total = total
+                    .checked_add(totals[partition])
+                    .expect("seed array partition size overflow");
+            }
+            offsets[partition + 1] = total;
+        }
+
+        // Prefix each worker by all preceding workers in the same partition,
+        // exactly like upstream `build_iterators`. Filling workers in parallel
+        // therefore retains sequence order without atomics or a merge copy.
+        let mut worker_cursors = Vec::with_capacity(worker_count);
+        let mut next = offsets[..num_partitions].to_vec();
+        for counts in &histogram.worker_counts {
+            worker_cursors.push(next.clone());
+            for partition in partition_begin..partition_end {
+                next[partition] += counts[partition];
+            }
+        }
+        data.clear();
+        if data.capacity() < total {
+            data.reserve_exact(total);
+        }
+        let data_ptr = data.as_mut_ptr() as usize;
+        let final_cursors: Vec<Vec<usize>> = worker_cursors
+            .into_par_iter()
+            .enumerate()
+            .map(|(worker, mut cursors)| {
+                let mut reduced = Vec::new();
+                for seq_id in worker_range(worker) {
+                    let seq = seqs[seq_id];
+                    if seq.len() < min_query_len || seq.len() < shape_length {
+                        continue;
+                    }
+                    reduce_seed_sequence_into(seq, reduction, &mut reduced);
+                    let last = seq.len() - shape_length;
+                    for pos in 0..=last {
+                        let seed = if raw_weight12 {
+                            // SAFETY: `pos..pos+shape_length` is in `reduced`.
+                            unsafe {
+                                shape.set_seed_reduced_12_unchecked(reduced.as_ptr().add(pos))
+                            }
+                        } else {
+                            shape.set_seed_reduced(&reduced[pos..pos + shape_length], reduction)
+                        };
+                        if let Some(seed) = seed {
+                            let partition = seed::seed_partition(seed, mask) as usize;
+                            if partition < partition_begin || partition >= partition_end {
+                                continue;
+                            }
+                            let index = cursors[partition];
+                            cursors[partition] += 1;
+                            // SAFETY: histogram prefixes assign every worker a
+                            // disjoint exact range inside the initialized chunk.
+                            unsafe {
+                                std::ptr::write(
+                                    (data_ptr as *mut SeedEntry).add(index),
+                                    SeedEntry {
+                                        key: seed::seed_partition_offset(seed, seedp_bits as u64)
+                                            as u32,
+                                        loc: seq_offsets[seq_id] + pos as u32,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                cursors
+            })
+            .collect();
+        for partition in partition_begin..partition_end {
+            assert_eq!(
+                final_cursors
+                    .last()
+                    .map_or(offsets[partition], |cursors| { cursors[partition] }),
+                offsets[partition + 1]
+            );
+        }
+        // SAFETY: exact histogram cursor checks above prove every slot written.
+        unsafe { data.set_len(total) };
+        Self {
             data,
             offsets,
             seq_offsets,
@@ -818,7 +1033,7 @@ pub fn decode_seq_pos(seq_offsets: &[u32], entry: SeedEntry) -> (u32, u32) {
 
 /// Compact accelerator for repeatedly resolving seed-array locations.
 ///
-/// `SeedEntry::loc` is a position in the concatenation of all records.  The
+/// `SeedEntry::loc` is an absolute position in the padded sequence backing. The
 /// straightforward decoder above therefore has to binary-search the record
 /// offsets for every seed occurrence.  Stage 1 does that for both sides of
 /// every joined key before the Hamming filter, while upstream can address its
@@ -843,7 +1058,9 @@ impl<'a> SeqOffsetLocator<'a> {
         let mut block_seq = Vec::with_capacity(block_count);
         for block in 0..block_count {
             let loc = (block << Self::BLOCK_SHIFT) as u32;
-            let seq = offsets.partition_point(|&offset| offset <= loc) - 1;
+            let seq = offsets
+                .partition_point(|&offset| offset <= loc)
+                .saturating_sub(1);
             block_seq.push(seq as u32);
         }
         Self { offsets, block_seq }
@@ -1432,6 +1649,60 @@ mod tests {
         for loc in 0..*offsets.last().unwrap() {
             let entry = SeedEntry { key: 0, loc };
             assert_eq!(locator.decode(entry), decode_seq_pos(&offsets, entry));
+        }
+    }
+
+    #[test]
+    fn all_shape_worker_histogram_preserves_chunk_fill_order() {
+        let reduction = Reduction::default_reduction();
+        let shapes = [
+            Shape::from_code("111", &reduction),
+            Shape::from_code("1101", &reduction),
+        ];
+        let records = [
+            (0..91).map(|i| (i * 7 % 20) as Letter).collect::<Vec<_>>(),
+            (0..67)
+                .map(|i| ((i * 11 + 3) % 20) as Letter)
+                .collect::<Vec<_>>(),
+            (0..103)
+                .map(|i| ((i * 13 + 5) % 20) as Letter)
+                .collect::<Vec<_>>(),
+        ];
+        let seqs = records.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let histograms =
+            SeedArray::count_partitions_by_worker_all_shapes(&seqs, &shapes, &reduction, 4, 0);
+
+        for (shape_id, shape) in shapes.iter().enumerate() {
+            for (begin, end) in [(0, 8), (8, 16)] {
+                let expected =
+                    SeedArray::build_with_complexity_cut_and_min_query_len_partition_range(
+                        &seqs, shape, &reduction, 4, 0.0, 0, begin, end,
+                    );
+                let actual = SeedArray::build_partition_range_from_worker_counts_reuse(
+                    &seqs,
+                    shape,
+                    &reduction,
+                    4,
+                    0,
+                    begin,
+                    end,
+                    &histograms[shape_id],
+                    Vec::new(),
+                );
+                for partition in 0..16 {
+                    let expected = expected
+                        .partition(partition)
+                        .iter()
+                        .map(|entry| (entry.key, entry.loc))
+                        .collect::<Vec<_>>();
+                    let actual = actual
+                        .partition(partition)
+                        .iter()
+                        .map(|entry| (entry.key, entry.loc))
+                        .collect::<Vec<_>>();
+                    assert_eq!(actual, expected, "shape={shape_id} partition={partition}");
+                }
+            }
         }
     }
 }

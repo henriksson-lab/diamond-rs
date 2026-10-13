@@ -203,6 +203,95 @@ pub fn reduced_match(q: &[Letter], s: &[Letter], len: i32, reduction: &Reduction
     }
 }
 
+/// Pointer-backed variant of C++ `reduced_match`.
+///
+/// Upstream loads a complete 16-byte vector for the final partial block and
+/// masks the unused lanes afterwards.  Callers using `SequenceSet` backing
+/// storage have the same delimiter/perimeter bytes available beyond the
+/// logical window, so preserve that execution path instead of scalarizing the
+/// tail merely because the logical comparison length is not a multiple of 16.
+#[inline(always)]
+pub fn reduced_match_padded(q: &[Letter], s: &[Letter], len: i32, reduction: &Reduction) -> u64 {
+    assert!((0..=64).contains(&len));
+    let len = len as usize;
+    if len == 0 {
+        return 0;
+    }
+    let padded_len = len.div_ceil(16) * 16;
+    assert!(q.len() >= padded_len && s.len() >= padded_len);
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::arch::is_x86_feature_detected!("ssse3") {
+        // SAFETY: SSSE3 was detected and both slices cover every complete
+        // 16-byte load, including the masked final block.
+        return unsafe { reduced_match_padded_ssse3(q, s, len, reduction) };
+    }
+
+    let mut matches = 0u64;
+    for offset in (0..padded_len).step_by(16) {
+        matches |= u64::from(match_block_reduced(
+            &q[offset..offset + 16],
+            &s[offset..offset + 16],
+            reduction,
+        )) << offset;
+    }
+    if len < 64 {
+        matches & ((1u64 << len) - 1)
+    } else {
+        matches
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3")]
+unsafe fn reduced_match_padded_ssse3(
+    q: &[Letter],
+    s: &[Letter],
+    len: usize,
+    reduction: &Reduction,
+) -> u64 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let low_map_q = _mm_loadu_si128(reduction.map8().as_ptr().cast());
+    let high_map_q = _mm_loadu_si128(reduction.map8().as_ptr().add(16).cast());
+    let low_map_s = _mm_loadu_si128(reduction.map8b().as_ptr().cast());
+    let high_map_s = _mm_loadu_si128(reduction.map8b().as_ptr().add(16).cast());
+    let letter_mask = _mm_set1_epi8(crate::basic::value::LETTER_MASK);
+    let high_bit = _mm_set1_epi8(i8::MIN);
+    let sixteen = _mm_set1_epi8(0x10);
+    let mut matches = 0u64;
+    let padded_len = len.div_ceil(16) * 16;
+    for offset in (0..padded_len).step_by(16) {
+        let q_letters = _mm_and_si128(_mm_loadu_si128(q.as_ptr().add(offset).cast()), letter_mask);
+        let s_letters = _mm_and_si128(_mm_loadu_si128(s.as_ptr().add(offset).cast()), letter_mask);
+        let q_high_mask = _mm_slli_epi16(_mm_and_si128(q_letters, sixteen), 3);
+        let s_high_mask = _mm_slli_epi16(_mm_and_si128(s_letters, sixteen), 3);
+        let q_reduced = _mm_or_si128(
+            _mm_shuffle_epi8(low_map_q, _mm_or_si128(q_letters, q_high_mask)),
+            _mm_shuffle_epi8(
+                high_map_q,
+                _mm_or_si128(q_letters, _mm_xor_si128(q_high_mask, high_bit)),
+            ),
+        );
+        let s_reduced = _mm_or_si128(
+            _mm_shuffle_epi8(low_map_s, _mm_or_si128(s_letters, s_high_mask)),
+            _mm_shuffle_epi8(
+                high_map_s,
+                _mm_or_si128(s_letters, _mm_xor_si128(s_high_mask, high_bit)),
+            ),
+        );
+        matches |= (_mm_movemask_epi8(_mm_cmpeq_epi8(q_reduced, s_reduced)) as u64) << offset;
+    }
+    if len < 64 {
+        matches & ((1u64 << len) - 1)
+    } else {
+        matches
+    }
+}
+
 /// Matches C++ `seed_mask(const Letter*, int)`.
 #[inline(always)]
 pub fn seed_mask(s: &[Letter], len: i32) -> u64 {
@@ -227,6 +316,42 @@ pub fn seed_mask(s: &[Letter], len: i32) -> u64 {
                 mask |= 1u64 << i;
             }
         }
+        mask
+    }
+}
+
+/// Pointer-backed variant of C++ `seed_mask` that performs the final full
+/// vector load before masking its unused lanes.
+#[inline(always)]
+pub fn seed_mask_padded(s: &[Letter], len: i32) -> u64 {
+    assert!((0..=64).contains(&len));
+    let len = len as usize;
+    if len == 0 {
+        return 0;
+    }
+    let padded_len = len.div_ceil(16) * 16;
+    assert!(s.len() >= padded_len);
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let mask = if std::arch::is_x86_feature_detected!("sse2") {
+        // SAFETY: SSE2 was detected and the padded slice covers every full
+        // vector load made by the kernel.
+        unsafe { seed_mask_sse2(s, padded_len) }
+    } else {
+        seed_mask(s, padded_len as i32)
+    };
+    #[cfg(target_arch = "aarch64")]
+    let mask = {
+        // SAFETY: Advanced SIMD is mandatory on AArch64 and the padded slice
+        // covers every full vector load made by the kernel.
+        unsafe { seed_mask_neon(s, padded_len) }
+    };
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    let mask = seed_mask(s, padded_len as i32);
+
+    if len < 64 {
+        mask & ((1u64 << len) - 1)
+    } else {
         mask
     }
 }
@@ -354,6 +479,17 @@ mod tests {
                 )) << offset;
             }
             assert_eq!(reduced_match(&q, &s, len as i32, &reduction), expected);
+            assert_eq!(
+                reduced_match_padded(&q, &s, len as i32, &reduction),
+                expected
+            );
+            let expected_seed_mask = q[..len]
+                .iter()
+                .enumerate()
+                .fold(0u64, |mask, (i, &letter)| {
+                    mask | (u64::from(letter & SEED_MASK != 0) << i)
+                });
+            assert_eq!(seed_mask_padded(&q, len as i32), expected_seed_mask);
             if len <= 32 {
                 assert_eq!(reduced_match32(&q, &s, len as u32, &reduction), expected);
             }

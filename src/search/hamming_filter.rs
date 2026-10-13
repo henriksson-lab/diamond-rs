@@ -49,6 +49,8 @@ struct FingerprintScratch {
 struct StreamingFingerprintScratch {
     query: Vec<AlignedFingerprint48>,
     target: Vec<AlignedFingerprint48>,
+    pass_masks: Vec<u64>,
+    pass_words: Vec<u64>,
 }
 
 thread_local! {
@@ -330,6 +332,17 @@ fn load_sequence_set_fingerprint(seqs: &[&[Letter]], seq_id: u32, pos: u32) -> [
     })
 }
 
+#[inline]
+fn load_absolute_fingerprint(
+    seqs: &crate::data::sequence_set::SequenceSet,
+    loc: u32,
+) -> [Letter; FP_LEN] {
+    debug_assert!(loc as usize >= FP_BEFORE);
+    // SequenceSet supplies 256 bytes of perimeter padding and one delimiter
+    // between records, exactly as the pointer-based upstream loader expects.
+    FingerPrint::from_seq_center(seqs.data_at(loc as u64 - FP_BEFORE as u64), FP_BEFORE).r
+}
+
 // Compatibility path for the materialized stage-1 helpers. Production blastp
 // uses `visit_hamming_group` with original sequence backing and never enters
 // this sparse-restoration path.
@@ -410,19 +423,12 @@ pub(crate) fn visit_hamming_group<F>(
 ) where
     F: FnMut((u32, u32), (u32, u32), usize),
 {
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx512bw") {
-        return visit_hamming_group_for::<FP_AVX512BW, F>(
-            query_locs,
-            target_locs,
-            query_seqs,
-            ref_seqs,
-            hamming_filter_id,
-            visit,
-        );
-    }
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        // Match upstream's production `ARCH_AVX2::stage1` dispatch as a
+        // whole. The AVX-512 kernel remains directly testable, but selecting
+        // it for this one sub-kernel creates an ISA mixture upstream does not
+        // execute on the benchmark host.
         if std::arch::is_x86_feature_detected!("avx2") {
             return visit_hamming_group_for::<FP_AVX2, F>(
                 query_locs,
@@ -471,11 +477,10 @@ pub(crate) fn visit_hamming_group_for<const KERNEL: u8, F>(
     query_seqs: &[&[Letter]],
     ref_seqs: &[&[Letter]],
     hamming_filter_id: u32,
-    mut visit: F,
+    visit: F,
 ) where
     F: FnMut((u32, u32), (u32, u32), usize),
 {
-    const TILE_SIZE: usize = 64;
     let mut scratch =
         STREAMING_FINGERPRINT_SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
     scratch.query.clear();
@@ -486,109 +491,190 @@ pub(crate) fn visit_hamming_group_for<const KERNEL: u8, F>(
     scratch.target.extend(target_locs.iter().map(|&(id, pos)| {
         AlignedFingerprint48::new(load_sequence_set_fingerprint(ref_seqs, id, pos))
     }));
-    let mut pass_masks = [0u64; TILE_SIZE];
+    visit_loaded_hamming_group_for::<KERNEL, _, _, _>(
+        query_locs,
+        target_locs,
+        &scratch.query,
+        &scratch.target,
+        &mut scratch.pass_masks,
+        &mut scratch.pass_words,
+        hamming_filter_id,
+        visit,
+    );
+    STREAMING_FINGERPRINT_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
+}
+
+/// Pointer-relative production path matching upstream `FingerPrint::load`.
+/// Locations stay absolute through the Hamming filter, so rejected seed
+/// groups never pay to recover record ids and local offsets.
+#[inline]
+pub(crate) fn visit_hamming_group_absolute_for<const KERNEL: u8, F>(
+    query_locs: &[u32],
+    target_locs: &[u32],
+    query_seqs: &crate::data::sequence_set::SequenceSet,
+    ref_seqs: &crate::data::sequence_set::SequenceSet,
+    hamming_filter_id: u32,
+    visit: F,
+) where
+    F: FnMut(u32, u32, usize),
+{
+    let mut scratch =
+        STREAMING_FINGERPRINT_SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    scratch.query.clear();
+    scratch.target.clear();
+    scratch.query.extend(
+        query_locs
+            .iter()
+            .map(|&loc| AlignedFingerprint48::new(load_absolute_fingerprint(query_seqs, loc))),
+    );
+    scratch.target.extend(
+        target_locs
+            .iter()
+            .map(|&loc| AlignedFingerprint48::new(load_absolute_fingerprint(ref_seqs, loc))),
+    );
+    visit_loaded_hamming_group_for::<KERNEL, _, _, _>(
+        query_locs,
+        target_locs,
+        &scratch.query,
+        &scratch.target,
+        &mut scratch.pass_masks,
+        &mut scratch.pass_words,
+        hamming_filter_id,
+        visit,
+    );
+    STREAMING_FINGERPRINT_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
+}
+
+#[inline]
+fn visit_loaded_hamming_group_for<const KERNEL: u8, Q: Copy, R: Copy, F>(
+    query_locs: &[Q],
+    target_locs: &[R],
+    query_fps: &[AlignedFingerprint48],
+    target_fps: &[AlignedFingerprint48],
+    pass_masks: &mut Vec<u64>,
+    pass_words: &mut Vec<u64>,
+    hamming_filter_id: u32,
+    mut visit: F,
+) where
+    F: FnMut(Q, R, usize),
+{
+    // `basic/config.cpp` defaults `--tile-size` to 1024.  Preserve that
+    // boundary and its query-major traversal: stage 2 must see all passing
+    // targets for one query in the tile before advancing to the next query.
+    const TILE_SIZE: usize = 1024;
+    const MASK_WIDTH: usize = 64;
     for (query_loc_tile, query_fp_tile) in query_locs
         .chunks(TILE_SIZE)
-        .zip(scratch.query.chunks(TILE_SIZE))
+        .zip(query_fps.chunks(TILE_SIZE))
     {
         for (target_tile_index, (target_loc_tile, target_fp_tile)) in target_locs
             .chunks(TILE_SIZE)
-            .zip(scratch.target.chunks(TILE_SIZE))
+            .zip(target_fps.chunks(TILE_SIZE))
             .enumerate()
         {
-            #[cfg(target_arch = "x86_64")]
-            if KERNEL == FP_AVX512BW {
-                // SAFETY: this specialization is selected only after
-                // AVX-512BW detection at the group boundary. Masked loads
-                // consume exactly the 48 initialized fingerprint bytes.
-                unsafe {
-                    all_vs_all_pass_masks_avx512bw(
-                        query_fp_tile,
-                        target_fp_tile,
-                        hamming_filter_id,
-                        &mut pass_masks[..query_fp_tile.len()],
-                    );
-                }
-            } else if KERNEL == FP_AVX2 {
-                // SAFETY: AVX2 was detected at the group boundary. Inputs
-                // contain complete fingerprints, target tiles have at most 64
-                // rows, and the output covers every query in this tile.
-                unsafe {
-                    all_vs_all_pass_masks_avx2(
-                        query_fp_tile,
-                        target_fp_tile,
-                        hamming_filter_id,
-                        &mut pass_masks[..query_fp_tile.len()],
-                    );
-                }
-            } else {
-                pass_masks[..query_fp_tile.len()].fill(0);
-                for (query_index, query_fp) in query_fp_tile.iter().enumerate() {
-                    for (target_index, target_fp) in target_fp_tile.iter().enumerate() {
-                        if fingerprint_equal_count_for::<KERNEL>(&query_fp.bytes, &target_fp.bytes)
-                            >= hamming_filter_id
-                        {
-                            pass_masks[query_index] |= 1u64 << target_index;
+            let words_per_query = target_fp_tile.len().div_ceil(MASK_WIDTH);
+            pass_words.clear();
+            pass_words.resize(query_fp_tile.len() * words_per_query, 0);
+            pass_masks.clear();
+            pass_masks.resize(query_fp_tile.len(), 0);
+            for (target_word, target_fp_word) in target_fp_tile.chunks(MASK_WIDTH).enumerate() {
+                #[cfg(target_arch = "x86_64")]
+                if KERNEL == FP_AVX512BW {
+                    // SAFETY: AVX-512BW was checked at the run boundary.
+                    unsafe {
+                        all_vs_all_pass_masks_avx512bw(
+                            query_fp_tile,
+                            target_fp_word,
+                            hamming_filter_id,
+                            pass_masks,
+                        );
+                    }
+                } else if KERNEL == FP_AVX2 {
+                    // SAFETY: AVX2 was checked at the run boundary.
+                    unsafe {
+                        all_vs_all_pass_masks_avx2(
+                            query_fp_tile,
+                            target_fp_word,
+                            hamming_filter_id,
+                            pass_masks,
+                        );
+                    }
+                } else {
+                    pass_masks.fill(0);
+                    for (query_index, query_fp) in query_fp_tile.iter().enumerate() {
+                        for (target_index, target_fp) in target_fp_word.iter().enumerate() {
+                            if fingerprint_equal_count_for::<KERNEL>(
+                                &query_fp.bytes,
+                                &target_fp.bytes,
+                            ) >= hamming_filter_id
+                            {
+                                pass_masks[query_index] |= 1u64 << target_index;
+                            }
                         }
                     }
                 }
-            }
-            #[cfg(target_arch = "x86")]
-            if KERNEL == FP_AVX2 {
-                // SAFETY: AVX2 was detected at the group boundary. Inputs
-                // contain complete fingerprints, target tiles have at most 64
-                // rows, and the output covers every query in this tile.
-                unsafe {
-                    all_vs_all_pass_masks_avx2(
-                        query_fp_tile,
-                        target_fp_tile,
-                        hamming_filter_id,
-                        &mut pass_masks[..query_fp_tile.len()],
-                    );
-                }
-            } else {
-                pass_masks[..query_fp_tile.len()].fill(0);
-                for (query_index, query_fp) in query_fp_tile.iter().enumerate() {
-                    for (target_index, target_fp) in target_fp_tile.iter().enumerate() {
-                        if fingerprint_equal_count_for::<KERNEL>(&query_fp.bytes, &target_fp.bytes)
-                            >= hamming_filter_id
-                        {
-                            pass_masks[query_index] |= 1u64 << target_index;
+                #[cfg(target_arch = "x86")]
+                if KERNEL == FP_AVX2 {
+                    // SAFETY: AVX2 was checked at the run boundary.
+                    unsafe {
+                        all_vs_all_pass_masks_avx2(
+                            query_fp_tile,
+                            target_fp_word,
+                            hamming_filter_id,
+                            pass_masks,
+                        );
+                    }
+                } else {
+                    pass_masks.fill(0);
+                    for (query_index, query_fp) in query_fp_tile.iter().enumerate() {
+                        for (target_index, target_fp) in target_fp_word.iter().enumerate() {
+                            if fingerprint_equal_count_for::<KERNEL>(
+                                &query_fp.bytes,
+                                &target_fp.bytes,
+                            ) >= hamming_filter_id
+                            {
+                                pass_masks[query_index] |= 1u64 << target_index;
+                            }
                         }
                     }
                 }
-            }
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            {
-                pass_masks[..query_fp_tile.len()].fill(0);
-                for (query_index, query_fp) in query_fp_tile.iter().enumerate() {
-                    for (target_index, target_fp) in target_fp_tile.iter().enumerate() {
-                        if fingerprint_equal_count_for::<KERNEL>(&query_fp.bytes, &target_fp.bytes)
-                            >= hamming_filter_id
-                        {
-                            pass_masks[query_index] |= 1u64 << target_index;
+                #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+                {
+                    pass_masks.fill(0);
+                    for (query_index, query_fp) in query_fp_tile.iter().enumerate() {
+                        for (target_index, target_fp) in target_fp_word.iter().enumerate() {
+                            if fingerprint_equal_count_for::<KERNEL>(
+                                &query_fp.bytes,
+                                &target_fp.bytes,
+                            ) >= hamming_filter_id
+                            {
+                                pass_masks[query_index] |= 1u64 << target_index;
+                            }
                         }
                     }
                 }
+                for (query_index, &mask) in pass_masks.iter().enumerate() {
+                    pass_words[query_index * words_per_query + target_word] = mask;
+                }
             }
-            // Upstream writes a HitField and consumes it query-major after the
-            // comparison kernel. These masks reproduce that ordering without
-            // allocating a cross-product-sized match vector.
+            // C++ writes a 1024-target HitField, then consumes it query-major.
             for (query_index, &query_loc) in query_loc_tile.iter().enumerate() {
-                let mut targets = pass_masks[query_index];
-                while targets != 0 {
-                    let target_index = targets.trailing_zeros() as usize;
-                    visit(
-                        query_loc,
-                        target_loc_tile[target_index],
-                        target_tile_index * TILE_SIZE + target_index,
-                    );
-                    targets &= targets - 1;
+                for target_word in 0..words_per_query {
+                    let mut targets = pass_words[query_index * words_per_query + target_word];
+                    while targets != 0 {
+                        let target_in_word = targets.trailing_zeros() as usize;
+                        let target_index = target_word * MASK_WIDTH + target_in_word;
+                        visit(
+                            query_loc,
+                            target_loc_tile[target_index],
+                            target_tile_index * TILE_SIZE + target_index,
+                        );
+                        targets &= targets - 1;
+                    }
                 }
             }
         }
     }
-    STREAMING_FINGERPRINT_SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
 }
 
 /// Streaming form of upstream `stage1_self`: load the target seed group once
@@ -806,6 +892,80 @@ mod tests {
             &targets,
             20,
             |query, target, _| actual.push((query, target)),
+        );
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn streaming_group_preserves_upstream_1024_tile_order() {
+        let sequence = vec![1; 96];
+        let queries: Vec<&[Letter]> = vec![&sequence, &sequence];
+        let targets: Vec<&[Letter]> = vec![&sequence];
+        let query_locs = vec![(0, 32), (1, 32)];
+        let target_locs = vec![(0, 32); 1100];
+        let mut actual = Vec::new();
+        visit_hamming_group(
+            &query_locs,
+            &target_locs,
+            &queries,
+            &targets,
+            FP_LEN as u32,
+            |query, _, target_index| actual.push((query.0, target_index)),
+        );
+
+        let mut expected = Vec::new();
+        for target_tile in [0..1024, 1024..1100] {
+            for query in 0..2 {
+                expected.extend(target_tile.clone().map(|target| (query, target)));
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn absolute_backing_fingerprints_match_record_lookup_and_order() {
+        let records = [
+            (0..47).map(|i| (i % 20) as Letter).collect::<Vec<_>>(),
+            (0..83)
+                .map(|i| ((i * 7 + 3) % 20) as Letter)
+                .collect::<Vec<_>>(),
+        ];
+        let slices = records.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut set = crate::data::sequence_set::SequenceSet::new();
+        for record in &records {
+            set.push(record);
+        }
+        set.finish_reserve();
+        let locals = [(0u32, 0u32), (0, 31), (1, 0), (1, 41), (1, 82)];
+        let absolute = locals
+            .iter()
+            .map(|&(id, pos)| set.position(id as usize, pos as usize) as u32)
+            .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        visit_hamming_group_for::<FP_SCALAR, _>(
+            &locals,
+            &locals,
+            &slices,
+            &slices,
+            12,
+            |query, target, index| expected.push((query, target, index)),
+        );
+        let mut actual = Vec::new();
+        visit_hamming_group_absolute_for::<FP_SCALAR, _>(
+            &absolute,
+            &absolute,
+            &set,
+            &set,
+            12,
+            |query, target, index| {
+                let query = set.local_position(query as usize);
+                let target = set.local_position(target as usize);
+                actual.push((
+                    (query.0 as u32, query.1 as u32),
+                    (target.0 as u32, target.1 as u32),
+                    index,
+                ))
+            },
         );
         assert_eq!(actual, expected);
     }

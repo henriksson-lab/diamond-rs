@@ -7,6 +7,7 @@
 use crate::basic::value::SuperBlockId;
 use crate::config::{block_size, Sensitivity};
 use crate::data::sequence_file::DbFilter;
+use crate::masking::{MaskingAlgo, MaskingMode};
 use crate::util::algo::{greedy_vertex_cover, Edge};
 use crate::util::data_structures::FlatArray;
 
@@ -58,7 +59,16 @@ pub struct CascadedSearchConfig {
     pub lin_stage1_combo: bool,
     pub approx_min_id: f64,
     pub max_evalue: f64,
+    /// Upstream constructs this score state once before entering the cascaded
+    /// workflow. Rounds mutate sensitivity and cutoffs but retain it.
+    pub matrix: String,
+    pub gap_open: i32,
+    pub gap_extend: i32,
     pub comp_based_stats: i32,
+    pub masking: MaskingMode,
+    pub soft_masking: MaskingAlgo,
+    pub motif_masking: String,
+    pub extension_mode: String,
     pub hamming_ext: bool,
     pub diag_filter_cov: Option<f64>,
     pub diag_filter_id: Option<f64>,
@@ -74,9 +84,15 @@ pub struct CascadedConfig {
     pub helpers: CascadedHelpersConfig,
     pub approx_min_id: f64,
     pub max_evalue: f64,
+    pub matrix: String,
+    pub gap_open: i32,
+    pub gap_extend: i32,
     pub anchored_swipe: bool,
     pub extension_mode: String,
     pub comp_based_stats: i32,
+    pub masking: MaskingMode,
+    pub soft_masking: MaskingAlgo,
+    pub motif_masking: String,
     pub hamming_ext: bool,
     pub diag_filter_cov: Option<f64>,
     pub diag_filter_id: Option<f64>,
@@ -88,6 +104,7 @@ pub struct CascadedConfig {
     pub weighted_gvc: bool,
     pub strict_gvc: bool,
     pub no_gvc_reassign: bool,
+    pub kmer_ranking: bool,
     pub alignment_output: Option<String>,
     // Fields mutated by `cluster`, retained because they are observable global
     // configuration in the original implementation.
@@ -109,9 +126,17 @@ impl Default for CascadedConfig {
             helpers: CascadedHelpersConfig::default(),
             approx_min_id: 50.0,
             max_evalue: 0.001,
+            matrix: "blosum62".to_owned(),
+            gap_open: -1,
+            gap_extend: -1,
             anchored_swipe: false,
             extension_mode: String::new(),
             comp_based_stats: 1,
+            // Cluster::init_thresholds overrides the ordinary search defaults:
+            // hard masking is disabled and soft TANTAN masking is enabled.
+            masking: MaskingMode::None,
+            soft_masking: MaskingAlgo::Tantan,
+            motif_masking: String::new(),
             hamming_ext: false,
             diag_filter_cov: None,
             diag_filter_id: None,
@@ -123,6 +148,7 @@ impl Default for CascadedConfig {
             weighted_gvc: false,
             strict_gvc: false,
             no_gvc_reassign: false,
+            kmer_ranking: false,
             alignment_output: None,
             query_cover: 0.0,
             subject_cover: 0.0,
@@ -362,7 +388,7 @@ pub fn cluster<B: CascadedBackend>(
         // then 0, then nonzero values for this workflow. Preserve that
         // observed search state explicitly instead of relying on UB.
         current_ref_block: if round == 1 { 0 } else { 1 },
-        kmer_ranking: false,
+        kmer_ranking: config.kmer_ranking,
         min_length_ratio: derived_min_length_ratio(
             config.query_cover,
             config.subject_cover,
@@ -373,7 +399,14 @@ pub fn cluster<B: CascadedBackend>(
         lin_stage1_combo: false,
         approx_min_id: config.approx_min_id,
         max_evalue: config.max_evalue,
+        matrix: config.matrix.clone(),
+        gap_open: config.gap_open,
+        gap_extend: config.gap_extend,
         comp_based_stats: config.comp_based_stats,
+        masking: config.masking,
+        soft_masking: config.soft_masking,
+        motif_masking: config.motif_masking.clone(),
+        extension_mode: config.extension_mode.clone(),
         hamming_ext: config.hamming_ext,
         diag_filter_cov: config.diag_filter_cov,
         diag_filter_id: config.diag_filter_id,
@@ -722,6 +755,12 @@ mod tests {
                 connected_component_depth: vec![],
             },
             max_evalue: 0.1,
+            matrix: "pam250".to_owned(),
+            gap_open: 15,
+            gap_extend: 3,
+            masking: MaskingMode::Tantan,
+            soft_masking: MaskingAlgo::Seg,
+            motif_masking: "0".to_owned(),
             approx_min_id: 50.0,
             anchored_swipe: true,
             graph_algo: GraphAlgo::LengthSorted,
@@ -733,6 +772,14 @@ mod tests {
         assert_eq!(backend.searches[0].1, None);
         assert_eq!(backend.searches[1].1, Some(vec![true, false, true]));
         assert_eq!(backend.searches[0].0.chunk_size, 32768.0);
+        for (search, _) in &backend.searches {
+            assert_eq!(search.matrix, "pam250");
+            assert_eq!(search.gap_open, 15);
+            assert_eq!(search.gap_extend, 3);
+            assert_eq!(search.masking, MaskingMode::Tantan);
+            assert_eq!(search.soft_masking, MaskingAlgo::Seg);
+            assert_eq!(search.motif_masking, "0");
+        }
         assert!(backend.searches[0].0.mutual_cover);
         assert_eq!(
             (

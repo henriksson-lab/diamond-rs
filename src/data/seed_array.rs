@@ -170,7 +170,7 @@ impl<SeedLoc: SeedLocation> SeedArray<SeedLoc> {
         }
 
         let mut data = vec![SeedArrayEntry::default(); *begin.last().unwrap() as usize];
-        let mut iterators = build_iterators(&begin, hst, range);
+        let iterators = build_iterators(&begin, hst, range);
         let partition = enum_cfg
             .partition
             .ok_or_else(|| "EnumCfg::partition is required.".to_string())?;
@@ -182,21 +182,32 @@ impl<SeedLoc: SeedLocation> SeedArray<SeedLoc> {
                 "Shape histogram row count must match sequence partition count.".to_string(),
             );
         }
+        // Upstream writes each sequence partition directly into its disjoint
+        // slice of the pre-sized seed-array buffer.  Keep that ownership
+        // model here: the previous Rust adapter first accumulated a second
+        // complete Vec-of-Vecs and then copied it into `data`, doubling the
+        // live reference-seed footprint (about 21 MiB for the indexed-search
+        // validation fixture).
+        let data_ptr = data.as_mut_ptr();
         let mut callbacks: Vec<BuildCallback<SeedLoc>> = (0..partition.len() - 1)
-            .map(|_| BuildCallback::new(*range, seedp_bits))
+            .map(|sequence_partition| {
+                let ends = (range.begin()..range.end())
+                    .enumerate()
+                    .map(|(relative_partition, absolute_partition)| {
+                        iterators[sequence_partition][relative_partition]
+                            + hst[sequence_partition][absolute_partition as usize] as usize
+                    })
+                    .collect();
+                BuildCallback::new(
+                    *range,
+                    seedp_bits,
+                    data_ptr,
+                    iterators[sequence_partition].clone(),
+                    ends,
+                )
+            })
             .collect();
         let stats = enum_seeds_block(seqs, &mut callbacks, filter, enum_cfg, ctx)?;
-
-        for (sequence_partition, cb) in callbacks.into_iter().enumerate() {
-            for (part, entries) in cb.it.out.into_iter().enumerate() {
-                let mut dst = iterators[sequence_partition][part];
-                for entry in entries {
-                    data[dst] = entry;
-                    dst += 1;
-                }
-                iterators[sequence_partition][part] = dst;
-            }
-        }
 
         Ok(Self {
             key_bits,
@@ -327,36 +338,6 @@ pub fn seed_bits(
     }
 }
 
-struct BufferedWriter<SeedLoc: SeedLocation> {
-    seedp_mask: PackedSeed,
-    seedp_bits: i32,
-    range: SeedPartitionRange,
-    out: Vec<Vec<SeedArrayEntry<SeedLoc>>>,
-}
-
-impl<SeedLoc: SeedLocation> BufferedWriter<SeedLoc> {
-    fn new(range: SeedPartitionRange, seedp_bits: i32) -> Self {
-        Self {
-            seedp_mask: seedp_mask(seedp_bits),
-            seedp_bits,
-            range,
-            out: vec![Vec::new(); range.size() as usize],
-        }
-    }
-
-    fn push(&mut self, key: PackedSeed, value: usize, block_id: u32) {
-        let p = seed_partition(key, self.seedp_mask);
-        if self.range.contains(p) {
-            let d = (p - self.range.begin()) as usize;
-            self.out[d].push(SeedArrayEntry::with_block_id(
-                seed_partition_offset(key, self.seedp_bits as u64),
-                PackedLoc::new(value as u64),
-                block_id,
-            ));
-        }
-    }
-}
-
 fn build_iterators(
     begin: &[i64],
     hst: &ShapeHistogram,
@@ -376,22 +357,91 @@ fn build_iterators(
     iterators
 }
 
+const BUILD_BUFFER_SIZE: usize = 16;
+
 struct BuildCallback<SeedLoc: SeedLocation> {
-    it: BufferedWriter<SeedLoc>,
+    seedp_mask: PackedSeed,
+    seedp_bits: i32,
+    range: SeedPartitionRange,
+    data: *mut SeedArrayEntry<SeedLoc>,
+    cursors: Vec<usize>,
+    ends: Vec<usize>,
+    buffers: Vec<[SeedArrayEntry<SeedLoc>; BUILD_BUFFER_SIZE]>,
+    buffered: Vec<u8>,
 }
 
 impl<SeedLoc: SeedLocation> BuildCallback<SeedLoc> {
-    fn new(range: SeedPartitionRange, seedp_bits: i32) -> Self {
+    fn new(
+        range: SeedPartitionRange,
+        seedp_bits: i32,
+        data: *mut SeedArrayEntry<SeedLoc>,
+        cursors: Vec<usize>,
+        ends: Vec<usize>,
+    ) -> Self {
         Self {
-            it: BufferedWriter::new(range, seedp_bits),
+            seedp_mask: seedp_mask(seedp_bits),
+            seedp_bits,
+            range,
+            data,
+            cursors,
+            ends,
+            buffers: vec![[SeedArrayEntry::default(); BUILD_BUFFER_SIZE]; range.size() as usize],
+            buffered: vec![0; range.size() as usize],
         }
+    }
+
+    #[inline(never)]
+    fn flush(&mut self, relative_partition: usize) {
+        let count = self.buffered[relative_partition] as usize;
+        if count == 0 {
+            return;
+        }
+        let cursor = self.cursors[relative_partition];
+        assert!(
+            cursor + count <= self.ends[relative_partition],
+            "seed histogram undercount"
+        );
+        // SAFETY: `data` points into the fixed-size allocation owned by the
+        // SeedArray constructor. Each callback receives non-overlapping
+        // histogram-derived ranges, the destination bound is checked above,
+        // and both source and destination hold initialized Copy entries.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.buffers[relative_partition].as_ptr(),
+                self.data.add(cursor),
+                count,
+            );
+        }
+        self.cursors[relative_partition] = cursor + count;
+        self.buffered[relative_partition] = 0;
     }
 }
 
 impl<SeedLoc: SeedLocation> EnumSeedsCallback for BuildCallback<SeedLoc> {
     fn call(&mut self, seed: u64, pos: usize, block_id: usize, _shape: i32) -> bool {
-        self.it.push(seed, pos, block_id as u32);
+        let partition = seed_partition(seed, self.seedp_mask);
+        if !self.range.contains(partition) {
+            return true;
+        }
+        let relative_partition = (partition - self.range.begin()) as usize;
+        let buffered = self.buffered[relative_partition] as usize;
+        self.buffers[relative_partition][buffered] = SeedArrayEntry::with_block_id(
+            seed_partition_offset(seed, self.seedp_bits as u64),
+            PackedLoc::new(pos as u64),
+            block_id as u32,
+        );
+        self.buffered[relative_partition] += 1;
+        if buffered + 1 == BUILD_BUFFER_SIZE {
+            self.flush(relative_partition);
+        }
         true
+    }
+
+    fn finish(&mut self) {
+        for relative_partition in 0..self.buffered.len() {
+            self.flush(relative_partition);
+        }
+        assert_eq!(self.cursors, self.ends, "seed histogram overcount");
     }
 }
 
