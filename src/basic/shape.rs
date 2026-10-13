@@ -114,9 +114,6 @@ impl Shape {
                     // inside `length`, and callers provide a complete window.
                     let position = unsafe { *self.positions.get_unchecked($index) as usize };
                     let raw = unsafe { *seq.get_unchecked(position) };
-                    if raw & crate::basic::value::SEED_MASK != 0 {
-                        return None;
-                    }
                     raw & LETTER_MASK
                 }};
             }
@@ -144,13 +141,6 @@ impl Shape {
         let mut s: PackedSeed = 0;
         for i in 0..self.weight as usize {
             let raw = seq[self.positions[i] as usize];
-            // Match C++'s `soft_masking` behavior: any soft-masked position
-            // (high bit set, from tantan) makes the entire seed invalid for
-            // indexing. Mirrors what `EnumCfg::soft_masking` triggers in
-            // C++ DIAMOND seed enumeration.
-            if (raw & crate::basic::value::SEED_MASK) != 0 {
-                return None;
-            }
             let l = raw & LETTER_MASK;
             if !is_amino_acid(l) {
                 return None;
@@ -279,9 +269,6 @@ impl Shape {
         let size = reduction.size() as u64;
         for i in 0..weight {
             let raw = seq[self.positions[i] as usize];
-            if (raw & crate::basic::value::SEED_MASK) != 0 {
-                return None;
-            }
             let l = raw & LETTER_MASK;
             if (l as i32) >= TRUE_AA {
                 return None;
@@ -489,6 +476,47 @@ mod tests {
         let seq = vec![0i8, MASK_LETTER, 2];
         let seed = s.set_seed(&seq, &r);
         assert!(seed.is_none());
+    }
+
+    #[test]
+    fn seed_mask_annotations_do_not_change_checked_seed_extraction() {
+        let reduction = Reduction::default_reduction();
+
+        let generic = Shape::from_code("111", &reduction);
+        let raw = vec![0, 1, 2];
+        let annotated: Vec<Letter> = raw
+            .iter()
+            .map(|&letter| letter | crate::basic::value::SEED_MASK)
+            .collect();
+        assert_eq!(
+            generic.set_seed(&raw, &reduction),
+            generic.set_seed(&annotated, &reduction)
+        );
+        assert_eq!(
+            generic.set_seed_with_complexity(&raw, &reduction, 0.0),
+            generic.set_seed_with_complexity(&annotated, &reduction, 0.0)
+        );
+
+        let optimized = Shape::from_code("111101110111", &reduction);
+        let raw: Vec<Letter> = (0..optimized.length)
+            .map(|position| (position % 20) as Letter)
+            .collect();
+        let annotated: Vec<Letter> = raw
+            .iter()
+            .map(|&letter| letter | crate::basic::value::SEED_MASK)
+            .collect();
+        assert_eq!(
+            optimized.set_seed(&raw, &reduction),
+            optimized.set_seed(&annotated, &reduction)
+        );
+
+        let mut masked = raw;
+        masked[optimized.positions[0] as usize] = MASK_LETTER | crate::basic::value::SEED_MASK;
+        assert_eq!(optimized.set_seed(&masked, &reduction), None);
+        assert_eq!(
+            optimized.set_seed_with_complexity(&masked, &reduction, 0.0),
+            None
+        );
     }
 
     #[test]

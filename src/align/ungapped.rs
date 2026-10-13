@@ -167,7 +167,7 @@ impl WorkTarget {
 /// Matches C++ `Extension::ungapped_stage(begin, end, ..., block_id, ...)`.
 pub fn ungapped_stage_target(
     hits: &mut [SeedHit],
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; TRUE_AA as usize],
     block_id: BlockId,
@@ -305,7 +305,7 @@ pub fn ungapped_stage_target(
 
 /// Matches C++ `Extension::ungapped_stage(const Sequence*, ..., FlatArray<SeedHit>::Iterator, ...)`.
 pub fn ungapped_stage_seed_hits(
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; TRUE_AA as usize],
     seed_hits: &FlatArray<SeedHit>,
@@ -407,7 +407,7 @@ mod tests {
         let cfg = UngappedStageConfig::default();
         let wt = ungapped_stage_target(
             &mut hits,
-            &[query],
+            &[query.as_slice()],
             &[],
             &comp,
             0,
@@ -468,7 +468,7 @@ mod tests {
         cfg.mutual_cover = true;
         let wt = ungapped_stage_target(
             &mut hits,
-            &[query],
+            &[query.as_slice()],
             &[],
             &comp,
             0,
@@ -497,13 +497,13 @@ mod tests {
             query_translated: true,
             ..UngappedStageConfig::default()
         };
-        let queries = vec![
-            query.clone(),
-            query.clone(),
-            query.clone(),
-            query.clone(),
-            query.clone(),
-            query,
+        let queries = [
+            query.as_slice(),
+            query.as_slice(),
+            query.as_slice(),
+            query.as_slice(),
+            query.as_slice(),
+            query.as_slice(),
         ];
         let wt = ungapped_stage_target(
             &mut hits,
@@ -541,7 +541,7 @@ mod tests {
         };
         let wt = ungapped_stage_target(
             &mut hits,
-            &[query],
+            &[query.as_slice()],
             &[cbs],
             &comp,
             0,
@@ -569,7 +569,7 @@ mod tests {
         let mut stats = Statistics::new();
         let cfg = UngappedStageConfig::default();
         let out = ungapped_stage_seed_hits(
-            &[query],
+            &[query.as_slice()],
             &[],
             &comp,
             &seed_hits,

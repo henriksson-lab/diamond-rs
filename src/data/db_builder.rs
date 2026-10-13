@@ -326,12 +326,15 @@ fn write_string_vector<W: Write>(writer: &mut W, values: &[String]) -> io::Resul
 mod tests {
     use super::*;
     use crate::data::dmnd::{DatabaseFile, DatabaseOpenOptions, MAGIC_NUMBER};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_PATH_NONCE: AtomicU64 = AtomicU64::new(0);
 
     fn temp_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "diamond_rs_{label}_{}_{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            TEMP_PATH_NONCE.fetch_add(1, Ordering::Relaxed)
         ))
     }
 

@@ -131,6 +131,8 @@ pub struct CentroidSearchConfig {
     pub masking: crate::masking::MaskingMode,
     pub soft_masking: crate::masking::MaskingAlgo,
     pub motif_masking: String,
+    pub freq_masking: bool,
+    pub db_size: u64,
     pub extension_mode: String,
     pub hamming_ext: bool,
     pub diag_filter_cov: Option<f64>,
@@ -305,6 +307,8 @@ fn search_vs_centroids<B: CascadedWrapperBackend>(
         masking: config.core.masking,
         soft_masking: config.core.soft_masking,
         motif_masking: config.core.motif_masking.clone(),
+        freq_masking: config.freq_masking,
+        db_size: config.core.db_size,
         extension_mode: config.core.extension_mode.clone(),
         hamming_ext: config.core.hamming_ext,
         diag_filter_cov: config.core.diag_filter_cov,
@@ -396,6 +400,7 @@ pub fn run<B: CascadedWrapperBackend>(
             traits.sketch_size,
         )?;
         config.freq_masking = true;
+        config.core.freq_masking = true;
 
         for (index, mut item) in super_blocks.into_iter().enumerate() {
             let block_count = backend.block_sequence_count(&item.block);
@@ -728,11 +733,14 @@ mod tests {
         assert_eq!(backend.searches.len(), 1);
         assert!(!backend.searches[0].self_search);
         assert_eq!(backend.searches[0].max_target_seqs, 1);
+        assert!(backend.searches[0].freq_masking);
+        assert_eq!(backend.searches[0].db_size, 10_000_000);
         assert_eq!(
             backend.output,
             Some(WrapperOutput::Pairs(vec![(0, 0), (0, 1), (0, 2), (3, 3)]))
         );
         assert!(cfg.freq_masking);
+        assert!(cfg.core.freq_masking);
         assert_eq!(cfg.db_size, Some(10_000_000));
     }
 }

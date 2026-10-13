@@ -103,17 +103,14 @@ impl Reduction {
         map8b[STOP_LETTER as u8 as usize] = (size + 1) as Letter;
         map8b[DELIMITER_LETTER as u8 as usize] = (size + 1) as Letter;
 
-        // Seed enumeration treats either a soft-mask bit or any non-amino
-        // residue as the reduced MASK sentinel. Precompute the complete byte
-        // mapping so whole-sequence reduction is one lookup per residue, as
-        // in upstream Reduction::reduce_seq.
+        // C++ `Shape::set_seed` uses `SEQ_MASK`, stripping annotation bits
+        // before validating/reducing the biological residue. Precompute that
+        // exact mapping for every byte; X/stop/delimiter still map to MASK.
         let mut seed_map8 = [MASK_LETTER; 256];
         for byte in 0..256usize {
-            if byte & 0x80 == 0 {
-                let letter = byte & super::value::LETTER_MASK as usize;
-                if letter < TRUE_AA as usize {
-                    seed_map8[byte] = map8[letter];
-                }
+            let letter = byte & super::value::LETTER_MASK as usize;
+            if letter < TRUE_AA as usize {
+                seed_map8[byte] = map8[letter];
             }
         }
 
@@ -248,15 +245,11 @@ mod tests {
         let reduction = Reduction::default_reduction();
         for byte in 0u16..=255 {
             let raw = byte as u8 as Letter;
-            let expected = if byte & 0x80 != 0 {
-                MASK_LETTER
+            let letter = raw & super::super::value::LETTER_MASK;
+            let expected = if letter < TRUE_AA as Letter {
+                reduction.reduce(letter) as Letter
             } else {
-                let letter = raw & super::super::value::LETTER_MASK;
-                if letter < TRUE_AA as Letter {
-                    reduction.reduce(letter) as Letter
-                } else {
-                    MASK_LETTER
-                }
+                MASK_LETTER
             };
             assert_eq!(reduction.reduce_seed_letter(raw), expected);
         }

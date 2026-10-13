@@ -537,6 +537,8 @@ impl CascadedBackend for NativeBlock {
             },
             Some(self.soft_tantan_masker.as_ref()),
             config.soft_masking,
+            config.freq_masking,
+            (config.db_size != 0).then_some(config.db_size),
             extension_mode,
         )
         .map_err(|error| error.to_string())?;
@@ -809,6 +811,8 @@ impl CascadedWrapperBackend for NativeBackend {
             },
             Some(self.soft_tantan_masker.as_ref()),
             config.soft_masking,
+            config.freq_masking,
+            (config.db_size != 0).then_some(config.db_size),
             extension_mode,
         )
         .map_err(|error| error.to_string())?;

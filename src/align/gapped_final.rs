@@ -67,7 +67,7 @@ pub fn first_round_filter_all(cfg: &GappedScoreConfig, first_round_hsp_values: H
 pub fn add_final_dp_targets(
     target: &Target,
     target_idx: usize,
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     dp_targets: &mut [Targets; MAX_CONTEXT as usize],
     flags: Flags,
     hsp_values: HspValues,
@@ -131,7 +131,7 @@ pub fn add_final_dp_targets(
 pub fn align_targets_final(
     targets: &mut Vec<Target>,
     previous_matches: i64,
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_id: &str,
     query_cbs: &[Vec<i8>],
     source_query_len: i32,
@@ -399,7 +399,7 @@ mod tests {
         let matches = align_targets_final(
             &mut targets,
             0,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             "query",
             &[],
             query.len() as i32,
@@ -436,7 +436,7 @@ mod tests {
         let _ = align_targets_final(
             &mut targets,
             0,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             "query",
             &[],
             query.len() as i32,

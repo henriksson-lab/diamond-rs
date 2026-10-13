@@ -3,13 +3,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::basic::translate;
-use crate::basic::value::{Letter, SequenceType};
-use crate::commands::blastp::{BlastpConfig, TranslatedQueryLayout, TranslatedQuerySource};
+use crate::basic::value::SequenceType;
+use crate::commands::blastp::{BlastpConfig, TranslatedQueryLayout};
 use crate::config::Sensitivity;
+use crate::data::block::Block;
 use crate::data::fasta::{self, FastaRecord};
 use crate::stats::cbs::CbsMode;
-use crate::util::sequence::find_orfs;
 
 /// Configuration for a blastx run.
 pub struct BlastxConfig {
@@ -73,61 +72,34 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
     let (dna_records, paired) = load_query_records(&config.query_files)?;
     eprintln!("Queries: {} DNA sequences", dna_records.len());
 
-    // Translate to protein in all 6 frames. Each frame becomes a private
-    // protein query; the grouped extension path maps results back to the
-    // source DNA query and DNA coordinates before formatting output.
-    let mut protein_records = Vec::new();
+    // Upstream loads source DNA and all six protein contexts into one Block.
+    // Build that same contiguous owner directly: the downstream search masks,
+    // restores, fingerprints, and extends these exact sequences rather than
+    // retaining six separately allocated FastaRecords plus a second arena.
+    let mut query_block = Block::new();
     let dna_query_count = dna_records.len();
-    let mut translated_sources = Vec::with_capacity(dna_records.len());
+    let mut mate_indices = Vec::with_capacity(dna_records.len());
+    let frame_mask =
+        (if use_forward { 0b000111 } else { 0 }) | (if use_reverse { 0b111000 } else { 0 });
 
     for (dna_index, dna_rec) in dna_records.into_iter().enumerate() {
-        let dna_bytes: Vec<u8> = dna_rec.sequence.iter().map(|&l| l as u8).collect();
-        let dna_len = dna_bytes.len() as i32;
-        let frames =
-            translate::translate_6_frames_with_genetic_code(&dna_bytes, config.query_gencode)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
         let dna_short: String = dna_rec
             .id
             .split(|c: char| crate::util::sequence::ID_DELIMITERS.contains(c))
             .next()
             .unwrap_or("")
             .to_string();
-        translated_sources.push(TranslatedQuerySource {
-            id: dna_short.clone(),
-            dna_len,
-            sequence: dna_rec.sequence,
-            mate_index: paired.then_some(dna_index ^ 1),
-        });
-
-        for (frame_idx, frame_seq) in frames.iter().enumerate() {
-            let frame = translate::Frame::from_index(frame_idx as i32);
-            // Include the input ordinal in the private frame id. Two input
-            // records are allowed to have the same printed FASTA id, but they
-            // must still be culled independently as two source queries.
-            let frame_id = format!(
-                "{}_diamond_query{}_frame{}",
-                dna_short,
-                dna_index,
-                frame.signed_frame()
-            );
-            let active = (frame_idx < 3 && use_forward) || (frame_idx >= 3 && use_reverse);
-            let mut sequence: Vec<Letter> = if active && !frame_seq.is_empty() {
-                frame_seq.iter().map(|&b| b as Letter).collect()
-            } else {
-                // Keep a six-record layout without giving disabled/empty
-                // contexts any seedable residues.
-                vec![crate::basic::value::MASK_LETTER]
-            };
-            if active {
-                let min_orf = min_orf_len(config.min_orf.unwrap_or(0), sequence.len());
-                find_orfs(&mut sequence, min_orf as i32);
-            }
-            protein_records.push(FastaRecord {
-                id: frame_id,
-                sequence,
-            });
-        }
+        query_block
+            .push_back_translated_with_genetic_code(
+                &dna_rec.sequence,
+                Some(&dna_short),
+                dna_index as u64,
+                frame_mask,
+                config.min_orf.unwrap_or(0) as i32,
+                config.query_gencode,
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        mate_indices.push(paired.then_some(dna_index ^ 1));
     }
     // Reuse blastp's database loading and seed-search front end. The internal
     // translated layout makes its extension stage combine all six contexts.
@@ -161,17 +133,15 @@ pub fn run(config: &BlastxConfig) -> io::Result<()> {
         memory_limit: config.memory_limit,
         tmpdir: config.tmpdir.clone(),
         target_indexed: config.target_indexed,
-        translated_query_layout: Some(TranslatedQueryLayout {
-            sources: translated_sources,
-        }),
+        translated_query_layout: Some(TranslatedQueryLayout { mate_indices }),
     };
 
-    let translated_frame_count = protein_records.len();
+    let translated_frame_count = query_block.seqs().len();
     eprintln!(
         "Translated {dna_query_count} DNA queries into {translated_frame_count} protein frames in {:.1}s",
         start.elapsed().as_secs_f64()
     );
-    crate::commands::blastp::run_with_query_records(&blastp_config, protein_records)
+    crate::commands::blastp::run_with_translated_query_block(&blastp_config, query_block)
 }
 
 fn load_query_records(paths: &[String]) -> io::Result<(Vec<FastaRecord>, bool)> {
@@ -214,6 +184,7 @@ fn interleave_paired_records(
     Ok(records)
 }
 
+#[cfg(test)]
 fn min_orf_len(run_len: u32, length: usize) -> u32 {
     if run_len != 0 {
         return run_len;
@@ -230,6 +201,9 @@ fn min_orf_len(run_len: u32, length: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basic::translate;
+    use crate::basic::value::Letter;
+    use crate::util::sequence::find_orfs;
 
     fn record(id: &str, base: Letter) -> FastaRecord {
         FastaRecord {

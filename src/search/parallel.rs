@@ -902,6 +902,7 @@ where
         hamming_filter_id,
         partition_batch_size,
         false,
+        false,
         0.0,
         false,
         map_batch,
@@ -909,9 +910,10 @@ where
     )
 }
 
-/// Variant selecting C++ `stage1_query_lin(_ranked)`: one query occurrence
-/// per joined seed group is chosen by the default length ranking and compared
-/// against every target occurrence.
+/// Variant selecting the C++ linear stage-1 kernels. Query-linear search
+/// chooses one query occurrence per joined seed group; target-linear search
+/// chooses one target occurrence. The retained pivot is then compared against
+/// every occurrence on the other side.
 pub fn visit_prepared_seed_matches_streaming_hamming_mode<T, F, C>(
     query_fingerprint_seqs: &[&[Letter]],
     ref_fingerprint_seqs: &[&[Letter]],
@@ -923,6 +925,7 @@ pub fn visit_prepared_seed_matches_streaming_hamming_mode<T, F, C>(
     hamming_filter_id: u32,
     partition_batch_size: usize,
     linear_stage1_query: bool,
+    linear_stage1_target: bool,
     min_length_ratio: f64,
     self_search: bool,
     map_batch: F,
@@ -941,6 +944,7 @@ where
         hamming_filter_id,
         partition_batch_size,
         linear_stage1_query,
+        linear_stage1_target,
         min_length_ratio,
         self_search,
         |query, target_indices, target_locs, target_subjects, partition, output| {
@@ -984,6 +988,7 @@ pub fn visit_prepared_seed_hits_streaming_hamming_mode<T, F, C>(
     hamming_filter_id: u32,
     partition_batch_size: usize,
     linear_stage1_query: bool,
+    linear_stage1_target: bool,
     min_length_ratio: f64,
     self_search: bool,
     map_batch: F,
@@ -1004,6 +1009,7 @@ where
                 hamming_filter_id,
                 partition_batch_size,
                 linear_stage1_query,
+                linear_stage1_target,
                 min_length_ratio,
                 self_search,
                 map_batch,
@@ -1044,6 +1050,7 @@ fn visit_prepared_seed_hits_streaming_hamming_for<const HAMMING_KERNEL: u8, T, F
     hamming_filter_id: u32,
     partition_batch_size: usize,
     linear_stage1_query: bool,
+    linear_stage1_target: bool,
     min_length_ratio: f64,
     self_search: bool,
     map_batch: F,
@@ -1135,11 +1142,15 @@ where
                 n.saturating_mul(n.saturating_sub(1)) / 2
             } else if linear_stage1_query {
                 block.r_count as usize
+            } else if linear_stage1_target {
+                block.q_count as usize
             } else {
                 block.q_count as usize * block.r_count as usize
             };
-            let absolute_hamming =
-                !linear_stage1_query && !self_search && exact_stage1_sets.is_some();
+            let absolute_hamming = !linear_stage1_query
+                && !linear_stage1_target
+                && !self_search
+                && exact_stage1_sets.is_some();
             query_locs.clear();
             query_absolute.clear();
             if absolute_hamming {
@@ -1211,7 +1222,9 @@ where
                 // Keep that boundary instead of repeatedly re-entering stage
                 // 2 for every 32 Hamming survivors.
             };
-            if (linear_stage1_query || self_search) && exact_stage1_sets.is_some() {
+            if (linear_stage1_query || linear_stage1_target || self_search)
+                && exact_stage1_sets.is_some()
+            {
                 let (query_set, target_set) = exact_stage1_sets.unwrap();
                 query_packed.clear();
                 query_packed.extend(query_locs.iter().map(|&(id, pos)| {
@@ -1229,6 +1242,7 @@ where
                 }));
                 let dispatch = crate::search::hamming::Stage1DispatchConfig {
                     lin_stage1_query: linear_stage1_query,
+                    lin_stage1_target: linear_stage1_target,
                     min_length_ratio,
                     self_search,
                     ..Default::default()
@@ -2065,6 +2079,57 @@ mod tests {
         };
         assert_eq!(raw_count, raw.len());
         assert_eq!(signature(&fused), signature(&expected));
+    }
+
+    #[test]
+    fn target_linear_streaming_stage1_keeps_only_first_target_occurrence() {
+        let reduction = Reduction::default_reduction();
+        let shape = Shape::from_code("111", &reduction);
+        let query_data = [vec![0; 16]];
+        let ref_data = [vec![0; 16], vec![0; 16]];
+        let query_seqs: Vec<&[Letter]> = query_data.iter().map(Vec::as_slice).collect();
+        let ref_seqs: Vec<&[Letter]> = ref_data.iter().map(Vec::as_slice).collect();
+        let mut query_set = crate::data::sequence_set::SequenceSet::new();
+        let mut ref_set = crate::data::sequence_set::SequenceSet::new();
+        query_data
+            .iter()
+            .for_each(|sequence| query_set.push(sequence));
+        ref_data.iter().for_each(|sequence| ref_set.push(sequence));
+
+        let prepared = prepare_seed_join_partitioned_min_query_len(
+            &query_seqs,
+            &ref_seqs,
+            &shape,
+            &reduction,
+            0.0,
+            0,
+            0,
+        );
+        let mut target_ids = Vec::new();
+        visit_prepared_seed_hits_streaming_hamming_mode(
+            &query_seqs,
+            &ref_seqs,
+            Some((&query_set, &ref_set)),
+            prepared,
+            0,
+            usize::MAX,
+            false,
+            true,
+            0.0,
+            false,
+            |_query, target_indices, target_locs, _, _, output| {
+                output.extend(
+                    target_indices
+                        .iter()
+                        .map(|&index| target_locs[index as usize].0),
+                );
+                target_indices.len()
+            },
+            |partitions| target_ids.extend(partitions.into_iter().flatten()),
+        );
+
+        assert!(!target_ids.is_empty());
+        assert!(target_ids.iter().all(|&target| target == 0));
     }
 
     #[test]

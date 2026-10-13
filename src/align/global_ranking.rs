@@ -42,7 +42,7 @@ pub fn db_filter(table: &[Hit], db_size: usize) -> BitVector {
 /// Matches C++ `GlobalRanking::target_score`.
 pub fn target_score(
     hits: &mut [SeedHit],
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     target_seq: &[Letter],
     no_reextend: bool,
     xdrop: i32,
@@ -172,7 +172,7 @@ pub fn get_query_hits(
 pub fn get_query_hits_reextend(
     _source_query_block_id: BlockId,
     seed_hits: &mut [SearchHit],
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     target_block: &Block,
     query_contexts: u32,
     no_reextend: bool,
@@ -204,7 +204,7 @@ pub fn get_query_hits_reextend(
 pub fn extend_query_from_query_list<F1, F2>(
     query_list: &QueryList,
     db2block_id: &TargetMap,
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_title: &str,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
@@ -272,7 +272,7 @@ pub fn extend_query_from_ranking_table<F1, F2>(
     source_query_block_id: BlockId,
     ranking_table: &[Hit],
     db2block_id: &TargetMap,
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_title: &str,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
@@ -470,7 +470,7 @@ mod tests {
         let score_matrix = sm();
         let query = vec![0, 1, 2, 3, 4, 5, 6, 7];
         let target = query.clone();
-        let query_seq = vec![query.clone()];
+        let query_seq = [query.as_slice()];
         let mut hits = vec![SeedHit::new(1, 1, 10, 0), SeedHit::new(4, 4, 20, 0)];
         assert_eq!(
             target_score(&mut hits, &query_seq, &target, true, 20, &score_matrix),
@@ -560,7 +560,7 @@ mod tests {
         let reextended = get_query_hits_reextend(
             0,
             &mut hits,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             &target_block,
             1,
             false,
@@ -607,7 +607,7 @@ mod tests {
         let matches = extend_query_from_query_list(
             &query_list,
             &db2block_id,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             "q",
             query.len() as i32,
             &[],
@@ -639,7 +639,7 @@ mod tests {
             0,
             &ranking_table,
             &db2block_id,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             "q",
             query.len() as i32,
             &[],

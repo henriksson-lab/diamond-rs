@@ -179,7 +179,15 @@ unsafe fn window_ungapped_avx2(
     let lane_offset = 32 - subjects.len();
     for block_begin in (0..window).step_by(32) {
         let block_len = (window - block_begin).min(32);
-        if block_len == 32 {
+        // Upstream's SequenceSet has perimeter padding and always presents a
+        // complete vector to `transpose`, including the final partial score
+        // block. Preserve that fast path whenever the borrowed Rust slices
+        // expose the same padding. Generic callers with exact-length slices
+        // retain the explicit tail copy below.
+        if subjects
+            .iter()
+            .all(|subject| subject.len() >= block_begin + 32)
+        {
             crate::util::simd::transpose_32_avx2(
                 &subject_ptrs[..subjects.len()],
                 subjects.len(),
@@ -596,6 +604,32 @@ mod tests {
             }
             assert_eq!(actual, expected, "batch size {count}");
         }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn avx2_padded_tail_matches_exact_length_tail() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let score_matrix = matrix();
+        let query: Vec<Letter> = (0..48).map(|i| ((i * 7 + 3) % 25) as Letter).collect();
+        let subject_data: Vec<Vec<Letter>> = (0..32)
+            .map(|lane| {
+                (0..80)
+                    .map(|i| ((i * 11 + lane * 5 + 1) % 25) as Letter)
+                    .collect()
+            })
+            .collect();
+        let padded: Vec<&[Letter]> = subject_data.iter().map(Vec::as_slice).collect();
+        let exact: Vec<&[Letter]> = subject_data.iter().map(|subject| &subject[..48]).collect();
+        let mut padded_scores = [0; 32];
+        let mut exact_scores = [0; 32];
+        unsafe {
+            window_ungapped_avx2(&query, &padded, 48, &score_matrix, &mut padded_scores);
+            window_ungapped_avx2(&query, &exact, 48, &score_matrix, &mut exact_scores);
+        }
+        assert_eq!(padded_scores, exact_scores);
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

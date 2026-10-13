@@ -349,7 +349,7 @@ mod tests {
         let test_job = job(&dir.0, 0, false);
 
         let manifest = get_reps_fasta(&test_job, &[volume], GetRepsConfig::default()).unwrap();
-        let output = dir.0.join("reps/0.faa");
+        let output = dir.0.join("reps").join("0.faa");
         assert_eq!(
             std::fs::read_to_string(&output).unwrap(),
             ">11\nDCQ\n>12\nEGH\n"

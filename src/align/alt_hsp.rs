@@ -96,7 +96,7 @@ type TargetVec = Vec<ActiveTarget>;
 fn recompute_alt_hsps_round(
     matches: &mut [Match],
     targets: &mut [ActiveTarget],
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_cbs: &[Vec<i8>],
     query_source_len: i32,
     hsp_values: HspValues,
@@ -207,7 +207,7 @@ fn recompute_alt_hsps_round(
 /// C++ public `recompute_alt_hsps` iterator-range overload.
 pub fn recompute_alt_hsps(
     matches: &mut [Match],
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_cbs: &[Vec<i8>],
     query_source_len: i32,
     hsp_values: HspValues,
@@ -303,7 +303,7 @@ mod tests {
         let mut statistics = Statistics::new();
         recompute_alt_hsps(
             std::slice::from_mut(&mut target_match),
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             &[],
             query.len() as i32,
             HspValues::COORDS,
@@ -335,7 +335,7 @@ mod tests {
         let mut statistics = Statistics::new();
         recompute_alt_hsps(
             std::slice::from_mut(&mut target_match),
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             &[],
             query.len() as i32,
             HspValues::COORDS,

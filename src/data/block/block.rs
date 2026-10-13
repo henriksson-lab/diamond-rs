@@ -108,6 +108,17 @@ impl Block {
         &mut self.seqs
     }
 
+    /// Split the translated/protein contexts from the block while retaining
+    /// source sequences, titles, and OID metadata in the block.
+    pub fn take_seqs(&mut self) -> SequenceSet {
+        std::mem::take(&mut self.seqs)
+    }
+
+    pub fn put_seqs(&mut self, seqs: SequenceSet) {
+        debug_assert!(self.seqs.is_empty());
+        self.seqs = seqs;
+    }
+
     pub fn ids(&self) -> Result<&StringSet, String> {
         if self.ids.empty() {
             Err("Block::ids()".to_string())
@@ -431,6 +442,63 @@ impl Block {
                 letters += find_orfs(frame, min_len as Loc) as i64;
                 self.seqs.push(frame);
             } else {
+                self.seqs.fill(frame.len(), MASK_LETTER);
+            }
+        }
+        Ok(letters)
+    }
+
+    /// Add one nucleotide source and its six translated protein contexts.
+    ///
+    /// This is the explicit-genetic-code counterpart of
+    /// `push_back_with_min_orf`.  Keeping the source and all contexts in this
+    /// block mirrors upstream's translated query block and lets search mutate,
+    /// restore, and extend the same contiguous sequence storage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_back_translated_with_genetic_code(
+        &mut self,
+        seq: &[Letter],
+        id: Option<&str>,
+        oid: OId,
+        frame_mask: i32,
+        run_len: Loc,
+        genetic_code: u32,
+    ) -> Result<i64, String> {
+        const OVERFLOW_ERR: &str = "Sequences in block exceed supported maximum.";
+        if self.block2oid.len() == BlockId::MAX as usize
+            || self.seqs.len() > BlockId::MAX as usize - 6
+        {
+            return Err(OVERFLOW_ERR.to_string());
+        }
+        if let Some(id) = id {
+            self.ids.push_back(id.as_bytes());
+        }
+        self.block2oid.push(oid);
+        self.source_seqs.push(seq);
+
+        let dna: Vec<u8> = seq.iter().map(|&letter| letter as u8).collect();
+        let mut translated =
+            crate::basic::translate::translate_6_frames_with_genetic_code(&dna, genetic_code)?;
+        let min_len = if run_len != 0 {
+            run_len
+        } else if translated[0].len() < 30 {
+            1
+        } else if translated[0].len() < 100 {
+            20
+        } else {
+            40
+        };
+        let mut letters = 0i64;
+        for (frame_index, frame) in translated.iter_mut().enumerate() {
+            if frame_mask & (1 << frame_index) != 0 {
+                let mut encoded: Vec<Letter> =
+                    frame.iter().map(|&letter| letter as Letter).collect();
+                letters += find_orfs(&mut encoded, min_len) as i64;
+                self.seqs.push(&encoded);
+            } else {
+                // Upstream retains all six contexts. Disabled strands have
+                // their natural translated length but contain no seedable
+                // residues.
                 self.seqs.fill(frame.len(), MASK_LETTER);
             }
         }

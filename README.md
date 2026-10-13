@@ -6,6 +6,7 @@ DIAMOND is a high-performance sequence aligner for protein and translated DNA se
 
 **This crate is under translation. Do not use it. Do not trust any text below**
 
+* 2026-10-13: More fixes
 * 2026-10-05: More fixes
 * 2026-09-30: More optimization. portability work
 * 2026-09-28: Ondisk blastp mode, but also faster inmem mode (not in original). Parity on broader datasets
@@ -180,7 +181,8 @@ is byte-identical.
 | `blastx --mid-sensitive` | 1,000,000 contiguous *E. coli* nt vs 1,000 AMR proteins | 16G | 1 | 3 | 4.52 s | 3.47 s | 1.303x | 268,804 KiB | 188,920 KiB | 0.703x | PASS |
 | `blastx --mid-sensitive --min-orf 30` | same natural translated-search workload | 16G | 1 | 3 | 5.05 s | 4.34 s | 1.164x | 266,664 KiB | 188,568 KiB | 0.707x | PASS |
 | `blastx --mid-sensitive`, DAA output | same natural translated-search workload | 16G | 1 | 3 | 4.62 s | 3.62 s | 1.276x | 268,764 KiB | 188,564 KiB | 0.702x | PASS |
-| paired `blastx --mid-sensitive` | 5,000 natural SRR1703350 read pairs vs 7,000 AMR proteins; includes `full_qseq_mate` | 16G | 1 | 3 | 6.09 s | 5.64 s | 1.080x | 47,664 KiB | 49,716 KiB | 1.043x | PASS |
+| paired `blastx --mid-sensitive` | 5,000 natural SRR1703350 read pairs vs 7,000 AMR proteins; includes `full_qseq_mate` | 16G | 1 | 3 | 6.38 s | 6.07 s | 1.051x | 47,784 KiB | 36,656 KiB | 0.767x | PASS |
+| paired `blastx --mid-sensitive` | same paired workload | 0G | 1 | 3 | 6.38 s | 6.49 s | 0.983x | 47,784 KiB | 37,408 KiB | 0.783x | PASS |
 | paired `blastx --mid-sensitive` | same paired workload | 16G | 4 | 3 | 2.64 s | 2.30 s | 1.148x | 62,824 KiB | 53,580 KiB | 0.853x | PASS |
 | `blastp --ultra-sensitive` | 300 distinct AMR queries vs 1,000 AMR proteins | 16G | 1 | 3 | 17.04 s | 15.88 s | 1.073x | 29,160 KiB | 20,944 KiB | 0.718x | PASS |
 | `blastp --very-sensitive` | 300 distinct AMR queries vs 1,000 AMR proteins | 16G | 1 | 3 | 3.99 s | 3.96 s | 1.008x | 25,252 KiB | 18,444 KiB | 0.730x | PASS |
@@ -197,6 +199,7 @@ is byte-identical.
 | `cluster` | 4,000 distinct AMR proteins | n/a | 4 | 3 | 3.03 s | 2.63 s | 1.152x | 80,184 KiB | 20,552 KiB | 0.256x | PASS |
 | `linclust` | 10,000 distinct AMR proteins | n/a | 1 | 3 | 2.93 s | 2.79 s | 1.050x | 35,932 KiB | 34,104 KiB | 0.949x | PASS |
 | `linclust` | 10,000 distinct AMR proteins | n/a | 4 | 3 | 1.37 s | 1.02 s | 1.343x | 59,588 KiB | 40,360 KiB | 0.677x | PASS |
+| `linclust` forced split | 4,000 distinct AMR proteins | 5M | 1 | 3 | 1.59 s | 1.28 s | 1.242x | 25,460 KiB | 16,320 KiB | 0.641x | PASS |
 | `deepclust` | 4,000 distinct AMR proteins | n/a | 1 | 3 | 9.21 s | 8.90 s | 1.035x | 27,912 KiB | 17,152 KiB | 0.615x | PASS |
 | `makedb` | 574,627 natural Swiss-Prot records | n/a | 1 | 3 | 16.34 s | 15.83 s | 1.032x | 402,172 KiB | 350,720 KiB | 0.872x | PASS |
 | `makedb` | 89 MiB gzip, 574,627 natural Swiss-Prot records | n/a | default (40) | 3 | 6.38 s | 4.10 s | 1.556x | 552,272 KiB | 379,412 KiB | 0.687x | PASS |
@@ -226,12 +229,26 @@ On the natural delayed-spill scout this is 5.0% faster with 1.4% lower RSS;
 cross-command controls also improve paired four-thread `blastx`, one-thread
 ultra-sensitive `blastp`, and `linclust`. A separate contiguous `blastx`
 control varied 1.4% in the other direction, below the material threshold.
+The AVX2 ungapped kernel now also follows upstream's padded full-vector load
+for the final partial block of its fixed 48-byte window, while keeping a safe
+fallback for exact-length library slices. A bounded exact-output natural A/B
+changed 16.65 to 16.57 seconds and 20,900 to 20,584 KiB; this single contended
+pair is treated as a regression check rather than a stable benchmark.
 The subsequent multithread translation now computes upstream's complete
 worker-by-shape seed histogram once before the shape/chunk loop. Reusing its
 stable worker ranges removes three redundant count passes per chunk without
 changing seed order. Paired four-thread `blastx` improves from 3.04 to 2.30 s
 in exact Rust A/B runs, and the delayed-spill row reaches runtime parity while
 retaining substantially lower RSS.
+The paired one-thread path now also follows upstream's single-owner query
+lifetime: one authoritative `Block` owns the source DNA and all six translated
+contexts, masking and restoration mutate that storage in place, and extension
+borrows its slices. Correct `SEED_MASK` versus `LETTER_MASK` handling preserves
+the seed-mask state across restoration. Focused motif-disabled multi-shape and
+target-indexed checks each retain exact 25-row output parity. On the balanced
+natural paired workload this removes the former duplicate-frame RSS excess:
+Rust uses 0.767x upstream RSS at the default 16G limit and 0.783x at forced-disk
+0G.
 Pairwise view now writes alignment characters as bytes, matching upstream's
 text-buffer path instead of routing each character through generic formatting.
 Upstream has no corresponding memory-limit option and uses its normal

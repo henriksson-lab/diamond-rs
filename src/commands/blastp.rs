@@ -69,7 +69,7 @@ struct StoredHit {
 }
 
 struct TargetIndexedState {
-    query: Block,
+    query: Option<Block>,
     shapes: ShapeConfig,
     seeds: crate::data::seed_set::HashedSeedSet,
 }
@@ -1119,30 +1119,18 @@ pub struct BlastpConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct TranslatedQuerySource {
-    pub id: String,
-    pub dna_len: i32,
-    /// Original nucleotide query, retained for native DAA records. The six
-    /// translated protein contexts are owned separately by the extension
-    /// groups, so this is the only stored source-DNA copy.
-    pub sequence: Vec<Letter>,
-    /// Adjacent source-query ordinal for synchronized two-file blastx input.
-    /// Storing an index instead of a second sequence keeps the mate relation
-    /// zero-copy, matching upstream's shared source-sequence block.
-    pub mate_index: Option<usize>,
-}
-
-#[derive(Clone, Debug)]
 pub struct TranslatedQueryLayout {
-    pub sources: Vec<TranslatedQuerySource>,
+    /// Synchronized two-file blastx mate relation. IDs, source DNA, and all
+    /// translated contexts live in the authoritative query `Block`.
+    pub mate_indices: Vec<Option<usize>>,
 }
 
 struct TranslatedExtensionGroup<'a> {
-    id: String,
+    id: &'a str,
     dna_len: i32,
     source_sequence: &'a [Letter],
     mate_sequence: Option<&'a [Letter]>,
-    frames: Vec<Vec<Letter>>,
+    frames: [&'a [Letter]; 6],
 }
 
 enum QueryOutput {
@@ -1482,10 +1470,13 @@ pub fn run(config: &BlastpConfig) -> io::Result<()> {
         None,
         MaskingAlgo::None,
         false,
+        None,
+        false,
         false,
         false,
         0.0,
         false,
+        None,
         None,
         None,
         None,
@@ -1509,6 +1500,8 @@ pub fn run_with_query_records(
         None,
         MaskingAlgo::None,
         false,
+        None,
+        false,
         false,
         false,
         0.0,
@@ -1516,6 +1509,34 @@ pub fn run_with_query_records(
         None,
         None,
         None,
+        None,
+    )
+}
+
+/// Run translated search with the upstream-shaped query block as its sole
+/// owner of source DNA and six-frame protein contexts.
+pub fn run_with_translated_query_block(
+    config: &BlastpConfig,
+    query_block: Block,
+) -> io::Result<()> {
+    run_impl(
+        config,
+        None,
+        None,
+        None,
+        None,
+        MaskingAlgo::None,
+        false,
+        None,
+        false,
+        false,
+        false,
+        0.0,
+        false,
+        None,
+        None,
+        None,
+        Some(query_block),
     )
 }
 
@@ -1552,6 +1573,8 @@ pub fn run_edges_in_memory(
     hamming_ext: HammingExtConfig,
     soft_tantan_masker: Option<&crate::masking::tantan::TantanMasker>,
     soft_masking_override: MaskingAlgo,
+    freq_masking: bool,
+    effective_db_letters: Option<u64>,
     extension_mode_override: Option<sensitivity::ExtensionMode>,
 ) -> io::Result<Vec<InMemorySearchEdge>> {
     let edges = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1562,6 +1585,8 @@ pub fn run_edges_in_memory(
         Some(edges.clone()),
         Some(approx_min_id),
         soft_masking_override,
+        freq_masking,
+        effective_db_letters,
         linear_stage1_query,
         linear_stage1_target,
         self_search,
@@ -1570,6 +1595,7 @@ pub fn run_edges_in_memory(
         Some(hamming_ext),
         soft_tantan_masker,
         extension_mode_override,
+        None,
     )?;
     let result = edges.lock().unwrap().clone();
     Ok(result)
@@ -1582,6 +1608,8 @@ fn run_impl(
     edge_output: Option<std::sync::Arc<std::sync::Mutex<Vec<InMemorySearchEdge>>>>,
     approx_min_id_override: Option<f64>,
     soft_masking_override: MaskingAlgo,
+    freq_masking: bool,
+    effective_db_letters: Option<u64>,
     linear_stage1_query: bool,
     linear_stage1_target: bool,
     self_search: bool,
@@ -1590,6 +1618,7 @@ fn run_impl(
     hamming_ext: Option<HammingExtConfig>,
     soft_tantan_masker: Option<&crate::masking::tantan::TantanMasker>,
     extension_mode_override: Option<sensitivity::ExtensionMode>,
+    mut translated_query_block: Option<Block>,
 ) -> io::Result<()> {
     let start = Instant::now();
     // Upstream linear self-search aliases target to query instead of loading
@@ -1714,7 +1743,13 @@ fn run_impl(
     };
 
     // Compute total database letters for E-value normalization
-    let db_letters: u64 = db_records.iter().map(|r| r.sequence.len() as u64).sum();
+    let loaded_db_letters: u64 = db_records.iter().map(|r| r.sequence.len() as u64).sum();
+    // `Search::run` normalizes E-values with global `config.db_size` when it
+    // is set. The low-memory clustering wrapper sets that value to the full
+    // input database size before searching any individual super-block.
+    let db_letters = effective_db_letters
+        .filter(|&letters| letters != 0)
+        .unwrap_or(loaded_db_letters);
 
     // Load scoring matrix with database size
     let score_matrix = ScoreMatrix::new(
@@ -1742,9 +1777,14 @@ fn run_impl(
         }
         records
     };
+    let translated_context_count = translated_query_block
+        .as_ref()
+        .map_or(0, |block| block.seqs().len());
     eprintln!(
         "Queries: {} sequences",
-        if shared_self_records {
+        if let Some(layout) = &config.translated_query_layout {
+            layout.mate_indices.len()
+        } else if shared_self_records {
             db_records.len()
         } else {
             query_records.len()
@@ -1834,6 +1874,11 @@ fn run_impl(
             };
             if shared_self_records {
                 // The database mutation above is the query mutation too.
+            } else if let Some(block) = translated_query_block.as_mut() {
+                for query_id in 0..block.seqs().len() {
+                    crate::masking::remove_bit_mask(block.seqs_mut().get_mut(query_id));
+                    tantan_masker.mask(block.seqs_mut().get_mut(query_id));
+                }
             } else if query_records
                 .iter()
                 .any(|record| record.sequence.len() > LONG_QUERY_RESIDUES)
@@ -1854,9 +1899,15 @@ fn run_impl(
                 crate::masking::mask_sequence(&mut record.sequence, MaskingAlgo::Seg);
             });
             if !shared_self_records {
-                query_records
-                    .par_iter_mut()
-                    .for_each(|record| crate::masking::remove_bit_mask(&mut record.sequence));
+                if let Some(block) = translated_query_block.as_mut() {
+                    for query_id in 0..block.seqs().len() {
+                        crate::masking::remove_bit_mask(block.seqs_mut().get_mut(query_id));
+                    }
+                } else {
+                    query_records
+                        .par_iter_mut()
+                        .for_each(|record| crate::masking::remove_bit_mask(&mut record.sequence));
+                }
             }
         }
     }
@@ -1885,9 +1936,15 @@ fn run_impl(
             .par_iter_mut()
             .for_each(|r| hard_mask(&mut r.sequence));
         if !shared_self_records {
-            query_records
-                .par_iter_mut()
-                .for_each(|r| hard_mask(&mut r.sequence));
+            if let Some(block) = translated_query_block.as_mut() {
+                for query_id in 0..block.seqs().len() {
+                    hard_mask(block.seqs_mut().get_mut(query_id));
+                }
+            } else {
+                query_records
+                    .par_iter_mut()
+                    .for_each(|r| hard_mask(&mut r.sequence));
+            }
         }
     }
 
@@ -1900,17 +1957,24 @@ fn run_impl(
     } else {
         &query_records
     };
-    let mut stage2_query_set = SequenceSet::new();
-    stage2_query_set.reserve_capacity(
-        query_source.len(),
-        query_source
-            .iter()
-            .map(|record| record.sequence.len())
-            .sum(),
-    );
-    for record in query_source {
-        stage2_query_set.push(&record.sequence);
-    }
+    let mut stage2_query_set = if let Some(block) = translated_query_block.as_mut() {
+        let sequences = block.take_seqs();
+        debug_assert_eq!(sequences.len(), translated_context_count);
+        sequences
+    } else {
+        let mut sequences = SequenceSet::new();
+        sequences.reserve_capacity(
+            query_source.len(),
+            query_source
+                .iter()
+                .map(|record| record.sequence.len())
+                .sum(),
+        );
+        for record in query_source {
+            sequences.push(&record.sequence);
+        }
+        sequences
+    };
     let mut db_block = Block::new();
     for (idx, record) in db_records.iter().enumerate() {
         db_block
@@ -2029,7 +2093,7 @@ fn run_impl(
         &sensitivity::get_traits(config.sensitivity),
         &config.motif_masking,
         false,
-        false,
+        freq_masking,
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let use_motif_masking = soft_masking == MaskingAlgo::Motif;
@@ -2044,6 +2108,12 @@ fn run_impl(
     let query_motif_saves: Vec<Vec<crate::masking::motifs::MotifMaskEntry>> = if use_motif_masking {
         if shared_self_records {
             Vec::new()
+        } else if translated_query_block.is_some() && !config.target_indexed {
+            (0..stage2_query_set.len())
+                .map(|query_id| {
+                    crate::masking::motifs::mask_motifs(stage2_query_set.get_mut(query_id))
+                })
+                .collect()
         } else {
             query_records
                 .par_iter_mut()
@@ -2083,20 +2153,25 @@ fn run_impl(
             .collect::<Vec<_>>();
         let shape_config = ShapeConfig::from_codes(&shape_codes, 0, &reduction)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let mut query = Block::new();
-        for (oid, record) in query_records.iter().enumerate() {
-            query
-                .push_back(
-                    stage2_query_set.get(oid),
-                    Some(&record.id),
-                    None,
-                    oid as u64,
-                    SequenceType::AminoAcid,
-                    0,
-                    false,
-                )
-                .map_err(io::Error::other)?;
-        }
+        let query = if translated_query_block.is_some() {
+            None
+        } else {
+            let mut query = Block::new();
+            for (oid, record) in query_records.iter().enumerate() {
+                query
+                    .push_back(
+                        stage2_query_set.get(oid),
+                        Some(&record.id),
+                        None,
+                        oid as u64,
+                        SequenceType::AminoAcid,
+                        0,
+                        false,
+                    )
+                    .map_err(io::Error::other)?;
+            }
+            Some(query)
+        };
         let histogram_cfg = crate::data::flags::EnumCfg {
             partition: None,
             shape_begin: 0,
@@ -2162,6 +2237,11 @@ fn run_impl(
             .iter()
             .map(|record| record.sequence.as_slice())
             .collect()
+    } else if translated_query_block.is_some() {
+        // The authoritative translated arena is mutated between seed
+        // enumeration and Hamming filtering, so it is borrowed only inside
+        // each phase below.
+        Vec::new()
     } else {
         query_records
             .iter()
@@ -2212,23 +2292,25 @@ fn run_impl(
     } else {
         &query_motif_saves
     };
-    for (query_id, saved) in query_motif_saves_for_restore.iter().enumerate() {
-        crate::masking::motifs::restore_motifs(
-            stage2_query_set.get_mut(query_id),
-            saved,
-            template_len,
-        );
-    }
-    // C++ MaskingTable::remove restores TANTAN-masked residues for extension,
-    // then annotates every seed start whose template overlaps the restored
-    // range. Preserve the residues already stored in stage2_query_set and apply
-    // precisely that left-extended SEED_MASK interval.
-    for (query_id, spans) in soft_query_spans.iter().enumerate() {
-        let query = stage2_query_set.get_mut(query_id);
-        for &(begin, end) in spans {
-            let mask_begin = begin.saturating_sub((template_len.max(1) - 1) as usize);
-            for letter in &mut query[mask_begin..end] {
-                *letter |= SEED_MASK;
+    if translated_query_block.is_none() {
+        for (query_id, saved) in query_motif_saves_for_restore.iter().enumerate() {
+            crate::masking::motifs::restore_motifs(
+                stage2_query_set.get_mut(query_id),
+                saved,
+                template_len,
+            );
+        }
+        // C++ MaskingTable::remove restores TANTAN-masked residues for extension,
+        // then annotates every seed start whose template overlaps the restored
+        // range. Preserve the residues already stored in stage2_query_set and apply
+        // precisely that left-extended SEED_MASK interval.
+        for (query_id, spans) in soft_query_spans.iter().enumerate() {
+            let query = stage2_query_set.get_mut(query_id);
+            for &(begin, end) in spans {
+                let mask_begin = begin.saturating_sub((template_len.max(1) - 1) as usize);
+                for letter in &mut query[mask_begin..end] {
+                    *letter |= SEED_MASK;
+                }
             }
         }
     }
@@ -2314,6 +2396,18 @@ fn run_impl(
     let mut retained_hit_count = 0usize;
     let mut raw_seed_matches = 0usize;
     let mut current_left_most_matcher = PatternMatcher::new(&[]);
+    let translated_histogram_query_seqs: Vec<&[Letter]> = if translated_query_block.is_some() {
+        (0..stage2_query_set.len())
+            .map(|query_id| stage2_query_set.get(query_id))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let histogram_query_seqs = if translated_query_block.is_some() {
+        &translated_histogram_query_seqs
+    } else {
+        &query_seqs
+    };
     // Upstream constructs one worker×shape×partition SeedHistogram for the
     // complete query/reference block, then reuses it for every index chunk.
     // Keep worker sequence ranges in the histogram so parallel fills preserve
@@ -2324,7 +2418,7 @@ fn run_impl(
         .then(|| {
             (
                 crate::search::seed_array::SeedArray::count_partitions_by_worker_all_shapes(
-                    &query_seqs,
+                    histogram_query_seqs,
                     &shapes,
                     &reduction,
                     10,
@@ -2339,6 +2433,8 @@ fn run_impl(
                 ),
             )
         });
+    let _ = histogram_query_seqs;
+    drop(translated_histogram_query_seqs);
     for (shape_id, shape) in shapes.iter().enumerate() {
         let previous_left_most_matcher = current_left_most_matcher.clone();
         current_left_most_matcher.add_pattern(shape.mask);
@@ -2370,9 +2466,20 @@ fn run_impl(
             };
             stage0_config.target_seeds = Some(&state.seeds);
 
+            // Translated target-indexed search temporarily reunites the
+            // context arena with its source/ID block. `search_shape` performs
+            // soft mask -> enumeration -> restore on that same block.
+            if let Some(block) = translated_query_block.as_mut() {
+                block.put_seqs(std::mem::take(&mut stage2_query_set));
+            }
+            let query_stage0_block = if let Some(block) = translated_query_block.as_mut() {
+                block
+            } else {
+                state.query.as_mut().expect("protein indexed query block")
+            };
             let indexed_report = crate::search::stage0::search_shape(
                 shape_id as u32,
-                &mut state.query,
+                query_stage0_block,
                 &mut db_block,
                 &stage0_config,
                 |partition, query_stage0, target_stage0| {
@@ -2425,6 +2532,9 @@ fn run_impl(
                 },
             )
             .map_err(io::Error::other)?;
+            if let Some(block) = translated_query_block.as_mut() {
+                stage2_query_set = block.take_seqs();
+            }
             eprintln!(
                 "Indexed seeds (shape {}): query={}, reference={}",
                 shape_id + 1,
@@ -2460,9 +2570,21 @@ fn run_impl(
         // sketch construction retain their existing worker-local layouts.
         let precomputed_counts = (rayon::current_num_threads() == 1 && traits.sketch_size <= 0)
             .then(|| {
+                let translated_query_seqs = if translated_query_block.is_some() {
+                    (0..stage2_query_set.len())
+                        .map(|query_id| stage2_query_set.get(query_id))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let shape_query_seqs = if translated_query_block.is_some() {
+                    &translated_query_seqs
+                } else {
+                    &query_seqs
+                };
                 (
                     crate::search::seed_array::SeedArray::count_partitions(
-                        &query_seqs,
+                        shape_query_seqs,
                         shape,
                         &reduction,
                         10,
@@ -2481,10 +2603,22 @@ fn run_impl(
             });
         let mut shape_raw_seed_matches = 0usize;
         for chunk in 0..index_chunks.parts {
+            let translated_query_seqs = if translated_query_block.is_some() {
+                (0..stage2_query_set.len())
+                    .map(|query_id| stage2_query_set.get(query_id))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let shape_query_seqs = if translated_query_block.is_some() {
+                &translated_query_seqs
+            } else {
+                &query_seqs
+            };
             let prepared =
                 if let Some((query_counts, reference_counts)) = &precomputed_worker_histograms {
                     parallel::prepare_seed_join_partition_range_from_worker_counts_min_query_len(
-                        &query_seqs,
+                        shape_query_seqs,
                         &db_seqs,
                         shape,
                         &reduction,
@@ -2497,7 +2631,7 @@ fn run_impl(
                     )
                 } else if let Some((query_counts, reference_counts)) = &precomputed_counts {
                     parallel::prepare_seed_join_partition_range_from_counts_min_query_len(
-                        &query_seqs,
+                        shape_query_seqs,
                         &db_seqs,
                         shape,
                         &reduction,
@@ -2510,7 +2644,7 @@ fn run_impl(
                     )
                 } else {
                     parallel::prepare_seed_join_partition_range_min_query_len(
-                        &query_seqs,
+                        shape_query_seqs,
                         &db_seqs,
                         shape,
                         &reduction,
@@ -2521,18 +2655,28 @@ fn run_impl(
                         index_chunks.end(chunk),
                     )
                 };
-            for &(query_id, query_pos) in prepared.masked_positions() {
-                if query_id as usize >= stage2_query_set.len() {
-                    continue;
-                }
-                if let Some(letter) = stage2_query_set
-                    .get_mut(query_id as usize)
-                    .get_mut(query_pos as usize)
-                {
-                    *letter |= SEED_MASK;
+            let _ = shape_query_seqs;
+            drop(translated_query_seqs);
+            if translated_query_block.is_some() {
+                for (query_id, saved) in query_motif_saves.iter().enumerate() {
+                    crate::masking::motifs::restore_motifs(
+                        stage2_query_set.get_mut(query_id),
+                        saved,
+                        template_len,
+                    );
                 }
             }
             low_complexity_query_positions.extend_from_slice(prepared.masked_positions());
+            for &(query_id, query_pos) in &low_complexity_query_positions {
+                if (query_id as usize) < stage2_query_set.len() {
+                    if let Some(letter) = stage2_query_set
+                        .get_mut(query_id as usize)
+                        .get_mut(query_pos as usize)
+                    {
+                        *letter |= SEED_MASK;
+                    }
+                }
+            }
             let query_fingerprint_seqs: Vec<&[Letter]> = (0..stage2_query_set.len())
                 .map(|id| stage2_query_set.get(id))
                 .collect();
@@ -2579,6 +2723,7 @@ fn run_impl(
                     hamming_filter_id,
                     usize::MAX,
                     linear_stage1_query,
+                    linear_stage1_target,
                     min_length_ratio,
                     self_search,
                     map_candidates,
@@ -2600,6 +2745,7 @@ fn run_impl(
                     // 1024-partition shape) for forced-disk RSS control.
                     rayon::current_num_threads().max(1) * 15,
                     linear_stage1_query,
+                    linear_stage1_target,
                     min_length_ratio,
                     self_search,
                     map_candidates,
@@ -2618,6 +2764,17 @@ fn run_impl(
                 raw
             };
             shape_raw_seed_matches += chunk_raw_seed_matches;
+            if translated_query_block.is_some()
+                && use_motif_masking
+                && (chunk + 1 < index_chunks.parts || shape_id + 1 < shapes.len())
+            {
+                for (query_id, saved) in query_motif_saves.iter().enumerate() {
+                    crate::masking::motifs::reapply_motifs(
+                        stage2_query_set.get_mut(query_id),
+                        saved,
+                    );
+                }
+            }
         }
         raw_seed_matches += shape_raw_seed_matches;
     }
@@ -2687,49 +2844,53 @@ fn run_impl(
         // `Block::remove_soft_masking` restores the same query storage that is
         // later consumed by extension. Move that exact state back before
         // releasing the temporary SequenceSet.
-        restore_extension_queries(&mut query_records, &stage2_query_set);
+        if config.translated_query_layout.is_none() {
+            restore_extension_queries(&mut query_records, &stage2_query_set);
+        }
     }
 
     // Release seed-enumeration record storage and the temporary query copy
     // before extension.
     drop(db_records);
-    drop(stage2_query_set);
+    // Translated extension borrows the same contiguous query arena. Ordinary
+    // blastp releases its arena after restoring record-owned extension state.
+    if config.translated_query_layout.is_none() {
+        stage2_query_set.clear();
+        stage2_query_set.shrink_to_fit();
+    }
     drop(db_motif_saves);
     drop(query_motif_saves);
     trim_freed_heap_pages();
     let db_ids = db_block.ids().map_err(io::Error::other)?;
 
-    // Once seeding is complete, move (do not clone) the six translated
-    // protein sequences into one source-query object. This is the shape the
-    // extension code expects for translated search and avoids retaining a
-    // second copy of long contigs.
+    // Once seeding is complete, build lightweight per-source views over the
+    // authoritative block and contiguous context arena. Extension borrows all
+    // six frames and the source DNA; no sequence bytes are moved or cloned.
     let translated_groups = if let Some(layout) = &config.translated_query_layout {
-        let expected = layout.sources.len().saturating_mul(6);
-        if query_records.len() != expected {
+        let expected = layout.mate_indices.len().saturating_mul(6);
+        if stage2_query_set.len() != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "blastx internal layout has {} protein records, expected {expected}",
-                    query_records.len()
+                    stage2_query_set.len()
                 ),
             ));
         }
-        let mut records = std::mem::take(&mut query_records).into_iter();
-        let mut groups = Vec::with_capacity(layout.sources.len());
-        for source in &layout.sources {
-            let frames = records
-                .by_ref()
-                .take(6)
-                .map(|record| record.sequence)
-                .collect();
+        let block = translated_query_block
+            .as_ref()
+            .expect("translated layout requires its source query block");
+        let ids = block.ids().map_err(io::Error::other)?;
+        let mut groups = Vec::with_capacity(layout.mate_indices.len());
+        for (source_index, &mate_index) in layout.mate_indices.iter().enumerate() {
+            let context = source_index * 6;
+            let frames = std::array::from_fn(|frame| stage2_query_set.get(context + frame));
             groups.push(TranslatedExtensionGroup {
-                id: source.id.clone(),
-                dna_len: source.dna_len,
-                source_sequence: &source.sequence,
-                mate_sequence: source
-                    .mate_index
-                    .and_then(|index| layout.sources.get(index))
-                    .map(|mate| mate.sequence.as_slice()),
+                id: std::str::from_utf8(ids.get(source_index))
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                dna_len: block.source_seqs().length(source_index) as i32,
+                source_sequence: block.source_seqs().get(source_index),
+                mate_sequence: mate_index.map(|index| block.source_seqs().get(index)),
                 frames,
             });
         }
@@ -2896,10 +3057,11 @@ fn run_impl(
         } else {
             std::slice::from_ref(&query_cbs)
         };
+        let query_contexts = [query.as_slice()];
         let mut matches = extend_targets(
             query_idx as u32,
             &mut hits,
-            std::slice::from_ref(query),
+            &query_contexts,
             &query_rec.id,
             query.len() as i32,
             query_cbs_arg,
@@ -3047,7 +3209,6 @@ fn run_impl(
         |(query_idx, group, query_hits): (usize, &TranslatedExtensionGroup, &[Vec<CompactHit>]),
          scratch: &mut ExtensionWorkerScratch|
          -> io::Result<QueryOutput> {
-            debug_assert_eq!(group.frames.len(), 6);
             debug_assert_eq!(query_hits.len(), 6);
             let ExtensionWorkerScratch {
                 hits,
@@ -3055,7 +3216,7 @@ fn run_impl(
                 hauser_values,
             } = scratch;
             let query_cbs: &[Vec<i8>] = if config.comp_based_stats.hauser() {
-                for (query, output) in group.frames.iter().zip(query_cbs.iter_mut()) {
+                for (&query, output) in group.frames.iter().zip(query_cbs.iter_mut()) {
                     crate::stats::hauser_correction::hauser_correction_into(
                         query,
                         &score_matrix,
@@ -3067,7 +3228,7 @@ fn run_impl(
             } else {
                 &[]
             };
-            let query_comp = crate::stats::cbs::compute_composition(&group.frames[0]);
+            let query_comp = crate::stats::cbs::compute_composition(group.frames[0]);
             let ungapped_cfg = UngappedStageConfig {
                 query_contexts: 6,
                 query_translated: true,
@@ -3131,7 +3292,7 @@ fn run_impl(
                 query_idx as u32,
                 hits,
                 &group.frames,
-                &group.id,
+                group.id,
                 group.dna_len,
                 query_cbs,
                 &query_comp,
@@ -3216,7 +3377,7 @@ fn run_impl(
                 })?;
                 format::write_tabular_row_with_query_info(
                     &mut buf,
-                    &group.id,
+                    group.id,
                     target_title,
                     &hsp,
                     &fields,
@@ -3393,7 +3554,7 @@ fn run_impl(
                             let mut bytes = Vec::new();
                             let count = encode_daa_query(
                                 &mut bytes,
-                                &group.id,
+                                group.id,
                                 group.source_sequence,
                                 SequenceType::Nucleotide,
                                 &matches,

@@ -23,7 +23,7 @@ pub struct UpdateTableConfig<'a> {
     pub no_reextend: bool,
     pub xdrop: i32,
     /// Query contexts stored consecutively for each source query.
-    pub query_sequences: &'a [Vec<Letter>],
+    pub query_sequences: &'a [&'a [Letter]],
     pub target_block: &'a Block,
     pub score_matrix: &'a ScoreMatrix,
 }
@@ -179,11 +179,11 @@ mod tests {
         ]);
         let mut table = vec![Hit::default(); 4];
         table[0] = Hit::new(11, 40, 0);
-        let queries = vec![
-            vec![0, 1, 2, 3, 4, 5],
-            vec![5, 4, 3, 2, 1, 0],
-            vec![0, 1, 2, 3, 4, 5],
-            vec![5, 4, 3, 2, 1, 0],
+        let queries: [&[Letter]; 4] = [
+            &[0, 1, 2, 3, 4, 5],
+            &[5, 4, 3, 2, 1, 0],
+            &[0, 1, 2, 3, 4, 5],
+            &[5, 4, 3, 2, 1, 0],
         ];
         let config = UpdateTableConfig {
             query_contexts: 2,
@@ -208,7 +208,7 @@ mod tests {
     fn update_table_retains_empty_buffer_like_cpp_early_return() {
         let target = target_block();
         let matrix = score_matrix();
-        let queries = vec![vec![0, 1, 2, 3, 4, 5]];
+        let queries: [&[Letter]; 1] = [&[0, 1, 2, 3, 4, 5]];
         let config = UpdateTableConfig {
             query_contexts: 1,
             global_ranking_targets: 1,

@@ -135,6 +135,15 @@ pub struct MotifMaskEntry {
     pub original: Letter,
 }
 
+/// Reapply a previously discovered motif mask without rescanning a sequence.
+/// This is used when one query arena is restored for Hamming filtering and
+/// then masked again for the next seed chunk/shape.
+pub fn reapply_motifs(seq: &mut [Letter], saved: &[MotifMaskEntry]) {
+    for entry in saved {
+        seq[entry.pos] = MASK_LETTER;
+    }
+}
+
 /// Apply motif masking in place. Returns a vector of saved positions so the
 /// caller can restore the original letters after seed enumeration. The mask
 /// is `MASK_LETTER` (hard mask) — seed enumeration drops seeds overlapping a

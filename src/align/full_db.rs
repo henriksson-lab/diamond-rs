@@ -13,7 +13,7 @@ use crate::stats::score_matrix::ScoreMatrix;
 /// Align every query context against every sequence in a target block and
 /// group the resulting HSPs by subject, matching C++ `full_db_align`.
 pub fn full_db_align(
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_cbs: &[Vec<i8>],
     flags: Flags,
     hsp_values: HspValues,
@@ -108,7 +108,7 @@ mod tests {
             .unwrap();
         let mut statistics = Statistics::new();
         let targets = full_db_align(
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             &[],
             Flags::NONE,
             HspValues::COORDS,

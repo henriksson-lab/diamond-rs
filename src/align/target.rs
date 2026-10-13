@@ -356,7 +356,7 @@ pub fn lazy_masking(target_block_ids: &[BlockId], targets: &mut Block, algo: Mas
 
 /// Matches C++ `extend_chunk`.
 pub fn extend_chunk<F1, F2>(
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_id: Option<&str>,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
@@ -395,7 +395,6 @@ where
                 .iter()
                 .any(|query| query.len() as i32 >= GAPPED_FILTER_MIN_QLEN))
     {
-        let query_refs: Vec<&[Letter]> = query_seq.iter().map(Vec::as_slice).collect();
         let query_cbs_refs: Vec<&[i8]> = query_cbs.iter().map(Vec::as_slice).collect();
         let query_cbs_arg = if query_cbs_refs.is_empty() {
             None
@@ -403,7 +402,7 @@ where
             Some(query_cbs_refs.as_slice())
         };
         let (filtered_hits, filtered_ids) = gapped_filter_seed_hits(
-            &query_refs,
+            query_seq,
             query_cbs_arg,
             seed_hits,
             target_block_ids,
@@ -481,7 +480,7 @@ impl TargetBlockAccess<'_> {
 
 fn extend_seed_hit_list_with_block<F1, F2>(
     query_id: BlockId,
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_title: &str,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
@@ -508,9 +507,9 @@ where
 {
     const UNIFIED_TARGET_LEN: u32 = 50;
     let query_len = if cfg.query_translated {
-        query_seq.iter().map(Vec::len).max().unwrap_or(0) as u32
+        query_seq.iter().map(|query| query.len()).max().unwrap_or(0) as u32
     } else {
-        query_seq.first().map_or(0, Vec::len) as u32
+        query_seq.first().map_or(0, |query| query.len()) as u32
     };
     let self_aln_score = if target_block.block().has_self_aln() {
         target_block.block().self_aln_score(query_id as i64)
@@ -785,7 +784,7 @@ where
 /// Matches C++ `extend(BlockId, const Search::Config&, Statistics&, DP::Flags, SeedHitList&)`.
 pub fn extend_seed_hit_list<F1, F2>(
     query_id: BlockId,
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_title: &str,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
@@ -838,7 +837,7 @@ where
 /// Matches C++ `extend(BlockId, const Search::Config&, Statistics&, DP::Flags, SeedHitList&)`.
 pub fn extend_seed_hit_list_mut<F1, F2>(
     query_id: BlockId,
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_title: &str,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
@@ -892,7 +891,7 @@ where
 fn extend_with_block<F1, F2, G>(
     query_id: BlockId,
     hits: &mut [Hit],
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_title: &str,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
@@ -949,7 +948,7 @@ where
                 &mut list.target_scores,
                 &list.target_block_ids,
                 &list.seed_hits,
-                query_seq.first().map(Vec::as_slice),
+                query_seq.first().copied(),
                 Some(target_block.block()),
                 cfg.global_ranking_targets,
                 cfg.ungapped_window,
@@ -987,7 +986,7 @@ where
 pub fn extend<F1, F2, G>(
     query_id: BlockId,
     hits: &mut [Hit],
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_title: &str,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
@@ -1043,7 +1042,7 @@ where
 pub fn extend_mut<F1, F2, G>(
     query_id: BlockId,
     hits: &mut [Hit],
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_title: &str,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
@@ -1157,7 +1156,7 @@ pub fn add_dp_targets(
     target: &crate::align::ungapped::WorkTarget,
     target_idx: BlockId,
     matrix: Option<Arc<TargetMatrix>>,
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     dp_targets: &mut [Targets; MAX_CONTEXT as usize],
     hsp_values: HspValues,
     mode: ExtensionMode,
@@ -1329,7 +1328,7 @@ pub fn add_dp_targets(
 /// Matches C++ `align(vector<WorkTarget>&, const Sequence*, ...)` in `gapped_score.cpp`.
 pub fn align_work_targets(
     targets: &mut Vec<crate::align::ungapped::WorkTarget>,
-    query_seq: &[Vec<Letter>],
+    query_seq: &[&[Letter]],
     query_id: Option<&str>,
     query_cbs: &[Vec<i8>],
     source_query_len: i32,
@@ -2076,7 +2075,7 @@ mod tests {
             &work,
             9,
             None,
-            &[vec![0, 1, 2, 3, 4, 5, 6, 7]],
+            &[&[0, 1, 2, 3, 4, 5, 6, 7]],
             &mut dp_targets,
             HspValues::NONE,
             ExtensionMode::Full,
@@ -2110,7 +2109,7 @@ mod tests {
             &work,
             4,
             None,
-            &[vec![0, 1, 2, 3, 4, 5, 6, 7]],
+            &[&[0, 1, 2, 3, 4, 5, 6, 7]],
             &mut dp_targets,
             HspValues::NONE,
             ExtensionMode::BandedFast,
@@ -2154,7 +2153,7 @@ mod tests {
         let mut stat = Statistics::new();
         let out = align_work_targets(
             &mut targets,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             Some("q"),
             &[],
             query.len() as i32,
@@ -2192,7 +2191,7 @@ mod tests {
         let mut stat = Statistics::new();
         let out = align_work_targets(
             &mut targets,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             Some("q"),
             &[],
             query.len() as i32,
@@ -2235,7 +2234,7 @@ mod tests {
         cfg.query_contexts = 1;
         let mut stat = Statistics::new();
         let out = full_db_align(
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             &[],
             Flags::NONE,
             HspValues::COORDS,
@@ -2294,7 +2293,7 @@ mod tests {
         add_final_dp_targets(
             &target,
             0,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             &mut dp_targets,
             Flags::NONE,
             HspValues::COORDS,
@@ -2308,7 +2307,7 @@ mod tests {
         let out = align_targets_final(
             &mut targets,
             0,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             "q",
             &[],
             query.len() as i32,
@@ -2348,7 +2347,7 @@ mod tests {
         let mut stat = Statistics::new();
         recompute_alt_hsps(
             &mut matches,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             &[],
             query.len() as i32,
             HspValues::COORDS,
@@ -2437,7 +2436,7 @@ mod tests {
         let query_comp = crate::stats::cbs::compute_composition(&query);
         let mut stat = Statistics::new();
         let out = extend_chunk(
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             Some("q"),
             query.len() as i32,
             &[],
@@ -2488,7 +2487,7 @@ mod tests {
         let mut stat = Statistics::new();
         let seed_only = extend_seed_hit_list(
             0,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             "q",
             query.len() as i32,
             &[],
@@ -2517,7 +2516,7 @@ mod tests {
         let mut stat = Statistics::new();
         let gapped = extend_seed_hit_list(
             0,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             "q",
             query.len() as i32,
             &[],
@@ -2550,7 +2549,7 @@ mod tests {
         let from_hits = extend(
             0,
             &mut hits,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             "q",
             query.len() as i32,
             &[],
@@ -2582,7 +2581,7 @@ mod tests {
         let ranked = extend(
             0,
             &mut hits,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             "q",
             query.len() as i32,
             &[],
@@ -2615,7 +2614,7 @@ mod tests {
         let lazy = extend_mut(
             0,
             &mut hits,
-            std::slice::from_ref(&query),
+            &[query.as_slice()],
             "q",
             query.len() as i32,
             &[],

@@ -68,6 +68,7 @@ pub struct CascadedSearchConfig {
     pub masking: MaskingMode,
     pub soft_masking: MaskingAlgo,
     pub motif_masking: String,
+    pub freq_masking: bool,
     pub extension_mode: String,
     pub hamming_ext: bool,
     pub diag_filter_cov: Option<f64>,
@@ -93,6 +94,7 @@ pub struct CascadedConfig {
     pub masking: MaskingMode,
     pub soft_masking: MaskingAlgo,
     pub motif_masking: String,
+    pub freq_masking: bool,
     pub hamming_ext: bool,
     pub diag_filter_cov: Option<f64>,
     pub diag_filter_id: Option<f64>,
@@ -137,6 +139,7 @@ impl Default for CascadedConfig {
             masking: MaskingMode::None,
             soft_masking: MaskingAlgo::Tantan,
             motif_masking: String::new(),
+            freq_masking: false,
             hamming_ext: false,
             diag_filter_cov: None,
             diag_filter_id: None,
@@ -383,10 +386,11 @@ pub fn cluster<B: CascadedBackend>(
         sensitivity: config.sensitivity,
         lin_stage1_query: config.lin_stage1_query,
         // `Search::keep_target_id` observes this value before the reference
-        // loop. Upstream leaves the constructor field uninitialized; the
-        // cascaded call sequence deterministically presents a nonzero value,
-        // then 0, then nonzero values for this workflow. Preserve that
-        // observed search state explicitly instead of relying on UB.
+        // loop. Upstream leaves the constructor field uninitialized, so its
+        // first-round behavior can vary with process layout. Keep the defined
+        // round state that matches the ordinary validated workflow rather
+        // than reproduce that UB; the forced-split compatibility boundary is
+        // documented in GAPS.md.
         current_ref_block: if round == 1 { 0 } else { 1 },
         kmer_ranking: config.kmer_ranking,
         min_length_ratio: derived_min_length_ratio(
@@ -406,6 +410,7 @@ pub fn cluster<B: CascadedBackend>(
         masking: config.masking,
         soft_masking: config.soft_masking,
         motif_masking: config.motif_masking.clone(),
+        freq_masking: config.freq_masking,
         extension_mode: config.extension_mode.clone(),
         hamming_ext: config.hamming_ext,
         diag_filter_cov: config.diag_filter_cov,
