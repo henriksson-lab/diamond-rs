@@ -359,21 +359,85 @@ impl FileStack {
     ) -> Result<T, String> {
         let _thread_lock = self.mtx.lock().map_err(|e| e.to_string())?;
         let mut file = self.file.lock().map_err(|e| e.to_string())?;
-        file.lock().map_err(|e| {
+        lock_file(&file).map_err(|e| {
             format!(
                 "could not put lock on file {}: {e}",
                 self.file_name.display()
             )
         })?;
         let result = operation(&mut file);
-        let unlock = file
-            .unlock()
+        let unlock = unlock_file(&file)
             .map_err(|e| format!("could not unlock file {}: {e}", self.file_name.display()));
         match (result, unlock) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
             (Ok(value), Ok(())) => Ok(value),
         }
+    }
+}
+
+/// Exclusive advisory lock on the whole file (equivalent of `File::lock`,
+/// which is only stable since Rust 1.89).
+#[cfg(unix)]
+fn lock_file(file: &File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn lock_file(file: &File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn unlock_file(file: &File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        UnlockFileEx(file.as_raw_handle() as _, 0, u32::MAX, u32::MAX, &mut overlapped)
+    };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
