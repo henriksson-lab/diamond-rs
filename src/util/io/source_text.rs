@@ -109,7 +109,9 @@ impl SourceTextInput {
         }
     }
     /// Source tellg between getline calls (no pending numeric lookahead).
-    /// Exception-disabled streams set failure and return -1, without perror.
+    /// tellg returns a failed position without setting failbit when pubseekoff
+    /// itself fails. In particular, Windows text-mode cookies for LF-only
+    /// files may be -1 while later getline calls must still consume input.
     pub(crate) fn line_position(&mut self) -> i64 {
         if !self.good() || self.eofbit || self.pending.is_some() {
             self.failed = true;
@@ -121,10 +123,7 @@ impl SourceTextInput {
             .and_then(|stream| stream.position().ok())
         {
             Some(position) => position,
-            None => {
-                self.failed = true;
-                -1
-            }
+            None => -1,
         }
     }
     /// A sentry failure leaves the previous value intact. Once num_get runs,
@@ -408,6 +407,42 @@ pub(crate) fn expected_text(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn text_position_failure_does_not_poison_later_line_extraction() {
+        let path = std::env::temp_dir().join(format!(
+            "diamond-text-position-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Keep literal LF: Windows CRT text-position accounting may fail on
+        // these cookies, as it does for Source's std::ifstream/fgetpos.
+        std::fs::write(&path, b">a\nARN\n\n>b\nCQE\n").unwrap();
+        let mut input =
+            SourceTextInput::open(&path, &IoErrorOwner::default(), b"Failed to open file: ")
+                .unwrap();
+        let mut lines = Vec::new();
+        while let Some(line) = input.line() {
+            let _ = input.line_position();
+            assert!(input.good(), "tellg failure must not set failbit");
+            lines.push(line);
+        }
+        assert_eq!(
+            lines,
+            [
+                b">a".to_vec(),
+                b"ARN".to_vec(),
+                Vec::new(),
+                b">b".to_vec(),
+                b"CQE".to_vec()
+            ]
+        );
+        drop(input);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn retained_numeric_extraction_keeps_values_after_sentry_failure() {
         let root = std::env::temp_dir().join(format!(

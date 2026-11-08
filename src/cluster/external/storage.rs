@@ -834,17 +834,48 @@ mod tests {
     }
 
     #[test]
-    fn source_file_array_existing_file_reaches_the_output_constructor() {
+    fn source_file_array_existing_file_preserves_platform_constructor_failure() {
         let root = temp_dir();
         fs::write(root.join("0"), b"not a directory").unwrap();
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            // FileArray includes the trailing separator in its mkdir argument.
+            // Darwin rejects an existing regular file there with ENOTDIR;
+            // Source only ignores EEXIST, so OutputFile is never constructed.
+            let directory = file_array_directory(&root, 0);
+            let name = std::ffi::CString::new(directory.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkdir(name.as_ptr(), 0o755) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOTDIR)
+            );
+        }
         let errors = IoErrorOwner::default();
         let result = BucketWriter::new_owned(&root, 2, 1, errors.clone());
         let error = errors.finish(result.map(|_| ())).unwrap_err();
-        let open = crate::util::io::file_open_error::find(&error)
-            .expect("Source mkdir ignores EEXIST; the actual OutputFile open must fail");
-        assert_eq!(open.path, root.join("0/worker_2_volume_0"));
-        #[cfg(unix)]
-        assert_eq!(open.raw_os_error, Some(libc::ENOTDIR));
+        #[cfg(target_vendor = "apple")]
+        {
+            assert!(crate::util::io::file_open_error::find(&error).is_none());
+            let mut expected = b"could not create temporary directory ".to_vec();
+            expected.extend(
+                crate::util::io::path_diagnostic_bytes(&file_array_directory(&root, 0)).unwrap(),
+            );
+            assert_eq!(
+                crate::util::io::RawDiagnosticError::find(&error),
+                Some(expected.as_slice())
+            );
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            // Linux mkdir returns EEXIST and Windows ignores CreateDirectory's
+            // result: both reach the actual OutputFile constructor instead.
+            let open = crate::util::io::file_open_error::find(&error)
+                .expect("the actual OutputFile open must retain its failure");
+            assert_eq!(open.path, root.join("0").join("worker_2_volume_0"));
+            #[cfg(unix)]
+            assert_eq!(open.raw_os_error, Some(libc::ENOTDIR));
+        }
         assert_eq!(fs::read(root.join("0")).unwrap(), b"not a directory");
         fs::remove_dir_all(root).unwrap();
     }
@@ -1042,7 +1073,7 @@ mod tests {
     #[test]
     fn oversized_radix_workers_route_single_record_volumes_and_keep_source_inputs() {
         let root = temp_dir();
-        let input_dir = root.join("seeds/0");
+        let input_dir = root.join("seeds").join("0");
         fs::create_dir_all(&input_dir).unwrap();
         let mut manifest = Vec::new();
         let mut expected = Vec::new();
@@ -1109,7 +1140,7 @@ mod tests {
     #[test]
     fn radix_worker_eof_retains_the_previous_record_within_one_volume() {
         let root = temp_dir();
-        let input_dir = root.join("seeds/0");
+        let input_dir = root.join("seeds").join("0");
         fs::create_dir_all(&input_dir).unwrap();
         let path = input_dir.join("one-physical-record");
         let bytes = seed_record(12, 4);
@@ -1140,7 +1171,7 @@ mod tests {
     #[test]
     fn radix_worker_preserves_the_missing_input_file_error() {
         let root = temp_dir();
-        let input_dir = root.join("seeds/0");
+        let input_dir = root.join("seeds").join("0");
         fs::create_dir_all(&input_dir).unwrap();
         let missing = input_dir.join("missing-volume");
         let manifest = input_dir.join("bucket.tsv");

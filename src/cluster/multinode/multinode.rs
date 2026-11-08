@@ -1342,8 +1342,8 @@ mod tests {
         let root = temp_dir("indexed-preparation");
         let first = root.join("first.faa");
         let second = root.join("second.faa");
-        fs::write(&first, b">first\xff\nARND\n").unwrap();
-        fs::write(&second, b">b\nCQEG\n>c\nHILK\n>d\nMFPS\n").unwrap();
+        fs::write(&first, expected_text(b">first\xff\nARND\n")).unwrap();
+        fs::write(&second, expected_text(b">b\nCQEG\n>c\nHILK\n>d\nMFPS\n")).unwrap();
         let volumes = VolumedFile(vec![
             Volume::new(first, 0, 1, 1),
             Volume::new(second, 1, 4, 3),

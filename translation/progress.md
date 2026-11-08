@@ -1579,3 +1579,29 @@ No Source reruns occurred. Evidence: `external-parallel-controls/captures/896536
 and `external-mkdir-controls/native-8965365/comparison.json`. Those release
 proofs precede this new clustering/POD/realign code; fresh Native comparisons
 and broader final-snapshot command/profile coverage still remain necessary.
+
+
+## CI run 42514413206 repair (2026-11-08)
+
+The pushed `038f53c` run exposed one default-test failure on each macOS host and
+eight on Windows. Windows text-position queries could return -1 for CRT LF-only
+cookies. Native incorrectly set the input failbit there, unlike Source tellg,
+which discarded later FASTA records. The input owner now returns the failed
+position while preserving line extraction; a literal-LF regression retains all
+five original lines. This preserves Source cookie quirks rather than inventing
+new offsets. Random-access/index fixtures use platform text input and assert
+exact physical positions, output bytes and the original full record counts.
+
+Other fixtures now build paths component by component for native separators.
+The FileArray regular-file fixture distinguishes Darwin's earlier ENOTDIR
+mkdir failure from Linux's ignored EEXIST and Windows's ignored directory result;
+all branches retain exact error-stage/path assertions. Production directory
+semantics and archive/manifest bytes are unchanged.
+
+Frozen package `221e26e3a15c539e269e0a0c20b85f86d03a620509d46d593f4ea3d7ea95f0ca`
+passes isolated default, dna/mcl/zstd and Windows GNU all-target checks plus 125
+focused tests (external 83, multinode 22, FASTA 15 and text 5). Current source/test
+bytes match the package. These local checks do not prove hosted macOS/Windows
+runtime success; the fixes require a pushed rerun. The original Linux job's
+optional-feature step is still running and is monitored without restarting it.
+Translation/parity completion remains unproven; CI repair is the current priority.

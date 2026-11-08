@@ -1116,7 +1116,7 @@ mod tests {
             write_round(&job, 0, &[&[0]]);
             job.next_round().unwrap();
             write_round(&job, 1, &[&[0]]);
-            let manifest = job.base_dir(Some(0)).join("reps/reps.tsv");
+            let manifest = job.base_dir(Some(0)).join("reps").join("reps.tsv");
             if blank {
                 fs::create_dir_all(manifest.parent().unwrap()).unwrap();
                 fs::write(&manifest, b"\n").unwrap();

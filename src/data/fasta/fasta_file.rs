@@ -658,17 +658,25 @@ mod tests {
     fn index_text_owner_preserves_source_empty_line_positions_and_partial_errors() {
         let path = temp("index-source-boundaries.fa");
         let index = temp("index-source-boundaries.fai");
-        std::fs::write(&path, b">a\nARN\n\n>b\nCQE\n").unwrap();
+        std::fs::write(&path, expected_text(b">a\nARN\n\n>b\nCQE\n")).unwrap();
         FastaFile::index_io(&path, &index).unwrap();
         assert_eq!(
             std::fs::read(&index).unwrap(),
-            expected_text(b"0\t3\n7\t3\n")
+            expected_text(if cfg!(windows) {
+                b"0\t3\n9\t3\n"
+            } else {
+                b"0\t3\n7\t3\n"
+            })
         );
-        std::fs::write(&path, b">a\nARN\n>\n").unwrap();
+        std::fs::write(&path, expected_text(b">a\nARN\n>\n")).unwrap();
         let error = FastaFile::index_io(&path, &index).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "FASTA format error: empty id at file offset 7"
+            if cfg!(windows) {
+                "FASTA format error: empty id at file offset 9"
+            } else {
+                "FASTA format error: empty id at file offset 7"
+            }
         );
         assert_eq!(std::fs::read(&index).unwrap(), expected_text(b"0\t3\n"));
         std::fs::remove_file(&path).unwrap();
@@ -712,9 +720,16 @@ mod tests {
     fn fasta_offsets_index_and_random_access() {
         let fasta = temp("fasta-file.fa");
         let index = temp("fasta-file.fai");
-        std::fs::write(&fasta, b">one full title\nARND\n>two\nCQ\n").unwrap();
+        std::fs::write(&fasta, expected_text(b">one full title\nARND\n>two\nCQ\n")).unwrap();
         FastaFile::index(&fasta, &index).unwrap();
-        assert_eq!(std::fs::read_to_string(&index).unwrap(), "0\t4\n21\t2\n");
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            expected_text(if cfg!(windows) {
+                b"0\t4\n23\t2\n"
+            } else {
+                b"0\t4\n21\t2\n"
+            })
+        );
         let mut file = FastaFile::open(
             &[fasta.clone()],
             FastaFileConfig {
@@ -731,8 +746,9 @@ mod tests {
         assert_eq!(file.tell_seq(), 1);
         assert_eq!(record.id, "two");
         assert_eq!(record.sequence, vec![4, 5]);
-        let _ = std::fs::remove_file(fasta);
-        let _ = std::fs::remove_file(index);
+        drop(file);
+        std::fs::remove_file(fasta).unwrap();
+        std::fs::remove_file(index).unwrap();
     }
 
     #[test]

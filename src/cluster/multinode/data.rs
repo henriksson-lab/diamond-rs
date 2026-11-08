@@ -605,7 +605,7 @@ mod tests {
         let path = dir.0.join("input.faa");
         std::fs::write(&path, b">bad\nA?\n").unwrap();
         std::fs::write(dir.0.join("rep_ids0"), b"0").unwrap();
-        let output_path = dir.0.join("reps/0.faa");
+        let output_path = dir.0.join("reps").join("0.faa");
         std::fs::create_dir_all(&output_path).unwrap();
         let error = get_reps_path(
             &job(&dir.0, 0, false),
