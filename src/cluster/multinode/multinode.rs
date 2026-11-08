@@ -1170,6 +1170,7 @@ mod tests {
         let log = fs::read_to_string(root.join("diamond_job.log")).unwrap();
         assert!(log.contains("hello"));
         assert!(log.contains("Seeds considered: 3"));
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1206,6 +1207,7 @@ mod tests {
         assert_eq!(off_diagonal.subject_offset, 4);
         assert_eq!(off_diagonal.query_cover, 73.0);
         assert_eq!(off_diagonal.query_or_target_cover, 0.0);
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1263,6 +1265,7 @@ mod tests {
             .unwrap()
             .contains(&String::from_utf8(expected_text(b"3\n")).unwrap()));
         assert!(fs::read_to_string(reps).unwrap().contains("\t2\t0\t2"));
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1389,7 +1392,11 @@ mod tests {
         );
         assert_eq!(
             fs::read(root.join("index/1")).unwrap(),
-            expected_text(b"0\t4\n8\t4\n16\t4\n")
+            expected_text(if cfg!(windows) {
+                b"0\t4\n10\t4\n20\t4\n"
+            } else {
+                b"0\t4\n8\t4\n16\t4\n"
+            })
         );
         let manifest = format!(
             "{}\t2\n{}\t2\n",
@@ -1401,6 +1408,7 @@ mod tests {
             expected_text(manifest.as_bytes())
         );
         drop(job);
+        drop(done);
         fs::remove_dir_all(root).unwrap();
     }
 

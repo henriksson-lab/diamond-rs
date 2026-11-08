@@ -1,5 +1,11 @@
 # Translation progress
 
+Current status (2026-11-08): the full translation/parity goal is paused and
+unachieved. Only the already-started clustering/multiprocessing batch and CI
+repairs are being finished. Current inventory is 199 mapped implementation
+files; inventory coverage alone does not establish working integration or
+parity. See `CHECKPOINT.md` for current evidence and remaining gates.
+
 Historical checkpoint: 2026-09-26
 
 Current inventory correction (2026-11-07): the five removed test modules have
@@ -1605,3 +1611,83 @@ bytes match the package. These local checks do not prove hosted macOS/Windows
 runtime success; the fixes require a pushed rerun. The original Linux job's
 optional-feature step is still running and is monitored without restarting it.
 Translation/parity completion remains unproven; CI repair is the current priority.
+
+
+## Clustering and multiprocessing continuation (2026-11-08)
+
+Source review identified more concrete library/runtime gaps after the platform
+CI repair. External get_reps now reads only the requested OID range into a
+zero-filled owner, preserves short/partial physical bytes and ignores excess
+bytes, matching cluster.cpp's unchecked bulk count. It parses assignment
+manifests before allocating the mapping and retains Source's assignment and
+closing TaskTimer phases through the real barriers and return expressions.
+
+The multiprocessing command no longer recursively creates its work directory
+before recovery. Normal initialization uses the translated single mkdir;
+recovery probes input-open success, restores in-flight align/join records and
+ignores stop-file unlink errors as Source does. Concrete queue and barrier
+constructors propagate the invocation's IoErrorOwner instead of panicking.
+Unix worker identity uses gethostname and raw bytes; barrier paths append to
+OsString without a lossy display conversion. Pinned Source's uninitialized
+Windows hostname and failed-gethostname domains remain explicitly qualified;
+native does not read uninitialized memory.
+
+FileStack construction preserves Unix 0664 permissions, Windows read/write
+sharing without delete sharing, and platform-specific Source open diagnostics.
+The retained multiprocessing copy helper also preserves unchecked stream
+failures and destination creation/truncation order. The remaining Windows
+indexed-input fixture expects physical CRLF offsets 0/10/20; Unix remains
+0/8/16. New fixtures cover actual short inputs, constructor failures and work
+restoration, rather than relaxing the translated production behavior.
+
+This batch is still undergoing review/verification; no final-snapshot parity or
+translation-completion claim follows from these edits. No C++ build or fresh
+Source execution is part of this continuation.
+
+
+## Finished paused-goal batch (2026-11-08)
+
+The corrective native-only package
+`af5af1fb8c15915bddd36a1919c269d2831bf6986d33ba38ef2715721c9f3191`
+passes all-target default, dna/mcl/zstd and Windows GNU compilation, 1,988
+default and 1,986 optional library tests (six ignored per profile), and release
+build. The initial failed snapshot is preserved: one old parent-module fixture
+assumed recursive mkdir. It now creates its parent explicitly; related cleanup
+fixtures close actual retained FileStack/Atomic/Job owners before unlinking.
+Production source/test bytes still exactly match the corrective package.
+
+Release SHA256 `f4d248979b2de788656aeede07e7b5c5605728a8cbc3fe99968901b9ad19b987`
+passes all 24 defined checks across three natural clustering controls against
+unchanged Source captures, plus all three strict constructor/error comparisons.
+No fresh Source execution or build occurred. Each natural case has matching
+raw stdout/stderr, OID mapping, alignment-row multiset and stage counters.
+Queue counters, chunk cleanup and forced-case literal manifests also match;
+remaining raw differences are thread filenames/serialization, job-log clocks
+and the six old-root legacy manifests. No directory-mode or unclassified
+artifact differences remain. This is bounded parity, not every command/profile.
+
+Native-only multiprocessing CLI checks cover global startup mkdir failure for a
+missing parent, no-work recovery under an existing parent, initialization and
+real queued search. The numbered query output has eight rows byte-identical to
+ordinary native search. Source basic/config.cpp globally mkdirs the requested
+directory even for recovery; the recovery layer itself creates no additional
+directories. Source writes query output to `output_file_0`, leaving its master
+output empty. The smoke harness initially assumed otherwise; both captures and
+the corrected artifact review are preserved, without changing correct runtime
+behavior. Direct library no-directory recovery is separately covered by a unit.
+These CLI checks establish native integration, not fresh Source runtime parity.
+
+Evidence: `.tmp/native-cluster-mpp-corrective-20261108/{snapshot,results}.json`,
+its `mpp-cli-corrected/review.json`,
+`external-parallel-controls/captures/paused-batch-af5af1fb-first/recovery.json`
+and `external-mkdir-controls/native-paused-batch-20261108/comparison.json` under
+`.tmp/native-post-translation-20261107/` for the latter two controls.
+
+Hosted run 42514413206's Linux job is fully green, including default/optional
+suites, all-feature package build, release and delayed spilling. New run
+42519076363's macOS ARM job and both 32-bit jobs are green; Linux optional,
+macOS Intel default and musl tests remain live. Its sole reported Windows
+failure is the physical CRLF index fixture corrected in this batch. Hosted
+validation of these unpushed edits remains necessary. The translation goal
+stays paused and unachieved; unstarted integer parsing and broader final parity
+gates remain open.

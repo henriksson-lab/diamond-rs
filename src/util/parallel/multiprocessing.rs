@@ -54,11 +54,16 @@ pub fn unquote(text: &str) -> String {
 /// The destination is opened even if the source cannot be opened. This
 /// preserves the original's construction order (`ifstream src; ofstream
 /// dst;`), including its truncation/creation side effect on `dst`.
+/// Source never enables stream exceptions or checks the final stream state;
+/// open, copy and close failures therefore do not escape this helper.
 pub fn copy(src_file_name: &str, dst_file_name: &str) -> std::io::Result<()> {
-    let src = File::open(src_file_name);
-    let mut dst = File::create(dst_file_name)?;
-    let mut src = src?;
-    std::io::copy(&mut src, &mut dst)?;
+    let src =
+        File::open(crate::util::io::source_c_path(std::path::Path::new(src_file_name)).as_ref());
+    let dst =
+        File::create(crate::util::io::source_c_path(std::path::Path::new(dst_file_name)).as_ref());
+    if let (Ok(mut src), Ok(mut dst)) = (src, dst) {
+        let _ = std::io::copy(&mut src, &mut dst);
+    }
     Ok(())
 }
 
@@ -73,7 +78,7 @@ pub fn join_path(path_1: &str, path_2: &str) -> String {
 }
 
 pub fn file_exists(file_name: &str) -> bool {
-    File::open(file_name).is_ok()
+    File::open(crate::util::io::source_c_path(std::path::Path::new(file_name)).as_ref()).is_ok()
 }
 
 /// Types that can safely use the original native-representation scalar and
@@ -259,8 +264,14 @@ mod tests {
 
         std::fs::write(&dst, b"old contents").unwrap();
         let missing = root.join("missing");
-        assert!(copy(missing.to_str().unwrap(), dst.to_str().unwrap()).is_err());
+        copy(missing.to_str().unwrap(), dst.to_str().unwrap()).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"");
+        copy(
+            src.to_str().unwrap(),
+            missing.join("output").to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(!missing.exists());
 
         let expected = if cfg!(unix) {
             "left/right"

@@ -928,7 +928,8 @@ mod tests {
         stack.clear().unwrap();
         assert_eq!(stack.size().unwrap(), 0);
         assert_eq!(stack.file_name(), path.as_path());
-        let _ = std::fs::remove_file(&path);
+        drop(stack);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -951,7 +952,8 @@ mod tests {
         stack.truncate(5).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"abcdX");
 
-        let _ = std::fs::remove_file(&path);
+        drop(stack);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -978,7 +980,9 @@ mod tests {
         assert_eq!(atomic.fetch_add_one().unwrap(), 0);
         assert_eq!(atomic.fetch_add(5).unwrap(), 1);
         assert_eq!(atomic.get().unwrap(), 6);
-        let _ = std::fs::remove_file(&path);
+        drop(atomic);
+        drop(stack);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -989,6 +993,7 @@ mod tests {
             1
         ));
         let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
 
         {
             let mut p = Parallelizer::new();
@@ -1028,7 +1033,7 @@ mod tests {
             assert!(p.get_stack("custom").is_err());
         }
 
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

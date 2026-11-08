@@ -281,12 +281,13 @@ fn run_impl(
                 ))
             }
         }
-        std::fs::create_dir_all(source_c_path(&mp.directory).as_ref())?;
+        let errors = references.source_errors();
         if mp.recover {
             let _ = crate::util::system::log_rss();
-            return crate::run::multiprocessing::recover(&mp.directory).map(|()| references);
+            return crate::run::multiprocessing::recover_owned(&mp.directory, &errors)
+                .map(|()| references);
         }
-        let queues = MultiprocessingQueues::new(&mp.directory)?;
+        let queues = MultiprocessingQueues::new_owned(&mp.directory, errors)?;
         let partition = if let ReferenceSource::Database { file, .. } = &mut references {
             file.create_partition_balanced(i64::try_from(budget).map_err(io::Error::other)?)
                 .map_err(io::Error::other)?;

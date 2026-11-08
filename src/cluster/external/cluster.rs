@@ -191,9 +191,12 @@ pub fn compute_closure_from_assignment_file_with_threads(
     threads: usize,
 ) -> Result<(), String> {
     job.log("Computing transitive closure")?;
-    let rep = identity_mapping(representative_count(volumes)?);
+    let mut timer = crate::util::log_stream::TaskTimer::with_msg("Getting assignment volumes", 1);
     let assignment_volumes =
         super::external::read_manifest_owned(assignment_file, &job.io_errors())?;
+    timer.go(Some("Initializing mapping vector"));
+    let rep = identity_mapping(representative_count(volumes)?);
+    timer.go(Some("Reading assignments"));
     let next = AtomicUsize::new(0);
     plain_workers(job, threads.min(assignment_volumes.len()), |thread_id| {
         loop {
@@ -356,6 +359,9 @@ pub fn get_reps_with_threads(
         "Representatives written: {}",
         cluster_count.load(std::sync::atomic::Ordering::Relaxed)
     ))?;
+    // Source's closing timer also spans the completion barrier and actual
+    // retained FileStack release, before returning its path.
+    let _timer = crate::util::log_stream::TaskTimer::with_msg("Closing the output files", 1);
     let finished = Atomic::new(base_dir.join("finished"));
     finished.fetch_add(processed.load(std::sync::atomic::Ordering::Relaxed))?;
     finished.await_value(volumes.0.len() as i64)?;
@@ -437,6 +443,9 @@ pub fn cluster_with_threads(
         remove_manifest_storage(&bucket.path, &storage)?;
         processed += 1;
     }
+    // Keep this timer alive through assignment publication, the closure
+    // barrier/computation, and get_reps, matching Source's return-expression scope.
+    let _timer = crate::util::log_stream::TaskTimer::with_msg("Closing the output files", 1);
     output.lock().unwrap().finish()?;
     drop(output);
     let manifest = bucket_dir.join("bucket.tsv");
@@ -548,24 +557,43 @@ fn assign_higher_degree(
 }
 
 fn read_clustering_volume(job: &Job, index: usize, volume: &Volume) -> Result<Vec<OId>, String> {
-    let bytes = job.read_plain_file(
+    // Source constructs the zero-filled OID vector before opening its input,
+    // then ignores the complete-record count from a bounded bulk read.
+    let expected = usize::try_from(volume.oid_end.wrapping_sub(volume.oid_begin))
+        .map_err(|_| "Volume OID range does not fit memory.".to_owned())?;
+    let mut representatives = Vec::new();
+    representatives
+        .try_reserve_exact(expected)
+        .map_err(|error| {
+            job.capture_io::<()>(Err(std::io::Error::other(crate::util::io::BadAllocError(
+                error.to_string(),
+            ))))
+            .unwrap_err()
+        })?;
+    representatives.resize(expected, 0);
+    let mut input = job.open_input(
         &job.base_dir(None)
             .join("clustering")
             .join(format!("volume{index}")),
+        crate::util::io::InputFile::NO_AUTODETECT,
     )?;
-    let expected = usize::try_from(volume.oid_end.saturating_sub(volume.oid_begin))
-        .map_err(|_| "Volume OID range does not fit memory.".to_owned())?;
-    if bytes.len() != expected * std::mem::size_of::<OId>() {
-        return Err(format!(
-            "Clustering volume has {} bytes, expected {}.",
-            bytes.len(),
-            expected * std::mem::size_of::<OId>()
-        ));
+    // One bounded scratch record avoids a second packed volume allocation.
+    // A final partial record overwrites only its physical prefix; unread OIDs
+    // retain their initial zero bytes, and excess physical bytes are ignored.
+    let mut bytes = [0u8; std::mem::size_of::<OId>()];
+    for representative in &mut representatives {
+        let read = job.io(input.read_raw(&mut bytes))?;
+        if read == 0 {
+            break;
+        }
+        bytes[read..].fill(0);
+        *representative = OId::from_ne_bytes(bytes);
+        if read < bytes.len() {
+            break;
+        }
     }
-    Ok(bytes
-        .chunks_exact(8)
-        .map(|bytes| OId::from_ne_bytes(bytes.try_into().unwrap()))
-        .collect())
+    job.io(input.close())?;
+    Ok(representatives)
 }
 
 #[cfg(test)]
@@ -721,6 +749,31 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(values.len(), count);
         values
+    }
+
+    #[test]
+    fn representative_volume_bulk_read_preserves_partial_zero_tail_and_ignores_extra_bytes() {
+        let root = temp_dir("representative_bulk_read");
+        let job = Job::new(6, 1, 1024, &root, 0).unwrap();
+        let directory = job.base_dir(None).join("clustering");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("volume0");
+        let volume = Volume::new("unused.faa", 5, 7, 2);
+        for length in [0usize, 1, 8, 13, 16, 25] {
+            let payload = (0..length).map(|i| (i + 1) as u8).collect::<Vec<_>>();
+            fs::write(&path, &payload).unwrap();
+            let representatives = read_clustering_volume(&job, 0, &volume).unwrap();
+            let actual = representatives
+                .iter()
+                .flat_map(|oid| oid.to_ne_bytes())
+                .collect::<Vec<_>>();
+            let mut expected = vec![0; 16];
+            let copied = length.min(expected.len());
+            expected[..copied].copy_from_slice(&payload[..copied]);
+            assert_eq!(actual, expected, "physical bytes={length}");
+        }
+        drop(job);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

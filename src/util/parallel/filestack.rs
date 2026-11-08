@@ -74,15 +74,32 @@ impl FileStack {
         errors: crate::util::io::IoErrorOwner,
     ) -> Result<Self, String> {
         let file_name = file_name.to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o664);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        }
+        let file = options
             .open(source_c_path(&file_name).as_ref())
             .map_err(|_| {
                 errors
                     .capture::<()>(Err(std::io::Error::other(
-                        crate::util::io::IoError::path_message(b"could not open file ", &file_name),
+                        crate::util::io::IoError::path_message(
+                            if cfg!(windows) {
+                                b"Error opening file "
+                            } else {
+                                b"could not open file "
+                            },
+                            &file_name,
+                        ),
                     )))
                     .unwrap_err()
             })?;
@@ -588,6 +605,25 @@ mod tests {
         ))
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn source_stack_allows_peer_access_but_denies_unlink_until_close() {
+        let path = path("sharing");
+        let first = FileStack::try_new(&path).unwrap();
+        let second = FileStack::try_new(&path).unwrap();
+        assert_eq!(
+            std::fs::remove_file(&path).unwrap_err().raw_os_error(),
+            Some(32)
+        );
+        drop(first);
+        assert_eq!(
+            std::fs::remove_file(&path).unwrap_err().raw_os_error(),
+            Some(32)
+        );
+        drop(second);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn remove_preserves_empty_records_like_cpp_split_and_rewrite() {
         let path = path("empty-records");
@@ -596,7 +632,8 @@ mod tests {
         let stack = FileStack::new(&path);
         stack.remove("alpha").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"\nbeta\n");
-        let _ = std::fs::remove_file(path);
+        drop(stack);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -617,7 +654,8 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(first.top_i64().unwrap(), 200);
-        let _ = std::fs::remove_file(path);
+        drop((first, second));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -628,6 +666,7 @@ mod tests {
         stack.push_string("123456789").unwrap();
         assert_eq!(stack.pop_string().unwrap().as_deref(), Some("3456789"));
         assert_eq!(std::fs::read(&path).unwrap(), b"12");
-        let _ = std::fs::remove_file(path);
+        drop(stack);
+        std::fs::remove_file(path).unwrap();
     }
 }

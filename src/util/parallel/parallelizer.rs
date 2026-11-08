@@ -12,7 +12,7 @@ pub struct Parallelizer {
     work_directory: PathBuf,
     barrier_file: PathBuf,
     rank: i32,
-    id: String,
+    id: Vec<u8>,
     n_registered: i32,
     master_flag: bool,
     i_barrier: i32,
@@ -20,6 +20,7 @@ pub struct Parallelizer {
     continuous_cleanup_list: Vec<PathBuf>,
     final_cleanup_list: Vec<PathBuf>,
     fs_map: HashMap<String, Arc<FileStack>>,
+    errors: crate::util::io::IoErrorOwner,
 }
 
 static PARALLELIZER_INSTANCE: OnceLock<Arc<Mutex<Parallelizer>>> = OnceLock::new();
@@ -46,13 +47,17 @@ impl Parallelizer {
 
     /// C++ `Parallelizer::Parallelizer()`.
     pub fn new() -> Self {
+        Self::new_owned(Default::default())
+    }
+
+    pub fn new_owned(errors: crate::util::io::IoErrorOwner) -> Self {
         Self {
             work_directory: PathBuf::from("parallelizer"),
             barrier_file: PathBuf::new(),
             // The C++ field is not explicitly initialized; zero is the only
             // useful deterministic representation for its getter in Rust.
             rank: 0,
-            id: String::new(),
+            id: Vec::new(),
             n_registered: 0,
             master_flag: true,
             i_barrier: 0,
@@ -60,6 +65,7 @@ impl Parallelizer {
             continuous_cleanup_list: Vec::new(),
             final_cleanup_list: Vec::new(),
             fs_map: HashMap::new(),
+            errors,
         }
     }
 
@@ -69,14 +75,35 @@ impl Parallelizer {
         if !tempdir.as_os_str().is_empty() {
             self.work_directory = tempdir.join(&self.work_directory);
         }
-        std::fs::create_dir_all(&self.work_directory).map_err(|e| e.to_string())?;
+        self.errors
+            .capture(crate::util::system::mkdir_path(&self.work_directory))?;
 
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "localhost".to_string());
-        self.id = format!("{}_{}", hostname, std::process::id());
-
-        self.create_stack(Self::LOG, &self.id.clone())?;
+        #[cfg(unix)]
+        {
+            // Source uses gethostname, not an overridable environment value.
+            let mut hostname = [0u8; 1024];
+            let result = unsafe { libc::gethostname(hostname.as_mut_ptr().cast(), 1023) };
+            if result != 0 {
+                // Source ignores this failure and reads uninitialized bytes.
+                // Preserve a defined diagnostic rather than emulate that UB.
+                return self.errors.capture(Err(std::io::Error::other(
+                    "Source gethostname failed before worker identity construction.",
+                )));
+            }
+            self.id = hostname[..hostname.iter().position(|b| *b == 0).unwrap_or(1023)].to_vec();
+            self.id
+                .extend_from_slice(format!("_{}", std::process::id()).as_bytes());
+        }
+        #[cfg(not(unix))]
+        {
+            // Pinned Source Windows does not initialize hostname at all.
+            // Keep the existing safe native identity; this remains qualified.
+            let hostname = std::env::var("HOSTNAME")
+                .or_else(|_| std::env::var("COMPUTERNAME"))
+                .unwrap_or_else(|_| "localhost".to_owned());
+            self.id = format!("{}_{}", hostname, std::process::id()).into_bytes();
+        }
+        self.create_stack_bytes(Self::LOG, &self.id.clone())?;
         self.create_stack(Self::COMMAND, "")?;
         self.create_stack(Self::WORKERS, "")?;
         self.create_stack(Self::REGISTER, "")?;
@@ -95,7 +122,15 @@ impl Parallelizer {
     }
 
     pub fn get_id(&self) -> &str {
+        std::str::from_utf8(&self.id).expect("Worker identity is not UTF-8; use get_id_bytes")
+    }
+
+    pub fn get_id_bytes(&self) -> &[u8] {
         &self.id
+    }
+
+    pub fn io_errors(&self) -> crate::util::io::IoErrorOwner {
+        self.errors.clone()
     }
 
     pub fn get_work_directory(&self) -> &Path {
@@ -112,12 +147,12 @@ impl Parallelizer {
 
     pub fn register_workers(&mut self, sleep_s: f64) -> Result<bool, String> {
         self.get_stack(Self::REGISTER)?
-            .push_string(&self.id)
+            .push_bytes(&self.id)
             .map(|_| ())?;
         Self::sleep(sleep_s);
         if self.is_master() {
-            while let Some(line) = self.get_stack(Self::REGISTER)?.pop_string()? {
-                self.get_stack(Self::WORKERS)?.push_string(&line)?;
+            while let Some(line) = self.get_stack(Self::REGISTER)?.pop_bytes()? {
+                self.get_stack(Self::WORKERS)?.push_bytes(&line)?;
                 self.n_registered += 1;
             }
         }
@@ -131,9 +166,9 @@ impl Parallelizer {
         }
 
         let cmd_file_name = self.get_barrier_file_name("cmd", tag, self.i_barrier);
-        let cmd_fs = FileStack::new(&cmd_file_name);
+        let cmd_fs = FileStack::try_new_owned(&cmd_file_name, self.errors.clone())?;
         let ack_file_name = self.get_barrier_file_name("ack", tag, self.i_barrier);
-        let ack_fs = FileStack::new(&ack_file_name);
+        let ack_fs = FileStack::try_new_owned(&ack_file_name, self.errors.clone())?;
 
         let msg = "WAIT";
         if self.is_master() {
@@ -141,7 +176,7 @@ impl Parallelizer {
             cmd_fs.push_string(msg)?;
         }
         cmd_fs.poll_query(msg, Self::POLL_SLEEP_SECONDS, Self::POLL_MAX_ITERATIONS)?;
-        ack_fs.push_string(&self.id)?;
+        ack_fs.push_bytes(&self.id)?;
 
         let msg_ok = "GOON";
         if self.is_master() {
@@ -166,16 +201,22 @@ impl Parallelizer {
     }
 
     pub fn create_stack(&mut self, tag: &str, sfx: &str) -> Result<bool, String> {
+        self.create_stack_bytes(tag, sfx.as_bytes())
+    }
+
+    fn create_stack_bytes(&mut self, tag: &str, sfx: &[u8]) -> Result<bool, String> {
         if self.fs_map.contains_key(tag) {
             return Ok(false);
         }
-        let suffix = if sfx.is_empty() {
-            String::new()
-        } else {
-            format!("_{sfx}")
-        };
-        let file_name = self.work_directory.join(format!("{tag}{suffix}"));
-        self.create_stack_from_file(tag, &file_name)
+        let mut name = tag.as_bytes().to_vec();
+        if !sfx.is_empty() {
+            name.push(b'_');
+            name.extend_from_slice(sfx);
+        }
+        let name = self
+            .errors
+            .capture(crate::util::io::source_bytes_os(&name).map_err(std::io::Error::other))?;
+        self.create_stack_from_file(tag, self.work_directory.join(name))
     }
 
     pub fn create_stack_from_file(
@@ -186,7 +227,10 @@ impl Parallelizer {
         self.delete_stack(tag);
         self.fs_map.insert(
             tag.to_string(),
-            Arc::new(FileStack::new(file_name.as_ref())),
+            Arc::new(FileStack::try_new_owned(
+                file_name.as_ref(),
+                self.errors.clone(),
+            )?),
         );
         Ok(true)
     }
@@ -235,13 +279,9 @@ impl Parallelizer {
     }
 
     fn get_barrier_file_name(&self, step: &str, tag: &str, i: i32) -> PathBuf {
-        PathBuf::from(format!(
-            "{}_{}_{}_{}",
-            self.barrier_file.display(),
-            step,
-            tag,
-            i
-        ))
+        let mut path = self.barrier_file.as_os_str().to_os_string();
+        path.push(format!("_{step}_{tag}_{i}"));
+        path.into()
     }
 }
 
@@ -267,15 +307,61 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn init_does_not_create_missing_parent_directories() {
+        let root = temp_root("missing-parent");
+        let errors = crate::util::io::IoErrorOwner::default();
+        let mut p = Parallelizer::new_owned(errors.clone());
+        let error = errors.finish(p.init(root.join("nested"))).unwrap_err();
+        let mut expected = b"could not create temporary directory ".to_vec();
+        expected.extend_from_slice(
+            &crate::util::io::source_os_bytes(root.join("nested/parallelizer").as_os_str())
+                .unwrap(),
+        );
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error),
+            Some(expected.as_slice())
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn stack_constructor_failure_returns_the_captured_raw_diagnostic() {
+        let root = temp_root("stack-open-error");
+        std::fs::create_dir(&root).unwrap();
+        let blocked = root.join("directory-instead-of-stack");
+        std::fs::create_dir(&blocked).unwrap();
+        let errors = crate::util::io::IoErrorOwner::default();
+        let mut p = Parallelizer::new_owned(errors.clone());
+        let error = errors
+            .finish(p.create_stack_from_file("blocked", &blocked))
+            .unwrap_err();
+        let mut expected = if cfg!(windows) {
+            b"Error opening file ".to_vec()
+        } else {
+            b"could not open file ".to_vec()
+        };
+        expected.extend_from_slice(&crate::util::io::source_os_bytes(blocked.as_os_str()).unwrap());
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error),
+            Some(expected.as_slice())
+        );
+        assert!(!p.fs_map.contains_key("blocked"));
+        drop(p);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn init_register_barrier_log_and_cleanup() {
         let root = temp_root("lifecycle");
         let _ = std::fs::remove_dir_all(&root);
         let mut p = Parallelizer::new();
+        std::fs::create_dir(&root).unwrap();
         p.init(&root).unwrap();
         assert!(p.is_master());
         assert_eq!(p.get_rank(), 0);
-        assert!(p.get_id().contains('_'));
+        assert!(p.get_id_bytes().contains(&b'_'));
         assert!(p.get_work_directory().ends_with("parallelizer"));
         assert!(p.register_workers(0.0).unwrap());
         assert_eq!(p.get_n_registered(), 1);
@@ -313,7 +399,7 @@ mod tests {
         let mut p = Parallelizer::new();
         p.work_directory = root.join("parallelizer");
         p.barrier_file = p.work_directory.join(Parallelizer::BARRIER);
-        p.id = "worker".to_string();
+        p.id = b"worker".to_vec();
         p.master_flag = false;
         p.initialized = true;
         let command = FileStack::new(p.get_barrier_file_name("cmd", "failed", 0));
@@ -321,6 +407,8 @@ mod tests {
         let error = p.barrier("failed").unwrap_err();
         assert!(error.contains("STOP on FileStack"));
         p.initialized = false;
+        drop(command);
+        drop(p);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

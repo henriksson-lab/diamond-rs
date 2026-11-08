@@ -1,7 +1,8 @@
 # End-to-end translation completion
 
-Goal established 2026-11-06; not achieved. The user resumed translation work
-on 2026-11-08 while the next hosted CI run is monitored.
+Goal established 2026-11-06; paused and not achieved. On 2026-11-08 the user
+authorized finishing the existing code batch, CI fixes and commit while the
+broader translation goal remains paused.
 
 Completion requires native Rust implementations integrated into the executable
 and library, verified parity against pinned upstream DIAMOND, and no production
@@ -17,41 +18,37 @@ by test doubles leaves its production integration incomplete.
 
 ## Current integration checkpoint (2026-11-08)
 
-The raw OS argument/path, byte-option, GVC and TSV integration batch is now
-committed. Isolated default and optional-feature checks, Windows cross-checks,
-focused I/O tests and all optional integration targets passed in their recorded
-snapshots, including all 20 frozen regression hashes. All 18 raw-OS CLI controls
-match the preserved Source captures exactly; the six GVC and thirteen TSV
-controls also match. These are bounded comparisons, not universal parity.
+Production dispatch uses Rust and explicit default-off FFI remains a conformance
+oracle only. Later retained multinode indexed preparation, external worker/POD
+ownership, directory/log lifetimes and the native multinode backend are now
+connected. Source's inactive multinode CLI call remains inactive.
 
-CI follow-ups `cdbd43e` and `437fc9e` repair workflow option projection, independent
-zstd-frame reset, platform fixture assumptions and Windows test handle
-inheritance. The workflow now has seven jobs covering four native hosts, musl,
-and two 32-bit targets. Both hosted macOS spill checks passed in run 42472717649;
-verification of the latest CI repair remains pending.
+The current batch corrects bounded clustering OID reads, assignment initialization
+order and timer phases, plus multiprocessing mkdir/recovery and retained file
+error ownership. FileStack constructors preserve Source Unix permissions and
+Windows sharing/diagnostics; Unix worker IDs use actual gethostname bytes.
+Windows indexed-input fixtures account for CRLF physical offsets and release
+retained owners before cleanup. Package `af5af1fb8c15915bddd36a1919c269d2831bf6986d33ba38ef2715721c9f3191`
+passes isolated default, optional dna/mcl/zstd and Windows GNU all-target checks,
+plus 1,988 default and 1,986 optional library tests (six ignored in each). Release
+build and the bounded CLI comparisons below pass; no wider parity follows from
+these local checks. The first failed snapshot is retained: it exposed one old
+fixture relying on recursive mkdir, now corrected without weakening production.
 
-Resumed code work addresses raw partition-file parsing, retained multinode
-library byte/path semantics, and external clustering's volume read boundary
-and parallel alignment ownership. The frozen corrective package `5c816812…`
-passes isolated default/optional/Windows all-target checks and 86 focused tests.
-The activated task pool also now preserves Source's completion-notification
-mutex; the FileArray owner avoids allocating worker-local codec state.
-Multinode remains a retained library translation;
-Source's inactive CLI call is not made into a new command. The shared external
-two-worker empty-chunk scheduling hazard remains an explicit open boundary.
-The subsequent frozen package `b46aac0c…` adds actual same-pool nested DP,
-parallel volume building, retained multinode input/output ownership, and shared
-formatted text parsing. Null-pool dispatch and explicit query-pool dispatch are
-separate; single-worker pooled calls retain Source task counts and completed
-ranges merge under its mutex. The source-compatible byte manifest parser now
-serves the connected external stages as well as the retained library.
+The immutable `8965365` release previously passed all 24 defined checks across
+three natural 9,704-record two-round controls and three exact constructor/error
+comparisons. Directory modes now match; thread files/row ordering, elapsed logs
+and legacy work roots remain explicitly classified raw artifact differences.
+That release predates subsequent clustering/POD and text-stream changes.
 
-All three native compile profiles and 204 focused tests pass (one SIMD case
-ignored). Windows text-file fixture expectations were corrected against the
-CRT output in hosted run 42478857080; its full macOS ARM64 job passed. Fresh
-Source parallel-branch comparisons remain pending. The retained multinode
-prepare_inputs indexed partition/load_seqs adapter is still incomplete, and no
-full parallel, platform or translation-completion claim is made.
+Hosted run `42514413206` passed its full Linux default/optional suites,
+all-feature package build, release and delayed-spill checks. New run
+`42519076363` exposed the remaining Windows CRLF index fixture, corrected in the
+current batch; other jobs are being monitored. Current-snapshot hosted runtime
+success and full final command/profile parity remain open. FileStack integer
+pop/top still need Source std::stoll prefix/error semantics; no correction was
+started before the goal pause. Source's two-cross-process empty-chunk hazard and
+Windows uninitialized-hostname domain retain explicit qualifications.
 
 ## Current coverage (2026-11-08)
 
@@ -2573,3 +2570,51 @@ No Source reruns occurred. Evidence: `external-parallel-controls/captures/896536
 and `external-mkdir-controls/native-8965365/comparison.json`. Those release
 proofs precede this new clustering/POD/realign code; fresh Native comparisons
 and broader final-snapshot command/profile coverage still remain necessary.
+
+
+## Finished paused-goal batch (2026-11-08)
+
+The corrective native-only package
+`af5af1fb8c15915bddd36a1919c269d2831bf6986d33ba38ef2715721c9f3191`
+passes all-target default, dna/mcl/zstd and Windows GNU compilation, 1,988
+default and 1,986 optional library tests (six ignored per profile), and release
+build. The initial failed snapshot is preserved: one old parent-module fixture
+assumed recursive mkdir. It now creates its parent explicitly; related cleanup
+fixtures close actual retained FileStack/Atomic/Job owners before unlinking.
+Production source/test bytes still exactly match the corrective package.
+
+Release SHA256 `f4d248979b2de788656aeede07e7b5c5605728a8cbc3fe99968901b9ad19b987`
+passes all 24 defined checks across three natural clustering controls against
+unchanged Source captures, plus all three strict constructor/error comparisons.
+No fresh Source execution or build occurred. Each natural case has matching
+raw stdout/stderr, OID mapping, alignment-row multiset and stage counters.
+Queue counters, chunk cleanup and forced-case literal manifests also match;
+remaining raw differences are thread filenames/serialization, job-log clocks
+and the six old-root legacy manifests. No directory-mode or unclassified
+artifact differences remain. This is bounded parity, not every command/profile.
+
+Native-only multiprocessing CLI checks cover global startup mkdir failure for a
+missing parent, no-work recovery under an existing parent, initialization and
+real queued search. The numbered query output has eight rows byte-identical to
+ordinary native search. Source basic/config.cpp globally mkdirs the requested
+directory even for recovery; the recovery layer itself creates no additional
+directories. Source writes query output to `output_file_0`, leaving its master
+output empty. The smoke harness initially assumed otherwise; both captures and
+the corrected artifact review are preserved, without changing correct runtime
+behavior. Direct library no-directory recovery is separately covered by a unit.
+These CLI checks establish native integration, not fresh Source runtime parity.
+
+Evidence: `.tmp/native-cluster-mpp-corrective-20261108/{snapshot,results}.json`,
+its `mpp-cli-corrected/review.json`,
+`external-parallel-controls/captures/paused-batch-af5af1fb-first/recovery.json`
+and `external-mkdir-controls/native-paused-batch-20261108/comparison.json` under
+`.tmp/native-post-translation-20261107/` for the latter two controls.
+
+Hosted run 42514413206's Linux job is fully green, including default/optional
+suites, all-feature package build, release and delayed spilling. New run
+42519076363's macOS ARM job and both 32-bit jobs are green; Linux optional,
+macOS Intel default and musl tests remain live. Its sole reported Windows
+failure is the physical CRLF index fixture corrected in this batch. Hosted
+validation of these unpushed edits remains necessary. The translation goal
+stays paused and unachieved; unstarted integer parsing and broader final parity
+gates remain open.
