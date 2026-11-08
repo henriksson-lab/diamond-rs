@@ -70,7 +70,14 @@ jobs:
           echo "PACKAGE_DIR=$package_dir" >> "$GITHUB_ENV"
 
       - name: Test default features
-        run: cargo test --locked --all-targets --manifest-path "$PACKAGE_DIR/Cargo.toml"
+        run: |
+          # Source-compatible CRT files are inheritable. A subprocess test must
+          # not inherit files held by a concurrent in-process library test.
+          # This controls the harness; application thread-count tests still run.
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            export RUST_TEST_THREADS=1
+          fi
+          cargo test --locked --all-targets --manifest-path "$PACKAGE_DIR/Cargo.toml"
 
       # Run the optional suite once; the following build checks every feature
       # on all four native hosts, including both Apple architectures.
