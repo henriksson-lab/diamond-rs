@@ -1,6 +1,7 @@
 # End-to-end translation completion
 
-Goal established 2026-11-06; active, not achieved.
+Goal established 2026-11-06; paused by the user on 2026-11-08, not achieved.
+Current priority: finish the CI/CLI fixes and their running verification.
 
 Completion requires native Rust implementations integrated into the executable
 and library, verified parity against pinned upstream DIAMOND, and no production

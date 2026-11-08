@@ -9,7 +9,7 @@ use zstd_pure_rs::decompress::zstd_decompress::ZSTD_decompressContinue_into_hist
 use zstd_pure_rs::prelude::{
     ERR_getErrorName, ERR_isError, ZSTD_CStream, ZSTD_DStream, ZSTD_compressStream,
     ZSTD_createCStream, ZSTD_createDStream, ZSTD_decompress, ZSTD_endStream, ZSTD_initCStream,
-    ZSTD_initDStream, ZSTD_nextSrcSizeToDecompress, ZSTD_resetDStream, ZSTD_CLEVEL_DEFAULT,
+    ZSTD_initDStream, ZSTD_nextSrcSizeToDecompress, ZSTD_CLEVEL_DEFAULT,
 };
 
 use super::{InputStreamBuffer, IoError, IoResult, OutputStreamBuffer, StreamEntity};
@@ -240,10 +240,15 @@ impl<S: StreamEntity> StreamEntity for ZstdSource<S> {
                     self.eos = true;
                     break;
                 }
-                let result = ZSTD_resetDStream(stream);
+                // Each independent frame starts with fresh repeat offsets and
+                // entropy state. The backend's resetDStream clears the session
+                // and history but retains those prior-frame values. This
+                // Source reader never installs an external dictionary, so
+                // initDStream provides the complete no-dictionary transition.
+                let result = ZSTD_initDStream(stream);
                 if ERR_isError(result) {
                     return Err(IoError::Other(format!(
-                        "ZSTD_resetDStream: {}",
+                        "ZSTD_initDStream: {}",
                         ERR_getErrorName(result)
                     )));
                 }
@@ -452,6 +457,45 @@ mod tests {
             streamed.extend_from_slice(&chunk[..count]);
         }
         assert_eq!(streamed, expected);
+        assert!(source.eof().unwrap());
+    }
+
+    #[test]
+    fn concatenated_frames_reset_repeat_offsets_between_accession_records() {
+        let mut encoded = Vec::new();
+        let mut expected = Vec::new();
+        for begin in [0_u64, 1_000] {
+            let mut plain = Vec::new();
+            for member in begin..begin + 1_000 {
+                plain.extend_from_slice(&(member % 2).to_ne_bytes());
+                plain.extend_from_slice(&member.to_ne_bytes());
+                plain.push(0);
+                plain.extend_from_slice(format!("A{member}\0").as_bytes());
+            }
+            encoded.extend_from_slice(&compressed(&plain));
+            expected.extend_from_slice(&plain);
+        }
+        // Independent whole-frame decoding confirms that the producer's data
+        // are valid; the streaming consumer must reset frame-local offsets.
+        let mut whole = vec![0; expected.len()];
+        assert_eq!(
+            zstd_decompress(&encoded, &mut whole).unwrap(),
+            expected.len()
+        );
+        assert_eq!(whole, expected);
+
+        let input = InputStreamBuffer::with_buffer_size(VecStream::from_vec(encoded), 0, 11);
+        let mut source = ZstdSource::new(input).unwrap();
+        let mut decoded = Vec::new();
+        let mut chunk = [0; 37];
+        loop {
+            let count = source.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            decoded.extend_from_slice(&chunk[..count]);
+        }
+        assert_eq!(decoded, expected);
         assert!(source.eof().unwrap());
     }
 

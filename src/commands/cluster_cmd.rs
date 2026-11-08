@@ -1605,11 +1605,9 @@ pub fn run(config: &ClusterConfig) -> io::Result<()> {
                 .search_args
                 .as_ref()
                 .map(|args| {
-                    let mut args = args.clone();
-                    args.extend([OsString::from("--outfmt"), OsString::from("edge")]);
-                    let mut search = super::dispatch::parse_native_blastp_config_os(
-                        &args,
-                        &super::reassign::invocation_bytes_os(&args)?,
+                    let mut search = super::dispatch::parse_native_workflow_edge_config_os(
+                        args,
+                        &super::reassign::invocation_bytes_os(args)?,
                     )?;
                     search.tuning.runtime = config.tuning.runtime.clone();
                     Ok::<_, io::Error>(Arc::new(search))

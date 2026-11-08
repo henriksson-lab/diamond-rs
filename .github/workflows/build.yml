@@ -143,6 +143,10 @@ jobs:
       - name: Select Rust
         run: rustup default stable
 
+      - name: Check spill calibration control flow
+        shell: bash
+        run: bash scripts/tests/spill_calibration.sh
+
       - name: Build release executable
         run: cargo build --locked --release --bin diamond
 

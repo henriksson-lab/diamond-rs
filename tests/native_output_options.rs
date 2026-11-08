@@ -416,6 +416,8 @@ fn output_option_protocol_and_file_creation_match_source() {
     .enumerate()
     {
         let base = dir.join(format!("error-{index}"));
+        let supported_zstd =
+            cfg!(feature = "zstd") && format == "6" && flags.as_slice() == ["--compress", "zstd"];
         let result = Command::new(env!("CARGO_BIN_EXE_diamond"))
             .arg("blastp")
             .arg("-q")
@@ -428,6 +430,43 @@ fn output_option_protocol_and_file_creation_match_source() {
             .arg(&base)
             .output()
             .unwrap();
+        if supported_zstd {
+            assert!(
+                result.status.success(),
+                "{index}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(!base.exists(), "{index}: output suffix was not appended");
+            let file = PathBuf::from(format!("{}{suffix}", base.display()));
+            let encoded = std::fs::read(file).unwrap();
+            assert_eq!(&encoded[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+            let plain_path = dir.join(format!("reference-{index}"));
+            let reference = Command::new(env!("CARGO_BIN_EXE_diamond"))
+                .arg("blastp")
+                .arg("-q")
+                .arg(root.join("tests/data/tabular_context/query.faa"))
+                .arg("-d")
+                .arg(&db)
+                .args(["-f", format, "--compress", "0"])
+                .arg("-o")
+                .arg(&plain_path)
+                .output()
+                .unwrap();
+            assert!(
+                reference.status.success(),
+                "{index} uncompressed reference: {}",
+                String::from_utf8_lossy(&reference.stderr)
+            );
+            let expected = std::fs::read(plain_path).unwrap();
+            assert!(!expected.is_empty());
+            let mut decoded = vec![0; expected.len()];
+            assert_eq!(
+                diamond::util::io::zstd_stream::zstd_decompress(&encoded, &mut decoded).unwrap(),
+                expected.len()
+            );
+            wire(&decoded, &expected, "feature-enabled zstd output");
+            continue;
+        }
         assert_eq!(result.status.code(), Some(1));
         assert!(
             String::from_utf8_lossy(&result.stderr).ends_with(&format!("Error: {error}\n")),

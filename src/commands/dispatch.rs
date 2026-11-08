@@ -120,7 +120,8 @@ use crate::stats::cbs::CbsMode;
 mod dispatch_os;
 pub(crate) use dispatch_os::{
     parse_float_search_option_os, parse_native_blastp_config_os, parse_native_search_tuning_os,
-    parse_search_string_option_os, parse_signed_search_option_os, parse_source_config_tuning_os,
+    parse_native_workflow_edge_config_os, parse_search_string_option_os,
+    parse_signed_search_option_os, parse_source_config_tuning_os,
 };
 
 #[path = "native_main.rs"]

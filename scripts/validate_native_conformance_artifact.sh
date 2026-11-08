@@ -68,6 +68,8 @@ validate_spill() {
         }
         $1 == "delayed-gate-1" || $1 == "delayed-gate-2" {
             if ($3 != "delayed-spill" || $4 !~ /^[0-9]+$/ || $4 <= 0 || $5 <= 0.0) exit 1
+            if (delayed_limit != "" && $2 != delayed_limit) exit 1
+            delayed_limit = $2
             ++delayed
         }
         END {

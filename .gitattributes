@@ -1,0 +1,3 @@
+# Upstream conformance fixtures are byte-exact, including intentional LF,
+# CRLF, NUL and compressed data. Do not let checkout conversion alter them.
+/tests/data/** -text

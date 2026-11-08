@@ -459,6 +459,20 @@ pub(crate) fn parse_native_blastp_config_os(
     let options = Options::new(args)?;
     blastp_config(&options, invocation)
 }
+/// Project an already Source-validated workflow configuration into its internal
+/// protein edge search. Source mutates these fields on the existing Config;
+/// internal overrides are not a second user invocation or workflow permission.
+pub(crate) fn parse_native_workflow_edge_config_os(
+    args: &[OsString],
+    invocation: &[u8],
+) -> io::Result<BlastpConfig> {
+    let mut options = Options::new(args)?;
+    options.command = "blastp".to_owned();
+    options
+        .values
+        .insert("outfmt", vec![OsString::from("edge")]);
+    blastp_config(&options, invocation)
+}
 fn blastp_config(options: &Options, invocation: &[u8]) -> io::Result<BlastpConfig> {
     let dna = options.command == "blastn";
     let (output, outfmt) = output_options(options)?;
@@ -1208,6 +1222,31 @@ mod raw_tests {
         assert_eq!(config.outfmt, vec![b"format\xfb".to_vec()]);
         assert_eq!(config.threads, 3);
         assert_eq!(config.sam.invocation, b"original\xf9 invocation");
+    }
+    #[test]
+    fn workflow_edge_projection_validates_users_before_internal_overrides() {
+        for workflow in ["reassign", "recluster", "cluster"] {
+            let args =
+                ["diamond", workflow, "--db", "original-db", "--threads", "1"].map(OsString::from);
+            let invocation = b"original workflow invocation";
+            let config = parse_native_workflow_edge_config_os(&args, invocation).unwrap();
+            assert_eq!(config.outfmt, vec![b"edge".to_vec()]);
+            assert_eq!(config.database, PathBuf::from("original-db"));
+            assert_eq!(config.threads, 1);
+            assert_eq!(config.sam.invocation, invocation);
+
+            let mut user_format = args.to_vec();
+            user_format.extend([OsString::from("--outfmt"), OsString::from("xml")]);
+            let result = parse_native_workflow_edge_config_os(&user_format, invocation);
+            if cfg!(feature = "extra") {
+                assert_eq!(result.unwrap().outfmt, vec![b"edge".to_vec()]);
+            } else {
+                assert_eq!(
+                    result.err().unwrap().to_string(),
+                    "Option is not permitted for this workflow: outfmt"
+                );
+            }
+        }
     }
     #[test]
     fn final_disabled_short_id_shadowing_is_used_by_real_factories() {

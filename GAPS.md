@@ -30,7 +30,7 @@ is no automatic production C++ fallback. Earlier adapter-missing statements
 below are historical and superseded; unchecked validation items remain evidence
 gates, not proof that their code is absent. Current results and explicit Source
 compatibility boundaries are in `TRANSLATION_COMPLETION.md` and
-`translation/progress.md`. The overall translation goal is still active.
+`translation/progress.md`. The overall translation goal is unachieved and paused by the user; current priority is CI/CLI fixes.
 
 The latest external two-worker gate remains unresolved: a late unconditional
 empty-chunk allocation can disagree with another worker's captured chunk count.

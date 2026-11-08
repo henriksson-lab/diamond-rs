@@ -644,6 +644,8 @@ mod tests {
         let mut magic = [0; 2];
         raw.read_raw(&mut magic).unwrap();
         assert_eq!(magic, [0x1f, 0x8b]);
+        raw.close().unwrap();
+        input.close().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
@@ -655,6 +657,7 @@ mod tests {
             let mut output = vec![0; bytes.len()];
             assert_eq!(input.read_raw(&mut output).unwrap(), bytes.len());
             assert_eq!(output, bytes);
+            input.close().unwrap();
             std::fs::remove_file(path).unwrap();
         }
     }
@@ -714,6 +717,7 @@ mod tests {
             input.hash().unwrap(),
             crate::util::hash::file_hash(&bytes[17..])
         );
+        input.close().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 

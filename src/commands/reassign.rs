@@ -607,13 +607,11 @@ pub(crate) fn parse_options_with_startup_os(
         };
         // Source switches the existing common configuration to edge output; it
         // does not construct a second search configuration with fresh defaults.
-        // Project only its forced output format before the shared parser, so an
-        // unrelated requested DAA/XML format cannot affect this internal stream.
-        let mut search_args = args.to_vec();
-        search_args.extend([OsString::from("--outfmt"), OsString::from("edge")]);
+        // Validate the original workflow arguments before applying its trusted
+        // internal edge-format override to the captured option cells.
         let invocation = errors.capture(invocation_bytes_os(args))?;
-        let mut search = errors.capture(super::dispatch::parse_native_blastp_config_os(
-            &search_args,
+        let mut search = errors.capture(super::dispatch::parse_native_workflow_edge_config_os(
+            args,
             &invocation,
         ))?;
         if let Some(startup) = startup {
