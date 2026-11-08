@@ -231,7 +231,7 @@ where
 
     if iterated {
         if aligned {
-            IntermediateRecord::finish_query(&mut out, seek_pos);
+            IntermediateRecord::finish_query_io(&mut out, seek_pos)?;
         }
     } else {
         stat.inc(StatValue::Matches, n_hsp);
@@ -285,7 +285,7 @@ where
         }
     }
 
-    IntermediateRecord::finish_query(&mut out, seek_pos);
+    IntermediateRecord::finish_query_io(&mut out, seek_pos)?;
     Ok(out)
 }
 

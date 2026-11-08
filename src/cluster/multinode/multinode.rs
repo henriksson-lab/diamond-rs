@@ -1,8 +1,7 @@
 //! Multi-node clustering orchestration from
 //! `diamond/src/cluster/multinode/multinode.cpp`.
 
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -92,6 +91,8 @@ impl Job {
         let mut line =
             format!("[{}, {}] ", self.worker_id, self.start.elapsed().as_secs()).into_bytes();
         line.extend_from_slice(message);
+        #[cfg(windows)]
+        line.push(b'\r');
         line.push(b'\n');
         self.log_file.push_bytes(&line).map(|_| ())
     }
@@ -329,6 +330,17 @@ pub struct BlockSearchRequest {
 }
 
 pub trait MultinodeBackend: SequenceSource {
+    fn io_errors(&self) -> IoErrorOwner {
+        IoErrorOwner::default()
+    }
+    /// Source changes its shared configuration before constructing the job.
+    fn begin_workflow(&mut self, _config: &MultinodeConfig) -> Result<(), String> {
+        Ok(())
+    }
+    /// Source restores its original output path before the final output lock.
+    fn restore_output(&mut self, _output: &Path) -> Result<(), String> {
+        Ok(())
+    }
     fn run_search(&mut self, request: &BlockSearchRequest) -> Result<(), String>;
     fn greedy_vertex_cover(
         &mut self,
@@ -515,6 +527,32 @@ pub fn run_block_combos_path<B: MultinodeBackend>(
     )
 }
 
+/// Source's exception-disabled binary ofstream, with only the explicit good()
+/// checks from the caller. Its destructor does not promote fclose failures.
+struct BinaryAlignmentOutput {
+    stream: crate::util::io::cstdio_file::OwnedCstdio,
+    good: bool,
+}
+impl BinaryAlignmentOutput {
+    fn open(path: &Path, errors: &IoErrorOwner) -> Result<Self, String> {
+        let stream = crate::util::io::cstdio_file::OwnedCstdio::open_file_role_path(path, "wb")
+            .map_err(|_| {
+                crate::util::io::source_text::path_error(errors, b"Error opening file ", path)
+            })?;
+        Ok(Self { stream, good: true })
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        if self.good {
+            self.good = self.stream.write_text_output(bytes).unwrap_or(false);
+        }
+    }
+}
+impl Drop for BinaryAlignmentOutput {
+    fn drop(&mut self) {
+        let _ = self.stream.close_file_role();
+    }
+}
+
 fn finalize_block_combos<B: MultinodeBackend>(
     job: &Job,
     volumes: &VolumedFile,
@@ -532,40 +570,56 @@ fn finalize_block_combos<B: MultinodeBackend>(
         )?,
     );
     job.log_bytes(&message)?;
-    let mut alignment = BufWriter::new(
-        File::create(source_c_path(&alignment_path).as_ref()).map_err(|_| {
-            crate::util::io::source_text::path_error(
-                &job.errors,
-                b"Error opening file ",
-                &alignment_path,
-            )
-        })?,
-    );
-    for i in 0..n {
-        for j in i..n {
-            let path = base_dir.join(format!("{i}_{j}.tsv"));
-            let bytes = fs::read(source_c_path(&path).as_ref()).map_err(|_| {
-                crate::util::io::source_text::path_error(&job.errors, b"Error opening file ", &path)
-            })?;
-            alignment.write_all(&bytes).map_err(|_| {
-                crate::util::io::source_text::path_error(
-                    &job.errors,
-                    b"Error writing ",
-                    &alignment_path,
-                )
-            })?;
+    {
+        let mut alignment = BinaryAlignmentOutput::open(&alignment_path, &job.errors)?;
+        let mut buffer = [0u8; 8192];
+        for i in 0..n {
+            for j in i..n {
+                let path = base_dir.join(format!("{i}_{j}.tsv"));
+                let mut input =
+                    crate::util::io::file::File::open_path(&path, "rb").map_err(|_| {
+                        crate::util::io::source_text::path_error(
+                            &job.errors,
+                            b"Error opening file ",
+                            &path,
+                        )
+                    })?;
+                // Source peeks before inserting rdbuf; an empty/failing
+                // input peek produces no output insertion at all.
+                let mut first = [0u8; 1];
+                if input.read_max(&mut first).unwrap_or(0) == 0 {
+                    continue;
+                }
+                alignment.write(&first);
+                while alignment.good {
+                    let count = input.read_max(&mut buffer).unwrap_or(0);
+                    if count == 0 {
+                        // After a successful peek, filebuf read failure makes
+                        // ostream's rdbuf insertion fail its explicit check.
+                        alignment.good = input.read_at_eof().unwrap_or(false);
+                        break;
+                    }
+                    alignment.write(&buffer[..count]);
+                }
+                if !alignment.good {
+                    return Err(crate::util::io::source_text::path_error(
+                        &job.errors,
+                        b"Error writing ",
+                        &alignment_path,
+                    ));
+                }
+            }
         }
-    }
-    alignment.flush().map_err(|error| error.to_string())?;
+    } // Source closes the binary alignment owner before OID/GVC consumers.
 
     let oid_path = job.root_dir().join("oids.txt");
     if job.round() == 0 {
+        let mut output = crate::util::io::source_text::TextOutput::open_unchecked(&oid_path, true);
         job.log("Writing oid file")?;
-        let mut text = String::new();
         for oid in 0..=volumes.max_oid() {
-            text.push_str(&format!("{oid}\n"));
+            output.write(oid.to_string().as_bytes());
+            output.endl();
         }
-        fs::write(source_c_path(&oid_path).as_ref(), text).map_err(|error| error.to_string())?;
     }
     job.log("Running greedy vertex cover")?;
     let database = if job.round() == 0 {
@@ -607,9 +661,9 @@ pub fn round_path<B: MultinodeBackend>(
         };
     }
     job.log(&format!(
-        "Starting round {} sensitivity {:?}",
+        "Starting round {} sensitivity {}",
         job.round(),
-        config.sensitivity
+        crate::run::config::sensitivity_name(config.sensitivity)
     ))?;
     job.set_round(volumes.sparse_records());
     run_block_combos_path(job, volumes, config, backend)
@@ -630,7 +684,7 @@ pub fn multinode_io<B: MultinodeBackend>(
     input: &VolumedFile,
     backend: &mut B,
 ) -> std::io::Result<OId> {
-    let errors = IoErrorOwner::default();
+    let errors = backend.io_errors();
     let result = multinode_owned(config, input, backend, &errors);
     errors.finish(result)
 }
@@ -647,6 +701,7 @@ fn multinode_owned<B: MultinodeBackend>(
         return Err("Thread count must be positive.".to_owned());
     }
     config.file_buffer_size = 64 * 1024;
+    backend.begin_workflow(config)?;
     let mut job = Job::new_with_errors(
         input.max_oid(),
         config.memory_limit,
@@ -661,9 +716,14 @@ fn multinode_owned<B: MultinodeBackend>(
             } else {
                 "Uni-directional"
             },
-            config.mutual_cover.unwrap_or(config.member_cover)
+            crate::output::format::format_fixed_float(
+                config.mutual_cover.unwrap_or(config.member_cover),
+            )
         ))?;
-        job.log(&format!("Approx. id = {}", config.approx_min_id))?;
+        job.log(&format!(
+            "Approx. id = {}",
+            crate::output::format::format_fixed_float(config.approx_min_id)
+        ))?;
         job.log(&format!("#Volumes = {}", input.0.len()))?;
         job.log(&format!("#Sequences = {}", input.sparse_records()))?;
     }
@@ -712,6 +772,7 @@ fn multinode_owned<B: MultinodeBackend>(
         }
     }
     let output_lock = Atomic::new(job.root_dir().join("output_lock"));
+    backend.restore_output(&config.output_file)?;
     if output_lock.fetch_add_one()? == 0 {
         merge(
             &mut job,

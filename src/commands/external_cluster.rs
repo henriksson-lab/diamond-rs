@@ -277,7 +277,7 @@ impl ExternalPipeline for Pipeline {
         kind: ExternalRecordKind,
         bits_unsorted: u32,
     ) -> Result<RadixedTable, String> {
-        external::storage::radix_sort(job, table, kind, bits_unsorted)
+        external::storage::radix_sort_with_threads(job, table, kind, bits_unsorted, self.threads)
     }
     fn begin_pair_table(&mut self, job: &Job) -> Result<(), String> {
         self.pair_files = Some(PairFileArray::new_bounded_owned(

@@ -22,10 +22,17 @@ not known failures unless the text explicitly says otherwise.
 - The retained multinode indexed partition/load_seqs adapter is now concrete.
   The next batch adds parallel seed/pair/chunk workers and retained FASTA index
   streams; its frozen package passes three compile profiles and 142 focused tests.
-  Remaining code includes oversized radix spill parallelism, generic parallel
-  chunk input loading/sorting, and a concrete retained multinode search/GVC backend.
-  Seed progress logging also needs the Source numeric formatter. Fresh Source
-  comparisons and broader command/profile interactions remain evidence gates.
+  A subsequent frozen batch implements oversized radix spill parallelism,
+  parallel chunk input loading/sorting and the concrete retained multinode
+  search/GVC backend. It also connects actual intermediate generation and
+  corrects seed-log formatting. Its frozen package passes three compile
+  profiles and 112 focused tests; the final formatter-only package separately
+  passes default compilation and scoped multinode/formatter checks. Fresh
+  Source comparisons and broader command/profile interactions remain gates.
+- Oversized POD spill retains a documented Source stack-overflow boundary:
+  radix_sort.h:38 supplies sizeof(T) as a typed element count. Rust safely
+  decodes one record and preserves the zero-initialized/previous-record bytes
+  on EOF; Source overflow behavior is not a parity claim.
 - Hosted CI verification, the Source-shared two-worker hazard, and final parity
   gates remain open. No complete-translation claim applies.
 

@@ -177,13 +177,21 @@ impl IntermediateRecord {
     }
 
     pub fn finish_query(buf: &mut [u8], seek_pos: usize) {
+        Self::finish_query_io(buf, seek_pos).expect("invalid intermediate query size");
+    }
+
+    /// Source's safe_cast throws on a payload exceeding uint32. Concrete
+    /// generators propagate that error rather than panicking in the caller.
+    pub fn finish_query_io(buf: &mut [u8], seek_pos: usize) -> io::Result<()> {
         let payload_len = buf
             .len()
             .checked_sub(seek_pos + std::mem::size_of::<u32>() * 2)
-            .expect("invalid intermediate query seek position");
-        let n = u32::try_from(payload_len).expect("intermediate query payload exceeds uint32");
+            .ok_or_else(|| io::Error::other("invalid intermediate query seek position"))?;
+        let n =
+            crate::util::misc::safe_cast::<u32, _>(payload_len as u64).map_err(io::Error::other)?;
         buf[seek_pos + std::mem::size_of::<u32>()..seek_pos + std::mem::size_of::<u32>() * 2]
             .copy_from_slice(&n.to_ne_bytes());
+        Ok(())
     }
 
     pub fn write<W: Write>(

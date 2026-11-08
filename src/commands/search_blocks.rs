@@ -155,42 +155,37 @@ impl ReferenceDictionary {
         output_format: &OutputFormat,
         writer: &mut impl std::io::Write,
     ) -> io::Result<()> {
+        let target_oids = &capture.target_oids;
+        let self_aln_scores = &capture.target_self_aln_scores;
         for (query_id, matches) in capture.matches.iter_mut().enumerate() {
-            let mut bytes = Vec::new();
-            for target in matches.drain(..) {
-                let local = capture
-                    .target_oids
-                    .get(target.target_block_id as usize)
+            // The actual block writer uses the translated Source generator.
+            // Its callbacks retain the real dictionary and source OID mapping;
+            // dictionary insertion still occurs once per matched target, before
+            // that target's HSPs are serialized.
+            let local_id = |block_id: u32| {
+                target_oids
+                    .get(block_id as usize)
                     .copied()
-                    .unwrap_or(target.target_block_id as u64) as usize;
-                let original = oids[local];
-                let dict = self.insert(
-                    original,
-                    &references[local],
-                    capture
-                        .target_self_aln_scores
-                        .get(target.target_block_id as usize)
-                        .copied(),
-                    output_format.code == crate::output::format::FormatCode::Sam,
-                );
-                for hsp in target.hsps {
-                    IntermediateRecord::write(
-                        &mut bytes,
-                        &hsp,
-                        query_id as u32,
-                        dict as i64,
-                        original,
-                        output_format,
-                    )?;
-                }
-            }
-            if !bytes.is_empty() {
-                writer.write_all(&(query_id as u32).to_ne_bytes())?;
-                let size = u32::try_from(bytes.len())
-                    .map_err(|_| io::Error::other("intermediate query exceeds uint32"))?;
-                writer.write_all(&size.to_ne_bytes())?;
-                writer.write_all(&bytes)?;
-            }
+                    .unwrap_or(block_id as u64) as usize
+            };
+            let bytes = crate::align::output::generate_intermediate_output(
+                matches,
+                query_id as u32,
+                0,
+                output_format,
+                |_, block_id, format| {
+                    let local = local_id(block_id);
+                    Ok(self.insert(
+                        oids[local],
+                        &references[local],
+                        self_aln_scores.get(block_id as usize).copied(),
+                        format.code == crate::output::format::FormatCode::Sam,
+                    ) as i64)
+                },
+                |block_id| oids[local_id(block_id)],
+            )?;
+            writer.write_all(&bytes)?;
+            matches.clear();
         }
         IntermediateRecord::finish_file(writer)
     }

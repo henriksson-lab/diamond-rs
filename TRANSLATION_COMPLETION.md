@@ -2430,3 +2430,31 @@ parallel oversized radix spill, generic parallel chunk loading/sorting, the
 concrete retained multinode search/GVC backend and Source seed-log number
 formatting. Source's inactive multinode CLI remains inactive. The full
 translation/parity goal stays open.
+
+
+Native backend/storage verification (2026-11-08): frozen package
+`e95142bf7ac1de960cef6e6ca17d5b9bd3f8a219aefa1982050b714b987d1f64`
+passes isolated default, optional dna/mcl/zstd and Windows GNU all-target checks.
+It also passes 112 focused tests: 69 external, 22 multinode, eight alignment
+output, ten intermediate and three native search-block integration cases. The
+new multinode integration uses real startup, raw-title FASTA index/read owners,
+BLASTP and GVC; it checks exact assignment bytes and the shared initialized
+matrix owner. The error control verifies the exact typed Source index diagnostic.
+Parallel loader, spill routing, EOF reuse, rollover counters and error-owner
+controls pass. Source was not run or rebuilt. All packaged bytes stayed frozen.
+
+A final narrowly scoped follow-up uses the existing Source fixed-float formatter
+for multinode startup values, preserving signed/lowercase nonfinite spellings
+accepted by Source atof. Its isolated default all-target and multinode/formatter
+checks are recorded separately; the earlier three-profile result applies to
+`e95142bf...`, before this formatting-only follow-up. Full upstream parity,
+final-snapshot integration/profile/platform/RSS gates and the Source-shared
+external two-process-worker scheduling boundary remain open. No goal-completion
+claim is made.
+
+Final formatter-only package
+`c8fe6a374e452bb9876d3575ce529a6f2eaecf86df4684ccfe33d3cfc5061622`
+passes default all-target compilation and 51 focused tests (22 multinode,
+29 formatter). Workspace production/test inputs still match that frozen package
+exactly. The previous three-profile package remains the evidence for optional
+and Windows compilation before this small common-formatter substitution.

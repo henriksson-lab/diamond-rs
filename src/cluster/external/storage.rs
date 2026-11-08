@@ -44,12 +44,14 @@ struct BucketOutput {
     volume: u64,
     volume_bytes: u64,
     volume_records: u64,
+    records_total: u64,
 }
 
 #[derive(Debug)]
 pub(crate) struct BucketWriter {
     directory: PathBuf,
     worker: i64,
+    exclusive: bool,
     buckets: Vec<BucketOutput>,
     error: Option<String>,
     errors: IoErrorOwner,
@@ -134,6 +136,7 @@ impl BucketWriter {
         Ok(Self {
             directory: directory.into(),
             worker,
+            exclusive: false,
             buckets,
             error: None,
             errors,
@@ -149,6 +152,32 @@ impl BucketWriter {
         errors: IoErrorOwner,
     ) -> Result<Self, String> {
         Self::new_storage_owned(directory, worker, count, errors, false)
+    }
+
+    fn new_exclusive_file_array_owned(
+        directory: &Path,
+        worker: i64,
+        count: usize,
+        errors: IoErrorOwner,
+    ) -> Result<Self, String> {
+        let mut owner = Self::new_file_array_owned(directory, worker, count, errors)?;
+        owner.exclusive = true;
+        Ok(owner)
+    }
+
+    fn buckets(&self) -> RadixedTable {
+        RadixedTable(
+            self.buckets
+                .iter()
+                .enumerate()
+                .map(|(radix, bucket)| {
+                    Bucket::new(
+                        self.directory.join(radix.to_string()).join("bucket.tsv"),
+                        self.exclusive.then_some(bucket.records_total),
+                    )
+                })
+                .collect(),
+        )
     }
 
     fn append_worker_member(
@@ -182,6 +211,9 @@ impl BucketWriter {
         )?;
         bucket.volume_bytes += bytes.len() as u64;
         bucket.volume_records += records;
+        if self.exclusive {
+            bucket.records_total += records;
+        }
         if bucket.volume_bytes >= MAX_VOLUME_BYTES {
             self.publish(radix, true)?;
             self.buckets[radix].file =
@@ -293,6 +325,9 @@ impl BucketWriter {
             .expect("local BufferArray owner")
             .size() as u64;
         bucket.volume_records += bucket.pending_records;
+        if self.exclusive {
+            bucket.records_total += bucket.pending_records;
+        }
         bucket.pending_records = 0;
         bucket
             .compressed
@@ -319,8 +354,10 @@ impl BucketWriter {
                 self.errors
                     .capture(file.close().map_err(std::io::Error::other))?;
             }
-            if bucket.volume_records > 0 {
-                // FileStack takes the Source cross-process lock around each line.
+            if rollover || bucket.volume_records > 0 {
+                // A rollover publishes even a zero-record volume; only the
+                // final destructor removes an empty current file. FileStack
+                // takes the Source cross-process lock around each line.
                 bucket
                     .stack
                     .as_ref()
@@ -364,7 +401,10 @@ impl BucketWriter {
             let manifest = self.directory.join(radix.to_string()).join("bucket.tsv");
             // Other process workers can still append. Read aggregate counts
             // only after the stage's shared completion barrier.
-            buckets.push(Bucket::new(manifest, None));
+            buckets.push(Bucket::new(
+                manifest,
+                self.exclusive.then_some(self.buckets[radix].records_total),
+            ));
         }
         Ok(RadixedTable(buckets))
     }
@@ -385,9 +425,11 @@ impl BucketWriter {
         for radix in 0..self.buckets.len() {
             // Each worker BufferArray destructor finishes even an empty
             // stream. FileArray destruction itself adds no extra member.
-            self.buckets[radix].buffer_active = true;
-            self.flush(radix)?;
-            self.buckets[radix].buffer_active = false;
+            if self.buckets[radix].compressed.is_some() {
+                self.buckets[radix].buffer_active = true;
+                self.flush(radix)?;
+                self.buckets[radix].buffer_active = false;
+            }
             buckets.push(Bucket::new(
                 self.directory.join(radix.to_string()).join("bucket.tsv"),
                 None,
@@ -470,14 +512,16 @@ fn spill(
     bits: u32,
     volumes: Vec<(PathBuf, u64)>,
     count: u64,
+    threads: usize,
 ) -> Result<Vec<Bucket>, String> {
     if count == 0 {
+        // VolumedFile::remove ignores these results in Source.
         for (path, _) in volumes {
-            fs::remove_file(source_c_path(&(path)).as_ref()).map_err(|error| error.to_string())?;
+            let _ = fs::remove_file(source_c_path(&path).as_ref());
         }
-        fs::remove_file(source_c_path(&bucket.path).as_ref()).map_err(|error| error.to_string())?;
+        let _ = fs::remove_file(source_c_path(&bucket.path).as_ref());
         if let Some(directory) = bucket.path.parent() {
-            let _ = fs::remove_dir(source_c_path(&(directory)).as_ref());
+            let _ = fs::remove_dir(source_c_path(directory).as_ref());
         }
         return Ok(Vec::new());
     }
@@ -485,44 +529,64 @@ fn spill(
         return Ok(vec![Bucket::new(bucket.path, Some(count))]);
     }
     let shift = bits - RADIX_BITS;
-    let mut writer = BucketWriter::new_owned(
-        bucket.path.parent().unwrap_or(Path::new("")),
-        job.worker_id(),
-        RADIX_COUNT,
-        job.io_errors(),
-    )?;
-    for (path, records) in &volumes {
-        let mut input = job.open_input(path, 0)?;
-        let mut bytes = vec![0; record_size(kind)];
-        for _ in 0..*records {
-            let mut read = 0;
-            while read < bytes.len() {
-                let n = job.io(input.read_raw(&mut bytes[read..]))?;
-                if n == 0 {
-                    return Err("Short external radix record".into());
+    let output = std::sync::Arc::new(std::sync::Mutex::new(
+        BucketWriter::new_exclusive_file_array_owned(
+            bucket.path.parent().unwrap_or(Path::new("")),
+            job.worker_id(),
+            RADIX_COUNT,
+            job.io_errors(),
+        )?,
+    ));
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let volumes = std::sync::Arc::new(volumes);
+    let mut pool = crate::util::parallel::SimpleThreadPool::new();
+    for _ in 0..threads.min(volumes.len()) {
+        let job = job.clone();
+        let output = std::sync::Arc::clone(&output);
+        let next = std::sync::Arc::clone(&next);
+        let failure = std::sync::Arc::clone(&failure);
+        let volumes = std::sync::Arc::clone(&volumes);
+        pool.spawn(move |stop| {
+            let mut buffers =
+                WorkerBucketBuffers::new(output, RADIX_COUNT, job.io_errors(), failure);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((path, records)) = volumes.get(index) else {
+                    break;
+                };
+                let mut input = job.open_input(path, 0)?;
+                let mut bytes = vec![0; record_size(kind)];
+                for _ in 0..*records {
+                    // Source radix_sort.h:38 passes sizeof(T) as a typed
+                    // element count (Deserializer multiplies it by sizeof(T)).
+                    // Requests can overflow its one T object when more than T
+                    // bytes remain. Read safely within one record instead; the
+                    // Source-undefined multi-record case gets defined Rust IO.
+                    // Source ignores the count: partial/EOF reads leave the
+                    // initialized prior object bytes intact within this volume.
+                    let _ = job.io(input.read_raw(&mut bytes))?;
+                    buffers.write(((key(&bytes, kind) >> shift) & 255) as usize, &bytes)?;
                 }
-                read += n;
+                job.io(input.close())?;
             }
-            writer.write(((key(&bytes, kind) >> shift) & 255) as usize, &bytes)?;
-        }
+            // BufferArray flushes at worker destruction, before pool.join_all
+            // returns and before the exclusive FileArray publishes its files.
+            Ok(())
+        });
     }
-    let mut children = writer.finish()?;
-    drop(writer);
-    // Source radix_cluster has an exclusive output owner, so all 256 child
-    // counts (including zero) can be read without another process appending.
-    for child in children.iter_mut() {
-        child.records = Some(
-            manifest_records_owned(&child.path, &job.io_errors())?
-                .iter()
-                .map(|(_, n)| n)
-                .sum(),
-        );
+    pool.join_all()?;
+    if let Some(error) = failure.lock().unwrap().clone() {
+        return Err(error);
     }
+    // Source reads exclusive cumulative counters directly from the real file
+    // owner BEFORE closing it. No manifest reopen or post-close recount occurs.
+    let children = output.lock().unwrap().buckets();
+    output.lock().unwrap().finish()?;
+    drop(output);
     job.log(&format!("Radix sorted bucket records={count}"))?;
-    // Exactly one eight-bit pass, as in radix_sort.h. Source retains the old
-    // input bucket here and does not recurse even when a child still exceeds
-    // mem_limit. Thus the configured memory limit remains a heuristic on
-    // skewed distributions; changing pass depth can change chunk boundaries.
+    // One eight-bit pass only. Source retains the old input bucket here and
+    // does not recursively split a skewed child which still exceeds its limit.
     Ok(children.0)
 }
 
@@ -531,6 +595,16 @@ pub fn radix_sort(
     table: RadixedTable,
     kind: ExternalRecordKind,
     bits_unsorted: u32,
+) -> Result<RadixedTable, String> {
+    radix_sort_with_threads(job, table, kind, bits_unsorted, 1)
+}
+
+pub fn radix_sort_with_threads(
+    job: &Job,
+    table: RadixedTable,
+    kind: ExternalRecordKind,
+    bits_unsorted: u32,
+    threads: usize,
 ) -> Result<RadixedTable, String> {
     if bits_unsorted < RADIX_BITS || table.is_empty() {
         return Ok(table);
@@ -557,7 +631,15 @@ pub fn radix_sort(
             crate::util::string::format(count * record_size(kind) as u64)
         ))?;
         let mut text = Vec::new();
-        for result in spill(job, bucket.clone(), kind, bits_unsorted, volumes, count)? {
+        for result in spill(
+            job,
+            bucket.clone(),
+            kind,
+            bits_unsorted,
+            volumes,
+            count,
+            threads,
+        )? {
             text.extend_from_slice(
                 &job.io(manifest_line(&result.path, &[result.records.unwrap()]))?,
             );
@@ -765,6 +847,11 @@ mod tests {
             .iter()
             .all(|bucket| bucket.compressed.is_none()));
         assert!(files.buckets.iter().all(|bucket| !bucket.buffer_active));
+        files.flush_unpublished().unwrap();
+        assert!(files
+            .buckets
+            .iter()
+            .all(|bucket| bucket.compressed.is_none()));
         files.finish().unwrap();
         drop(files);
         assert!((0..3).all(|radix| !root
@@ -818,6 +905,187 @@ mod tests {
             records
         );
         drop(output);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exclusive_file_array_retains_counts_across_rollover() {
+        let root = temp_dir();
+        let mut files =
+            BucketWriter::new_exclusive_file_array_owned(&root, 4, 1, IoErrorOwner::default())
+                .unwrap();
+        let mut member = CompressedBuffer::new();
+        member.write(b"first").unwrap();
+        member.finish().unwrap();
+        files.buckets[0].volume_bytes = MAX_VOLUME_BYTES - 1;
+        files.append_member(0, member.data(), 1).unwrap();
+        assert_eq!(files.buckets().0[0].records, Some(1));
+        member.clear();
+        member.write(b"second").unwrap();
+        member.finish().unwrap();
+        files.append_member(0, member.data(), 1).unwrap();
+        let buckets = files.buckets();
+        files.finish().unwrap();
+        assert_eq!(buckets.0[0].records, Some(2));
+        assert_eq!(
+            manifest_records(&buckets.0[0].path)
+                .unwrap()
+                .iter()
+                .map(|(_, n)| *n)
+                .sum::<u64>(),
+            2
+        );
+        drop(files);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rollover_publishes_zero_record_member_before_empty_final_file_removal() {
+        let root = temp_dir();
+        let mut files =
+            BucketWriter::new_exclusive_file_array_owned(&root, 4, 1, IoErrorOwner::default())
+                .unwrap();
+        let mut member = CompressedBuffer::new();
+        member.finish().unwrap();
+        files.buckets[0].volume_bytes = MAX_VOLUME_BYTES - 1;
+        files.append_member(0, member.data(), 0).unwrap();
+        assert_eq!(
+            manifest_records(&root.join("0/bucket.tsv")).unwrap(),
+            vec![(root.join("0/worker_4_volume_0"), 0)]
+        );
+        assert!(root.join("0/worker_4_volume_0").exists());
+        files.finish().unwrap();
+        assert!(!root.join("0/worker_4_volume_1").exists());
+        drop(files);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn seed_record(seed: u64, oid: i64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&seed.to_ne_bytes());
+        bytes.extend_from_slice(&oid.to_ne_bytes());
+        bytes.extend_from_slice(&100i32.to_ne_bytes());
+        bytes
+    }
+
+    #[test]
+    fn oversized_radix_workers_route_single_record_volumes_and_keep_source_inputs() {
+        let root = temp_dir();
+        let input_dir = root.join("seeds/0");
+        fs::create_dir_all(&input_dir).unwrap();
+        let mut manifest = Vec::new();
+        let mut expected = Vec::new();
+        let mut original_paths = Vec::new();
+        for index in 0..8 {
+            let path = input_dir.join(format!("input-{index}"));
+            let bytes = seed_record(index + 1, index as i64);
+            fs::write(&path, &bytes).unwrap();
+            expected.push(bytes);
+            original_paths.push(path.clone());
+            manifest.extend(manifest_line(&path, &[1]).unwrap());
+        }
+        let manifest_path = input_dir.join("bucket.tsv");
+        fs::write(&manifest_path, manifest).unwrap();
+        let job = Job::new(8, 8, 1, root.join("job"), 7).unwrap();
+        let children = radix_sort_with_threads(
+            &job,
+            RadixedTable(vec![Bucket::new(&manifest_path, Some(8))]),
+            ExternalRecordKind::Seed,
+            RADIX_BITS,
+            4,
+        )
+        .unwrap();
+        assert_eq!(children.len(), RADIX_COUNT);
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| child.records.unwrap())
+                .sum::<u64>(),
+            8
+        );
+        assert!(original_paths.iter().all(|path| path.exists()));
+        assert!(
+            manifest_path.exists(),
+            "Source retains the oversized input after this one pass"
+        );
+        let mut actual = Vec::new();
+        for (radix, child) in children.iter().enumerate() {
+            let mut counted = 0;
+            for (path, records) in manifest_records(&child.path).unwrap() {
+                let mut input =
+                    InputFile::with_source_profile_path(&path, 0, BUFFER_BYTES).unwrap();
+                for _ in 0..records {
+                    let mut record = vec![0; 20];
+                    std::io::Read::read_exact(&mut input, &mut record).unwrap();
+                    assert_eq!(
+                        (key(&record, ExternalRecordKind::Seed) & 255) as usize,
+                        radix
+                    );
+                    actual.push(record);
+                }
+                counted += records;
+                input.close().unwrap();
+            }
+            assert_eq!(child.records, Some(counted));
+        }
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn radix_worker_eof_retains_the_previous_record_within_one_volume() {
+        let root = temp_dir();
+        let input_dir = root.join("seeds/0");
+        fs::create_dir_all(&input_dir).unwrap();
+        let path = input_dir.join("one-physical-record");
+        let bytes = seed_record(12, 4);
+        fs::write(&path, &bytes).unwrap();
+        let manifest = input_dir.join("bucket.tsv");
+        fs::write(&manifest, manifest_line(&path, &[2]).unwrap()).unwrap();
+        let job = Job::new(4, 1, 1, root.join("job"), 2).unwrap();
+        let children = radix_sort_with_threads(
+            &job,
+            RadixedTable(vec![Bucket::new(&manifest, Some(2))]),
+            ExternalRecordKind::Seed,
+            RADIX_BITS,
+            4,
+        )
+        .unwrap();
+        let radix = (key(&bytes, ExternalRecordKind::Seed) & 255) as usize;
+        assert_eq!(children[radix].records, Some(2));
+        let rows = manifest_records(&children[radix].path).unwrap();
+        let mut input = InputFile::with_source_profile_path(&rows[0].0, 0, BUFFER_BYTES).unwrap();
+        let mut actual = vec![0; 40];
+        std::io::Read::read_exact(&mut input, &mut actual).unwrap();
+        input.close().unwrap();
+        assert_eq!(actual, [bytes.clone(), bytes].concat());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn radix_worker_preserves_the_missing_input_file_error() {
+        let root = temp_dir();
+        let input_dir = root.join("seeds/0");
+        fs::create_dir_all(&input_dir).unwrap();
+        let missing = input_dir.join("missing-volume");
+        let manifest = input_dir.join("bucket.tsv");
+        fs::write(&manifest, manifest_line(&missing, &[2]).unwrap()).unwrap();
+        let errors = IoErrorOwner::default();
+        let job = Job::new_owned(4, 1, 1, root.join("job"), 2, errors.clone()).unwrap();
+        let result = radix_sort_with_threads(
+            &job,
+            RadixedTable(vec![Bucket::new(&manifest, Some(2))]),
+            ExternalRecordKind::Seed,
+            RADIX_BITS,
+            4,
+        );
+        let error = errors.finish(result).unwrap_err();
+        assert_eq!(
+            crate::util::io::file_open_error::find(&error).unwrap().path,
+            missing
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

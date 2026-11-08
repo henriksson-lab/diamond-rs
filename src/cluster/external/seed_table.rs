@@ -630,7 +630,7 @@ fn run_seed_worker(
             settings.shape_count,
             volume_index + 1,
             volumes.len(),
-            volume.record_count,
+            crate::util::string::format(volume.record_count),
         ))?;
         let accession_out = RefCell::new(None);
         let mut on_open = || {

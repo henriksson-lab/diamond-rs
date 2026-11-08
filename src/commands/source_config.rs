@@ -493,7 +493,7 @@ pub(super) fn prepare(args: &[String]) -> io::Result<Arc<Startup>> {
     let args: Vec<OsString> = args.iter().map(OsString::from).collect();
     prepare_os(&args)
 }
-pub(super) fn prepare_os(args: &[OsString]) -> io::Result<Arc<Startup>> {
+pub(crate) fn prepare_os(args: &[OsString]) -> io::Result<Arc<Startup>> {
     prepare_with_io_os(args, true)
 }
 pub(super) fn prepare_without_io(args: &[String]) -> io::Result<Arc<Startup>> {

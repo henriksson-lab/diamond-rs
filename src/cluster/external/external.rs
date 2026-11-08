@@ -793,15 +793,15 @@ pub fn build_chunk_table(
         let Some(bucket) = pair_table.get(bucket_index) else {
             break;
         };
-        let (mut pairs, storage) = read_pair_bucket(job, bucket)?;
+        let (mut pairs, storage) = read_pair_bucket(job, bucket, config.threads)?;
         job.log(&format!(
             "Building chunk table. Bucket={}/{} Records={} Size={}",
             bucket_index + 1,
             pair_table.len(),
-            pairs.len(),
-            pairs.len() * 24,
+            crate::util::string::format(pairs.len() as u64),
+            crate::util::string::format((pairs.len() * 24) as u64),
         ))?;
-        pairs.sort_unstable();
+        sort_input_buffer(&mut pairs, config.threads)?;
         let ranges = chunk_pair_ranges(&pairs, config.threads);
         let pairs = Arc::new(pairs);
         let failure = Arc::new(Mutex::new(None));
@@ -890,15 +890,17 @@ pub fn build_chunks_with_threads<R: SequenceVolumeReader>(
         let Some(bucket) = chunk_table.get(bucket_index) else {
             break;
         };
-        let (mut entries, storage) = read_chunk_table_bucket(job, bucket)?;
-        entries.sort_unstable();
+        let (mut entries, storage) = read_chunk_table_bucket(job, bucket, threads)?;
         job.log(&format!(
             "Building chunks. Bucket={}/{} Records={} Size={}",
             bucket_index + 1,
             chunk_table.len(),
-            entries.len(),
-            entries.len() * ChunkTableEntry::ENCODED_SIZE,
+            crate::util::string::format(entries.len() as u64),
+            crate::util::string::format((entries.len() * ChunkTableEntry::ENCODED_SIZE) as u64),
         ))?;
+        if !entries.is_empty() {
+            sort_input_buffer(&mut entries, threads)?;
+        }
         // Retain only the current radix bucket's OID mapping, shared by its
         // workers. No database sequences are copied into the worker factory.
         let mut wanted = BTreeMap::<OId, BTreeSet<i32>>::new();
@@ -1060,42 +1062,157 @@ fn write_chunk_volume<R: SequenceVolumeReader + ?Sized>(
     )
 }
 
+/// Source POD InputBuffer: allocate one record domain and let each worker
+/// retain an InputFile while filling its volume's declared OID range. Scoped
+/// disjoint slices avoid shared mutable aliases and full-volume staging copies.
+fn read_pod_input_buffer<T, F>(
+    job: &Job,
+    bucket: &Bucket,
+    threads: usize,
+    decode: F,
+) -> Result<(Vec<T>, Vec<(PathBuf, usize)>), String>
+where
+    T: Default + Clone + Send,
+    F: Fn(&Job, &mut InputFile) -> Result<T, String> + Sync,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    let volumes = read_volumed_file_manifest_owned(&bucket.path, &job.io_errors())?;
+    let count = volumes
+        .0
+        .iter()
+        .try_fold(0usize, |sum, volume| {
+            sum.checked_add(usize::try_from(volume.record_count).ok()?)
+        })
+        .ok_or("POD InputBuffer size overflow.")?;
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(count).map_err(|error| {
+        job.capture_io::<()>(Err(std::io::Error::other(crate::util::io::BadAllocError(
+            error.to_string(),
+        ))))
+        .unwrap_err()
+    })?;
+    entries.resize(count, T::default());
+    // Split by physical destination order, then restore Source's volume queue
+    // order. Manifest enumeration need not be ordered by OID range.
+    let mut order: Vec<usize> = (0..volumes.0.len()).collect();
+    order.sort_by_key(|&index| volumes.0[index].oid_begin);
+    let mut tail = entries.as_mut_slice();
+    let mut cursor = 0usize;
+    let mut destinations = Vec::with_capacity(volumes.0.len());
+    for index in order {
+        let volume = &volumes.0[index];
+        let begin = usize::try_from(volume.oid_begin).map_err(|error| error.to_string())?;
+        let count = usize::try_from(volume.record_count).map_err(|error| error.to_string())?;
+        if begin < cursor || begin - cursor > tail.len() || count > tail.len() - (begin - cursor) {
+            return Err(
+                "Source InputBuffer volume ranges overlap or exceed its allocated record domain."
+                    .to_owned(),
+            );
+        }
+        let (_, remaining) = tail.split_at_mut(begin - cursor);
+        let (destination, remaining) = remaining.split_at_mut(count);
+        tail = remaining;
+        cursor = begin + count;
+        destinations.push((index, &volume.path, destination));
+    }
+    destinations.sort_by_key(|(index, _, _)| *index);
+    let destinations = destinations
+        .into_iter()
+        .map(|(_, path, destination)| (path, destination));
+    let pending = Mutex::new(destinations);
+    let stop = AtomicBool::new(false);
+    let error = Mutex::new(None);
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for _ in 0..threads.min(volumes.0.len()) {
+            match std::thread::Builder::new().spawn_scoped(scope, || {
+                while !stop.load(Ordering::Relaxed) {
+                    let Some((path, destination)) = pending.lock().unwrap().next() else {
+                        break;
+                    };
+                    let result = (|| {
+                        let mut input = job.open_input(path, 0)?;
+                        for entry in destination {
+                            *entry = decode(job, &mut input)?;
+                        }
+                        job.io(input.close())?;
+                        Ok::<_, String>(())
+                    })();
+                    if let Err(message) = result {
+                        error.lock().unwrap().get_or_insert(message);
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }) {
+                Ok(worker) => workers.push(worker),
+                Err(failure) => {
+                    let message = job.capture_io::<()>(Err(failure)).unwrap_err();
+                    error.lock().unwrap().get_or_insert(message);
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    drop(pending);
+    if let Some(error) = error.into_inner().unwrap() {
+        return Err(error);
+    }
+    Ok((
+        entries,
+        volumes
+            .0
+            .into_iter()
+            .map(|volume| (volume.path, volume.record_count as usize))
+            .collect(),
+    ))
+}
+
+fn sort_input_buffer<T: Ord + Send>(entries: &mut [T], threads: usize) -> Result<(), String> {
+    use rayon::prelude::*;
+    if threads > 1 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|error| format!("Error creating InputBuffer sorting threads: {error}"))?
+            .install(|| entries.par_sort_unstable());
+    } else {
+        entries.sort_unstable();
+    }
+    Ok(())
+}
+
 fn read_pair_bucket(
     job: &Job,
     bucket: &Bucket,
+    threads: usize,
 ) -> Result<(Vec<PairEntry>, Vec<(PathBuf, usize)>), String> {
-    let storage = read_manifest_owned(&bucket.path, &job.io_errors())?;
-    let mut pairs = Vec::new();
-    for (path, count) in &storage {
-        let mut input = job.open_input(path, 0)?;
-        for _ in 0..*count {
-            pairs.push(PairEntry {
-                rep_oid: job.io(input.read_u64())?,
-                member_oid: job.io(input.read_u64())?,
-                rep_len: job.io(input.read_u32())?,
-                member_len: job.io(input.read_u32())?,
-            });
-        }
-    }
-    Ok((pairs, storage))
+    read_pod_input_buffer(job, bucket, threads, |job, input| {
+        Ok(PairEntry {
+            rep_oid: job.io(input.read_u64())?,
+            member_oid: job.io(input.read_u64())?,
+            rep_len: job.io(input.read_u32())?,
+            member_len: job.io(input.read_u32())?,
+        })
+    })
 }
 
 fn read_chunk_table_bucket(
     job: &Job,
     bucket: &Bucket,
+    threads: usize,
 ) -> Result<(Vec<ChunkTableEntry>, Vec<(PathBuf, usize)>), String> {
-    let storage = read_manifest_owned(&bucket.path, &job.io_errors())?;
-    let mut entries = Vec::new();
-    for (path, count) in &storage {
-        let mut input = job.open_input(path, 0)?;
-        for _ in 0..*count {
-            entries.push(ChunkTableEntry {
-                oid: job.io(input.read_u64())?,
-                chunk: job.io(input.read_i32())?,
-            });
-        }
-    }
-    Ok((entries, storage))
+    read_pod_input_buffer(job, bucket, threads, |job, input| {
+        Ok(ChunkTableEntry {
+            oid: job.io(input.read_u64())?,
+            chunk: job.io(input.read_i32())?,
+        })
+    })
 }
 
 fn read_manifest(path: &Path) -> Result<Vec<(PathBuf, usize)>, String> {
@@ -1519,6 +1636,82 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn pod_input_buffer_reads_independent_volumes_concurrently_into_declared_ranges() {
+        use std::sync::{Condvar, Mutex};
+        let dir = temp_dir("parallel-input-buffer");
+        let job = Job::new(20, 2, 1 << 20, &dir, 0).unwrap();
+        let first = ChunkTableEntry::new(9, 2);
+        let second = ChunkTableEntry::new(2, 1);
+        let paths = [dir.join("first"), dir.join("second")];
+        for (path, record) in paths.iter().zip([first, second]) {
+            let mut bytes = Vec::new();
+            record.serialize(&mut bytes);
+            fs::write(path, bytes).unwrap();
+        }
+        let manifest = dir.join("input.tsv");
+        let mut rows = super::super::storage::manifest_line(&paths[1], &[1, 1, 2]).unwrap();
+        rows.extend_from_slice(
+            &super::super::storage::manifest_line(&paths[0], &[1, 0, 1]).unwrap(),
+        );
+        fs::write(&manifest, rows).unwrap();
+        let gate = (Mutex::new(0usize), Condvar::new());
+        let (mut entries, storage) =
+            read_pod_input_buffer(&job, &Bucket::new(&manifest, None), 2, |job, input| {
+                let mut arrived = gate.0.lock().unwrap();
+                *arrived += 1;
+                gate.1.notify_all();
+                let (arrived, timeout) = gate
+                    .1
+                    .wait_timeout_while(arrived, std::time::Duration::from_secs(5), |count| {
+                        *count < 2
+                    })
+                    .unwrap();
+                if timeout.timed_out() {
+                    return Err(
+                        "InputBuffer did not decode independent volumes concurrently.".to_owned(),
+                    );
+                }
+                drop(arrived);
+                Ok(ChunkTableEntry {
+                    oid: job.io(input.read_u64())?,
+                    chunk: job.io(input.read_i32())?,
+                })
+            })
+            .unwrap();
+        assert_eq!(entries, [first, second]);
+        assert_eq!(storage, [(paths[0].clone(), 1), (paths[1].clone(), 1)]);
+        sort_input_buffer(&mut entries, 2).unwrap();
+        assert_eq!(entries, [second, first]);
+        drop(job);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pod_input_buffer_rejects_overlapping_source_write_domains() {
+        let dir = temp_dir("overlapping-input-buffer");
+        let job = Job::new(20, 2, 1 << 20, &dir, 0).unwrap();
+        let manifest = dir.join("input.tsv");
+        let mut rows =
+            super::super::storage::manifest_line(&dir.join("first"), &[1, 0, 1]).unwrap();
+        rows.extend_from_slice(
+            &super::super::storage::manifest_line(&dir.join("second"), &[1, 0, 1]).unwrap(),
+        );
+        fs::write(&manifest, rows).unwrap();
+        let result = read_pod_input_buffer::<ChunkTableEntry, _>(
+            &job,
+            &Bucket::new(&manifest, None),
+            2,
+            |_, _| Err("overlapping domains must be rejected before file reads".to_owned()),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "Source InputBuffer volume ranges overlap or exceed its allocated record domain."
+        );
+        drop(job);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -2,7 +2,10 @@
 
 pub mod data;
 pub mod multinode;
+pub mod native;
 pub mod output;
+
+pub use native::{multinode_native_io, NativeMultinodeBackend};
 
 pub use data::{
     get_reps, get_reps_fasta, get_reps_path, ByteSequenceRecord, FastaSequenceSource,

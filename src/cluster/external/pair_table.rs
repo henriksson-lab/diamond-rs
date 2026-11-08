@@ -637,25 +637,34 @@ fn read_seed_bucket(
         .unwrap_err()
     })?;
     entries.resize(count, SeedEntry::default());
+    // Split by physical destination order, then restore Source's volume queue
+    // order. Manifest enumeration need not be ordered by OID range.
+    let mut order: Vec<usize> = (0..volumes.0.len()).collect();
+    order.sort_by_key(|&index| volumes.0[index].oid_begin);
     let mut tail = entries.as_mut_slice();
     let mut cursor = 0usize;
     let mut destinations = Vec::with_capacity(volumes.0.len());
-    for volume in &volumes.0 {
-        let begin = usize::try_from(volume.oid_begin).map_err(|e| e.to_string())?;
-        let count = usize::try_from(volume.record_count).map_err(|e| e.to_string())?;
+    for index in order {
+        let volume = &volumes.0[index];
+        let begin = usize::try_from(volume.oid_begin).map_err(|error| error.to_string())?;
+        let count = usize::try_from(volume.record_count).map_err(|error| error.to_string())?;
         if begin < cursor || begin - cursor > tail.len() || count > tail.len() - (begin - cursor) {
             return Err(
                 "Source InputBuffer volume ranges overlap or exceed its allocated record domain."
-                    .into(),
+                    .to_owned(),
             );
         }
         let (_, remaining) = tail.split_at_mut(begin - cursor);
         let (destination, remaining) = remaining.split_at_mut(count);
         tail = remaining;
         cursor = begin + count;
-        destinations.push((&volume.path, destination));
+        destinations.push((index, &volume.path, destination));
     }
-    let pending = Mutex::new(destinations.into_iter());
+    destinations.sort_by_key(|(index, _, _)| *index);
+    let destinations = destinations
+        .into_iter()
+        .map(|(_, path, destination)| (path, destination));
+    let pending = Mutex::new(destinations);
     let stop = std::sync::atomic::AtomicBool::new(false);
     let error = Mutex::new(None);
     std::thread::scope(|scope| {

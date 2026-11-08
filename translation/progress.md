@@ -1352,3 +1352,61 @@ A subsequent code audit identified a remaining UTF-8 title gate in the actual
 frameshift capture backend (`align/legacy/native.rs` and its QueryMapper
 contracts). That byte-contract migration is in progress and is not covered by
 the package above. Full translation and final-snapshot parity remain open.
+
+
+## Native backend and parallel storage continuation (2026-11-08)
+
+The retained multinode library now has a concrete native search/GVC backend,
+with real indexed FASTA owners, retained initialized configuration and one typed
+I/O error owner. Source's commented CLI call remains inactive. External radix
+spill and POD chunk inputs now use real parallel readers and shared output
+owners. The native intermediate writer calls the translated
+`generate_intermediate_output` with the actual dictionary and original OIDs;
+the duplicate framing loop is removed. Seed progress uses Source's numeric
+formatter. These edits await the combined frozen-package checks below.
+
+The oversized POD spill path has an explicit Source undefined-behavior boundary:
+`diamond/src/cluster/external/radix_sort.h:38` calls
+`in.read(&x, sizeof(T))`; inherited `Deserializer::read(T*, size_t)` at
+`diamond/src/util/io/deserializer.h:118` interprets the second argument as an
+element count and requests `sizeof(T)^2` bytes into one stack object. Native
+code reads at most one record into its retained buffer, propagating real I/O
+errors and preserving the previous bytes on short reads/EOF. All four actual
+record types have zeroing Source constructors, so initial buffer state is also
+retained. Source's volume workers and file-array ownership are preserved. No stack overwrite is emulated and no byte-parity claim
+applies to that undefined Source domain. Defined paths and final-snapshot
+upstream comparisons still require evidence; this does not complete the goal.
+
+A read-only dispatch audit again finds no automatic production C++ call. The
+only executable oracle branch requires explicit `--legacy`, the default-off
+`ffi` feature, linked oracle availability and a non-Windows target. Public
+native dispatch never enters that branch. Evidence and input hashes are retained
+under `.tmp/translation-native-backends-spill-20261108/dispatch-audit.json`.
+
+
+Native backend/storage verification (2026-11-08): frozen package
+`e95142bf7ac1de960cef6e6ca17d5b9bd3f8a219aefa1982050b714b987d1f64`
+passes isolated default, optional dna/mcl/zstd and Windows GNU all-target checks.
+It also passes 112 focused tests: 69 external, 22 multinode, eight alignment
+output, ten intermediate and three native search-block integration cases. The
+new multinode integration uses real startup, raw-title FASTA index/read owners,
+BLASTP and GVC; it checks exact assignment bytes and the shared initialized
+matrix owner. The error control verifies the exact typed Source index diagnostic.
+Parallel loader, spill routing, EOF reuse, rollover counters and error-owner
+controls pass. Source was not run or rebuilt. All packaged bytes stayed frozen.
+
+A final narrowly scoped follow-up uses the existing Source fixed-float formatter
+for multinode startup values, preserving signed/lowercase nonfinite spellings
+accepted by Source atof. Its isolated default all-target and multinode/formatter
+checks are recorded separately; the earlier three-profile result applies to
+`e95142bf...`, before this formatting-only follow-up. Full upstream parity,
+final-snapshot integration/profile/platform/RSS gates and the Source-shared
+external two-process-worker scheduling boundary remain open. No goal-completion
+claim is made.
+
+Final formatter-only package
+`c8fe6a374e452bb9876d3575ce529a6f2eaecf86df4684ccfe33d3cfc5061622`
+passes default all-target compilation and 51 focused tests (22 multinode,
+29 formatter). Workspace production/test inputs still match that frozen package
+exactly. The previous three-profile package remains the evidence for optional
+and Windows compilation before this small common-formatter substitution.
