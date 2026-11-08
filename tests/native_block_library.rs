@@ -7,10 +7,8 @@ fn config(directory: &Path, format: &str, threads: i32) -> BlastpConfig {
     BlastpConfig {
         query_files: Vec::new(),
         database: Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data/search_output/reference.faa")
-            .to_string_lossy()
-            .into_owned(),
-        output: Some(directory.join("output").to_string_lossy().into_owned()),
+            .join("tests/data/search_output/reference.faa"),
+        output: Some(directory.join("output")),
         matrix: "blosum62".into(),
         gap_open: 11,
         gap_extend: 1,
@@ -21,16 +19,16 @@ fn config(directory: &Path, format: &str, threads: i32) -> BlastpConfig {
         report_unaligned: -1,
         include_lineage: false,
         output_header: None,
-        compression: String::new(),
+        compression: Vec::new(),
         file_buffer_size: 67_108_864,
         sam: Default::default(),
         archive: Default::default(),
         tuning: Default::default(),
         scoring_matrix: None,
         auxiliary_output: Default::default(),
-        taxonlist: String::new(),
-        taxon_exclude: String::new(),
-        seqidlist: String::new(),
+        taxonlist: Vec::new(),
+        taxon_exclude: Vec::new(),
+        seqidlist: PathBuf::new(),
         skip_missing_seqids: false,
         range_culling: false,
         range_cover: 50.0,
@@ -58,7 +56,7 @@ fn config(directory: &Path, format: &str, threads: i32) -> BlastpConfig {
         outfmt: vec![format.into()],
         sensitivity: diamond::config::Sensitivity::Default,
         masking: diamond::masking::MaskingMode::None,
-        motif_masking: String::new(),
+        motif_masking: Vec::new(),
         min_query_len: 0,
         query_cover: 0.0,
         subject_cover: 0.0,
@@ -117,7 +115,10 @@ fn supplied_translated_contexts_match_five_frozen_source_formats() {
                 actual = String::from_utf8(actual)
                     .unwrap()
                     .replace(
-                        &format!("<BlastOutput_db>{}</BlastOutput_db>", config.database),
+                        &format!(
+                            "<BlastOutput_db>{}</BlastOutput_db>",
+                            config.database.display()
+                        ),
                         "<BlastOutput_db>@DATABASE@</BlastOutput_db>",
                     )
                     .into_bytes();
@@ -174,7 +175,7 @@ fn supplied_paired_contexts_retain_genetic_code_orfs_and_mate_source_sequences()
             "qframe",
             "full_qseq_mate",
         ]
-        .map(str::to_owned)
+        .map(|value| value.as_bytes().to_vec())
         .to_vec();
         let mut block = Block::new();
         for (left, right) in records.iter().zip(records.iter().rev()) {
@@ -223,7 +224,7 @@ fn supplied_translated_contexts_use_native_sam_callbacks() {
     let frozen = std::fs::read_to_string(root.join("tests/data/sam_search/case-041.sam")).unwrap();
     for threads in [1, 4] {
         let mut config = config(&directory, "sam", threads);
-        config.database = inputs.join("reference.faa").to_string_lossy().into_owned();
+        config.database = inputs.join("reference.faa");
         config.sam = blastp::SamOptions {
             invocation: "supplied translated query block".into(),
             all_subject_titles: true,
@@ -253,7 +254,10 @@ fn supplied_translated_contexts_use_native_sam_callbacks() {
             .unwrap();
         let (prefix, after) = frozen.split_once("\tCL:").unwrap();
         let (_, suffix) = after.split_once('\n').unwrap();
-        let expected = format!("{prefix}\tCL:{}\n{suffix}", config.sam.invocation);
+        let expected = format!(
+            "{prefix}\tCL:{}\n{suffix}",
+            std::str::from_utf8(&config.sam.invocation).unwrap()
+        );
         assert_eq!(
             std::fs::read(config.output.unwrap()).unwrap(),
             expected.as_bytes()
@@ -270,7 +274,7 @@ fn supplied_protein_and_translated_queries_preserve_binary_edge_records() {
     for threads in [1, 4] {
         for (translated, fixture) in [(false, "case-003"), (true, "case-027")] {
             let mut config = config(&directory, "edge", threads);
-            config.database = inputs.join("reference.faa").to_string_lossy().into_owned();
+            config.database = inputs.join("reference.faa");
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads as usize)
                 .build()
@@ -342,7 +346,7 @@ fn supplied_queries_use_taxonomy_defaults_and_explicit_overrides() {
         for (translated, command) in [(false, "blastp"), (true, "blastx")] {
             for mode in ["default", "all", "score"] {
                 let mut config = config(&directory, "102", threads);
-                config.database = database.to_string_lossy().into_owned();
+                config.database = database.clone();
                 config.include_lineage = true;
                 config.max_hsps = 1;
                 if mode == "all" {
@@ -417,7 +421,7 @@ fn supplied_queries_match_complete_gzip_headers_with_fixed_invocation() {
                     })
                     .unwrap();
                 let mut config = config(&directory, format, threads);
-                config.database = inputs.join("reference.faa").to_string_lossy().into_owned();
+                config.database = inputs.join("reference.faa");
                 config.output_header = Some(vec!["verbose".into()]);
                 config.compression = "1".into();
                 config.file_buffer_size = 7;
@@ -436,7 +440,7 @@ fn supplied_queries_match_complete_gzip_headers_with_fixed_invocation() {
                             "bitscore",
                         ]
                         .into_iter()
-                        .map(str::to_owned),
+                        .map(|value| value.as_bytes().to_vec()),
                     );
                 }
                 let pool = rayon::ThreadPoolBuilder::new()

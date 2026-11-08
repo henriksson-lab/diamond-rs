@@ -139,7 +139,7 @@ mod tests {
         let matrix = score_matrix();
         for invalid in ["1", "SEG", "TANTAN"] {
             let input = SetupSearchInput {
-                soft_masking: invalid.to_string(),
+                soft_masking: invalid.as_bytes().to_vec(),
                 ..SetupSearchInput::default()
             };
             assert_eq!(

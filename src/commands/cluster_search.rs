@@ -5,6 +5,7 @@
 #[path = "cluster_double_indexed.rs"]
 mod native_owned;
 
+use crate::util::io::source_c_path;
 use std::io::{self, Write};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -77,13 +78,13 @@ impl ClusterSearchOwner {
                     "Options --taxonlist and --taxon-exclude are mutually exclusive.",
                 ));
             }
-            crate::data::sequence_file::parse_taxonomy_filter(
+            crate::data::sequence_file::parse_taxonomy_filter_bytes(
                 if config.taxonlist.is_empty() {
                     &config.taxon_exclude
                 } else {
                     &config.taxonlist
                 },
-                ',',
+                b',',
             )
             .map_err(io::Error::other)?;
             // A user taxonomy filter replaces, rather than intersects, a
@@ -210,29 +211,32 @@ fn run_with_owner_inner(
     } else {
         queries.unwrap_or(database)
     };
-    let search_setup = crate::run::config::Config::from_input(&crate::run::config::ConfigInput {
-        self_search: config.tuning.self_search,
-        iterate: config.iterate.clone(),
-        sensitivity: config.sensitivity,
-        lin_stage1_query: options.linear_query || config.tuning.setup.lin_stage1_query,
-        lin_stage1_target: options.linear_target || config.tuning.setup.lin_stage1_target,
-        target_indexed: config.target_indexed,
-        global_ranking_targets: config.global_ranking_targets,
-        frame_shift: config.frame_shift,
-        multiprocessing: config.tuning.multiprocessing.enabled,
-        taxonlist: config.taxonlist.clone(),
-        taxon_exclude: config.taxon_exclude.clone(),
-        query_cover: config.query_cover,
-        subject_cover: config.subject_cover,
-        min_length_ratio: config.tuning.min_length_ratio,
-        algo: config.tuning.algorithm.source_request(
-            config.query_indexed,
-            config.contiguous_seed_mode,
-            config.swipe_all,
-        ),
-        ..Default::default()
-    })
-    .map_err(io::Error::other)?;
+    let errors = crate::util::io::IoErrorOwner::default();
+    let search_setup = errors.finish(crate::run::config::Config::from_input_with_io_owner(
+        &crate::run::config::ConfigInput {
+            self_search: config.tuning.self_search,
+            iterate: config.iterate.clone(),
+            sensitivity: config.sensitivity,
+            lin_stage1_query: options.linear_query || config.tuning.setup.lin_stage1_query,
+            lin_stage1_target: options.linear_target || config.tuning.setup.lin_stage1_target,
+            target_indexed: config.target_indexed,
+            global_ranking_targets: config.global_ranking_targets,
+            frame_shift: config.frame_shift,
+            multiprocessing: config.tuning.multiprocessing.enabled,
+            taxonlist: config.taxonlist.clone(),
+            taxon_exclude: config.taxon_exclude.clone(),
+            query_cover: config.query_cover,
+            subject_cover: config.subject_cover,
+            min_length_ratio: config.tuning.min_length_ratio,
+            algo: config.tuning.algorithm.source_request(
+                config.query_indexed,
+                config.contiguous_seed_mode,
+                config.swipe_all,
+            ),
+            ..Default::default()
+        },
+        &errors,
+    ))?;
     if let Some(message) = &search_setup.iteration_message {
         search_message!("{message}");
     }
@@ -257,7 +261,7 @@ fn run_with_owner_inner(
         let guard = super::TemporaryDatabase(path.clone(), config.tuning.no_unlink);
         let mut output = std::io::BufWriter::with_capacity(
             config.file_buffer_size,
-            std::fs::File::create(&path)
+            std::fs::File::create(source_c_path(&path).as_ref())
                 .map_err(|error| crate::util::io::FileOpenError::into_io(&path, error))?,
         );
         crate::data::fasta::write_fasta_bytes(

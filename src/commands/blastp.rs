@@ -736,14 +736,23 @@ impl AdaptiveHitStore {
         }
         disk.take_error().map_err(io::Error::other)?;
         self.disk = Some(disk);
-        search_message!(
-            "Hit buffer: RSS reached --memory-limit; spilling {migrated_hits} retained hits to {}",
-            if self.tmpdir.as_os_str().is_empty() {
-                ".".to_owned()
-            } else {
-                self.tmpdir.display().to_string()
-            }
+        let mut message = format!(
+            "Hit buffer: RSS reached --memory-limit; spilling {migrated_hits} retained hits to "
+        )
+        .into_bytes();
+        let path = if self.tmpdir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &self.tmpdir
+        };
+        message.extend_from_slice(
+            &crate::util::io::source_os_bytes(path.as_os_str()).map_err(io::Error::other)?,
         );
+        message.push(b'\n');
+        crate::util::log_stream::message_stream()
+            .lock()
+            .unwrap()
+            .write_bytes(&message)?;
         trim_freed_heap_pages();
         Ok(())
     }
@@ -2451,8 +2460,8 @@ fn is_blast_database(path: &Path) -> bool {
     let mut pal = path.as_os_str().to_owned();
     pal.push(".pal");
     path.extension().is_some_and(|extension| extension == "pal")
-        || PathBuf::from(pin).exists()
-        || PathBuf::from(pal).exists()
+        || crate::util::io::source_c_path(&PathBuf::from(pin)).exists()
+        || crate::util::io::source_c_path(&PathBuf::from(pal)).exists()
 }
 
 pub(crate) fn requested_search_taxonomy_flags(config: &BlastpConfig) -> SequenceFileFlags {
@@ -3700,7 +3709,7 @@ fn run_impl(
         let db_path = Path::new(&config.database);
         let dmnd_path = if db_path.extension().is_some_and(|e| e == "dmnd") {
             db_path.to_path_buf()
-        } else if db_path.exists() {
+        } else if crate::util::io::source_c_path(&db_path).exists() {
             // File-as-given exists (typically a FASTA). Don't try to substitute
             // a `.dmnd` sibling — leave the path alone so the FASTA branch
             // below runs. We set `dmnd_path` to the given path; `exists()` is
@@ -3731,7 +3740,7 @@ fn run_impl(
             );
             database_metadata = Some(metadata);
             (records, false)
-        } else if dmnd_path.exists() {
+        } else if crate::util::io::source_c_path(&dmnd_path).exists() {
             // Keep ordinary search on the lean sequence-only reader.  An
             // empty `Vec<TaxId>` per subject would cost 24 bytes per database
             // sequence even when no taxonomy column was requested.
@@ -4683,7 +4692,7 @@ fn run_impl(
                     }
                 } else {
                     let mut database_path = PathBuf::from(&config.database);
-                    if !database_path.exists() {
+                    if !crate::util::io::source_c_path(&database_path).exists() {
                         database_path.as_mut_os_string().push(".dmnd");
                     }
                     database_path.as_mut_os_string().push(".seed_idx");
@@ -4694,7 +4703,16 @@ fn run_impl(
                         )
                         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
                     );
-                    search_message!("Loaded persistent seed index: {}", database_path.display());
+                    let mut message = b"Loaded persistent seed index: ".to_vec();
+                    message.extend_from_slice(
+                        &crate::util::io::source_os_bytes(database_path.as_os_str())
+                            .map_err(io::Error::other)?,
+                    );
+                    message.push(b'\n');
+                    crate::util::log_stream::message_stream()
+                        .lock()
+                        .unwrap()
+                        .write_bytes(&message)?;
                 }
             }
             Some(SeedIndexState {
@@ -6662,7 +6680,7 @@ mod tests {
                 report_unaligned: -1,
                 include_lineage: false,
                 output_header: None,
-                compression: String::new(),
+                compression: Vec::new(),
                 file_buffer_size: 67_108_864,
                 sam: Default::default(),
                 archive: Default::default(),
@@ -6701,7 +6719,7 @@ mod tests {
                 strand: "both".into(),
                 min_orf: None,
                 masking: MaskingMode::None,
-                motif_masking: String::new(),
+                motif_masking: Vec::new(),
                 query_cover: 0.0,
                 subject_cover: 0.0,
                 comp_based_stats: CbsMode::Hauser,
@@ -6774,9 +6792,9 @@ mod tests {
             dmnd.to_str().unwrap(),
             SequenceType::AminoAcid,
             &crate::data::db_builder::BuildOptions {
-                taxonmap: Some(mapping.to_string_lossy().into_owned()),
-                taxonnodes: Some(nodes.to_string_lossy().into_owned()),
-                taxonnames: Some(names.to_string_lossy().into_owned()),
+                taxonmap: Some(mapping.clone()),
+                taxonnodes: Some(nodes.clone()),
+                taxonnames: Some(names.clone()),
                 no_parse_seqids: false,
                 file_buffer_size: None,
             },
@@ -7194,10 +7212,10 @@ mod tests {
         .unwrap();
 
         run(&BlastpConfig {
-            query_files: vec![query_path.to_string_lossy().into_owned()],
-            database: db_path.to_string_lossy().into_owned(),
-            output: Some(output_path.to_string_lossy().into_owned()),
-            matrix: "blosum62".to_owned(),
+            query_files: vec![query_path.clone()],
+            database: db_path.clone(),
+            output: Some(output_path.clone()),
+            matrix: b"blosum62".to_vec(),
             gap_open: 11,
             gap_extend: 1,
             max_evalue: 0.001,
@@ -7207,7 +7225,7 @@ mod tests {
             report_unaligned: -1,
             include_lineage: false,
             output_header: None,
-            compression: String::new(),
+            compression: Vec::new(),
             file_buffer_size: 67_108_864,
             sam: Default::default(),
             archive: Default::default(),
@@ -7242,23 +7260,23 @@ mod tests {
             contiguous_seed_mode: false,
             swipe_all: false,
             outfmt: vec![
-                "6".to_owned(),
-                "qseqid".to_owned(),
-                "sseqid".to_owned(),
-                "pident".to_owned(),
-                "length".to_owned(),
-                "mismatch".to_owned(),
-                "gapopen".to_owned(),
-                "qstart".to_owned(),
-                "qend".to_owned(),
-                "sstart".to_owned(),
-                "send".to_owned(),
-                "evalue".to_owned(),
-                "bitscore".to_owned(),
+                b"6".to_vec(),
+                b"qseqid".to_vec(),
+                b"sseqid".to_vec(),
+                b"pident".to_vec(),
+                b"length".to_vec(),
+                b"mismatch".to_vec(),
+                b"gapopen".to_vec(),
+                b"qstart".to_vec(),
+                b"qend".to_vec(),
+                b"sstart".to_vec(),
+                b"send".to_vec(),
+                b"evalue".to_vec(),
+                b"bitscore".to_vec(),
             ],
             sensitivity: Sensitivity::Default,
             masking: MaskingMode::None,
-            motif_masking: String::new(),
+            motif_masking: Vec::new(),
             min_query_len: 0,
             query_cover: 0.0,
             subject_cover: 0.0,

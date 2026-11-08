@@ -1382,7 +1382,7 @@ mod tests {
         let empty_path = dir.join("empty.sqlite3");
         {
             let connection = SqliteConnection::open(
-                empty_path.to_str().unwrap(),
+                &empty_path,
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
             )
             .unwrap();
@@ -1948,7 +1948,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             crate::util::io::file_open_error::find(&error).unwrap().path,
-            missing.to_string_lossy()
+            missing
         );
 
         let bytes = dir.join("byte-ids");

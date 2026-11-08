@@ -267,12 +267,16 @@ impl NativeDatabase {
             let mut fasta_totals = None;
             let mut source = match kind {
                 SequenceFileType::Dmnd => Source::Dmnd(
-                    Box::new(DatabaseFile::open_with_options_io(
-                        path,
+                    // Source SequenceFile::auto_create constructs DatabaseFile
+                    // on its retained InputFile, even for supplied cluster owners.
+                    // Keep constructor flags unchanged; records still use SeqInfo.
+                    Box::new(DatabaseFile::open_source_with_options_io(
+                        &path,
                         crate::data::dmnd::DatabaseOpenOptions {
                             file_buffer_size,
                             ..Default::default()
                         },
+                        false,
                     )?),
                     0,
                 ),

@@ -5,6 +5,7 @@
 //! the translated backend traits so each command retains its upstream workflow
 //! rather than substituting a shared clustering algorithm.
 
+use crate::util::io::source_c_path;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -194,7 +195,7 @@ struct SpillFile {
 impl Drop for SpillFile {
     fn drop(&mut self) {
         if !self.no_unlink {
-            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(source_c_path(&self.path).as_ref());
         }
     }
 }
@@ -362,14 +363,27 @@ fn visit_input_records_owned<F>(
 where
     F: FnMut(usize, FastaRecord) -> Result<(), String>,
 {
-    if crate::data::dmnd::is_diamond_db_file(path) {
-        let mut file = errors.capture(crate::data::dmnd::DatabaseFile::open_with_options_io(
-            path,
-            crate::data::dmnd::DatabaseOpenOptions {
-                file_buffer_size: Some(buffer_size),
-                ..Default::default()
-            },
+    // This is an actual Source SequenceFile owner, not the independent raw
+    // positional library profile. Keep its InputFile codec/C-path semantics;
+    // record reads below retain the existing SeqInfo-indexed seek lifecycle.
+    let (kind, resolved) =
+        errors.capture(crate::data::sequence_file::detect_type_source_with_buffer(
+            &[path.to_path_buf()],
+            crate::data::sequence_file::SequenceFileFlags::NONE,
+            Default::default(),
+            buffer_size,
         ))?;
+    if kind == crate::data::sequence_file::SequenceFileType::Dmnd {
+        let mut file = errors.capture(
+            crate::data::dmnd::DatabaseFile::open_source_with_options_io(
+                &resolved,
+                crate::data::dmnd::DatabaseOpenOptions {
+                    file_buffer_size: Some(buffer_size),
+                    ..Default::default()
+                },
+                false,
+            ),
+        )?;
         for oid in 0..file.sequence_count() {
             let (sequence, id) = errors.capture(file.record_bytes_io(oid))?;
             visit(
@@ -410,7 +424,7 @@ fn create_spill_file(
         .write(true)
         .truncate(true)
         .create(cfg!(windows))
-        .open(&path)
+        .open(source_c_path(&path).as_ref())
         .map_err(|error| crate::util::io::FileOpenError::into_io(&path, error))?;
     Ok((
         Arc::new(SpillFile { path, no_unlink }),
@@ -437,7 +451,7 @@ fn read_spill_records(
 ) -> Result<(Vec<FastaRecord>, Vec<OId>), String> {
     let mut input = BufReader::with_capacity(
         buffer_size,
-        File::open(path).map_err(|error| error.to_string())?,
+        File::open(source_c_path(&(path)).as_ref()).map_err(|error| error.to_string())?,
     );
     let mut records = Vec::new();
     let mut original_oids = Vec::new();
@@ -735,7 +749,7 @@ impl CascadedBackend for NativeBlock {
                 query_indexed: false,
                 contiguous_seed_mode: false,
                 swipe_all: false,
-                outfmt: vec!["6".to_owned()],
+                outfmt: vec![b"6".to_vec()],
                 sensitivity: config.sensitivity,
                 masking: config.masking,
                 motif_masking: config.motif_masking.clone(),
@@ -895,7 +909,8 @@ impl CascadedBackend for NativeBlock {
         path: &Path,
         edges: &[Edge<SuperBlockId>],
     ) -> Result<(), String> {
-        let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+        let file = std::fs::File::create(source_c_path(&(path)).as_ref())
+            .map_err(|error| error.to_string())?;
         let mut out = BufWriter::new(file);
         for edge in edges {
             let query = self
@@ -1178,7 +1193,7 @@ impl CascadedWrapperBackend for NativeBackend {
                 query_indexed: false,
                 contiguous_seed_mode: false,
                 swipe_all: false,
-                outfmt: vec!["6".to_owned()],
+                outfmt: vec![b"6".to_vec()],
                 sensitivity: config.sensitivity,
                 masking: config.masking,
                 motif_masking: config.motif_masking.clone(),

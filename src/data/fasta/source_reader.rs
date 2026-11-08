@@ -12,7 +12,7 @@ pub(super) struct RecordReader {
     pending: Option<u8>,
     line: u64,
     pub offset: u64,
-    name: String,
+    name: std::path::PathBuf,
     temporary: bool,
     unlinked: bool,
     closed: bool,
@@ -60,11 +60,19 @@ impl RecordReader {
         }
         self.closed = true;
         self.input.close().map_err(io::Error::other)?;
-        if self.temporary && !self.unlinked && std::fs::remove_file(&self.name).is_err() {
-            crate::util::io::console::source_eprintln!(
-                "Warning: Failed to delete temporary file {}",
-                self.name
+        if self.temporary
+            && !self.unlinked
+            && std::fs::remove_file(crate::util::io::source_c_path(&self.name).as_ref()).is_err()
+        {
+            // InputFile's warning inserts std::string into cerr: retain all
+            // stored bytes here, while remove() above consumes its C prefix.
+            let mut warning = b"Warning: Failed to delete temporary file ".to_vec();
+            warning.extend_from_slice(
+                &crate::util::io::source_os_bytes(self.name.as_os_str())
+                    .map_err(io::Error::other)?,
             );
+            warning.push(b'\n');
+            let _ = std::io::Write::write_all(&mut crate::util::io::console::stderr(), &warning);
         }
         Ok(())
     }

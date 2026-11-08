@@ -3,7 +3,7 @@
 //! This mirrors `diamond/src/util/tsv/table.{h,cpp}`. Records are concatenated
 //! in `data`, while `limits` stores native signed 64-bit byte offsets.
 
-use crate::util::string::convert_string_i64;
+use crate::util::string::convert_string_i64_bytes;
 use crate::util::text_buffer::TextBuffer;
 
 use super::{File, Record, RecordId, Schema, SchemaMismatch, Type, Value};
@@ -94,6 +94,15 @@ impl Table {
         line: &[u8],
         record_id: Option<RecordId>,
     ) -> Result<(), String> {
+        self.push_back_raw_line_io(line, record_id)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn push_back_raw_line_io(
+        &mut self,
+        line: &[u8],
+        record_id: Option<RecordId>,
+    ) -> std::io::Result<()> {
         let mut field = 0usize;
         self.limits.push(*self.limits.last().unwrap());
         if let Some(record_id) = record_id {
@@ -112,15 +121,13 @@ impl Table {
             let token = &line[begin..end];
             match self.schema[field] {
                 Type::String => self.push_bytes(token),
-                Type::Int64 => self.push_i64(convert_string_i64(
-                    std::str::from_utf8(token).map_err(|error| error.to_string())?,
-                )?),
+                Type::Int64 => self.push_i64(convert_string_i64_bytes(token)?),
             }
             field += 1;
             begin = end.saturating_add(1);
         }
         if field < self.schema.len() {
-            return Err("Missing fields in input line".to_string());
+            return Err(std::io::Error::other("Missing fields in input line"));
         }
         Ok(())
     }
@@ -159,6 +166,7 @@ impl Table {
         for i in 0..self.schema.len().min(values.len()) {
             match (self.schema[i], &values[i]) {
                 (Type::String, Value::String(s)) => self.push_str(s),
+                (Type::String, Value::Bytes(s)) => self.push_bytes(s),
                 (Type::Int64, Value::Int64(x)) => self.push_i64(*x),
                 _ => return Err("Invalid type in schema".to_string()),
             }
@@ -243,6 +251,41 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_integer_conversion_uses_c_prefix_and_preserves_raw_errors() {
+        let mut table = Table::new(vec![Type::Int64, Type::String]);
+        table
+            .push_back_raw_line_io(b"7\0\xff\tid\xfe", None)
+            .unwrap();
+        assert_eq!(table.record(0).get_t::<i64>(0), 7);
+        assert_eq!(table.record(0).string_bytes(1), b"id\xfe");
+        for invalid in [
+            b"+0".as_slice(),
+            b"00",
+            b"-0",
+            b" 0",
+            b"7 ",
+            b"9223372036854775807",
+            b"-9223372036854775808",
+            b"7\xff",
+        ] {
+            let error = Table::new(vec![Type::Int64])
+                .push_back_raw_line_io(invalid, None)
+                .unwrap_err();
+            let mut expected = b"Error converting integer value: ".to_vec();
+            expected.extend_from_slice(invalid);
+            assert_eq!(
+                crate::util::io::RawDiagnosticError::find(&error).unwrap(),
+                expected
+            );
+        }
+        for valid in [b"0".as_slice(), b" +7", b"-7", b"07"] {
+            Table::new(vec![Type::Int64])
+                .push_back_raw_line_io(valid, None)
+                .unwrap();
+        }
+    }
 
     #[test]
     fn append_offsets_and_allocation_size_match_binary_layout() {

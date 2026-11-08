@@ -591,7 +591,7 @@ pub fn guess_format(bytes: &[u8]) -> Result<SeqFileFormat, String> {
     match bytes.first() { Some(b'>')=>Ok(SeqFileFormat::Fasta),Some(b'@')=>Ok(SeqFileFormat::Fastq),None=>Err("Error detecting input file format. Input file seems to be empty.".into()),_=>Err("Error detecting input file format. First line must begin with '>' (FASTA) or '@' (FASTQ).".into()) }
 }
 fn read_index(path: &Path) -> io::Result<Vec<(u64, Loc)>> {
-    let file = File::open(path).map_err(|_| {
+    let file = File::open(crate::util::io::source_c_path(path).as_ref()).map_err(|_| {
         io::Error::other(crate::util::io::IoError::path_message(
             b"Error opening file: ",
             path,

@@ -202,6 +202,41 @@ impl NativeDnaBlock {
         shape_mask: &[String],
         shape_count: u32,
     ) -> Result<Self, String> {
+        let shape_mask = shape_mask
+            .iter()
+            .map(|code| code.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        Self::new_with_seed_shapes_bytes(
+            targets,
+            statistics,
+            sensitivity,
+            options,
+            minimizer_window,
+            min_query_len,
+            threads,
+            index_chunks,
+            max_evalue,
+            &shape_mask,
+            shape_count,
+        )
+    }
+
+    /// Canonical Source shape-byte constructor. String convenience callers
+    /// share the same index and storage validation through the adapter above.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_seed_shapes_bytes(
+        targets: LetterStringSet,
+        statistics: Blastn_Score,
+        sensitivity: Sensitivity,
+        options: DnaOptions,
+        minimizer_window: Option<i32>,
+        min_query_len: i32,
+        threads: i32,
+        index_chunks: i32,
+        max_evalue: f64,
+        shape_mask: &[Vec<u8>],
+        shape_count: u32,
+    ) -> Result<Self, String> {
         if threads < 1 || index_chunks < 1 {
             return Err("Invalid nucleotide index thread/chunk count".into());
         }
@@ -217,7 +252,7 @@ impl NativeDnaBlock {
             setup::shape_codes(sensitivity)
                 .ok_or("Unsupported nucleotide seed shapes")?
                 .iter()
-                .map(|code| (*code).to_owned())
+                .map(|code| code.as_bytes().to_vec())
                 .collect::<Vec<_>>()
         } else {
             shape_mask.to_vec()
@@ -231,15 +266,19 @@ impl NativeDnaBlock {
             return Err("Nucleotide seed shape count exceeds supported storage".into());
         }
         for code in codes.iter().take(selected) {
-            let weight = code.bytes().filter(|&c| c == b'1').count();
+            let code = crate::util::sequence::c_string_bytes(code);
+            let weight = code.iter().filter(|&&c| c == b'1').count();
             if code.len() > 32 || !(2..=31).contains(&weight) {
                 // Source Shape asserts these storage/coordinate bounds; its
                 // midpoint index underflows for weights0/1 and 4^32 overflows.
                 return Err("Nucleotide seed shape exceeds supported length/weight".into());
             }
         }
-        let shapes =
-            crate::basic::shape_config::ShapeConfig::from_codes(&codes, shape_count, &reduction)?;
+        let shapes = crate::basic::shape_config::ShapeConfig::from_codes_bytes(
+            &codes,
+            shape_count,
+            &reduction,
+        )?;
         // DNA Index and seed_lookup explicitly use shape0, after validating
         // all selected shapes for the uniform-weight Source contract.
         let shape = shapes[0];

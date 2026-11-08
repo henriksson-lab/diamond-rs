@@ -473,7 +473,7 @@ impl DoubleIndexedBackend for DnaBackend<'_> {
                 target_set.push_back(&record.sequence);
             }
             target_set.finish_reserve();
-            let engine = NativeDnaBlock::new_with_seed_shapes(
+            let engine = NativeDnaBlock::new_with_seed_shapes_bytes(
                 target_set,
                 statistics,
                 round.sensitivity,

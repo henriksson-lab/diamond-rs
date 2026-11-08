@@ -1,6 +1,7 @@
 //! Seekable native cache for a Source FASTA/FASTQ reference owner.
 //! Only record offsets are retained in memory; sequences remain unmasked and
 //! qualities survive random-access reloads. This is not a DIAMOND database.
+use crate::util::io::source_c_path;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -56,13 +57,16 @@ impl FastaReference {
                 .write(true)
                 .create(cfg!(windows))
                 .truncate(cfg!(windows))
-                .open(&owner.0)
+                .open(source_c_path(&owner.0).as_ref())
                 .map_err(|error| crate::util::io::FileOpenError::into_io(&owner.0, error))?;
             // TempFileData owns an open path too; retain the cache independently.
             let mut retained = reserved.name.as_os_str().to_os_string();
             retained.push(".fasta-cache");
             let retained = PathBuf::from(retained);
-            std::fs::rename(&owner.0, &retained)?;
+            std::fs::rename(
+                source_c_path(&owner.0).as_ref(),
+                source_c_path(&retained).as_ref(),
+            )?;
             let owner = TemporaryDatabase(retained, config.tuning.no_unlink);
             drop(reserved);
             let mut input = RecordStream::open_ready(
@@ -126,7 +130,7 @@ impl FastaReference {
 
     pub fn duplicate(&self) -> io::Result<Self> {
         Ok(Self {
-            file: File::open(&self.index.owner.0)?,
+            file: File::open(source_c_path(&self.index.owner.0).as_ref())?,
             index: self.index.clone(),
             cursor: 0,
         })

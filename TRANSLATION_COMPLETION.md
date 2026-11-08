@@ -14,6 +14,22 @@ audit every function, test it, integrate its concrete dependencies, and compare
 its observable behavior with upstream. An abstract backend implemented only
 by test doubles leaves its production integration incomplete.
 
+## Current integration checkpoint (2026-11-08)
+
+Commit `c194d6e` is an explicitly uncompiled work-in-progress checkpoint, not a
+completion claim. The subsequent raw OS argument/path and byte-option batch
+has reached library compilation in an isolated package without adjacent C++
+sources. The latest full-target check (`350883bb…`) stopped on one stale SAM
+invocation fixture; that fixture is corrected in the worktree. Optional and
+Windows checks, focused tests, and actual raw-path CLI comparisons have not yet
+run for this batch.
+
+Static review also found connected byte-content gaps in greedy vertex cover
+and the reusable TSV facade, plus a Source worker-exception behavior mismatch.
+Those translations are in progress. Earlier passing snapshots below do not
+prove these new changes. See `translation/CHECKPOINT.md` for the committed
+checkpoint's scope; the overall goal remains active.
+
 ## Current coverage (2026-11-08)
 
 All baseline commands and the enabled EXTRA, DNA and MCL adapters have concrete

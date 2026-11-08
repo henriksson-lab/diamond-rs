@@ -581,6 +581,32 @@ impl<'a> ByteTokenizer<'a> {
         };
         Ok(value as i64)
     }
+    /// Source Tokenizer<double>: use the selected CRT's strtod, ignore errno,
+    /// then require exactly the delimiter or the current C-string terminator.
+    pub fn read_f64(&mut self) -> Result<f64, TokenizerException> {
+        if !self.good() {
+            return Err(TokenizerException::with_msg("No token left"));
+        }
+        let position = self.position.unwrap();
+        let mut terminated = self.input[position..].to_vec();
+        terminated.push(0);
+        let begin = terminated.as_ptr().cast::<libc::c_char>();
+        let mut end = std::ptr::null_mut();
+        let value = unsafe { libc::strtod(begin, &mut end) };
+        let consumed = unsafe { end.offset_from(begin) } as usize;
+        if consumed == 0 {
+            return Err(TokenizerException::with_msg("Unable to parse double"));
+        }
+        let next = position + consumed;
+        self.position = if next == self.input.len() {
+            None
+        } else if self.input[next] == self.delimiter {
+            Some(next + 1)
+        } else {
+            return Err(TokenizerException::new());
+        };
+        Ok(value)
+    }
     pub fn read_u64(&mut self) -> Result<u64, TokenizerException> {
         self.read_i64().map(|value| value as u64)
     }
@@ -696,15 +722,25 @@ fn scan_decimal_float_prefix(value: &str, position: usize) -> Option<(usize, usi
     Some((start, end))
 }
 
-pub fn convert_string_i64(s: &str) -> Result<i64, String> {
-    let trimmed = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let value = trimmed
-        .parse::<i64>()
-        .map_err(|_| format!("Error converting integer value: {}", s))?;
-    if value == i64::MAX || value == i64::MIN {
-        return Err(format!("Error converting integer value: {}", s));
+/// Source `convert_string<int64_t>(const char*)`, including its C-string
+/// boundary and the deliberately rejected signed extrema and noncanonical zero.
+pub fn convert_string_i64_bytes(s: &[u8]) -> std::io::Result<i64> {
+    let s = crate::util::sequence::c_string_bytes(s);
+    let mut terminated = s.to_vec();
+    terminated.push(0);
+    let begin = terminated.as_ptr().cast::<libc::c_char>();
+    let mut end = std::ptr::null_mut();
+    let value = unsafe { libc::strtoll(begin, &mut end, 10) } as i64;
+    if (value == 0 && s != b"0") || value == i64::MAX || value == i64::MIN || unsafe { *end } != 0 {
+        let mut message = b"Error converting integer value: ".to_vec();
+        message.extend_from_slice(s);
+        return Err(crate::util::io::RawDiagnosticError(message).into_io());
     }
     Ok(value)
+}
+
+pub fn convert_string_i64(s: &str) -> Result<i64, String> {
+    convert_string_i64_bytes(s.as_bytes()).map_err(|error| error.to_string())
 }
 
 pub fn convert_string_i32(s: &str) -> Result<i32, String> {

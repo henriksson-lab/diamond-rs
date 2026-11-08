@@ -181,7 +181,7 @@ pub(crate) fn build_query_seeds(
     block.set_max_motif_len(config.tuning.max_motif_len);
     block.put_seqs(std::mem::take(sequences));
     let result = (|| {
-        let automatic = crate::search::sensitivity::soft_masking_algo(
+        let automatic = crate::search::sensitivity::soft_masking_algo_bytes(
             &crate::search::sensitivity::get_traits(config.sensitivity),
             &config.motif_masking,
             false,

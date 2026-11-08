@@ -1,4 +1,5 @@
 //! Concrete native adapters for the translated intermediate block merger.
+use crate::util::io::source_c_path;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 
@@ -550,7 +551,7 @@ struct TemporaryDatabase(std::path::PathBuf, bool);
 impl Drop for TemporaryDatabase {
     fn drop(&mut self) {
         if !self.1 {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(source_c_path(&self.0).as_ref());
         }
     }
 }
@@ -575,7 +576,7 @@ impl IntermediateFile {
             .write(true)
             .truncate(true)
             .create(cfg!(windows))
-            .open(&path)
+            .open(source_c_path(&path).as_ref())
             .map_err(|error| crate::util::io::FileOpenError::into_io(&path, error))?;
         Ok((
             owner,
@@ -585,14 +586,14 @@ impl IntermediateFile {
     fn reader(&self) -> io::Result<std::io::BufReader<std::fs::File>> {
         Ok(std::io::BufReader::with_capacity(
             self.1,
-            std::fs::File::open(&self.0)?,
+            std::fs::File::open(source_c_path(&self.0).as_ref())?,
         ))
     }
 }
 impl Drop for IntermediateFile {
     fn drop(&mut self) {
         if !self.2 {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(source_c_path(&self.0).as_ref());
         }
     }
 }
@@ -728,7 +729,7 @@ impl UnalignedTargets {
                 .map_err(|_| io::Error::other("Target tracking lock poisoned."))?;
             let mut output = io::BufWriter::with_capacity(
                 self.file_buffer_size,
-                std::fs::File::create(self.path)?,
+                std::fs::File::create(source_c_path(&(self.path)).as_ref())?,
             );
             let spool = self.accession_spool.ok_or_else(|| io::Error::other(
             "Source provided database accession lookup dereferences a missing OID_TO_ACC_MAPPING spool."))?;

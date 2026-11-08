@@ -1101,7 +1101,7 @@ mod tests {
             min_identities: Some(3),
             approx_min_id: 90.0,
             query_bins: Some(2),
-            shape_mask: vec!["1111111111".to_string()],
+            shape_mask: vec![b"1111111111".to_vec()],
             lin_stage1_query: true,
             soft_masking: b"tantan".to_vec(),
             ext: b"full".to_vec(),
@@ -1145,7 +1145,7 @@ mod tests {
         );
 
         let input = SetupSearchInput {
-            shape_mask: vec!["111".to_string()],
+            shape_mask: vec![b"111".to_vec()],
             lin_stage1_target: true,
             ..SetupSearchInput::default()
         };
@@ -1185,7 +1185,7 @@ mod tests {
         );
 
         let input = SetupSearchInput {
-            aln_out: "x.daa".to_string(),
+            aln_out: "x.daa".into(),
             ..SetupSearchInput::default()
         };
         assert_eq!(

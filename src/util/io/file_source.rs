@@ -357,7 +357,12 @@ mod fallback {
                         break;
                     }
                     Ok(count) => read += count,
-                    Err(_) => return Err(IoError::path_message(b"Error reading file ", &name)),
+                    Err(_) => {
+                        return Err(IoError::path_message(
+                            b"Error reading file ",
+                            Path::new(&name),
+                        ))
+                    }
                 }
             }
             Ok(read)
@@ -505,7 +510,7 @@ mod tests {
         source.close().unwrap();
         assert_eq!(
             source.read(&mut [0]).unwrap_err(),
-            IoError::path_message(b"Error reading file ", &name)
+            IoError::path_message(b"Error reading file ", Path::new(&name))
         );
         std::fs::remove_file(path).unwrap();
     }

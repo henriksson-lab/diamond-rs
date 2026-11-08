@@ -623,7 +623,7 @@ impl ScoreMatrix {
             .map_err(std::io::Error::other);
         }
         #[cfg(not(windows))]
-        let bytes = fs::read(matrix_file);
+        let bytes = fs::read(crate::util::io::source_c_path(matrix_file).as_ref());
         #[cfg(windows)]
         let bytes = (|| {
             // Source ifstream uses CRT text mode on Windows. Read through the

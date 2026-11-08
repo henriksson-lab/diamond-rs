@@ -18,10 +18,10 @@ fn raw_error(prefix: &[u8], value: &[u8], suffix: &[u8]) -> io::Error {
 impl Options {
     pub(super) fn new(args: &[OsString]) -> io::Result<Self> {
         let values = crate::commands::argument_registry::values_os(args)?;
-        let command = args.get(1).and_then(|v| v.to_str()).unwrap_or("");
+        let command = super::super::argument_registry::command_name_os(args)?.unwrap_or("");
         Ok(Self {
             values,
-            command: command.strip_prefix("--").unwrap_or(command).to_owned(),
+            command: command.to_owned(),
         })
     }
     pub(super) fn has(&self, id: &str) -> bool {
@@ -769,12 +769,8 @@ pub(super) fn prepare(
         return Err(NativeDispatchError::Untranslated);
     }
     let mut normalized = original_args.to_vec();
-    if let Some(command) = original_args[1].to_str() {
-        normalized[1] = OsString::from(match command {
-            "-V" => "version",
-            "-h" => "help",
-            _ => command.strip_prefix("--").unwrap_or(command),
-        });
+    if let Some(command) = crate::commands::argument_registry::command_name_os(original_args)? {
+        normalized[1] = OsString::from(command);
     }
     let args = normalized.as_slice();
     let options = Options::new(args)?;

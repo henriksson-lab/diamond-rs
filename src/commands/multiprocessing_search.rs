@@ -2,6 +2,7 @@
 //! Nested under search_blocks so query/reference owners and normal output
 //! renderers are reused rather than reconstructed through a second pipeline.
 
+use crate::util::io::source_c_path;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -280,7 +281,7 @@ fn run_impl(
                 ))
             }
         }
-        std::fs::create_dir_all(&mp.directory)?;
+        std::fs::create_dir_all(source_c_path(&mp.directory).as_ref())?;
         if mp.recover {
             let _ = crate::util::system::log_rss();
             return crate::run::multiprocessing::recover(&mp.directory).map(|()| references);
@@ -687,8 +688,10 @@ impl crate::run::double_indexed::owned::DoubleIndexedBackend for MppBackend<'_, 
             .map_err(|_| io::Error::other("Reference block index exceeds uint32"))?;
         self.source_reference_block = block_config.tuning.search_block.reference;
         let path = get_ref_block_tmpfile_name(&mp.directory, query_block, reference_id);
-        let mut output =
-            io::BufWriter::with_capacity(config.file_buffer_size, File::create(&path)?);
+        let mut output = io::BufWriter::with_capacity(
+            config.file_buffer_size,
+            File::create(source_c_path(&path).as_ref())?,
+        );
         let mut dictionary = ReferenceDictionary::new(sequence_count, layout.sequences);
         if !mp.self_compare || reference_id >= query_block {
             let count = u64::try_from(reference.n_seqs).map_err(io::Error::other)?;
@@ -732,7 +735,7 @@ impl crate::run::double_indexed::owned::DoubleIndexedBackend for MppBackend<'_, 
                 } else {
                     crate::util::system::hardware_concurrency() as i32
                 };
-                let engine = crate::dna::native::NativeDnaBlock::new_with_seed_shapes(
+                let engine = crate::dna::native::NativeDnaBlock::new_with_seed_shapes_bytes(
                     sequences,
                     statistics,
                     config.sensitivity,
@@ -931,7 +934,7 @@ impl crate::run::double_indexed::owned::DoubleIndexedBackend for MppBackend<'_, 
             for reference in 0..partition.len() {
                 let path = dictionary_file_name(&mp.directory, query_block, reference);
                 let entries = load_dictionary(&path, layout, config.file_buffer_size)?;
-                std::fs::remove_file(path)?;
+                std::fs::remove_file(source_c_path(&(path)).as_ref())?;
                 let mut ids = Vec::new();
                 for entry in entries {
                     let id = dictionary.entries.len();
@@ -949,11 +952,12 @@ impl crate::run::double_indexed::owned::DoubleIndexedBackend for MppBackend<'_, 
                 mappings.push(ids);
                 files.push(io::BufReader::with_capacity(
                     config.file_buffer_size,
-                    File::open(get_ref_block_tmpfile_name(
-                        &mp.directory,
-                        query_block,
-                        reference,
-                    ))?,
+                    File::open(
+                        source_c_path(
+                            &(get_ref_block_tmpfile_name(&mp.directory, query_block, reference)),
+                        )
+                        .as_ref(),
+                    )?,
                 ));
             }
             references.load_matched_taxonomy(&mut dictionary)?;
@@ -1038,11 +1042,12 @@ impl crate::run::double_indexed::owned::DoubleIndexedBackend for MppBackend<'_, 
             output.finish_multiprocessing_chunk()?;
             queues.finish_join(&work, &token)?;
             for reference in 0..partition.len() {
-                std::fs::remove_file(get_ref_block_tmpfile_name(
-                    &mp.directory,
-                    query_block,
-                    reference,
-                ))?;
+                std::fs::remove_file(
+                    source_c_path(
+                        &(get_ref_block_tmpfile_name(&mp.directory, query_block, reference)),
+                    )
+                    .as_ref(),
+                )?;
             }
         }
         for pass in [false, true] {

@@ -635,6 +635,28 @@ impl<const ARITY: u8> ReadOption for RegistryCell<ARITY> {
     }
 }
 
+/// Resolve only the command cell through Source's narrow argv encoding.
+/// A Windows best-fit conversion can differ from the original UTF-16 spelling;
+/// all semantic dispatchers must use the same bytes as CommandLineParser.
+/// Unknown names stay unresolved so the actual parser owns their diagnostics.
+pub(crate) fn command_name_os(args: &[OsString]) -> io::Result<Option<&'static str>> {
+    let Some(command) = args.get(1) else {
+        return Ok(None);
+    };
+    let bytes = crate::util::io::source_os_bytes(command.as_os_str()).map_err(io::Error::other)?;
+    // Native one-dash conveniences apply before Source's optional -- prefix:
+    // ---V must remain an invalid Source command, not become the -V alias.
+    let name = match bytes.as_ref() {
+        b"-V" => b"version".as_slice(),
+        b"-h" => b"help".as_slice(),
+        name => name.strip_prefix(b"--").unwrap_or(name),
+    };
+    Ok(COMMANDS
+        .iter()
+        .find(|command| command.name.as_bytes() == name)
+        .map(|command| command.name))
+}
+
 pub(crate) fn validate_os(args: &[OsString]) -> io::Result<()> {
     values_os(args).map(|_| ())
 }
@@ -742,15 +764,7 @@ pub(crate) fn values_os(args: &[OsString]) -> io::Result<OsValues> {
     }
     // This native convenience must not change Source's unknown-option
     // diagnostics in unrelated commands merely by existing in the registry.
-    if args.get(1).is_some_and(|command| {
-        matches!(
-            command
-                .to_str()
-                .and_then(|name| name.strip_prefix("--").or(Some(name)))
-                .unwrap_or(""),
-            "blastp" | "blastx"
-        )
-    }) {
+    if matches!(command_name_os(args)?, Some("blastp" | "blastx")) {
         let cell = RegistryCell::<1>::new("help", captured.clone());
         parser.add_option(
             help_group,
@@ -763,10 +777,8 @@ pub(crate) fn values_os(args: &[OsString]) -> io::Result<OsValues> {
         );
     }
     let mut argv: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
-    match argv.get(1).and_then(|arg| arg.to_str()) {
-        Some("-V") => argv[1] = OsStr::new("version"),
-        Some("-h") => argv[1] = OsStr::new("help"),
-        _ => (),
+    if let Some(command) = command_name_os(args)? {
+        argv[1] = OsStr::new(command);
     }
     parser.store_os(&argv, &mut 0)?;
     let values = std::mem::take(&mut *captured.borrow_mut());

@@ -24,35 +24,49 @@ pub fn join(
     output_fields: &[FileColumn],
     out: &mut File,
 ) -> Result<(), String> {
+    join_io(file1, file2, column1, column2, output_fields, out).map_err(|error| error.to_string())
+}
+
+pub fn join_io(
+    file1: &mut File,
+    file2: &mut File,
+    column1: usize,
+    column2: usize,
+    output_fields: &[FileColumn],
+    out: &mut File,
+) -> std::io::Result<()> {
     if output_fields.is_empty() {
-        return Err("Join with empty output".to_string());
+        return Err(std::io::Error::other("Join with empty output"));
     }
 
-    let mut tables = [file1.read_record(), file2.read_record()];
+    let mut tables = [file1.read_record_io()?, file2.read_record_io()?];
     while !tables[0].empty() && !tables[1].empty() {
         let keys = [
             tables[0].front().get_t::<i64>(column1),
             tables[1].front().get_t::<i64>(column2),
         ];
         if keys[0] < keys[1] {
-            tables[0] = file1.read_record();
+            tables[0] = file1.read_record_io()?;
         } else if keys[1] < keys[0] {
-            tables[1] = file2.read_record();
+            tables[1] = file2.read_record_io()?;
         } else {
             let mut values = Vec::with_capacity(output_fields.len());
             for field in output_fields {
                 values.push(match tables[field.file].schema()[field.column] {
-                    Type::String => {
-                        Value::String(tables[field.file].front().get_t::<String>(field.column))
-                    }
+                    Type::String => Value::Bytes(
+                        tables[field.file]
+                            .front()
+                            .string_bytes(field.column)
+                            .to_vec(),
+                    ),
                     Type::Int64 => {
                         Value::Int64(tables[field.file].front().get_t::<i64>(field.column))
                     }
                 });
             }
-            out.write_record_values(&values)?;
-            tables[0] = file1.read_record();
-            tables[1] = file2.read_record();
+            out.write_record_values_io(&values)?;
+            tables[0] = file1.read_record_io()?;
+            tables[1] = file2.read_record_io()?;
         }
     }
     Ok(())
@@ -68,7 +82,11 @@ pub fn joined(
 ) -> Result<File, String> {
     let schemas = [file1.schema(), file2.schema()];
     let schema = join_schema(&schemas, output_fields);
-    let mut out = File::new(schema, "", Flags::TEMP, Config::default())?;
+    let mut out = if file1.is_source_owner() || file2.is_source_owner() {
+        File::new(schema, "", Flags::TEMP, Config::default())?
+    } else {
+        File::from_table(super::Table::new(schema), Flags::TEMP)
+    };
 
     // Upstream currently calls the output overload with `file1` twice here.
     // Passing both supplied files is the intended behavior and preserves the
@@ -86,6 +104,15 @@ mod tests {
 
     fn schema() -> Schema {
         vec![Type::Int64, Type::String]
+    }
+
+    #[test]
+    fn join_projects_raw_byte_string_columns() {
+        let mut left = File::from_byte_lines(schema(), [b"1\tleft\xff".as_slice()]).unwrap();
+        let mut right = File::from_byte_lines(schema(), [b"1\tright\xfe".as_slice()]).unwrap();
+        let output = joined(&mut left, &mut right, 0, 0, &[LEFT_VALUE, RIGHT_VALUE]).unwrap();
+        assert_eq!(output.table().record(0).string_bytes(0), b"left\xff");
+        assert_eq!(output.table().record(0).string_bytes(1), b"right\xfe");
     }
 
     #[test]

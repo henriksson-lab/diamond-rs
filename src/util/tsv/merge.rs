@@ -10,18 +10,31 @@ use super::{Config, File, Flags};
 
 /// Merge sorted files, ordering equal keys by their input-file index.
 pub fn merge(files: &mut [&mut File], column: usize) -> Result<File, String> {
+    merge_io(files, column).map_err(|error| error.to_string())
+}
+
+pub fn merge_io(files: &mut [&mut File], column: usize) -> std::io::Result<File> {
     // Upstream dereferences `begin` unconditionally. Retain the established
     // Rust API's defined error instead of reproducing undefined behavior.
     if files.is_empty() {
-        return Err("merge with empty input".to_string());
+        return Err(std::io::Error::other("merge with empty input"));
     }
 
     let schema = files[0].schema();
-    let mut out = File::new(schema, "", Flags::TEMP, Config::default())?;
+    let mut out = if files.iter().any(|file| file.is_source_owner()) {
+        File::new_path_io(
+            schema,
+            std::path::Path::new(""),
+            Flags::TEMP,
+            Config::default(),
+        )?
+    } else {
+        File::from_table(super::Table::new(schema), Flags::TEMP)
+    };
     let mut queue = BinaryHeap::<Reverse<(i64, usize)>>::new();
     let mut tables = Vec::with_capacity(files.len());
     for (i, file) in files.iter_mut().enumerate() {
-        let table = file.read_record();
+        let table = file.read_record_io()?;
         if !table.empty() {
             queue.push(Reverse((table.front().get_t::<i64>(column), i)));
         }
@@ -29,9 +42,8 @@ pub fn merge(files: &mut [&mut File], column: usize) -> Result<File, String> {
     }
 
     while let Some(Reverse((_, file_index))) = queue.pop() {
-        out.write(&tables[file_index].front())
-            .map_err(|e| e.to_string())?;
-        tables[file_index] = files[file_index].read_record();
+        out.write_io(&tables[file_index].front())?;
+        tables[file_index] = files[file_index].read_record_io()?;
         if !tables[file_index].empty() {
             queue.push(Reverse((
                 tables[file_index].front().get_t::<i64>(column),

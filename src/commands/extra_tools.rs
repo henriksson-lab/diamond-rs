@@ -82,10 +82,7 @@ pub(super) fn run_os(
     args: &[OsString],
     startup: &super::source_config::Startup,
 ) -> io::Result<bool> {
-    let command = args
-        .get(1)
-        .and_then(|s| s.to_str())
-        .map(|s| s.strip_prefix("--").unwrap_or(s));
+    let command = super::argument_registry::command_name_os(args)?;
     if !matches!(
         command,
         Some("split" | "hashseqs" | "listseeds" | "wc" | "cut" | "roc-id" | "find-shapes")
@@ -360,11 +357,7 @@ pub(super) fn source_fallthrough(args: &[String]) -> io::Result<bool> {
     source_fallthrough_os(&args.iter().map(OsString::from).collect::<Vec<_>>())
 }
 pub(super) fn source_fallthrough_os(args: &[OsString]) -> io::Result<bool> {
-    let command = args
-        .get(1)
-        .and_then(|s| s.to_str())
-        .map(|s| s.strip_prefix("--").unwrap_or(s))
-        .unwrap_or("");
+    let command = super::argument_registry::command_name_os(args)?.unwrap_or("");
     if !matches!(
         command,
         "sort"

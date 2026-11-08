@@ -40,6 +40,7 @@ impl std::error::Error for SchemaMismatch {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     String(String),
+    Bytes(Vec<u8>),
     Int64(i64),
 }
 
@@ -238,7 +239,7 @@ mod tests {
     #[test]
     fn test_file_read_write_sort_map() {
         let schema = vec![Type::Int64, Type::String];
-        let mut file = File::new(schema.clone(), "", Flags::TEMP, Config::default()).unwrap();
+        let mut file = File::from_table(Table::new(schema.clone()), Flags::TEMP);
         file.write_record_values(&[Value::Int64(2), Value::String("b".to_string())])
             .unwrap();
         file.write_record_values(&[Value::Int64(1), Value::String("a".to_string())])
@@ -291,37 +292,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(file.file_name(), name);
-        assert_eq!(file.read_record().front().get_t::<i64>(0), 11);
-        assert_eq!(file.read_record().front().get_t::<String>(1), "beta");
-        assert!(file.read_record().empty());
+        assert_eq!(
+            file.read_record_io().unwrap_err().to_string(),
+            "Invalid use of CharTokenizer"
+        );
+        let table = file.read_table_io(1).unwrap();
+        assert_eq!(table.record(0).get_t::<i64>(0), 11);
+        assert_eq!(table.record(1).string_bytes(1), b"beta");
+        // Default Source CharTokenizer does not call TextInputFile::getline,
+        // so reading raw chunks does not set its eof_ flag.
+        assert!(!file.eof());
+        file.close_io().unwrap();
 
-        let mut record_id_file = File::new(
-            vec![Type::Int64, Type::Int64, Type::String],
-            &name,
-            Flags::READ | Flags::RECORD_ID_COLUMN,
-            Config::default(),
-        )
-        .unwrap();
-        let first = record_id_file.read_record();
-        assert_eq!(first.front().get_t::<i64>(0), 0);
-        assert_eq!(first.front().get_t::<i64>(1), 11);
-        let second = record_id_file.read_record();
-        assert_eq!(second.front().get_t::<i64>(0), 1);
-        assert_eq!(second.front().get_t::<String>(2), "beta");
-
-        let mut out = File::new(
-            vec![Type::Int64, Type::Int64, Type::String],
-            "",
+        let mut out = File::from_table(
+            Table::new(vec![Type::Int64, Type::Int64, Type::String]),
             Flags::TEMP | Flags::RECORD_ID_COLUMN,
-            Config::default(),
-        )
-        .unwrap();
+        );
         out.write_record_values(&[Value::Int64(7), Value::String("x".to_string())])
             .unwrap();
         out.write_record_strings(&["8", "y"]).unwrap();
         assert_eq!(out.table().record(0).get_t::<i64>(0), 0);
         assert_eq!(out.table().record(1).get_t::<i64>(0), 1);
-        assert_eq!(out.table().record(1).get_t::<String>(2), "y");
+        assert_eq!(out.table().record(1).string_bytes(2), b"y");
 
         std::fs::remove_file(path).unwrap();
     }

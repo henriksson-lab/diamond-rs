@@ -723,7 +723,7 @@ mod tests {
         };
         let mut b = Backend::default();
         let c = Config::new(&i, &mut b).unwrap();
-        assert_eq!(c.output_file, "hits.daa");
+        assert_eq!(c.output_file, Path::new("hits.daa"));
         assert_eq!(
             (c.range_culling, c.top, c.frame_shift),
             (true, Some(10.0), 15)

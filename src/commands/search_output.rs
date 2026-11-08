@@ -318,8 +318,8 @@ impl SearchFormat {
             b"101" | b"sam" => Some(Self::Sam),
             b"null" => Some(Self::Null),
             b"edge" => Some(Self::Edge),
-            b"bin1" if cfg!(feature = b"mcl") => Some(Self::Bin1),
-            b"clus" if cfg!(feature = b"mcl") => Some(Self::Clustering),
+            b"bin1" if cfg!(feature = "mcl") => Some(Self::Bin1),
+            b"clus" if cfg!(feature = "mcl") => Some(Self::Clustering),
             b"102" => Some(Self::Taxon {
                 include_lineage: false,
             }),
@@ -369,7 +369,8 @@ impl SearchFormat {
                 config.max_evalue,
                 first_title,
                 first_len as u32,
-                &crate::util::io::source_os_bytes(config.database.as_os_str())?,
+                &crate::util::io::source_os_bytes(config.database.as_os_str())
+                    .map_err(io::Error::other)?,
             ),
             Self::Sam => crate::output::sam_format::SamFormat.print_header_bytes(
                 out,

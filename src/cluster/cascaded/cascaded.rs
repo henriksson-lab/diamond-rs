@@ -815,12 +815,12 @@ mod tests {
         assert_eq!(backend.searches[1].1, Some(vec![true, false, true]));
         assert_eq!(backend.searches[0].0.chunk_size, 32768.0);
         for (search, _) in &backend.searches {
-            assert_eq!(search.matrix, "pam250");
+            assert_eq!(search.matrix, b"pam250");
             assert_eq!(search.gap_open, 15);
             assert_eq!(search.gap_extend, 3);
             assert_eq!(search.masking, MaskingMode::Tantan);
             assert_eq!(search.soft_masking, MaskingAlgo::Seg);
-            assert_eq!(search.motif_masking, "0");
+            assert_eq!(search.motif_masking, b"0");
         }
         assert!(backend.searches[0].0.mutual_cover);
         assert_eq!(
@@ -847,7 +847,7 @@ mod tests {
             vec![2, 0]
         );
         assert_eq!(config.max_evalue, 0.1);
-        assert_eq!(config.extension_mode, "banded-fast");
+        assert_eq!(config.extension_mode, b"banded-fast");
         assert!(config.anchored_swipe);
     }
 

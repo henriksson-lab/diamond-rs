@@ -10,6 +10,18 @@ scoring, clustering, and DAA/view scope. No failure from that matrix is known
 to remain. Unchecked items below are untested or untranslated surface area,
 not known failures unless the text explicitly says otherwise.
 
+## Active translation batch (2026-11-08)
+
+- Raw OS arguments, filesystem paths, late byte-valued options, and their native
+  callers have been migrated together. Combined compilation is still being
+  corrected; no final-snapshot parity claim applies yet.
+- Greedy vertex cover still needs its raw mapping/edge and numeric tokenizer
+  translation integrated. The reusable TSV file/join facade also needs raw
+  content support, and actual Source TSV worker failures must preserve the
+  upstream abort boundary. These code changes are currently in progress.
+- The raw-path CLI comparison harness is prepared but has not executed Source
+  or Native. Hosted macOS runtime and the external two-worker gate remain open.
+
 ## Current implementation and remaining evidence (2026-11-08)
 
 Baseline commands, enabled optional adapters, external clustering, streamed BLAST

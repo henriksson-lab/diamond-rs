@@ -12,6 +12,7 @@ use std::io;
 pub(crate) struct PreparedExtra {
     args: Vec<std::ffi::OsString>,
     original_args: Vec<std::ffi::OsString>,
+    command_name: &'static str,
     startup: std::sync::Arc<super::source_config::Startup>,
 }
 
@@ -19,12 +20,7 @@ pub(crate) struct PreparedExtra {
 impl PreparedExtra {
     pub(crate) fn command(&self) -> crate::run::main::RunCommand {
         use crate::run::main::RunCommand::*;
-        match self.args[1]
-            .to_str()
-            .unwrap_or("")
-            .strip_prefix("--")
-            .unwrap_or(self.args[1].to_str().unwrap_or(""))
-        {
+        match self.command_name {
             "random-seqs" => RandomSeqs,
             "mask" => Mask,
             "fastq2fasta" => Fastq2Fasta,
@@ -79,18 +75,14 @@ pub(crate) fn prepare_os(
     original_args: &[std::ffi::OsString],
     startup: std::sync::Arc<super::source_config::Startup>,
 ) -> io::Result<Option<PreparedExtra>> {
-    if !super::argument_registry::is_extra_command(
-        args[1]
-            .to_str()
-            .unwrap_or("")
-            .strip_prefix("--")
-            .unwrap_or(args[1].to_str().unwrap_or("")),
-    ) {
+    let command_name = super::argument_registry::command_name_os(args)?.unwrap_or("");
+    if !super::argument_registry::is_extra_command(command_name) {
         return Ok(None);
     }
     Ok(Some(PreparedExtra {
         args: args.to_vec(),
         original_args: original_args.to_vec(),
+        command_name,
         startup,
     }))
 }
@@ -419,15 +411,16 @@ mod enabled {
         original_args: &[OsString],
         startup: &super::super::source_config::Startup,
     ) -> io::Result<bool> {
+        let command = super::super::argument_registry::command_name_os(args)?;
         #[cfg(not(feature = "dna"))]
         let _ = original_args;
         #[cfg(feature = "dna")]
-        if args.get(1).is_some_and(|command| command == "blastn") {
+        if command == Some("blastn") {
             super::super::blastn::run_with_startup_os(original_args, Some(startup))?;
             return Ok(true);
         }
         #[cfg(not(feature = "dna"))]
-        if args.get(1).is_some_and(|command| command == "blastn") {
+        if command == Some("blastn") {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Nucleotide search requires the `dna` Cargo feature.",
@@ -436,10 +429,6 @@ mod enabled {
         if super::super::extra_tools::run_os(args, startup)? {
             return Ok(true);
         }
-        let command = args
-            .get(1)
-            .and_then(|s| s.to_str())
-            .map(|s| s.strip_prefix("--").unwrap_or(s));
         if !matches!(
             command,
             Some("random-seqs" | "mask" | "fastq2fasta" | "info" | "reverse" | "smith-waterman")

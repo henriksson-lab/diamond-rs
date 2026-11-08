@@ -227,7 +227,7 @@ impl ConfigBackend for Backend<'_> {
     }
 
     fn presentation(&mut self, input: &ConfigInput, verbosity: u8) -> Result<(), String> {
-        let command = command_name(&input.argv);
+        let command = self.errors.capture(command_name(&input.argv))?;
         if verbosity >= 1 || input.command == Command::RegressionTest {
             let header = format!("diamond v{}.{} (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n",
                 crate::basic::consts::VERSION_STRING, crate::basic::consts::BUILD_VERSION);
@@ -282,7 +282,7 @@ impl ConfigBackend for Backend<'_> {
                     .map(|_| ()),
             )?;
         }
-        let command = command_name(&input.argv);
+        let command = self.errors.capture(command_name(&input.argv))?;
         if input.argc != 2
             && matches!(
                 command,
@@ -480,12 +480,14 @@ fn scalar<T: ReadOption>(values: &Values, name: &str, mut default: T) -> Result<
     Ok(default)
 }
 
-fn command_name(args: &[OsString]) -> &str {
-    match args.get(1).and_then(|arg| arg.to_str()).unwrap_or("help") {
-        "-V" => "version",
-        "-h" => "help",
-        name => name.strip_prefix("--").unwrap_or(name),
-    }
+fn command_name(args: &[OsString]) -> io::Result<&'static str> {
+    Ok(
+        super::argument_registry::command_name_os(args)?.unwrap_or(if args.len() < 2 {
+            "help"
+        } else {
+            ""
+        }),
+    )
 }
 pub(super) fn prepare(args: &[String]) -> io::Result<Arc<Startup>> {
     let args: Vec<OsString> = args.iter().map(OsString::from).collect();
@@ -545,7 +547,7 @@ fn prepare_values_os(
     check_io: bool,
     values: &Values,
 ) -> Result<Startup, String> {
-    let command_name = command_name(args);
+    let command_name = values.errors.capture(command_name(args))?;
     let command = match command_name {
         "makedb" => Command::MakeDb,
         "blastp" => Command::BlastP,
@@ -626,7 +628,6 @@ fn prepare_values_os(
     flag!(target_indexed, "target-indexed");
     flag!(swipe_all, "swipe");
     flag!(hit_membuf, "hit-membuf");
-    flag!(store_query_quality, "store-query-quality");
     input.translated_cbs_supported =
         CbsMode::parse(&input.comp_based_stats.to_string()).support_translated();
     input.top_present = values.contains_key("top");

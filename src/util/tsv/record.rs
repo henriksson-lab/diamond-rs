@@ -33,10 +33,24 @@ impl TsvValue for i32 {
     }
 }
 
+impl TsvValue for Vec<u8> {
+    fn interpret(ptr: &[u8]) -> Self {
+        let len = i32::from_ne_bytes(ptr[..4].try_into().unwrap()) as usize;
+        ptr[4..4 + len].to_vec()
+    }
+    fn push_to(self, table: &mut Table) {
+        table.push_bytes(&self);
+    }
+}
+impl TsvType for Vec<u8> {
+    const TYPE: Type = Type::String;
+}
+
 impl TsvValue for String {
     fn interpret(ptr: &[u8]) -> Self {
         let len = i32::from_ne_bytes(ptr[..4].try_into().unwrap()) as usize;
-        String::from_utf8(ptr[4..4 + len].to_vec()).unwrap()
+        String::from_utf8(ptr[4..4 + len].to_vec())
+            .expect("Non-UTF-8 TSV field; use Vec<u8> or string_bytes")
     }
 
     fn push_to(self, table: &mut Table) {
@@ -128,6 +142,11 @@ impl<'a> Record<'a> {
             iterator.next();
         }
         iterator.value_string()
+    }
+
+    /// Checked compatibility for callers requesting UTF-8 string fields.
+    pub fn try_get_string(&self, i: usize) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.string_bytes(i).to_vec())
     }
 
     /// Source strings are arbitrary bytes, including non-UTF-8 TSV fields.

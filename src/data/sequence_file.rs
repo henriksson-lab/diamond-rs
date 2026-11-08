@@ -679,37 +679,86 @@ impl<T> SequenceDictionary<T> {
     }
 }
 
+/// Checked compatibility adapter for Source's byte-oriented FAI reader.
 pub fn read_fai_file(
+    path: &Path,
+    seqs: i64,
+    letters: i64,
+    index: Option<&mut AccessionIndex>,
+) -> Result<(i64, i64), String> {
+    read_fai_file_io(path, seqs, letters, index).map_err(|error| error.to_string())
+}
+
+/// Source SequenceFile::read_fai_file: retain TextInputFile's physical EOF and
+/// CR handling, and the old CharDelimiter tokenizer's local C-string extent.
+pub fn read_fai_file_io(
+    path: &Path,
+    seqs: i64,
+    letters: i64,
+    index: Option<&mut AccessionIndex>,
+) -> std::io::Result<(i64, i64)> {
+    read_fai_file_with_buffer_size_io(path, seqs, letters, index, 67_108_864)
+}
+
+/// Explicit replacement for Source's global config.file_buffer_size.
+pub fn read_fai_file_with_buffer_size_io(
     path: &Path,
     mut seqs: i64,
     mut letters: i64,
-    index: Option<&mut AccessionIndex>,
-) -> Result<(i64, i64), String> {
-    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut index = index;
-    for line in text.lines() {
-        if line.is_empty() {
-            continue;
+    mut index: Option<&mut AccessionIndex>,
+    buffer_size: usize,
+) -> std::io::Result<(i64, i64)> {
+    let mut input =
+        crate::util::io::text_input_file::ByteTextInputFile::from_source_path_bytes_with_buffer_size(path, buffer_size)
+            .map_err(std::io::Error::other)?;
+    loop {
+        input.getline().map_err(std::io::Error::other)?;
+        if input.line.is_empty() && input.eof() {
+            break;
         }
-        let mut fields = line.split('\t');
-        let accession = fields.next().ok_or("Invalid FAI record")?;
-        let len: Loc = fields
-            .next()
-            .ok_or("Invalid FAI record")?
-            .parse::<Loc>()
-            .map_err(|e| e.to_string())?;
-        if let Some(idx) = index.as_deref_mut() {
-            idx.add_seqid_mapping(accession, seqs as OId)?;
+        let mut tokens = crate::util::string::ByteTokenizer::new(&input.line, b'\t');
+        let accession = tokens.read_bytes().map_err(std::io::Error::other)?;
+        let len = tokens.read_i32().map_err(std::io::Error::other)?;
+        if let Some(index) = index.as_deref_mut() {
+            // The FAI reader assigns the complete token directly, replacing
+            // duplicate keys. It does not call add_seqid_mapping or populate
+            // the independently requested OID-to-accession vector.
+            index.acc_to_oid.insert(accession, seqs as OId);
         }
         seqs += 1;
         letters += i64::from(len);
     }
+    input.into_inner().close().map_err(std::io::Error::other)?;
     Ok((seqs, letters))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fai_bytes_keep_accessions_and_source_assignment_semantics() {
+        let path = std::env::temp_dir().join(format!(
+            "diamond-fai-bytes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            b"acc\xff\t4\0ignored\x80\nacc\xff\t7\tstuff\nother\x80\t-2\r\n",
+        )
+        .unwrap();
+        let mut index = AccessionIndex::default();
+        let result = read_fai_file_io(&path, 5, 100, Some(&mut index));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(result.unwrap(), (8, 109));
+        assert_eq!(index.accession_to_oid_bytes(b"acc\xff").unwrap(), vec![6]);
+        assert_eq!(index.accession_to_oid_bytes(b"other\x80").unwrap(), vec![7]);
+        assert!(index.seqid_bytes(5).is_err());
+    }
 
     struct Tree {
         parent: Vec<TaxId>,

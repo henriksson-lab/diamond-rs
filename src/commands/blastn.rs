@@ -37,7 +37,7 @@ pub(crate) fn run_with_startup_os(
     let values = super::argument_registry::extra_values_os(args)?;
     let mut search = super::dispatch::parse_native_blastp_config_os(
         args,
-        &crate::basic::config::invocation_bytes(args).map_err(io::Error::other)?,
+        &crate::basic::config::invocation_bytes_io(args)?,
     )?;
     startup.apply_search(&mut search);
     let mut dna = DnaOptions::default();

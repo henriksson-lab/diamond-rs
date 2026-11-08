@@ -609,7 +609,7 @@ mod tests {
     fn typed_io_capture_retains_primary_and_returned_stdio_error() {
         let details = cstdio_file::StdioError {
             operation: cstdio_file::StdioOperation::Read,
-            path: "primary".to_owned(),
+            path: "primary".into(),
             raw_os_error: Some(5),
             perror: Some(b"Input/output error".to_vec()),
             message: b"Error reading file primary".to_vec(),

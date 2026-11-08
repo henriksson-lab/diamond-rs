@@ -292,6 +292,23 @@ mod posix {
             Ok(())
         }
 
+        /// Exception-disabled Source ofstream transport. The caller owns its
+        /// sticky failbit; short writes do not materialize errno diagnostics.
+        pub(crate) fn write_text_output(&mut self, bytes: &[u8]) -> IoResult<bool> {
+            self.sync_view()?;
+            let pointer = self.pointer()?;
+            Ok(
+                unsafe { libc::fwrite(bytes.as_ptr().cast(), 1, bytes.len(), pointer.as_ptr()) }
+                    == bytes.len(),
+            )
+        }
+        /// Flush exactly this text stream at a Source endl boundary.
+        pub(crate) fn flush_text_output(&mut self) -> IoResult<bool> {
+            self.sync_view()?;
+            let pointer = self.pointer()?;
+            Ok(unsafe { libc::fflush(pointer.as_ptr()) } == 0)
+        }
+
         pub(crate) fn write_bytes(&mut self, bytes: &[u8]) -> IoResult<()> {
             self.sync_view()?;
             let pointer = self.pointer()?;

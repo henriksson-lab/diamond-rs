@@ -156,8 +156,8 @@ fn native_seed_masking_and_approximate_identity_match_source() {
 fn config(dir: &Path, db: &Path, row: &[&str], threads: i32) -> BlastpConfig {
     BlastpConfig {
         query_files: Vec::new(),
-        database: db.to_string_lossy().into_owned(),
-        output: Some(dir.join("library.out").to_string_lossy().into_owned()),
+        database: db.to_path_buf(),
+        output: Some(dir.join("library.out")),
         matrix: "blosum62".into(),
         gap_open: 11,
         gap_extend: 1,
@@ -168,16 +168,16 @@ fn config(dir: &Path, db: &Path, row: &[&str], threads: i32) -> BlastpConfig {
         report_unaligned: -1,
         include_lineage: false,
         output_header: None,
-        compression: String::new(),
+        compression: Vec::new(),
         file_buffer_size: 67_108_864,
         sam: Default::default(),
         archive: Default::default(),
         tuning: Default::default(),
         scoring_matrix: None,
         auxiliary_output: Default::default(),
-        taxonlist: String::new(),
-        taxon_exclude: String::new(),
-        seqidlist: String::new(),
+        taxonlist: Vec::new(),
+        taxon_exclude: Vec::new(),
+        seqidlist: PathBuf::new(),
         skip_missing_seqids: false,
         range_culling: false,
         range_cover: 50.0,
@@ -209,11 +209,11 @@ fn config(dir: &Path, db: &Path, row: &[&str], threads: i32) -> BlastpConfig {
         swipe_all: false,
         outfmt: std::iter::once("6")
             .chain(fields(row[9]).iter().copied())
-            .map(str::to_owned)
+            .map(|value| value.as_bytes().to_vec())
             .collect(),
         sensitivity: diamond::config::Sensitivity::Default,
         masking: MaskingMode::None,
-        motif_masking: String::new(),
+        motif_masking: Vec::new(),
         min_query_len: 0,
         query_cover: 0.0,
         subject_cover: 0.0,

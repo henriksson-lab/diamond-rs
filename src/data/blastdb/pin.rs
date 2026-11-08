@@ -367,13 +367,13 @@ mod tests {
             }],
             taxid: None,
         }];
-        let mut raw = HashMap::from([("XP_1".to_string(), false)]);
-        assert!(acc_filter(&deflines, &mut raw));
-        assert!(raw["XP_1"]);
+        let mut raw = HashMap::from([(b"XP_1".to_vec(), false)]);
+        assert!(acc_filter_bytes(&deflines, &mut raw));
+        assert!(raw[b"XP_1".as_slice()]);
 
-        let mut formatted = HashMap::from([("XP_1.2_A".to_string(), false)]);
-        assert!(acc_filter(&deflines, &mut formatted));
-        assert!(formatted["XP_1.2_A"]);
+        let mut formatted = HashMap::from([(b"XP_1.2_A".to_vec(), false)]);
+        assert!(acc_filter_bytes(&deflines, &mut formatted));
+        assert!(formatted[b"XP_1.2_A".as_slice()]);
     }
 
     #[test]
@@ -387,8 +387,8 @@ mod tests {
             }],
             taxid: None,
         }];
-        let mut wanted = HashMap::from([("OTHER".to_string(), false)]);
-        assert!(!acc_filter(&deflines, &mut wanted));
-        assert!(!wanted["OTHER"]);
+        let mut wanted = HashMap::from([(b"OTHER".to_vec(), false)]);
+        assert!(!acc_filter_bytes(&deflines, &mut wanted));
+        assert!(!wanted[b"OTHER".as_slice()]);
     }
 }
