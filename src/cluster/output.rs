@@ -179,6 +179,8 @@ fn align_centroid<D: ClusterRealignDatabase>(
     params.band_bin = config.band_bin;
     params.col_bin = config.col_bin;
     params.swipe_task_size = config.swipe_task_size;
+    // run_block_pair dispatches centroids within the real query pool.
+    params.rayon_task_pool = true;
     params.transcript_len_estimate = config.transcript_len_estimate;
     params.threads_align = config.threads_align;
     params.target_parallel_verbosity = config.target_parallel_verbosity;

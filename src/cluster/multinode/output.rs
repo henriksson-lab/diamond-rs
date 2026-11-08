@@ -1,7 +1,7 @@
 //! Final multinode clustering merge from
 //! `diamond/src/cluster/multinode/output.cpp`.
 
-use super::source_io::{read_text, Fields, TextOutput};
+use crate::util::io::source_text::{SourceTextInput, TextOutput};
 use crate::util::io::IoErrorOwner;
 #[cfg(test)]
 use std::fs;
@@ -62,14 +62,13 @@ fn read_clusters_owned(
     max_oid: OId,
     errors: &IoErrorOwner,
 ) -> Result<Vec<OId>, String> {
-    let bytes = read_text(path, errors, b"Error opening clustering file: ")?;
     let len = usize::try_from(max_oid)
         .ok()
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| "Clustering OID range does not fit in memory.".to_owned())?;
     let mut mapping = vec![NIL; len];
-    let mut fields = Fields::from_text(&bytes);
-    while let (Some(rep), Some(member)) = (fields.number(), fields.number()) {
+    let mut input = SourceTextInput::open(path, errors, b"Error opening clustering file: ")?;
+    while let (Some(rep), Some(member)) = (input.number(), input.number()) {
         let member = usize::try_from(member)
             .ok()
             .filter(|member| *member < mapping.len())
@@ -160,13 +159,14 @@ pub fn output_accs<J: MultinodeOutputJob>(
             .root_dir()
             .join("accessions")
             .join(format!("{volume_index}.txt"));
-        let bytes = read_text(&path, &job.io_errors(), b"Error opening accessions file: ")?;
+        let mut input =
+            SourceTextInput::open(&path, &job.io_errors(), b"Error opening accessions file: ")?;
         let mut oid = volume.oid_begin;
-        for line in bytes.lines() {
-            if oid >= volume.oid_end {
+        while oid < volume.oid_end {
+            let Some(line) = input.line() else {
                 break;
-            }
-            accessions[oid as usize] = line.to_vec();
+            };
+            accessions[oid as usize] = line;
             oid += 1;
         }
     }
@@ -216,6 +216,7 @@ pub fn merge<J: MultinodeOutputJob>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::io::source_text::expected_text;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -290,8 +291,8 @@ mod tests {
         let merged = [0, 0, 2, 2, NIL];
         assert_eq!(output_oids(&job, &merged, &path).unwrap(), 2);
         assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "0\t0\n0\t1\n2\t2\n2\t3\n-1\t4\n"
+            fs::read(&path).unwrap(),
+            expected_text(b"0\t0\n0\t1\n2\t2\n2\t3\n-1\t4\n")
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -311,8 +312,8 @@ mod tests {
         let merged = [0, 0, 2, 2, 2];
         assert_eq!(output_accs(&job, &merged, &volumes, &path).unwrap(), 2);
         assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "a0\ta0\na0\ta1\na2\ta2\na2\ta3\na2\t\n"
+            fs::read(&path).unwrap(),
+            expected_text(b"a0\ta0\na0\ta1\na2\ta2\na2\ta3\na2\t\n")
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -341,8 +342,8 @@ mod tests {
         .unwrap();
         assert_eq!(count, 2);
         assert_eq!(
-            fs::read_to_string(output).unwrap(),
-            "0\t0\n0\t1\n0\t2\n0\t3\n4\t4\n"
+            fs::read(output).unwrap(),
+            expected_text(b"0\t0\n0\t1\n0\t2\n0\t3\n4\t4\n")
         );
         assert_eq!(job.logs, ["Merging clusterings", "Total clusters: 2"]);
         fs::remove_dir_all(root).unwrap();

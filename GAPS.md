@@ -15,13 +15,13 @@ not known failures unless the text explicitly says otherwise.
 - Raw OS arguments/paths and GVC/TSV byte content are integrated. The retained
   18 raw-OS, six GVC and thirteen TSV controls match Source; their broader
   combination/platform scope remains qualified.
-- Current code work covers partition-file byte/numeric semantics, retained
-  multinode library path/content handling, external volume-read stopping, and
-  Source's parallel alignment tasks and per-worker output-buffer ownership.
-- The combined batch passes isolated default/optional/Windows compilation and
-  86 focused tests. Nested DP work still uses global Rayon rather than the
-  external alignment pool; volume-building parallel dispatch and retained
-  multinode streaming-owner semantics also remain code follow-ups.
+- The latest batch implements same-pool nested DP tasks, explicit scoped query
+  pools, parallel external volume readers/buffers, retained multinode streams,
+  and Source's formatted manifest extraction. It passes isolated default,
+  optional and Windows compilation plus 204 focused tests (one SIMD case ignored).
+- The retained multinode prepare_inputs indexed partition/load_seqs adapter is
+  still a concrete code follow-up. Fresh Source comparisons of the new parallel
+  branches and broader command/profile interactions remain evidence gates.
 - Hosted CI verification, the Source-shared two-worker hazard, and final parity
   gates remain open. No complete-translation claim applies.
 

@@ -40,6 +40,7 @@ pub mod output_stream_buffer;
 pub use output_stream_buffer::OutputStreamBuffer;
 pub mod input_stream_buffer;
 pub use input_stream_buffer::InputStreamBuffer;
+pub(crate) mod source_text;
 pub mod text_input_file;
 pub use text_input_file::{ByteTextInputFile, TextInputFile};
 pub mod input_file;

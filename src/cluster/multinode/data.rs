@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use super::output::Volume;
-use super::source_io::{path_error, read_text, Fields, TextOutput};
 use crate::basic::sequence::Sequence;
 use crate::basic::value::{Letter, OId, SequenceType, AMINO_ACID_ALPHABET};
 use crate::data::fasta::fasta_file::{FastaFile, FastaFileConfig};
+use crate::util::io::source_text::{path_error, SourceTextInput, TextOutput};
 use crate::util::io::{source_c_path, IoErrorOwner};
 use crate::util::parallel::{Atomic, FileStack};
 
@@ -49,8 +49,55 @@ pub struct SequenceRecord<T = String> {
 
 pub type ByteSequenceRecord = SequenceRecord<Vec<u8>>;
 
+/// An open sequence owner: construction, record iteration and checked close
+/// remain separate Source operations. Legacy Vec adapters have no file owner.
+pub trait SequenceReader {
+    fn read_record(&mut self) -> Result<Option<ByteSequenceRecord>, String>;
+    fn close(&mut self) -> Result<(), String>;
+}
+struct VecSequenceReader(std::vec::IntoIter<ByteSequenceRecord>);
+impl SequenceReader for VecSequenceReader {
+    fn read_record(&mut self) -> Result<Option<ByteSequenceRecord>, String> {
+        Ok(self.0.next())
+    }
+    fn close(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+struct FastaSequenceReader {
+    input: FastaFile,
+    errors: IoErrorOwner,
+}
+impl SequenceReader for FastaSequenceReader {
+    fn read_record(&mut self) -> Result<Option<ByteSequenceRecord>, String> {
+        self.errors
+            .capture(self.input.read_seq_bytes_io())
+            .map(|record| {
+                record.map(|record| SequenceRecord {
+                    id: record.id,
+                    sequence: record.sequence,
+                })
+            })
+    }
+    fn close(&mut self) -> Result<(), String> {
+        self.errors.capture(self.input.close_io())
+    }
+}
+
 /// Explicit adapter for C++ `SequenceFile::auto_create` and `read_seq`.
 pub trait SequenceSource: Sync {
+    /// Compatibility implementation for in-memory custom sources. Concrete
+    /// file-backed sources override this to retain their actual input owner.
+    fn open_records(
+        &self,
+        path: &Path,
+        errors: &IoErrorOwner,
+    ) -> Result<Box<dyn SequenceReader>, String> {
+        Ok(Box::new(VecSequenceReader(
+            self.read_records_bytes_with_errors(path, errors)?
+                .into_iter(),
+        )))
+    }
     fn read_records_bytes_with_errors(
         &self,
         path: &Path,
@@ -87,6 +134,25 @@ impl FastaSequenceSource {
 }
 
 impl SequenceSource for FastaSequenceSource {
+    fn open_records(
+        &self,
+        path: &Path,
+        errors: &IoErrorOwner,
+    ) -> Result<Box<dyn SequenceReader>, String> {
+        let mut input = errors.capture(FastaFile::open_source_with_buffer(
+            &[path.to_path_buf()],
+            FastaFileConfig {
+                sequence_type: SequenceType::AminoAcid,
+                ..Default::default()
+            },
+            65_536,
+        ))?;
+        input.set_io_errors(errors.clone());
+        Ok(Box::new(FastaSequenceReader {
+            input,
+            errors: errors.clone(),
+        }))
+    }
     fn read_records(&self, path: &Path) -> Result<Vec<SequenceRecord>, String> {
         self.read_records_bytes(path)?
             .into_iter()
@@ -106,23 +172,12 @@ impl SequenceSource for FastaSequenceSource {
         path: &Path,
         errors: &IoErrorOwner,
     ) -> Result<Vec<ByteSequenceRecord>, String> {
-        let mut input = errors.capture(FastaFile::open_source_with_buffer(
-            &[path.to_path_buf()],
-            FastaFileConfig {
-                sequence_type: SequenceType::AminoAcid,
-                ..Default::default()
-            },
-            65_536,
-        ))?;
-        input.set_io_errors(errors.clone());
+        let mut input = self.open_records(path, errors)?;
         let mut records = Vec::new();
-        while let Some(record) = errors.capture(input.read_seq_bytes_io())? {
-            records.push(SequenceRecord {
-                id: record.id,
-                sequence: record.sequence,
-            });
+        while let Some(record) = input.read_record()? {
+            records.push(record);
         }
-        errors.capture(input.close_io())?;
+        input.close()?;
         Ok(records)
     }
 }
@@ -255,28 +310,27 @@ where
         ))?;
 
         let id_file = job.base_dir().join(format!("rep_ids{volume_index}"));
-        let rep_text = read_text(&id_file, &job.io_errors(), b"Error opening file ")?;
-        let mut fields = Fields::from_text(&rep_text);
-        let mut representatives = Vec::new();
-        while let Some(oid) = fields.number() {
-            representatives.push(oid);
-        }
-        let records = source.read_records_bytes_with_errors(&volume.path, &job.io_errors())?;
+        let mut representatives =
+            SourceTextInput::open(&id_file, &job.io_errors(), b"Error opening file ")?;
+        // Source opens the sequence before output but reads no sequence or
+        // representative until both constructors have completed.
+        let mut input = source.open_records(&volume.path, &job.io_errors())?;
 
         let out_file = base_dir.join(format!("{volume_index}.faa"));
         let mut output =
             TextOutput::open(&out_file, &job.io_errors(), b"Error opening file ", true)?;
         let mut count = 0u64;
-        let mut representative_index = 0usize;
+        let mut representative = None;
+        representatives.number_into(&mut representative);
         let mut file_oid = volume.oid_begin;
-        for record in records {
-            if stop.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) {
+            let Some(record) = input.read_record()? else {
                 break;
-            }
+            };
             if job.round() > 0 {
                 file_oid = atoll_oid_bytes(&record.id);
             }
-            if representatives.get(representative_index) == Some(&file_oid) {
+            if representative == Some(file_oid) {
                 output.write(format!(">{file_oid}\n").as_bytes());
                 output.write(
                     Sequence::new(&record.sequence)
@@ -285,18 +339,22 @@ where
                 );
                 output.write(b"\n");
                 count += 1;
-                representative_index += 1;
+                representatives.number_into(&mut representative);
             }
             file_oid = file_oid.wrapping_add(1);
         }
 
-        if let Some(rep) = representatives.get(representative_index) {
+        if let Some(rep) = representative.filter(|_| representatives.good()) {
+            // Defined num_get conversion values and sticky old values are
+            // retained even when a later extraction sets failbit. Initial
+            // sentry/EOF has no initialized Source value and stays None.
             return Err(path_error(
                 &job.io_errors(),
                 format!("Failed to find oid {rep} in file ").as_bytes(),
                 &volume.path,
             ));
         }
+        input.close()?;
         drop(output);
         let mut line = job.io_errors().capture(
             crate::util::io::source_os_bytes(out_file.as_os_str())
@@ -327,6 +385,7 @@ fn atoll_oid_bytes(value: &[u8]) -> OId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::io::source_text::expected_text;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestDir(PathBuf);
@@ -379,6 +438,61 @@ mod tests {
     }
 
     #[test]
+    fn sequence_read_failure_occurs_after_output_construction() {
+        let dir = TestDir::new("read-after-output");
+        let path = dir.0.join("input.faa");
+        std::fs::write(&path, b">bad\nA?\n").unwrap();
+        std::fs::write(dir.0.join("rep_ids0"), b"0").unwrap();
+        let output_path = dir.0.join("reps/0.faa");
+        std::fs::create_dir_all(&output_path).unwrap();
+        let error = get_reps_path(
+            &job(&dir.0, 0, false),
+            &[Volume::new(path, 0, 1, 1)],
+            GetRepsConfig::default(),
+            &FastaSequenceSource,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            format!("Error opening file {}", output_path.display())
+        );
+    }
+
+    #[test]
+    fn failed_rep_extraction_retains_defined_values_for_later_numeric_titles() {
+        for (name, rep_ids, fasta, expected) in [
+            (
+                "eof",
+                b"7".as_slice(),
+                b">7\nARN\n>7\nDCQ\n".as_slice(),
+                b">7\nARN\n>7\nDCQ\n".as_slice(),
+            ),
+            (
+                "num-get",
+                b"8x".as_slice(),
+                b">8\nARN\n>0\nDCQ\n>0\nEGH\n".as_slice(),
+                b">8\nARN\n>0\nDCQ\n>0\nEGH\n".as_slice(),
+            ),
+        ] {
+            let dir = TestDir::new(name);
+            let path = dir.0.join("input.faa");
+            std::fs::write(&path, fasta).unwrap();
+            std::fs::write(dir.0.join("rep_ids0"), rep_ids).unwrap();
+            get_reps_path(
+                &job(&dir.0, 1, false),
+                &[Volume::new(path, 0, 3, 3)],
+                GetRepsConfig::default(),
+                &FastaSequenceSource,
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(dir.0.join("reps/0.faa")).unwrap(),
+                expected_text(expected)
+            );
+        }
+    }
+
+    #[test]
     fn raw_title_and_os_path_representatives_use_the_byte_source() {
         let dir = TestDir::new("raw-representatives");
         #[cfg(unix)]
@@ -400,7 +514,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             std::fs::read(dir.0.join("reps/0.faa")).unwrap(),
-            b">10\nARN\n"
+            expected_text(b">10\nARN\n")
         );
         let rows = super::super::multinode::VolumedFile::from_manifest(&manifest).unwrap();
         assert_eq!(rows.0[0].path, dir.0.join("reps/0.faa"));
@@ -436,8 +550,8 @@ mod tests {
         let manifest = get_reps_fasta(&test_job, &[volume], GetRepsConfig::default()).unwrap();
         let output = dir.0.join("reps").join("0.faa");
         assert_eq!(
-            std::fs::read_to_string(&output).unwrap(),
-            ">11\nDCQ\n>12\nEGH\n"
+            std::fs::read(&output).unwrap(),
+            expected_text(b">11\nDCQ\n>12\nEGH\n")
         );
         assert_eq!(
             std::fs::read_to_string(manifest).unwrap(),
@@ -459,8 +573,8 @@ mod tests {
 
         get_reps_fasta(&job(&dir.0, 1, false), &[volume], GetRepsConfig::default()).unwrap();
         assert_eq!(
-            std::fs::read_to_string(dir.0.join("reps/0.faa")).unwrap(),
-            ">7\nDCQ\n>999\nEGH\n"
+            std::fs::read(dir.0.join("reps/0.faa")).unwrap(),
+            expected_text(b">7\nDCQ\n>999\nEGH\n")
         );
         assert_eq!(atoll_oid("  -2 suffix"), u64::MAX - 1);
         assert_eq!(atoll_oid("not-a-number"), 0);

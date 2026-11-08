@@ -39,9 +39,19 @@ mutex; the FileArray owner avoids allocating worker-local codec state.
 Multinode remains a retained library translation;
 Source's inactive CLI call is not made into a new command. The shared external
 two-worker empty-chunk scheduling hazard remains an explicit open boundary.
-Nested DP still needs the actual external pool carrier; parallel volume building
-and the retained multinode collection facade's streaming ownership remain code
-follow-ups. No full parallel or platform parity claim is made for this batch.
+The subsequent frozen package `b46aac0c…` adds actual same-pool nested DP,
+parallel volume building, retained multinode input/output ownership, and shared
+formatted text parsing. Null-pool dispatch and explicit query-pool dispatch are
+separate; single-worker pooled calls retain Source task counts and completed
+ranges merge under its mutex. The source-compatible byte manifest parser now
+serves the connected external stages as well as the retained library.
+
+All three native compile profiles and 204 focused tests pass (one SIMD case
+ignored). Windows text-file fixture expectations were corrected against the
+CRT output in hosted run 42478857080; its full macOS ARM64 job passed. Fresh
+Source parallel-branch comparisons remain pending. The retained multinode
+prepare_inputs indexed partition/load_seqs adapter is still incomplete, and no
+full parallel, platform or translation-completion claim is made.
 
 ## Current coverage (2026-11-08)
 

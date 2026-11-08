@@ -69,3 +69,26 @@ failed snapshot remains preserved. These checks do not establish fresh C++
 parity for the new parallel branch. Nested DP pool reuse, parallel volume
 building, retained multinode streaming ownership, and the Source-shared
 two-worker scheduling hazard remain open; the translation goal is not achieved.
+
+Active-goal continuation: nested external DP now uses priority-zero tasks on the
+actual parent pool, including one-worker execution. Arc input/matrix/target
+owners survive queued and reverse-pass work; null-pool calls dispatch directly.
+Ordinary query and anchored callers explicitly share their configured pool;
+completed DP ranges merge under the Source completion mutex. External volume
+building uses independent readers and worker codec buffers with atomic claims.
+The retained multinode library now retains real sequence/text owners and Source
+formatted-extraction state. Its indexed prepare_inputs partition adapter remains
+an explicit code gap; no inactive CLI route has been invented.
+
+The shared text stream utility moved to util/io/source_text.rs and also serves
+connected external manifests, preserving numeric prefixes, optional-field
+fail-state values, blank-row errors and raw paths. Hosted Windows run
+42478857080 exposed eight LF fixture assumptions after the CRT translation;
+expected text bytes are now projected without normalizing actual/binary data.
+The same pushed run's full macOS ARM64 job passed.
+
+Frozen package b46aac0cd3a62ba07d37ae37ae828c6b06f43cbdb24094805c06662982393415
+passes default/optional/Windows all-target checks and 204 focused tests with one
+SIMD case ignored. The first batch's null-pool counter fixture failure is retained
+separately. Fresh C++ parallel/profile parity and remaining completion gates stay
+open. No original Source tree or algorithm object was rebuilt or modified.

@@ -384,6 +384,7 @@ pub fn align_targets_final_with_block(
             params.cutoff_score_8bit = cfg.cutoff_score_8bit;
             params.max_swipe_dp = cfg.max_swipe_dp;
             params.swipe_task_size = cfg.swipe_task_size;
+            params.rayon_task_pool = cfg.rayon_task_pool;
             params.threads_align = cfg.threads_align;
             params.target_parallel_verbosity = cfg.target_parallel_verbosity;
             params.error_sink = cfg.swipe_error.clone();

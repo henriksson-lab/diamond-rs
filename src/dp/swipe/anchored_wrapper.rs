@@ -18,6 +18,7 @@ use crate::stats::cbs::{
 use crate::stats::{self, score_matrix::ScoreMatrix};
 use crate::util::geo;
 use crate::util::interval::Interval;
+use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -72,6 +73,8 @@ pub struct AnchoredSwipeConfig<'a> {
     pub statistics: Option<Arc<Mutex<Statistics>>>,
     /// Explicit replacement for C++'s process-global `config.swipe_task_size`.
     pub swipe_task_size: i64,
+    /// Explicit scoped query-pool ownership supplied by the concrete driver.
+    pub rayon_task_pool: bool,
     pub transcript_len_estimate: f64,
     /// Scale used by the composition-adjusted recomputation matrix.
     pub cbs_matrix_scale: i32,
@@ -97,6 +100,7 @@ impl<'a> AnchoredSwipeConfig<'a> {
             score_matrix,
             statistics: None,
             swipe_task_size: DEFAULT_SWIPE_TASK_SIZE,
+            rayon_task_pool: false,
             transcript_len_estimate: 1.0,
             cbs_matrix_scale: 1,
             matrix_adjust_tolerance: 1e-8,
@@ -255,7 +259,7 @@ pub fn add_target(
     }
 }
 
-/// C++ `swipe_threads`, executed deterministically with identical task ranges.
+/// C++ `swipe_threads`, retaining its sixteen-lane task ranges and query pool.
 pub fn swipe_threads(
     targets: &mut [Target],
     query: &[Letter],
@@ -295,18 +299,47 @@ fn swipe_threads_profiled(
     } else if begin < end {
         ranges.push((begin, end));
     }
-    let mut out = Stats::default();
-    for (begin, end) in ranges.iter().copied() {
-        let stats = smith_waterman_simd_profiled(
-            query,
-            &mut targets[begin..end],
-            cfg.score_matrix,
-            profile,
-            profile_reverse,
-        );
-        out.gross_cells += stats.gross_cells;
-        out.net_cells += stats.net_cells;
-    }
+    let out = if asynchronous && cfg.rayon_task_pool {
+        // Every task borrows a disjoint target range and the existing query
+        // profiles. No sequence/profile copies or additional pool are needed.
+        let mut remaining = targets;
+        let mut pieces = Vec::with_capacity(ranges.len());
+        for &(begin, end) in &ranges {
+            let (piece, tail) = remaining.split_at_mut(end - begin);
+            pieces.push(piece);
+            remaining = tail;
+        }
+        pieces
+            .into_par_iter()
+            .map(|piece| {
+                smith_waterman_simd_profiled(
+                    query,
+                    piece,
+                    cfg.score_matrix,
+                    profile,
+                    profile_reverse,
+                )
+            })
+            .reduce(Stats::default, |mut left, right| {
+                left.gross_cells += right.gross_cells;
+                left.net_cells += right.net_cells;
+                left
+            })
+    } else {
+        let mut out = Stats::default();
+        for &(begin, end) in &ranges {
+            let stats = smith_waterman_simd_profiled(
+                query,
+                &mut targets[begin..end],
+                cfg.score_matrix,
+                profile,
+                profile_reverse,
+            );
+            out.gross_cells += stats.gross_cells;
+            out.net_cells += stats.net_cells;
+        }
+        out
+    };
     inc(cfg, StatValue::SwipeTasksTotal, ranges.len() as i64);
     if asynchronous {
         inc(cfg, StatValue::SwipeTasksAsync, ranges.len() as i64);
@@ -501,6 +534,8 @@ pub fn anchored_swipe(targets: &mut Targets, cfg: &AnchoredSwipeConfig<'_>) -> V
     inc(cfg, StatValue::TimeAnchoredSwipe, micros(total));
     if cfg.recompute_adjusted {
         let mut params = Params::new(cfg.query, cfg.score_matrix);
+        params.rayon_task_pool = cfg.rayon_task_pool;
+        params.swipe_task_size = cfg.swipe_task_size;
         params.band_bin = cfg.band_bin;
         params.col_bin = cfg.col_bin;
         params.v = swipe::HspValues::COORDS;
@@ -557,6 +592,28 @@ mod tests {
         let statistics = statistics.lock().unwrap();
         assert_eq!(statistics.get(StatValue::SwipeTasksTotal), 2);
         assert_eq!(statistics.get(StatValue::SwipeTasksAsync), 2);
+    }
+
+    #[test]
+    fn scoped_query_pool_preserves_anchored_target_updates_and_cell_counts() {
+        let score_matrix = matrix();
+        let query = vec![0; 8];
+        let mut serial = (0..33)
+            .map(|idx| Target::new(vec![0; idx as usize % 7 + 1], 0, 8, 0, 8, idx, false))
+            .collect::<Vec<_>>();
+        let mut parallel = serial.clone();
+        let mut cfg = AnchoredSwipeConfig::new(&query, &score_matrix);
+        cfg.swipe_task_size = 1;
+        let expected = swipe_threads(&mut serial, &query, &cfg);
+        cfg.rayon_task_pool = true;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let actual = pool.install(|| swipe_threads(&mut parallel, &query, &cfg));
+        assert_eq!(parallel, serial);
+        assert_eq!(actual, expected);
+        assert!(actual.gross_cells > 0);
     }
 
     #[test]

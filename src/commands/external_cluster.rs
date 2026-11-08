@@ -21,6 +21,11 @@ struct Reader {
     errors: crate::util::io::IoErrorOwner,
 }
 impl SequenceVolumeReader for Reader {
+    fn fork_reader(&self) -> Option<Box<dyn SequenceVolumeReader + Send>> {
+        Some(Box::new(Self {
+            errors: self.errors.clone(),
+        }))
+    }
     fn visit_volume_bytes(
         &mut self,
         path: &Path,
@@ -114,6 +119,9 @@ struct Pipeline {
     tuning: super::blastp::SearchTuning,
 }
 impl SequenceVolumeReader for Pipeline {
+    fn fork_reader(&self) -> Option<Box<dyn SequenceVolumeReader + Send>> {
+        self.reader.fork_reader()
+    }
     fn visit_volume_bytes(
         &mut self,
         path: &Path,
@@ -278,6 +286,7 @@ impl ExternalPipeline for Pipeline {
                 max_evalue: self.max_evalue,
                 cutoff_score_8bit: self.tuning.cutoff_score_8bit,
                 max_swipe_dp: self.tuning.max_swipe_dp,
+                swipe_task_size: self.tuning.swipe_task_size,
                 band_bin: self.tuning.band_bin,
                 col_bin: self.tuning.col_bin,
                 approx_backtrace: self.tuning.approx_backtrace,

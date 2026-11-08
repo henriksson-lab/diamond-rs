@@ -356,6 +356,10 @@ mod tests {
             .hsps
             .iter()
             .any(|hsp| hsp.query_range.begin >= 4 && hsp.subject_range.begin >= 4));
-        assert!(statistics.get(crate::basic::statistics::StatValue::SwipeTasksTotal) > 0);
+        // Alternative-HSP recomputation deliberately passes a null pool.
+        assert_eq!(
+            statistics.get(crate::basic::statistics::StatValue::SwipeTasksTotal),
+            0
+        );
     }
 }

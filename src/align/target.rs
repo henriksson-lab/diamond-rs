@@ -146,6 +146,9 @@ pub struct GappedScoreConfig {
     pub cutoff_score_8bit: i32,
     pub max_swipe_dp: i64,
     pub swipe_task_size: i64,
+    /// Concrete query drivers share their configured execution pool. Standalone
+    /// library configurations keep Source's null-pool dispatch.
+    pub rayon_task_pool: bool,
     pub threads_align: u32,
     pub target_parallel_verbosity: u32,
     pub log_query: bool,
@@ -231,6 +234,7 @@ impl Default for GappedScoreConfig {
             cutoff_score_8bit: 240,
             max_swipe_dp: 1_000_000,
             swipe_task_size: 100_000_000,
+            rayon_task_pool: false,
             threads_align: 0,
             target_parallel_verbosity: u32::MAX,
             log_query: false,
@@ -1632,6 +1636,7 @@ pub fn align_work_targets_bytes(
             acfg.col_bin = cfg.col_bin;
             acfg.query_cbs = cbs;
             acfg.swipe_task_size = cfg.swipe_task_size;
+            acfg.rayon_task_pool = cfg.rayon_task_pool;
             acfg.transcript_len_estimate = cfg.transcript_len_estimate;
             acfg.recompute_adjusted = cfg.comp_based_stats_matrix_adjust;
             acfg.sensitivity = cfg.sensitivity;
@@ -1655,6 +1660,7 @@ pub fn align_work_targets_bytes(
             params.cutoff_score_8bit = cfg.cutoff_score_8bit;
             params.max_swipe_dp = cfg.max_swipe_dp;
             params.swipe_task_size = cfg.swipe_task_size;
+            params.rayon_task_pool = cfg.rayon_task_pool;
             params.threads_align = cfg.threads_align;
             params.target_parallel_verbosity = cfg.target_parallel_verbosity;
             params.error_sink = cfg.swipe_error.clone();
@@ -2515,7 +2521,9 @@ mod tests {
         assert_eq!(out[0].block_id, 4);
         assert!(out[0].filter_score > 0);
         assert_eq!(out[0].hsp[0].len(), 1);
-        assert!(stat.get(StatValue::SwipeTasksTotal) > 0);
+        // This standalone config has Source's null pool: DP runs directly,
+        // without counting a queued task (swipe_wrapper.cpp:285).
+        assert_eq!(stat.get(StatValue::SwipeTasksTotal), 0);
         assert!(stat.get(StatValue::GrossDpCells) > 0);
     }
 

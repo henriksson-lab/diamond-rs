@@ -415,6 +415,170 @@ impl SwipeError {
     }
 }
 
+/// Owned real inputs for child tasks on the existing Source ThreadPool.
+/// Sequence buffers and the scoring matrix are shared, never copied per range.
+#[derive(Clone)]
+pub struct SwipeTaskPool {
+    pool: crate::util::parallel::ThreadPool,
+    query: Arc<[Letter]>,
+    matrix: Arc<ScoreMatrix>,
+    composition_bias: Option<Arc<[i8]>>,
+}
+impl SwipeTaskPool {
+    pub fn new(
+        pool: crate::util::parallel::ThreadPool,
+        query: Arc<[Letter]>,
+        matrix: Arc<ScoreMatrix>,
+    ) -> Self {
+        Self {
+            pool,
+            query,
+            matrix,
+            composition_bias: None,
+        }
+    }
+    pub fn with_composition_bias(mut self, bias: Arc<[i8]>) -> Self {
+        self.composition_bias = Some(bias);
+        self
+    }
+    fn reversed(&self, query: Arc<[Letter]>, bias: Option<Arc<[i8]>>) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            query,
+            matrix: Arc::clone(&self.matrix),
+            composition_bias: bias,
+        }
+    }
+}
+
+// Snapshot every nonborrowed Params field. The borrowed fields are supplied
+// from actual Arc owners inside each task, so queued closures require neither
+// fabricated static references nor unsafe lifetime extension.
+#[derive(Clone)]
+struct SwipeTaskSettings {
+    frame: i32,
+    query_source_len: i32,
+    query_translated: bool,
+    flags: Flags,
+    reverse_targets: bool,
+    target_max_len: i32,
+    swipe_bin: i32,
+    v: HspValues,
+    band_bin: i32,
+    col_bin: i32,
+    cutoff_score_8bit: i32,
+    max_swipe_dp: i64,
+    swipe_task_size: i64,
+    threads_align: u32,
+    target_parallel_verbosity: u32,
+    error_sink: Option<SwipeError>,
+    rayon_task_pool: bool,
+    transcript_len_estimate: f64,
+    approx_backtrace: bool,
+    max_evalue: f64,
+    min_bit_score: f64,
+    query_cover: f64,
+    subject_cover: f64,
+    query_or_target_cover: f64,
+    approx_min_id: f64,
+    cbs_matrix_scale: i32,
+    statistics: Option<Arc<Mutex<Statistics>>>,
+}
+struct OwnedSwipeParams {
+    inputs: SwipeTaskPool,
+    query_id: Option<Arc<str>>,
+    query_id_bytes: Option<Arc<[u8]>>,
+    settings: SwipeTaskSettings,
+}
+impl OwnedSwipeParams {
+    fn new(params: &Params<'_>, inputs: &SwipeTaskPool) -> Result<Self, String> {
+        let bias_matches = match (params.composition_bias, inputs.composition_bias.as_deref()) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::ptr::eq(a, b),
+            _ => false,
+        };
+        if !std::ptr::eq(params.query, inputs.query.as_ref())
+            || !std::ptr::eq(params.score_matrix, inputs.matrix.as_ref())
+            || !bias_matches
+        {
+            return Err(
+                "DP child tasks require their actual query, matrix and bias owners.".into(),
+            );
+        }
+        Ok(Self {
+            inputs: inputs.clone(),
+            query_id: params.query_id.map(Arc::from),
+            query_id_bytes: params.query_id_bytes.map(Arc::from),
+            settings: SwipeTaskSettings {
+                frame: params.frame,
+                query_source_len: params.query_source_len,
+                query_translated: params.query_translated,
+                flags: params.flags,
+                reverse_targets: params.reverse_targets,
+                target_max_len: params.target_max_len,
+                swipe_bin: params.swipe_bin,
+                v: params.v,
+                band_bin: params.band_bin,
+                col_bin: params.col_bin,
+                cutoff_score_8bit: params.cutoff_score_8bit,
+                max_swipe_dp: params.max_swipe_dp,
+                swipe_task_size: params.swipe_task_size,
+                threads_align: params.threads_align,
+                target_parallel_verbosity: params.target_parallel_verbosity,
+                error_sink: params.error_sink.clone(),
+                rayon_task_pool: params.rayon_task_pool,
+                transcript_len_estimate: params.transcript_len_estimate,
+                approx_backtrace: params.approx_backtrace,
+                max_evalue: params.max_evalue,
+                min_bit_score: params.min_bit_score,
+                query_cover: params.query_cover,
+                subject_cover: params.subject_cover,
+                query_or_target_cover: params.query_or_target_cover,
+                approx_min_id: params.approx_min_id,
+                cbs_matrix_scale: params.cbs_matrix_scale,
+                statistics: params.statistics.clone(),
+            },
+        })
+    }
+    fn params(&self) -> Params<'_> {
+        Params {
+            query: &self.inputs.query,
+            query_id: self.query_id.as_deref(),
+            query_id_bytes: self.query_id_bytes.as_deref(),
+            composition_bias: self.inputs.composition_bias.as_deref(),
+            score_matrix: &self.inputs.matrix,
+            task_pool: Some(self.inputs.clone()),
+            frame: self.settings.frame,
+            query_source_len: self.settings.query_source_len,
+            query_translated: self.settings.query_translated,
+            flags: self.settings.flags,
+            reverse_targets: self.settings.reverse_targets,
+            target_max_len: self.settings.target_max_len,
+            swipe_bin: self.settings.swipe_bin,
+            v: self.settings.v,
+            band_bin: self.settings.band_bin,
+            col_bin: self.settings.col_bin,
+            cutoff_score_8bit: self.settings.cutoff_score_8bit,
+            max_swipe_dp: self.settings.max_swipe_dp,
+            swipe_task_size: self.settings.swipe_task_size,
+            threads_align: self.settings.threads_align,
+            target_parallel_verbosity: self.settings.target_parallel_verbosity,
+            error_sink: self.settings.error_sink.clone(),
+            rayon_task_pool: self.settings.rayon_task_pool,
+            transcript_len_estimate: self.settings.transcript_len_estimate,
+            approx_backtrace: self.settings.approx_backtrace,
+            max_evalue: self.settings.max_evalue,
+            min_bit_score: self.settings.min_bit_score,
+            query_cover: self.settings.query_cover,
+            subject_cover: self.settings.subject_cover,
+            query_or_target_cover: self.settings.query_or_target_cover,
+            approx_min_id: self.settings.approx_min_id,
+            cbs_matrix_scale: self.settings.cbs_matrix_scale,
+            statistics: self.settings.statistics.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Params<'a> {
     pub query: &'a [Letter],
@@ -444,6 +608,11 @@ pub struct Params<'a> {
     pub threads_align: u32,
     pub target_parallel_verbosity: u32,
     pub error_sink: Option<SwipeError>,
+    /// Source's actual parent ThreadPool, with owned input lifetimes.
+    pub task_pool: Option<SwipeTaskPool>,
+    /// Explicit adaptation for callers executing on their Source-equivalent
+    /// Rayon pool. Ambient/global Rayon availability alone is not a pool.
+    pub rayon_task_pool: bool,
     pub transcript_len_estimate: f64,
     pub approx_backtrace: bool,
     pub max_evalue: f64,
@@ -483,6 +652,8 @@ impl<'a> Params<'a> {
             threads_align: 0,
             target_parallel_verbosity: u32::MAX,
             error_sink: None,
+            task_pool: None,
+            rayon_task_pool: false,
             transcript_len_estimate: 1.0,
             approx_backtrace: false,
             max_evalue: f64::MAX,
@@ -1993,12 +2164,9 @@ pub fn swipe_threads_with_config(
         return Ok(Vec::new());
     }
 
-    // C++ queues target ranges of roughly `swipe_task_size` cells into the
-    // same pool which is processing queries. Rayon supports the same nested
-    // work-stealing model: this does not create threads or oversubscribe, and
-    // a worker waiting for its child ranges continues executing pool work.
-    // Keep boundaries aligned to the score-vector width so every dispatched
-    // range retains full SIMD batches.
+    // Non-PARALLEL Source calls use the actual parent pool pointer, or
+    // dispatch directly when it is null. Explicit Rayon callers adapt their
+    // existing execution pool; foreign worker threads never start global Rayon.
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let avx2 = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -2067,6 +2235,9 @@ pub fn swipe_threads_with_config(
         }
         return Ok(output);
     }
+    if p.task_pool.is_none() && !p.rayon_task_pool {
+        return Ok(dispatch_swipe(begin, overflow, p));
+    }
     let mut ranges = Vec::new();
     let mut task_begin = 0usize;
     let mut task_cells = 0i64;
@@ -2089,7 +2260,7 @@ pub fn swipe_threads_with_config(
 
     // Upstream avoids the task pool entirely unless at least one range hit
     // the threshold. This matters for the many small per-query SWIPE calls.
-    if ranges.is_empty() || rayon::current_num_threads() == 1 {
+    if ranges.is_empty() {
         p.inc_stat(StatValue::SwipeTasksTotal, 1);
         return Ok(dispatch_swipe(begin, overflow, p));
     }
@@ -2099,27 +2270,62 @@ pub fn swipe_threads_with_config(
     p.inc_stat(StatValue::SwipeTasksTotal, ranges.len() as i64);
     p.inc_stat(StatValue::SwipeTasksAsync, ranges.len() as i64);
 
+    if let Some(pool) = &p.task_pool {
+        let settings = Arc::new(OwnedSwipeParams::new(p, pool)?);
+        let results = Arc::new(Mutex::new((Vec::new(), TargetVec::default())));
+        let tasks = crate::util::parallel::TaskSet::new(&pool.pool, 0);
+        let monitor = crate::output::live_sink::current_monitor();
+        if let Some(monitor) = &monitor {
+            monitor.enqueue_dp(ranges.len());
+        }
+        for range in ranges {
+            // DpTarget clones only range metadata and its Arc sequence/matrix
+            // owners. No target sequence Vec is duplicated for child work.
+            let targets = begin[range].to_vec();
+            let settings = Arc::clone(&settings);
+            let results = Arc::clone(&results);
+            let monitor = monitor.clone();
+            tasks.enqueue(move || {
+                if let Some(monitor) = &monitor {
+                    monitor.start_dp();
+                }
+                let _progress = crate::output::live_sink::enter(monitor);
+                let params = settings.params();
+                let mut local_overflow = TargetVec::default();
+                let mut output = dispatch_swipe(&targets, &mut local_overflow, &params);
+                // Source merges completed child ranges under one mutex. The
+                // waiting outer worker also executes this priority-zero set.
+                let mut results = results.lock().unwrap();
+                results.0.append(&mut output);
+                results.1.push_back_vec(&local_overflow);
+            });
+        }
+        tasks.run();
+        let mut results = results.lock().unwrap();
+        overflow.push_back_vec(&results.1);
+        return Ok(std::mem::take(&mut results.0));
+    }
+
     let monitor = crate::output::live_sink::current_monitor();
     if let Some(monitor) = &monitor {
         monitor.enqueue_dp(ranges.len());
     }
-    let results: Vec<(Vec<Hsp>, TargetVec)> = ranges
-        .into_par_iter()
-        .map(|range| {
-            if let Some(monitor) = &monitor {
-                monitor.start_dp();
-            }
-            let _progress_scope = crate::output::live_sink::enter(monitor.clone());
-            let mut local_overflow = TargetVec::default();
-            let output = dispatch_swipe(&begin[range], &mut local_overflow, p);
-            (output, local_overflow)
-        })
-        .collect();
-    let mut output = Vec::new();
-    for (mut local_output, local_overflow) in results {
-        output.append(&mut local_output);
-        overflow.push_back_vec(&local_overflow);
-    }
+    // Source swipe_task splices HSPs and overflow as each range completes,
+    // under one mutex. Indexed collect would instead impose input-range order.
+    let results = Mutex::new((Vec::new(), TargetVec::default()));
+    ranges.into_par_iter().for_each(|range| {
+        if let Some(monitor) = &monitor {
+            monitor.start_dp();
+        }
+        let _progress_scope = crate::output::live_sink::enter(monitor.clone());
+        let mut local_overflow = TargetVec::default();
+        let mut output = dispatch_swipe(&begin[range], &mut local_overflow, p);
+        let mut results = results.lock().unwrap();
+        results.0.append(&mut output);
+        results.1.push_back_vec(&local_overflow);
+    });
+    let (output, local_overflow) = results.into_inner().unwrap();
+    overflow.push_back_vec(&local_overflow);
     Ok(output)
 }
 
@@ -2248,17 +2454,18 @@ pub fn recompute_reversed(hsps: &mut [Hsp], p: &mut Params<'_>) -> Vec<Hsp> {
 
     let mut reversed_query = p.query.to_vec();
     reversed_query.reverse();
-    let reversed_bias;
-    let composition_bias = match p.composition_bias {
-        Some(bias) => {
-            reversed_bias = reversed_composition_bias(bias, p.query.len());
-            Some(reversed_bias.as_slice())
-        }
-        None => None,
-    };
+    let reversed_query: Arc<[Letter]> = reversed_query.into();
+    let reversed_bias: Option<Arc<[i8]>> = p
+        .composition_bias
+        .map(|bias| reversed_composition_bias(bias, p.query.len()).into());
+    let task_pool = p
+        .task_pool
+        .as_ref()
+        .map(|pool| pool.reversed(Arc::clone(&reversed_query), reversed_bias.clone()));
     let mut params = Params {
         query: &reversed_query,
-        composition_bias,
+        composition_bias: reversed_bias.as_deref(),
+        task_pool,
         reverse_targets: true,
         target_max_len: 0,
         ..p.clone()
@@ -3023,7 +3230,9 @@ mod tests {
         assert_eq!(out[0].query_range, Interval::new(0, query.len() as i32));
         assert_eq!(out[0].subject_range, Interval::new(0, query.len() as i32));
         let statistics = statistics.lock().unwrap();
-        assert_eq!(statistics.get(StatValue::SwipeTasksTotal), 1);
+        // Source returns directly when Params::thread_pool is null, before
+        // incrementing its queued-task counters.
+        assert_eq!(statistics.get(StatValue::SwipeTasksTotal), 0);
         assert!(statistics.get(StatValue::GrossDpCells) > 0);
         assert!(statistics.get(StatValue::TimeTracebackSw) >= 0);
     }
@@ -3518,5 +3727,162 @@ mod tests {
         assert_eq!(&reversed[..3], &[3, 2, 1]);
         assert_eq!(reversed.len(), 35);
         assert!(reversed[3..].iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn source_null_pool_stays_direct_inside_unrelated_rayon() {
+        let ambient = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        ambient.install(|| {
+            let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+            let query: Vec<Letter> = (0..8).collect();
+            let target = DpTarget::full(query.clone(), query.len() as i32, 0, CarryOver::default());
+            let mut params = Params::new(&query, &matrix);
+            params.flags = Flags::FULL_MATRIX;
+            params.swipe_task_size = 1;
+            let statistics = Arc::new(Mutex::new(Statistics::new()));
+            params.statistics = Some(Arc::clone(&statistics));
+            let mut overflow = TargetVec::default();
+            let out = swipe_threads_with_config(&[target], &mut overflow, 0, 3, &params).unwrap();
+            assert_eq!(out.len(), 1);
+            assert_eq!(
+                statistics.lock().unwrap().get(StatValue::SwipeTasksTotal),
+                0
+            );
+            assert_eq!(
+                statistics.lock().unwrap().get(StatValue::SwipeTasksAsync),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn explicit_rayon_pool_retains_results_and_source_async_task_counts() {
+        for workers in [1, 3] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+                let query: Arc<[Letter]> = (0..8).collect::<Vec<Letter>>().into();
+                let targets: Vec<_> = (0..64)
+                    .map(|id| {
+                        DpTarget::full(
+                            Arc::clone(&query),
+                            query.len() as i32,
+                            id,
+                            CarryOver::default(),
+                        )
+                    })
+                    .collect();
+                let statistics = Arc::new(Mutex::new(Statistics::new()));
+                let mut params = Params::new(&query, &matrix);
+                params.flags = Flags::FULL_MATRIX;
+                params.swipe_task_size = 1;
+                params.rayon_task_pool = true;
+                params.statistics = Some(Arc::clone(&statistics));
+                let mut overflow = TargetVec::default();
+                let out =
+                    swipe_threads_with_config(&targets, &mut overflow, 0, 3, &params).unwrap();
+                assert_eq!(out.len(), 64);
+                assert!(overflow.empty());
+                let mut direct_params = params.clone();
+                direct_params.statistics = None;
+                let mut direct_overflow = TargetVec::default();
+                let direct = dispatch_swipe(&targets, &mut direct_overflow, &direct_params);
+                let signature = |out: &[Hsp]| {
+                    out.iter()
+                        .map(|hsp| {
+                            (
+                                hsp.swipe_target,
+                                hsp.score,
+                                hsp.query_range.begin,
+                                hsp.query_range.end,
+                                hsp.subject_range.begin,
+                                hsp.subject_range.end,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let mut actual = signature(&out);
+                let mut expected = signature(&direct);
+                if workers == 1 {
+                    assert_eq!(
+                        actual, expected,
+                        "one worker preserves sequential range completion order"
+                    );
+                }
+                // Multiple workers may finish ranges in any order. Compare the
+                // exact alignment bag, without requiring a particular schedule.
+                actual.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(actual, expected);
+                assert!(direct_overflow.empty());
+                let statistics = statistics.lock().unwrap();
+                assert!(statistics.get(StatValue::SwipeTasksAsync) > 0);
+                assert_eq!(
+                    statistics.get(StatValue::SwipeTasksAsync),
+                    statistics.get(StatValue::SwipeTasksTotal)
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn source_nested_taskset_reuses_parent_pool_and_reverse_owners() {
+        use crate::util::parallel::{TaskSet, ThreadPool};
+        for workers in [1, 3] {
+            let matrix = Arc::new(ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap());
+            let query: Arc<[Letter]> = (0..8).collect::<Vec<Letter>>().into();
+            let statistics = Arc::new(Mutex::new(Statistics::new()));
+            let result = Arc::new(Mutex::new(Vec::new()));
+            let pool = ThreadPool::default();
+            let tasks = TaskSet::new(&pool, 1);
+            let child_pool =
+                SwipeTaskPool::new(pool.clone(), Arc::clone(&query), Arc::clone(&matrix));
+            let result_for_task = Arc::clone(&result);
+            let stats_for_task = Arc::clone(&statistics);
+            tasks.enqueue(move || {
+                let bias: Arc<[i8]> = vec![0; query.len() + 32].into();
+                let child_pool = child_pool.with_composition_bias(Arc::clone(&bias));
+                let mut params = Params::new(&query, &matrix);
+                params.composition_bias = Some(&bias);
+                params.flags = Flags::FULL_MATRIX;
+                params.v = HspValues::COORDS;
+                params.swipe_task_size = 1;
+                params.statistics = Some(stats_for_task);
+                params.task_pool = Some(child_pool);
+                let mut input = targets();
+                for id in 0..64 {
+                    input[3].push_back(DpTarget::full(
+                        Arc::clone(&query),
+                        query.len() as i32,
+                        id,
+                        CarryOver::default(),
+                    ));
+                }
+                let mut out = swipe(&input, &mut params);
+                out.sort_by_key(|hsp| hsp.swipe_target);
+                *result_for_task.lock().unwrap() = out;
+            });
+            pool.run(workers, false, Some(&tasks));
+            pool.join();
+            let result = result.lock().unwrap();
+            assert_eq!(result.len(), 64);
+            for (id, hsp) in result.iter().enumerate() {
+                assert_eq!(hsp.swipe_target as usize, id);
+                assert_eq!(hsp.query_range, Interval::new(0, 8));
+                assert_eq!(hsp.subject_range, Interval::new(0, 8));
+            }
+            let stats = statistics.lock().unwrap();
+            assert!(stats.get(StatValue::SwipeTasksAsync) > 0);
+            assert_eq!(
+                stats.get(StatValue::SwipeTasksAsync),
+                stats.get(StatValue::SwipeTasksTotal)
+            );
+        }
     }
 }

@@ -5770,6 +5770,7 @@ fn run_impl(
         };
         let ext_mode = extension_mode_override.unwrap_or(setup.extension_mode);
         let gapped_cfg = GappedScoreConfig {
+            rayon_task_pool: true,
             band_bin: config.tuning.band_bin,
             col_bin: config.tuning.col_bin,
             log_query: config.tuning.log_query,
@@ -6164,6 +6165,7 @@ fn run_impl(
                 };
                 let ext_mode = extension_mode_override.unwrap_or(setup.extension_mode);
                 let gapped_cfg = GappedScoreConfig {
+                    rayon_task_pool: true,
                     band_bin: config.tuning.band_bin,
                     col_bin: config.tuning.col_bin,
                     narrow_band_cov: config.tuning.narrow_band_cov,

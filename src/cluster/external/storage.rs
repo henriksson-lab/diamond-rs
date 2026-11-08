@@ -432,27 +432,13 @@ pub(crate) fn manifest_records_owned(
     path: &Path,
     errors: &IoErrorOwner,
 ) -> Result<Vec<(PathBuf, u64)>, String> {
-    let bytes = fs::read(source_c_path(&(path)).as_ref()).map_err(|error| error.to_string())?;
-    bytes
-        .split(|&byte| byte == b'\n')
-        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-        .map(|line| {
-            let mut fields = line
-                .split(u8::is_ascii_whitespace)
-                .filter(|field| !field.is_empty());
-            let path = fields.next().ok_or("Format error in VolumedFile")?;
-            let count = std::str::from_utf8(fields.next().ok_or("Format error in VolumedFile")?)
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .ok_or("Format error in VolumedFile")?;
-            Ok((
-                PathBuf::from(errors.capture(
-                    crate::util::io::source_bytes_os(path).map_err(std::io::Error::other),
-                )?),
-                count,
-            ))
-        })
-        .collect()
+    Ok(
+        super::external::read_volumed_file_manifest_owned(path, errors)?
+            .0
+            .into_iter()
+            .map(|volume| (volume.path, volume.record_count))
+            .collect(),
+    )
 }
 
 fn record_size(kind: ExternalRecordKind) -> usize {
@@ -615,12 +601,23 @@ impl WorkerBucketBuffers {
     }
 
     pub(crate) fn write(&mut self, radix: usize, bytes: &[u8]) -> Result<(), String> {
+        self.write_count(radix, bytes, 1)
+    }
+
+    /// Source BufferArray's byte overload counts FASTA bytes, while its
+    /// record overload (alignment edges) counts serialized records.
+    pub(crate) fn write_count(
+        &mut self,
+        radix: usize,
+        bytes: &[u8],
+        records: u64,
+    ) -> Result<(), String> {
         self.errors.capture(
             self.buffers[radix]
                 .write(bytes)
                 .map_err(std::io::Error::other),
         )?;
-        self.records[radix] += 1;
+        self.records[radix] += records;
         if self.buffers[radix].size() >= BUFFER_BYTES {
             self.flush(radix, true)?;
         }

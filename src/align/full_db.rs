@@ -136,7 +136,8 @@ mod tests {
             &score_matrix,
         );
         assert_eq!(targets.len(), 1);
-        assert!(statistics.get(StatValue::SwipeTasksTotal) > 0);
+        // Source full_db passes nullptr and does not enqueue/count a task.
+        assert_eq!(statistics.get(StatValue::SwipeTasksTotal), 0);
         assert!(statistics.get(StatValue::GrossDpCells) > 0);
     }
 }

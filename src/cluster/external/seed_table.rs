@@ -68,6 +68,12 @@ impl TryFrom<ByteSeedSequence> for SeedSequence {
 }
 
 pub trait SequenceVolumeReader {
+    /// Construct an independent reader for an actual Source volume worker.
+    /// Legacy stateful library adapters remain explicitly serial when absent;
+    /// concrete file readers share only error transport, never input cursors.
+    fn fork_reader(&self) -> Option<Box<dyn SequenceVolumeReader + Send>> {
+        None
+    }
     fn read_volume(&mut self, path: &Path) -> Result<Vec<SeedSequence>, String>;
     fn visit_volume(
         &mut self,
@@ -129,6 +135,9 @@ pub trait SequenceVolumeReader {
 pub struct FastaVolumeReader;
 
 impl SequenceVolumeReader for FastaVolumeReader {
+    fn fork_reader(&self) -> Option<Box<dyn SequenceVolumeReader + Send>> {
+        Some(Box::new(Self))
+    }
     fn visit_volume_bytes(
         &mut self,
         path: &Path,

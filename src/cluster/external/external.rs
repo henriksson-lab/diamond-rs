@@ -688,7 +688,8 @@ pub fn build_chunk_table(
     Ok((table, chunk_count))
 }
 
-/// Storage-backed C++ `build_chunks`.
+/// Compatibility entry using one Source volume worker. Legacy readers without
+/// an independent-reader factory retain their explicit serial library adapter.
 pub fn build_chunks<R: SequenceVolumeReader>(
     job: &Job,
     database: &VolumedFile,
@@ -696,22 +697,33 @@ pub fn build_chunks<R: SequenceVolumeReader>(
     chunk_count: usize,
     reader: &mut R,
 ) -> Result<Vec<PathBuf>, String> {
+    build_chunks_with_threads(job, database, chunk_table, chunk_count, 1, reader)
+}
+
+/// Storage-backed Source build_chunks: one shared FileArray, and independent
+/// per-worker SequenceFile/BufferArray owners for each bounded radix bucket.
+pub fn build_chunks_with_threads<R: SequenceVolumeReader>(
+    job: &Job,
+    database: &VolumedFile,
+    chunk_table: &RadixedTable,
+    chunk_count: usize,
+    threads: usize,
+    reader: &mut R,
+) -> Result<Vec<PathBuf>, String> {
+    use super::storage::{BucketWriter, WorkerBucketBuffers};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
     let chunks_dir = job.base_dir(None).join("chunks");
     fs::create_dir_all(source_c_path(&chunks_dir).as_ref()).map_err(|error| error.to_string())?;
     let queue = Atomic::new(chunks_dir.join("queue"));
-    let mut output = super::storage::BucketWriter::new_owned(
+    let output = Arc::new(Mutex::new(BucketWriter::new_file_array_owned(
         &chunks_dir,
         job.worker_id(),
         chunk_count,
         job.io_errors(),
-    )?;
+    )?));
     let mut buckets_processed = 0_i64;
-    let traits = crate::basic::value::ValueTraits::new(
-        AMINO_ACID_ALPHABET,
-        crate::basic::value::MASK_LETTER,
-        b"UO-",
-        crate::basic::value::SequenceType::AminoAcid,
-    );
     loop {
         let bucket_index = usize::try_from(queue.fetch_add_one()?)
             .map_err(|_| "Negative bucket id.".to_owned())?;
@@ -725,9 +737,10 @@ pub fn build_chunks<R: SequenceVolumeReader>(
             bucket_index + 1,
             chunk_table.len(),
             entries.len(),
-            entries.len() * ChunkTableEntry::ENCODED_SIZE
+            entries.len() * ChunkTableEntry::ENCODED_SIZE,
         ))?;
-        // Retain only one radix bucket's OID-to-chunk mapping, as in Source.
+        // Retain only the current radix bucket's OID mapping, shared by its
+        // workers. No database sequences are copied into the worker factory.
         let mut wanted = BTreeMap::<OId, BTreeSet<i32>>::new();
         for entry in entries {
             if entry.chunk < 0 || entry.chunk as usize >= chunk_count {
@@ -738,61 +751,153 @@ pub fn build_chunks<R: SequenceVolumeReader>(
         if let (Some((&first, _)), Some((&last, _))) =
             (wanted.first_key_value(), wanted.last_key_value())
         {
-            let mut buffer = crate::util::text_buffer::TextBuffer::new();
-            for volume in &database.0 {
-                if volume.oid_end != 0 && (volume.oid_end <= first || volume.oid_begin > last) {
-                    continue;
-                }
-                // Source checks file_oid < oid_end before read_seq, then uses
-                // the current record's numeric title only in later rounds.
-                let sequential_oid = std::cell::Cell::new(volume.oid_begin);
-                let oid_end = last.wrapping_add(1);
-                reader.visit_volume_bytes_while(
-                    &volume.path,
-                    &mut || sequential_oid.get() < oid_end,
-                    &mut |record| {
-                        let oid = if job.round_index() > 0 {
-                            parse_oid_like_atoll(&record.id)
-                        } else {
-                            sequential_oid.get()
-                        };
-                        sequential_oid.set(oid.wrapping_add(1));
-                        let Some(chunks) = wanted.get(&oid) else {
-                            return Ok(());
-                        };
-                        buffer.clear();
-                        crate::util::sequence::format(
-                            &record.sequence,
-                            &oid.to_string(),
-                            None,
-                            &mut buffer,
-                            "fasta",
-                            &traits,
-                            160,
+            let volumes: Vec<_> = database
+                .0
+                .iter()
+                .filter(|volume| {
+                    volume.oid_end == 0 || (volume.oid_end > first && volume.oid_begin <= last)
+                })
+                .cloned()
+                .collect();
+            let failure = Arc::new(Mutex::new(None));
+            if !volumes.is_empty() {
+                if let Some(first_reader) = reader.fork_reader() {
+                    let volumes = Arc::new(volumes);
+                    let wanted = Arc::new(wanted);
+                    let next = Arc::new(AtomicUsize::new(0));
+                    let mut pool = crate::util::parallel::SimpleThreadPool::new();
+                    let mut first_reader = Some(first_reader);
+                    for _ in 0..threads.min(volumes.len()) {
+                        let mut worker_reader = first_reader
+                            .take()
+                            .or_else(|| reader.fork_reader())
+                            .ok_or("Volume reader factory became unavailable.")?;
+                        let files = Arc::clone(&output);
+                        let volumes = Arc::clone(&volumes);
+                        let wanted = Arc::clone(&wanted);
+                        let next = Arc::clone(&next);
+                        let errors = job.io_errors();
+                        let failure = Arc::clone(&failure);
+                        let round = job.round_index();
+                        pool.spawn(move |stop| {
+                            let mut buffers =
+                                WorkerBucketBuffers::new(files, chunk_count, errors, failure);
+                            let mut text = crate::util::text_buffer::TextBuffer::new();
+                            while !stop.load(Ordering::Relaxed) {
+                                let index = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(volume) = volumes.get(index) else {
+                                    break;
+                                };
+                                write_chunk_volume(
+                                    worker_reader.as_mut(),
+                                    volume,
+                                    round,
+                                    last.wrapping_add(1),
+                                    &wanted,
+                                    stop,
+                                    &mut text,
+                                    &mut |chunk, bytes| {
+                                        buffers.write_count(chunk, bytes, bytes.len() as u64)
+                                    },
+                                )?;
+                            }
+                            // Actual BufferArray destructor finishes every
+                            // member before SimpleThreadPool::join returns.
+                            Ok(())
+                        });
+                    }
+                    pool.join_all()?;
+                } else {
+                    // Compatibility for library readers which own mutable
+                    // in-memory state and cannot create independent cursors.
+                    let mut buffers = WorkerBucketBuffers::new(
+                        Arc::clone(&output),
+                        chunk_count,
+                        job.io_errors(),
+                        Arc::clone(&failure),
+                    );
+                    let mut text = crate::util::text_buffer::TextBuffer::new();
+                    let stop = AtomicBool::new(false);
+                    for volume in &volumes {
+                        write_chunk_volume(
+                            reader,
+                            volume,
+                            job.round_index(),
+                            last.wrapping_add(1),
+                            &wanted,
+                            &stop,
+                            &mut text,
+                            &mut |chunk, bytes| {
+                                buffers.write_count(chunk, bytes, bytes.len() as u64)
+                            },
                         )?;
-                        for &chunk in chunks {
-                            // Source BufferArray's byte-string overload counts
-                            // FASTA bytes, not sequences, in this volume manifest.
-                            output.write_count(
-                                chunk as usize,
-                                buffer.data(),
-                                buffer.data().len() as u64,
-                            )?;
-                        }
-                        Ok(())
-                    },
-                )?;
+                    }
+                    drop(buffers);
+                }
+            }
+            let cleanup_error = failure.lock().unwrap().take();
+            if let Some(error) = cleanup_error {
+                return Err(error);
             }
         }
         remove_manifest_storage(&bucket.path, &storage);
         buckets_processed += 1;
     }
-    let table = output.finish()?;
+    let table = output.lock().unwrap().finish()?;
+    drop(output); // FileArray closes/publishes before the completion barrier.
     let outputs = table.iter().map(|bucket| bucket.path.clone()).collect();
     let finished = Atomic::new(chunks_dir.join("finished"));
     finished.fetch_add(buckets_processed)?;
     finished.await_value(chunk_table.len() as i64)?;
     Ok(outputs)
+}
+
+fn write_chunk_volume<R: SequenceVolumeReader + ?Sized>(
+    reader: &mut R,
+    volume: &super::seed_table::Volume,
+    round: i32,
+    oid_end: OId,
+    wanted: &BTreeMap<OId, BTreeSet<i32>>,
+    stop: &std::sync::atomic::AtomicBool,
+    buffer: &mut crate::util::text_buffer::TextBuffer,
+    write: &mut dyn FnMut(usize, &[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let traits = crate::basic::value::ValueTraits::new(
+        AMINO_ACID_ALPHABET,
+        crate::basic::value::MASK_LETTER,
+        b"UO-",
+        crate::basic::value::SequenceType::AminoAcid,
+    );
+    let file_oid = std::cell::Cell::new(volume.oid_begin);
+    reader.visit_volume_bytes_while(
+        &volume.path,
+        &mut || !stop.load(std::sync::atomic::Ordering::Relaxed) && file_oid.get() < oid_end,
+        &mut |record| {
+            let oid = if round > 0 {
+                parse_oid_like_atoll(&record.id)
+            } else {
+                file_oid.get()
+            };
+            file_oid.set(oid.wrapping_add(1));
+            let Some(chunks) = wanted.get(&oid) else {
+                return Ok(());
+            };
+            buffer.clear();
+            crate::util::sequence::format(
+                &record.sequence,
+                &oid.to_string(),
+                None,
+                buffer,
+                "fasta",
+                &traits,
+                160,
+            )?;
+            for &chunk in chunks {
+                write(chunk as usize, buffer.data())?;
+            }
+            Ok(())
+        },
+    )
 }
 
 fn push_chunk_entry(
@@ -853,33 +958,11 @@ pub(crate) fn read_manifest_owned(
     path: &Path,
     errors: &IoErrorOwner,
 ) -> Result<Vec<(PathBuf, usize)>, String> {
-    let bytes = fs::read(source_c_path(&(path)).as_ref()).map_err(|error| error.to_string())?;
-    bytes
-        .split(|&b| b == b'\n')
-        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-        .map(|line| {
-            let mut fields = manifest_fields(line);
-            let path = fields.next().ok_or("Format error in VolumedFile")?;
-            let count = parse_manifest_number(fields.next().ok_or("Format error in VolumedFile")?)?;
-            Ok((
-                PathBuf::from(errors.capture(
-                    crate::util::io::source_bytes_os(path).map_err(std::io::Error::other),
-                )?),
-                count,
-            ))
-        })
-        .collect()
-}
-
-fn manifest_fields(line: &[u8]) -> impl Iterator<Item = &[u8]> {
-    line.split(u8::is_ascii_whitespace)
-        .filter(|field| !field.is_empty())
-}
-fn parse_manifest_number<T: std::str::FromStr>(field: &[u8]) -> Result<T, String> {
-    std::str::from_utf8(field)
-        .ok()
-        .and_then(|field| field.parse().ok())
-        .ok_or_else(|| "Format error in VolumedFile".to_owned())
+    Ok(read_volumed_file_manifest_owned(path, errors)?
+        .0
+        .into_iter()
+        .map(|volume| (volume.path, volume.record_count as usize))
+        .collect())
 }
 
 fn open_input(path: &Path) -> Result<InputFile, String> {
@@ -1099,7 +1182,14 @@ pub fn round<B: ExternalPipeline>(
     let chunk_bits = bit_length(volumes_max_oid(volumes)).saturating_sub(RADIX_BITS);
     let chunk_table =
         backend.radix_sort(job, chunk_table, ExternalRecordKind::ChunkTable, chunk_bits)?;
-    build_chunks(job, volumes, &chunk_table, chunk_count, backend)?;
+    build_chunks_with_threads(
+        job,
+        volumes,
+        &chunk_table,
+        chunk_count,
+        config.threads,
+        backend,
+    )?;
     let edges = backend.align(job, chunk_count, volumes_max_oid(volumes))?;
     if config.mutual_cover.is_some() {
         super::cluster::cluster_bidirectional(job, &edges, volumes)
@@ -1223,53 +1313,34 @@ pub fn read_volumed_file_manifest_owned(
     path: &Path,
     errors: &IoErrorOwner,
 ) -> Result<VolumedFile, String> {
-    // Source uses ifstream here: retain its runtime diagnostic, not the
-    // distinct InputFile/FileOpenException class.
-    let text = match fs::read(source_c_path(&(path)).as_ref()) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let mut message = b"Error opening file ".to_vec();
-            message.extend(errors.capture(
-                crate::util::io::path_diagnostic_bytes(path).map_err(std::io::Error::other),
-            )?);
-            return errors.capture(Err(crate::util::io::RawDiagnosticError(message).into_io()));
-        }
-    };
+    use crate::util::io::source_text::{Fields, SourceTextInput};
+
+    let mut input = SourceTextInput::open(path, errors, b"Error opening file ")?;
     let mut volumes = Vec::new();
     let mut next_oid = 0_u64;
-    for line in text
-        .split(|&byte| byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        let fields = manifest_fields(line).collect::<Vec<_>>();
-        if fields.len() < 2 {
-            return Err("Format error in VolumedFile".to_owned());
-        }
-        let count = parse_manifest_number::<u64>(fields[1])?;
-        let (begin, end) = if fields.len() >= 4 {
-            (
-                parse_manifest_number::<u64>(fields[2])?,
-                parse_manifest_number::<u64>(fields[3])?,
-            )
-        } else {
-            (
-                next_oid,
-                next_oid.checked_add(count).ok_or("Volume OID overflow")?,
-            )
-        };
+    while let Some(line) = input.line() {
+        // Volume::operator>> checks path/count extraction, while optional OID
+        // extraction affects only the row stream's state and stored values.
+        let mut fields = Fields::new(&line);
+        let name = fields.word().ok_or("Format error in VolumedFile")?;
+        let count = fields.number().ok_or("Format error in VolumedFile")?;
+        let mut begin = Some(0);
+        let mut end = Some(0);
+        fields.number_into(&mut begin);
+        fields.number_into(&mut end);
+        let (begin, end) = (begin.unwrap_or(0), end.unwrap_or(0));
         let (begin, end) = if begin == 0 && end == 0 {
-            (
-                next_oid,
-                next_oid.checked_add(count).ok_or("Volume OID overflow")?,
-            )
+            (next_oid, next_oid.wrapping_add(count))
         } else {
             (begin, end)
         };
-        next_oid = next_oid.checked_add(count).ok_or("Volume OID overflow")?;
+        next_oid = next_oid.wrapping_add(count);
         volumes.push(super::seed_table::Volume::new(
-            PathBuf::from(errors.capture(
-                crate::util::io::source_bytes_os(fields[0]).map_err(std::io::Error::other),
-            )?),
+            PathBuf::from(
+                errors.capture(
+                    crate::util::io::source_bytes_os(name).map_err(std::io::Error::other),
+                )?,
+            ),
             begin,
             end,
             count,
@@ -1301,6 +1372,40 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn volume_manifest_uses_source_prefix_values_and_row_fail_state() {
+        let dir = temp_dir("volume-prefix");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("volumes.tsv");
+        fs::write(
+            &path,
+            b"alpha 2tail 50 60\nbeta 3 40oops 99\ngamma 1\ndelta 1 18446744073709551616 99\n",
+        )
+        .unwrap();
+        let rows = read_volumed_file_manifest(&path).unwrap();
+        assert_eq!(
+            rows.0,
+            vec![
+                super::super::seed_table::Volume::new("alpha", 0, 2, 2),
+                super::super::seed_table::Volume::new("gamma", 5, 6, 1),
+                super::super::seed_table::Volume::new("beta", 40, 0, 3),
+                super::super::seed_table::Volume::new("delta", u64::MAX, 0, 1),
+            ]
+        );
+        for invalid in [
+            b"\n".as_slice(),
+            b"bad nope\n".as_slice(),
+            b"bad 18446744073709551616\n".as_slice(),
+        ] {
+            fs::write(&path, invalid).unwrap();
+            assert_eq!(
+                read_volumed_file_manifest(&path).unwrap_err(),
+                "Format error in VolumedFile"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1520,6 +1625,128 @@ mod tests {
             fs::write(&path, []).map_err(|error| error.to_string())?;
             Ok(RadixedTable(vec![Bucket::new(path, Some(0))]))
         }
+    }
+
+    #[test]
+    fn chunk_volume_workers_use_independent_inputs_and_byte_counted_members() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier, Mutex};
+        #[derive(Clone)]
+        struct Reader {
+            claims: Arc<Mutex<Vec<PathBuf>>>,
+            threads: Arc<Mutex<std::collections::HashSet<std::thread::ThreadId>>>,
+            started: Arc<AtomicUsize>,
+            first_pair: Arc<Barrier>,
+        }
+        impl SequenceVolumeReader for Reader {
+            fn fork_reader(&self) -> Option<Box<dyn SequenceVolumeReader + Send>> {
+                Some(Box::new(self.clone()))
+            }
+            fn read_volume(&mut self, _: &Path) -> Result<Vec<SeedSequence>, String> {
+                panic!("actual worker must retain its independent input owner")
+            }
+            fn visit_volume_bytes_while(
+                &mut self,
+                path: &Path,
+                should_read: &mut dyn FnMut() -> bool,
+                visitor: &mut dyn FnMut(
+                    super::super::seed_table::ByteSeedSequence,
+                ) -> Result<(), String>,
+            ) -> Result<(), String> {
+                super::super::reader::visit_volume_bytes_while_owned(
+                    path,
+                    should_read,
+                    visitor,
+                    &mut || {
+                        self.claims.lock().unwrap().push(path.to_owned());
+                        self.threads
+                            .lock()
+                            .unwrap()
+                            .insert(std::thread::current().id());
+                        // The first two real input owners must coexist. This
+                        // would block a serialized callback/input adapter.
+                        if self.started.fetch_add(1, Ordering::Relaxed) < 2 {
+                            self.first_pair.wait();
+                        }
+                        Ok(())
+                    },
+                    &Default::default(),
+                )
+            }
+        }
+        let dir = temp_dir("parallel-chunk-volumes");
+        let job = Job::new(3, 1, 1 << 20, &dir, 2).unwrap();
+        let mut database = VolumedFile::default();
+        for oid in 0..4 {
+            let path = dir.join(format!("input-{oid}.faa"));
+            let payload: &[u8] = if oid == 3 {
+                b">unused\xff\nARND\n>bad-tail\n!\n"
+            } else {
+                b">unused\xff\nARND\n"
+            };
+            fs::write(&path, payload).unwrap();
+            database.0.push(Volume::new(path, oid, oid + 1, 1));
+        }
+        let mut table_writer = super::super::storage::BucketWriter::new_owned(
+            &dir.join("chunk-table"),
+            job.worker_id(),
+            1,
+            job.io_errors(),
+        )
+        .unwrap();
+        for (oid, chunk) in [(0, 0), (0, 1), (1, 1), (2, 0), (3, 1)] {
+            let mut bytes = Vec::new();
+            ChunkTableEntry::new(oid, chunk).serialize(&mut bytes);
+            table_writer.write(0, &bytes).unwrap();
+        }
+        let table = table_writer.finish().unwrap();
+        let mut reader = Reader {
+            claims: Default::default(),
+            threads: Default::default(),
+            started: Default::default(),
+            first_pair: Arc::new(Barrier::new(2)),
+        };
+        let outputs =
+            build_chunks_with_threads(&job, &database, &table, 2, 2, &mut reader).unwrap();
+        let mut claimed = reader.claims.lock().unwrap().clone();
+        claimed.sort();
+        let mut expected: Vec<_> = database
+            .0
+            .iter()
+            .map(|volume| volume.path.clone())
+            .collect();
+        expected.sort();
+        assert_eq!(claimed, expected);
+        assert_eq!(reader.threads.lock().unwrap().len(), 2);
+        for (chunk, manifest) in outputs.iter().enumerate() {
+            let mut records = Vec::new();
+            for (path, count) in read_manifest(manifest).unwrap() {
+                let mut input = open_input(&path).unwrap();
+                let mut bytes = vec![0; count];
+                input.read_values(&mut bytes).unwrap();
+                assert_eq!(input.read_raw(&mut [0]).unwrap(), 0);
+                records.extend(
+                    bytes
+                        .split(|byte| *byte == b'>')
+                        .filter(|record| !record.is_empty())
+                        .map(|record| record.to_vec()),
+                );
+            }
+            records.sort();
+            let expected: Vec<Vec<u8>> = if chunk == 0 {
+                vec![b"0\nARND\n".to_vec(), b"2\nARND\n".to_vec()]
+            } else {
+                vec![
+                    b"0\nARND\n".to_vec(),
+                    b"1\nARND\n".to_vec(),
+                    b"3\nARND\n".to_vec(),
+                ]
+            };
+            assert_eq!(records, expected);
+        }
+        drop(table_writer);
+        drop(job);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

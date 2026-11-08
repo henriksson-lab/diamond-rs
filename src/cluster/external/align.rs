@@ -15,7 +15,7 @@ use super::storage::{BucketWriter, WorkerBucketBuffers};
 use crate::basic::statistics::Statistics;
 use crate::basic::value::Letter;
 use crate::dp::swipe::{
-    bin as swipe_bin, swipe, targets, CarryOver, DpTarget, Flags, HspValues, Params,
+    bin as swipe_bin, swipe, targets, CarryOver, DpTarget, Flags, HspValues, Params, SwipeTaskPool,
 };
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::hash::hash64;
@@ -30,6 +30,7 @@ pub struct AlignConfig {
     pub alignment_output: Option<PathBuf>,
     pub cutoff_score_8bit: i32,
     pub max_swipe_dp: i64,
+    pub swipe_task_size: i64,
     pub band_bin: i32,
     pub col_bin: i32,
     pub approx_backtrace: bool,
@@ -46,6 +47,7 @@ impl Default for AlignConfig {
             alignment_output: None,
             cutoff_score_8bit: i8::MAX as i32,
             max_swipe_dp: 1_000_000,
+            swipe_task_size: 100_000_000,
             band_bin: 24,
             col_bin: 400,
             approx_backtrace: false,
@@ -56,7 +58,7 @@ impl Default for AlignConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct ChunkSequences {
-    sequences: HashMap<u64, Vec<Letter>>,
+    sequences: HashMap<u64, Arc<[Letter]>>,
     letters: usize,
     volumes: usize,
 }
@@ -72,7 +74,7 @@ impl ChunkSequences {
             reader.visit_volume_bytes(&volume.path, &mut |sequence| {
                 let oid = parse_oid(&sequence.id);
                 letters += sequence.sequence.len();
-                sequences.insert(oid, sequence.sequence);
+                sequences.insert(oid, sequence.sequence.into());
                 Ok(())
             })?;
         }
@@ -86,8 +88,15 @@ impl ChunkSequences {
     pub fn get(&self, oid: u64) -> Result<&[Letter], String> {
         self.sequences
             .get(&oid)
-            .map(Vec::as_slice)
+            .map(AsRef::as_ref)
             .ok_or_else(|| "ChunkSeqs".to_string())
+    }
+
+    fn get_shared(&self, oid: u64) -> Result<Arc<[Letter]>, String> {
+        self.sequences
+            .get(&oid)
+            .cloned()
+            .ok_or_else(|| "ChunkSeqs".to_owned())
     }
 
     pub fn oids(&self) -> usize {
@@ -130,6 +139,28 @@ pub fn align_rep(
     alignment_output: Option<&mut dyn Write>,
     stats: &mut ClusterStats,
 ) -> Result<(), String> {
+    align_rep_with_pool(
+        chunk_sequences,
+        pairs,
+        score_matrix,
+        config,
+        output,
+        alignment_output,
+        stats,
+        None,
+    )
+}
+
+fn align_rep_with_pool(
+    chunk_sequences: &ChunkSequences,
+    pairs: &[PairEntryShort],
+    score_matrix: &ScoreMatrix,
+    config: &AlignConfig,
+    output: &mut Vec<Edge>,
+    alignment_output: Option<&mut dyn Write>,
+    stats: &mut ClusterStats,
+    pool: Option<&SwipeTaskPool>,
+) -> Result<(), String> {
     let Some(first) = pairs.first() else {
         return Ok(());
     };
@@ -153,7 +184,7 @@ pub fn align_rep(
             config.approx_backtrace,
         );
         dp_targets[bin].push_back(DpTarget::full(
-            member.to_vec(),
+            chunk_sequences.get_shared(pair.member_oid)?,
             member.len() as i32,
             index as i64,
             CarryOver::default(),
@@ -166,6 +197,8 @@ pub fn align_rep(
     params.v = HspValues::COORDS;
     params.cutoff_score_8bit = config.cutoff_score_8bit;
     params.max_swipe_dp = config.max_swipe_dp;
+    params.swipe_task_size = config.swipe_task_size;
+    params.task_pool = pool.cloned();
     params.band_bin = config.band_bin;
     params.col_bin = config.col_bin;
     params.approx_backtrace = config.approx_backtrace;
@@ -262,25 +295,7 @@ fn read_volumed_file(
     path: &Path,
     errors: &crate::util::io::IoErrorOwner,
 ) -> Result<VolumedFile, String> {
-    let bytes = fs::read(source_c_path(&(path)).as_ref()).map_err(|error| error.to_string())?;
-    let mut volumes = Vec::new();
-    for line in bytes
-        .split(|&b| b == b'\n')
-        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-    {
-        let fields = line
-            .split(u8::is_ascii_whitespace)
-            .filter(|field| !field.is_empty())
-            .collect::<Vec<_>>();
-        let records = fields
-            .last()
-            .and_then(|value| std::str::from_utf8(value).ok()?.parse::<u64>().ok())
-            .unwrap_or(0);
-        let path = errors
-            .capture(crate::util::io::source_bytes_os(fields[0]).map_err(std::io::Error::other))?;
-        volumes.push(Volume::new(PathBuf::from(path), 0, 0, records));
-    }
-    Ok(VolumedFile(volumes))
+    super::external::read_volumed_file_manifest_owned(path, errors)
 }
 
 #[cfg(test)]
@@ -444,6 +459,7 @@ struct AlignChunkOwner {
     input: Mutex<PairInput>,
     files: Arc<Mutex<BucketWriter>>,
     matrix: Arc<ScoreMatrix>,
+    pool: ThreadPool,
     config: AlignConfig,
     errors: crate::util::io::IoErrorOwner,
     failure: Arc<Mutex<Option<String>>>,
@@ -526,7 +542,12 @@ impl AlignChunkOwner {
                 end += 1;
             }
             let mut edges = Vec::new();
-            align_rep(
+            let pool = SwipeTaskPool::new(
+                self.pool.clone(),
+                self.sequences.get_shared(batch[begin].rep_oid)?,
+                Arc::clone(&self.matrix),
+            );
+            align_rep_with_pool(
                 &self.sequences,
                 &batch[begin..end],
                 &self.matrix,
@@ -534,6 +555,7 @@ impl AlignChunkOwner {
                 &mut edges,
                 alignment_output.as_mut().map(|file| file as &mut dyn Write),
                 &mut stats,
+                Some(&pool),
             )?;
             ALIGN_BUFFERS.with(|slot| {
                 let mut slot = slot.borrow_mut();
@@ -597,6 +619,7 @@ pub fn align_owned<R: SequenceVolumeReader>(
         let mut input = job.open_input(&pairs_path, crate::util::io::InputFile::NO_AUTODETECT)?;
         let total = job.io(input.file_size())? as u64;
         let failure = Arc::new(Mutex::new(None));
+        let pool = ThreadPool::default();
         let owner = Arc::new(AlignChunkOwner {
             sequences,
             input: Mutex::new(PairInput {
@@ -606,12 +629,12 @@ pub fn align_owned<R: SequenceVolumeReader>(
             }),
             files: Arc::clone(&output),
             matrix: Arc::clone(&score_matrix),
+            pool: pool.clone(),
             config: config.clone(),
             errors: job.io_errors(),
             failure,
             statistics: Mutex::new(ClusterStats::default()),
         });
-        let pool = ThreadPool::default();
         let tasks = Arc::new(TaskSet::new(&pool, 1));
         owner.enqueue(&tasks);
         pool.run(threads, true, Some(&tasks));
@@ -658,8 +681,8 @@ mod tests {
     #[test]
     fn align_rep_emits_both_unidirectional_edges_and_exact_stats() {
         let mut sequences = ChunkSequences::default();
-        sequences.sequences.insert(4, sequence("ARNDCQEGH"));
-        sequences.sequences.insert(9, sequence("ARNDCQEGH"));
+        sequences.sequences.insert(4, sequence("ARNDCQEGH").into());
+        sequences.sequences.insert(9, sequence("ARNDCQEGH").into());
         let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 1_000_000_000).unwrap();
         let config = AlignConfig {
             member_cover: 80.0,
@@ -698,8 +721,8 @@ mod tests {
     #[test]
     fn align_rep_mutual_cover_canonicalizes_oid_order() {
         let mut sequences = ChunkSequences::default();
-        sequences.sequences.insert(8, sequence("ARNDCQEGH"));
-        sequences.sequences.insert(2, sequence("ARNDCQEGH"));
+        sequences.sequences.insert(8, sequence("ARNDCQEGH").into());
+        sequences.sequences.insert(2, sequence("ARNDCQEGH").into());
         let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 1_000_000_000).unwrap();
         let config = AlignConfig {
             mutual_cover: Some(80.0),
@@ -733,8 +756,8 @@ mod tests {
         // do not distinguish equally scoring reverse endpoints.
         sequences
             .sequences
-            .insert(0, sequence("ARNDCQEGHILKMFPSTWYV"));
-        sequences.sequences.insert(1, sequence("ARNDCQEGHI"));
+            .insert(0, sequence("ARNDCQEGHILKMFPSTWYV").into());
+        sequences.sequences.insert(1, sequence("ARNDCQEGHI").into());
         let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 1_000_000_000).unwrap();
         let pairs = [PairEntryShort {
             rep_oid: 0,
@@ -768,10 +791,10 @@ mod tests {
         let mut sequences = ChunkSequences::default();
         sequences
             .sequences
-            .insert(0, sequence("AAAAAAAAAAAAAAAAAAAA"));
+            .insert(0, sequence("AAAAAAAAAAAAAAAAAAAA").into());
         sequences
             .sequences
-            .insert(1, sequence("AAAAAAAAAAAAAAAAAAAA"));
+            .insert(1, sequence("AAAAAAAAAAAAAAAAAAAA").into());
         let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 1_000_000_000).unwrap();
         let mut stats = ClusterStats::default();
         let mut edges = Vec::new();
@@ -912,6 +935,7 @@ mod tests {
             matrix,
             &AlignConfig {
                 threads: 4,
+                swipe_task_size: 1,
                 alignment_output: Some(root.join("aln")),
                 ..Default::default()
             },

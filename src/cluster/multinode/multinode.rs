@@ -11,7 +11,6 @@ use super::data::{
     SequenceSource,
 };
 use super::output::{merge, MergeConfig, MultinodeOutputJob, Volume};
-use super::source_io::{read_text, Fields};
 use crate::basic::value::{OId, AMINO_ACID_ALPHABET};
 use crate::cluster::cascaded::helpers::{
     cluster_steps, default_round_approx_id, default_round_cov,
@@ -20,6 +19,7 @@ use crate::cluster::external::external::ClusterStats;
 use crate::cluster::helpers::round_value;
 use crate::config::Sensitivity;
 use crate::masking::MaskingAlgo;
+use crate::util::io::source_text::{Fields, SourceTextInput};
 use crate::util::io::{source_c_path, IoErrorOwner};
 use crate::util::parallel::{Atomic, FileStack};
 use crate::util::sequence::seqid_bytes;
@@ -210,15 +210,18 @@ impl VolumedFile {
         errors.finish(Self::from_manifest_owned(path, &errors))
     }
     fn from_manifest_owned(path: &Path, errors: &IoErrorOwner) -> Result<Self, String> {
-        let text = read_text(path, errors, b"Error opening file ")?;
+        let mut input = SourceTextInput::open(path, errors, b"Error opening file ")?;
         let mut volumes = Vec::new();
         let mut next_oid = 0u64;
-        for line in text.lines() {
-            let mut fields = Fields::new(line);
+        while let Some(line) = input.line() {
+            let mut fields = Fields::new(&line);
             let path = fields.word().ok_or("Format error in VolumedFile")?;
             let record_count = fields.number().ok_or("Format error in VolumedFile")?;
-            let begin = fields.number().unwrap_or(0);
-            let end = fields.number().unwrap_or(0);
+            let mut begin = Some(0);
+            let mut end = Some(0);
+            fields.number_into(&mut begin);
+            fields.number_into(&mut end);
+            let (begin, end) = (begin.unwrap_or(0), end.unwrap_or(0));
             let (oid_begin, oid_end) = if begin == 0 && end == 0 {
                 (next_oid, next_oid.wrapping_add(record_count))
             } else {
@@ -530,17 +533,25 @@ fn finalize_block_combos<B: MultinodeBackend>(
     job.log_bytes(&message)?;
     let mut alignment = BufWriter::new(
         File::create(source_c_path(&alignment_path).as_ref()).map_err(|_| {
-            super::source_io::path_error(&job.errors, b"Error opening file ", &alignment_path)
+            crate::util::io::source_text::path_error(
+                &job.errors,
+                b"Error opening file ",
+                &alignment_path,
+            )
         })?,
     );
     for i in 0..n {
         for j in i..n {
             let path = base_dir.join(format!("{i}_{j}.tsv"));
             let bytes = fs::read(source_c_path(&path).as_ref()).map_err(|_| {
-                super::source_io::path_error(&job.errors, b"Error opening file ", &path)
+                crate::util::io::source_text::path_error(&job.errors, b"Error opening file ", &path)
             })?;
             alignment.write_all(&bytes).map_err(|_| {
-                super::source_io::path_error(&job.errors, b"Error writing ", &alignment_path)
+                crate::util::io::source_text::path_error(
+                    &job.errors,
+                    b"Error writing ",
+                    &alignment_path,
+                )
             })?;
         }
     }
@@ -724,42 +735,63 @@ fn write_accessions<B: SequenceSource>(
         .join("accessions")
         .join(format!("{index}.txt"));
     // Source checks the output before constructing its sequence input.
-    let mut output =
-        super::source_io::TextOutput::open(&path, &job.errors, b"Error opening file ", true)?;
-    let records = backend.read_records_bytes_with_errors(&volume.path, &job.errors)?;
-    for record in records {
+    let mut output = crate::util::io::source_text::TextOutput::open(
+        &path,
+        &job.errors,
+        b"Error opening file ",
+        true,
+    )?;
+    let mut input = backend.open_records(&volume.path, &job.errors)?;
+    while let Some(record) = input.read_record()? {
         output.write(&seqid_bytes(&record.id));
         output.endl();
     }
+    input.close()?;
     Ok(())
 }
 
 fn write_representative_ids(job: &Job, volumes: &VolumedFile, path: &Path) -> Result<(), String> {
-    let text = read_text(path, &job.errors, b"Error opening file ")?;
-    let mut per_volume = vec![String::new(); volumes.0.len()];
-    let mut all = String::new();
-    let mut fields = Fields::from_text(&text);
+    // Source does not check this ifstream or the two ofstreams. It creates
+    // their owners before extracting the first clustering record.
+    let mut fields = SourceTextInput::open_unchecked(path);
+    let mut volume = 0usize;
+    let mut output = crate::util::io::source_text::TextOutput::open_unchecked(
+        &job.base_dir().join("rep_ids0"),
+        true,
+    );
+    let mut all = crate::util::io::source_text::TextOutput::open_unchecked(
+        &job.base_dir().join("rep_ids"),
+        true,
+    );
     while let (Some(rep), Some(member)) = (fields.number(), fields.number()) {
-        if rep != member {
-            continue;
-        }
-        let volume = volumes
+        while volumes
             .0
-            .iter()
-            .position(|volume| member >= volume.oid_begin && member < volume.oid_end)
-            .ok_or_else(|| format!("Cluster member OID out of volume range: {member}"))?;
-        per_volume[volume].push_str(&format!("{rep}\n"));
-        all.push_str(&format!("{rep}\n"));
+            .get(volume)
+            .is_some_and(|entry| entry.oid_end <= member)
+        {
+            volume += 1;
+            if volume >= volumes.0.len() {
+                return Err(format!("Cluster member OID out of volume range: {member}"));
+            }
+            output = crate::util::io::source_text::TextOutput::open_unchecked(
+                &job.base_dir().join(format!("rep_ids{volume}")),
+                true,
+            );
+        }
+        if volume >= volumes.0.len() {
+            return Err(format!("Cluster member OID out of volume range: {member}"));
+        }
+        if rep == member {
+            let digits = rep.to_string();
+            output.write(digits.as_bytes());
+            output.endl();
+            all.write(digits.as_bytes());
+            all.endl();
+        }
     }
-    for (index, text) in per_volume.into_iter().enumerate() {
-        fs::write(
-            source_c_path(&job.base_dir().join(format!("rep_ids{index}"))).as_ref(),
-            text,
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    fs::write(source_c_path(&job.base_dir().join("rep_ids")).as_ref(), all)
-        .map_err(|error| error.to_string())
+    drop(output);
+    drop(all);
+    Ok(())
 }
 
 fn prepare_inputs<B: SequenceSource>(
@@ -774,14 +806,12 @@ fn prepare_inputs<B: SequenceSource>(
     let mut letters = 0_u64;
     for (index, volume) in volumes.0.iter().enumerate() {
         job.log(&format!("Indexing volume {index}/{}", volumes.0.len()))?;
-        let volume_records = backend.read_records_bytes_with_errors(&volume.path, &job.errors)?;
-        letters = letters.saturating_add(
-            volume_records
-                .iter()
-                .map(|record| record.sequence.len() as u64)
-                .sum::<u64>(),
-        );
-        records.extend(volume_records);
+        let mut input = backend.open_records(&volume.path, &job.errors)?;
+        while let Some(record) = input.read_record()? {
+            letters = letters.saturating_add(record.sequence.len() as u64);
+            records.push(record);
+        }
+        input.close()?;
     }
     let mut blocks: Vec<Vec<ByteSequenceRecord>> = vec![Vec::new()];
     let mut sizes = vec![0_u64];
@@ -889,6 +919,7 @@ fn sensitivity_from_step(step: &str) -> Result<Sensitivity, String> {
 mod tests {
     use super::*;
     use crate::basic::value::Letter;
+    use crate::util::io::source_text::expected_text;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
@@ -1086,8 +1117,8 @@ mod tests {
         let reps = run_block_combos(&job, &volumes, &config, &mut backend).unwrap();
         assert_eq!(backend.requests.len(), 3);
         assert_eq!(
-            fs::read_to_string(root.join("accessions/0.txt")).unwrap(),
-            "a0\na1\n"
+            fs::read(root.join("accessions/0.txt")).unwrap(),
+            expected_text(b"a0\na1\n")
         );
         assert_eq!(
             fs::read_to_string(job.base_dir().join("alignments.tsv")).unwrap(),
@@ -1095,7 +1126,7 @@ mod tests {
         );
         assert!(fs::read_to_string(job.base_dir().join("rep_ids"))
             .unwrap()
-            .contains("3\n"));
+            .contains(&String::from_utf8(expected_text(b"3\n")).unwrap()));
         assert!(fs::read_to_string(reps).unwrap().contains("\t2\t0\t2"));
         fs::remove_dir_all(root).unwrap();
     }
@@ -1214,7 +1245,7 @@ mod tests {
         };
         assert_eq!(multinode(&mut config, &input, &mut backend).unwrap(), 2);
         assert_eq!(config.file_buffer_size, 64 * 1024);
-        assert_eq!(fs::read_to_string(output).unwrap(), "0\t0\n1\t1\n");
+        assert_eq!(fs::read(output).unwrap(), expected_text(b"0\t0\n1\t1\n"));
         assert!(jobless_blocks(&root).len() >= 16);
         fs::remove_dir_all(root).unwrap();
     }
