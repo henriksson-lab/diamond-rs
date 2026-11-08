@@ -15,6 +15,17 @@ pub fn source_console_text(expected: &str) -> String {
     }
 }
 
+/// Source FileSink uses the actual CRT stdout on MSVC, retaining text mode
+/// even when its requested fopen mode is "wb". Other targets fdopen stdout
+/// with that binary mode. Named files and in-process Vec writers are separate.
+pub fn source_file_stdout_text(expected: &str) -> String {
+    if cfg!(all(windows, target_env = "msvc")) {
+        expected.replace('\n', "\r\n")
+    } else {
+        expected.to_owned()
+    }
+}
+
 fn age_warning() -> bool {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

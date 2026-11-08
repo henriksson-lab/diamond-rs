@@ -151,7 +151,9 @@ fn native_transcript_formats_match_upstream_for_both_search_modes() {
             );
             assert_eq!(
                 actual,
-                std::fs::read_to_string(fixtures.join("small-evalue.xml")).unwrap()
+                source_startup::source_file_stdout_text(
+                    &std::fs::read_to_string(fixtures.join("small-evalue.xml")).unwrap()
+                )
             );
         }
     }
@@ -206,8 +208,10 @@ fn unseeded_queries_are_skipped_inside_nonempty_weighted_bins() {
             "bins-query.fna"
         });
         for format in ["0", "xml", "paf"] {
-            let expected =
-                std::fs::read(fixtures.join(format!("bins.{mode}.{format}.out"))).unwrap();
+            let expected = source_startup::source_file_stdout_text(
+                &std::fs::read_to_string(fixtures.join(format!("bins.{mode}.{format}.out")))
+                    .unwrap(),
+            );
             for (threads, memory) in [("1", "16G"), ("4", "0G")] {
                 let result = Command::new(binary)
                     .arg(mode)
@@ -241,7 +245,7 @@ fn unseeded_queries_are_skipped_inside_nonempty_weighted_bins() {
                     "<BlastOutput_db>@DATABASE@</BlastOutput_db>",
                 );
                 assert!(
-                    actual.as_bytes() == expected,
+                    actual.as_bytes() == expected.as_bytes(),
                     "{mode} {format} p{threads}: bytes differ"
                 );
             }
@@ -340,7 +344,9 @@ fn translated_coverage_does_not_length_sort_equal_score_targets() {
         .unwrap();
     assert!(result.status.success());
     for format in ["xml", "paf"] {
-        let expected = std::fs::read(fixtures.join(format!("tie.{format}.out"))).unwrap();
+        let expected = source_startup::source_file_stdout_text(
+            &std::fs::read_to_string(fixtures.join(format!("tie.{format}.out"))).unwrap(),
+        );
         for (threads, memory) in [("1", "16G"), ("4", "0G")] {
             let result = Command::new(binary)
                 .args(["blastx", "-q"])
@@ -377,7 +383,7 @@ fn translated_coverage_does_not_length_sort_equal_score_targets() {
                 "<BlastOutput_db>@DATABASE@</BlastOutput_db>",
             );
             assert!(
-                actual.as_bytes() == expected,
+                actual.as_bytes() == expected.as_bytes(),
                 "{format} p{threads}: target order differs"
             );
         }

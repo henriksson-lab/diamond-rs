@@ -71,7 +71,10 @@ fn native_view_writes_text_and_seekable_daa_to_stdout() {
         "{}",
         String::from_utf8_lossy(&text.stderr)
     );
-    assert_eq!(text.stdout, b"query0\tref0\t30\n");
+    assert_eq!(
+        text.stdout,
+        source_startup::source_file_stdout_text("query0\tref0\t30\n").as_bytes()
+    );
     assert_eq!(text.stderr, source_startup::age_warning_stderr());
 
     let redirected = File::create(&daa_stdout).unwrap();
@@ -141,7 +144,10 @@ fn native_view_matches_upstream_help_and_console_verbosity_policy() {
         .output()
         .unwrap();
     assert!(stdout_default.status.success());
-    assert_eq!(stdout_default.stdout, b"query0\n");
+    assert_eq!(
+        stdout_default.stdout,
+        source_startup::source_file_stdout_text("query0\n").as_bytes()
+    );
     assert_eq!(stdout_default.stderr, source_startup::age_warning_stderr());
 
     let stdout_verbose = Command::new(env!("CARGO_BIN_EXE_diamond"))
@@ -150,7 +156,10 @@ fn native_view_matches_upstream_help_and_console_verbosity_policy() {
         .output()
         .unwrap();
     assert!(stdout_verbose.status.success());
-    assert_eq!(source_startup::stdout_body(&stdout_verbose), b"query0\n");
+    assert_eq!(
+        source_startup::stdout_body(&stdout_verbose),
+        source_startup::source_file_stdout_text("query0\n").as_bytes()
+    );
     let verbose_stderr = String::from_utf8(stdout_verbose.stderr).unwrap();
     assert!(verbose_stderr.starts_with("diamond v2.1.24.178 "));
     assert!(verbose_stderr.contains(&source_startup::source_console_text("#CPU threads: 1\n")));
