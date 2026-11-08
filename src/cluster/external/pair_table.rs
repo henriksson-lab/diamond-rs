@@ -623,89 +623,15 @@ fn read_seed_bucket(
     bucket: &Bucket,
     threads: usize,
 ) -> Result<(Vec<SeedEntry>, Vec<PathBuf>), String> {
-    let volumes =
-        super::external::read_volumed_file_manifest_owned(&bucket.path, &job.io_errors())?;
-    let count = volumes
-        .0
-        .iter()
-        .try_fold(0usize, |sum, volume| {
-            sum.checked_add(usize::try_from(volume.record_count).ok()?)
-        })
-        .ok_or("Seed InputBuffer size overflow.")?;
-    let mut entries = Vec::new();
-    entries.try_reserve_exact(count).map_err(|error| {
-        job.capture_io::<()>(Err(std::io::Error::other(crate::util::io::BadAllocError(
-            error.to_string(),
-        ))))
-        .unwrap_err()
-    })?;
-    entries.resize(count, SeedEntry::default());
-    // Split by physical destination order, then restore Source's volume queue
-    // order. Manifest enumeration need not be ordered by OID range.
-    let mut order: Vec<usize> = (0..volumes.0.len()).collect();
-    order.sort_by_key(|&index| volumes.0[index].oid_begin);
-    let mut tail = entries.as_mut_slice();
-    let mut cursor = 0usize;
-    let mut destinations = Vec::with_capacity(volumes.0.len());
-    for index in order {
-        let volume = &volumes.0[index];
-        let begin = usize::try_from(volume.oid_begin).map_err(|error| error.to_string())?;
-        let count = usize::try_from(volume.record_count).map_err(|error| error.to_string())?;
-        if begin < cursor || begin - cursor > tail.len() || count > tail.len() - (begin - cursor) {
-            return Err(
-                "Source InputBuffer volume ranges overlap or exceed its allocated record domain."
-                    .to_owned(),
-            );
-        }
-        let (_, remaining) = tail.split_at_mut(begin - cursor);
-        let (destination, remaining) = remaining.split_at_mut(count);
-        tail = remaining;
-        cursor = begin + count;
-        destinations.push((index, &volume.path, destination));
-    }
-    destinations.sort_by_key(|(index, _, _)| *index);
-    let destinations = destinations
-        .into_iter()
-        .map(|(_, path, destination)| (path, destination));
-    let pending = Mutex::new(destinations);
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    let error = Mutex::new(None);
-    std::thread::scope(|scope| {
-        for _ in 0..threads.min(volumes.0.len()) {
-            scope.spawn(|| {
-                while !stop.load(ThreadOrdering::Relaxed) {
-                    let Some((path, destination)) = pending.lock().unwrap().next() else {
-                        break;
-                    };
-                    let result = (|| {
-                        let mut input = job.open_input(path, 0)?;
-                        for entry in destination {
-                            *entry = SeedEntry {
-                                seed: job.io(input.read_u64())?,
-                                oid: job.io(input.read_i64())?,
-                                len: job.io(input.read_i32())?,
-                            };
-                        }
-                        job.io(input.close())?;
-                        Ok::<_, String>(())
-                    })();
-                    if let Err(message) = result {
-                        error.lock().unwrap().get_or_insert(message);
-                        stop.store(true, ThreadOrdering::Relaxed);
-                        break;
-                    }
-                }
-            });
-        }
-    });
-    drop(pending); // Release borrowed destination slices before returning their owner.
-    if let Some(error) = error.into_inner().unwrap() {
-        return Err(error);
-    }
-    Ok((
-        entries,
-        volumes.0.into_iter().map(|volume| volume.path).collect(),
-    ))
+    let (entries, storage) =
+        super::external::read_pod_input_buffer(job, bucket, threads, 20, |_, bytes| {
+            Ok(SeedEntry {
+                seed: u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+                oid: i64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
+                len: i32::from_ne_bytes(bytes[16..20].try_into().unwrap()),
+            })
+        })?;
+    Ok((entries, storage.into_iter().map(|(path, _)| path).collect()))
 }
 
 #[cfg(test)]
@@ -729,6 +655,33 @@ mod tests {
         let mut pairs: Vec<_> = output.pairs.iter().flatten().copied().collect();
         pairs.sort_unstable();
         pairs
+    }
+
+    #[test]
+    fn seed_input_preserves_source_partial_pod_and_zero_tail() {
+        let root = temp_dir("short_seed_input");
+        let job = Job::new(2, 1, 1024, root.join("job"), 0).unwrap();
+        let path = root.join("volume");
+        let manifest = root.join("input.tsv");
+        fs::write(
+            &manifest,
+            super::super::storage::manifest_line(&path, &[3]).unwrap(),
+        )
+        .unwrap();
+        let payload = (1..=29).collect::<Vec<u8>>();
+        fs::write(&path, &payload).unwrap();
+        let (entries, _) = read_seed_bucket(&job, &Bucket::new(&manifest, None), 2).unwrap();
+        let mut actual = Vec::new();
+        for entry in entries {
+            actual.extend_from_slice(&entry.seed.to_ne_bytes());
+            actual.extend_from_slice(&entry.oid.to_ne_bytes());
+            actual.extend_from_slice(&entry.len.to_ne_bytes());
+        }
+        let mut expected = vec![0; 60];
+        expected[..payload.len()].copy_from_slice(&payload);
+        assert_eq!(actual, expected);
+        drop(job);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

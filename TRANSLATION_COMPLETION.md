@@ -2533,3 +2533,43 @@ A Source closure race can occur when one part compresses a link another reads;
 Rust must use a real safe shared mapping owner, not unsafe aliases or a stale
 snapshot. This qualifies those race schedules, not all multithreaded inputs.
 Full translation and final parity remain open.
+
+
+## External clustering workers and Source POD EOF checkpoint (2026-11-08)
+
+Frozen package `da7c86366c2839e1546810aefa1ff6c655ece82c6fe0f00b799feb8d3f2df74f`
+passes isolated default, dna/mcl/zstd and Windows GNU all-target checks plus 83
+external tests. Actual Edge loading and sorting, per-member assignment workers,
+assignment-volume reads and closure compression use configured workers. The
+canonical mapping is one shared AtomicU64 vector initialized from identity;
+valid forest roots are compressed in place without unsafe mutable aliases or
+an obsolete snapshot. Source's cross-partition non-atomic compression race stays
+explicitly qualified; bidirectional degree/assignment loops remain serial.
+Assignment input consumes complete 16-byte records to EOF, ignoring declared
+counts and a final partial record just as Source does.
+
+The shared POD input owner now preserves Source's zero-filled unconsumed records
+and actual partial-record bytes when bulk input ends early, propagating real
+read/close failures. Pair 24 / Chunk 12 / Edge 24 / Seed 20 layouts decode native-endian
+bytes through bounded per-worker scratch; there is no second whole packed-input
+copy. Source hash-key partition boundaries and per-worker BufferArray lifetimes
+are retained. New controls exercise partial inputs, cross-partition chains,
+incorrect assignment manifest counts and member groups crossing nominal parts.
+
+A subsequent one-file realign correction uses startup's resolved thread count;
+omitted/-p0 no longer adopts RAYON_NUM_THREADS over Source hardware concurrency.
+Package `0132764a620e5c424e034bd63ffcb37d7d5f670971a07907bcb4f192808fc437`
+passes default all-target compilation and three existing realign integration
+controls. The earlier three-profile/83-test result precedes only this small
+thread-budget substitution. Current production/test inputs match that final
+frozen package exactly. Runtime/platform/upstream gates remain open.
+
+The immutable `8965365` release passes all 24 defined checks across the three
+natural controls; all 17 directory-mode differences are closed in each case.
+Remaining raw differences are classified thread file/row ordering, elapsed
+log time and old legacy work-root paths. All three constructor controls also
+match status 1, raw stdout/stderr and every artifact exactly against Source.
+No Source reruns occurred. Evidence: `external-parallel-controls/captures/8965365-first/recovery.json`
+and `external-mkdir-controls/native-8965365/comparison.json`. Those release
+proofs precede this new clustering/POD/realign code; fresh Native comparisons
+and broader final-snapshot command/profile coverage still remain necessary.

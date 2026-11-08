@@ -43,7 +43,11 @@ not known failures unless the text explicitly says otherwise.
   remain different in c3ea396; the subsequent mkdir/log package passes three
   compile profiles and 79 focused tests but awaits new-release comparisons.
   External Edge loading/sort, assignment workers/EOF and closure compression
-  remain concrete code work. Full artifact parity is not established.
+  now pass three compile profiles and 83 focused tests. Realign default-thread
+  follow-up passes default compilation and three integration controls. The
+  earlier 8965365 release closes all 17 directory modes and all three constructor
+  controls; the new clustering/POD release still needs upstream comparisons.
+  Broader final-snapshot parity and full artifact qualification remain open.
 - Hosted CI verification, the Source-shared two-worker hazard, and final parity
   gates remain open. No complete-translation claim applies.
 

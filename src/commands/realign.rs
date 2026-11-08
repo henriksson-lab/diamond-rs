@@ -312,7 +312,9 @@ pub(crate) fn run_with_startup_os(
             ))?;
         let qoffset = *qoffset.borrow() as u64;
         let soffset = *soffset.borrow() as u64;
-        let threads = *threads.borrow();
+        // Source resolves omitted/-p0 to hardware_concurrency before this
+        // workflow; do not let RAYON_NUM_THREADS replace that resolved budget.
+        let threads = startup.config.threads;
         let mut pool = rayon::ThreadPoolBuilder::new();
         if threads > 0 {
             pool = pool.num_threads(threads as usize);

@@ -1095,15 +1095,16 @@ fn write_chunk_volume<R: SequenceVolumeReader + ?Sized>(
 /// Source POD InputBuffer: allocate one record domain and let each worker
 /// retain an InputFile while filling its volume's declared OID range. Scoped
 /// disjoint slices avoid shared mutable aliases and full-volume staging copies.
-fn read_pod_input_buffer<T, F>(
+pub(crate) fn read_pod_input_buffer<T, F>(
     job: &Job,
     bucket: &Bucket,
     threads: usize,
+    record_size: usize,
     decode: F,
 ) -> Result<(Vec<T>, Vec<(PathBuf, usize)>), String>
 where
     T: Default + Clone + Send,
-    F: Fn(&Job, &mut InputFile) -> Result<T, String> + Sync,
+    F: Fn(&Job, &[u8]) -> Result<T, String> + Sync,
 {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -1163,8 +1164,24 @@ where
                     };
                     let result = (|| {
                         let mut input = job.open_input(path, 0)?;
+                        // Source reads into the already zero-initialized POD
+                        // domain and ignores its returned complete-record count.
+                        // Retain a trailing partial record and untouched zero
+                        // records without staging another packed volume buffer.
+                        let mut bytes = vec![0u8; record_size];
                         for entry in destination {
-                            *entry = decode(job, &mut input)?;
+                            let read = job.io(input.read_raw(&mut bytes))?;
+                            if read == 0 {
+                                break;
+                            }
+                            // Earlier reads reused the scratch record. Bytes
+                            // not overwritten now belong to the destination's
+                            // initial zero value, not the previous record.
+                            bytes[read..].fill(0);
+                            *entry = decode(job, &bytes)?;
+                            if read < record_size {
+                                break;
+                            }
                         }
                         job.io(input.close())?;
                         Ok::<_, String>(())
@@ -1203,7 +1220,10 @@ where
     ))
 }
 
-fn sort_input_buffer<T: Ord + Send>(entries: &mut [T], threads: usize) -> Result<(), String> {
+pub(crate) fn sort_input_buffer<T: Ord + Send>(
+    entries: &mut [T],
+    threads: usize,
+) -> Result<(), String> {
     use rayon::prelude::*;
     if threads > 1 {
         rayon::ThreadPoolBuilder::new()
@@ -1222,12 +1242,12 @@ fn read_pair_bucket(
     bucket: &Bucket,
     threads: usize,
 ) -> Result<(Vec<PairEntry>, Vec<(PathBuf, usize)>), String> {
-    read_pod_input_buffer(job, bucket, threads, |job, input| {
+    read_pod_input_buffer(job, bucket, threads, 24, |_, bytes| {
         Ok(PairEntry {
-            rep_oid: job.io(input.read_u64())?,
-            member_oid: job.io(input.read_u64())?,
-            rep_len: job.io(input.read_u32())?,
-            member_len: job.io(input.read_u32())?,
+            rep_oid: u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+            member_oid: u64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
+            rep_len: u32::from_ne_bytes(bytes[16..20].try_into().unwrap()),
+            member_len: u32::from_ne_bytes(bytes[20..24].try_into().unwrap()),
         })
     })
 }
@@ -1237,10 +1257,25 @@ fn read_chunk_table_bucket(
     bucket: &Bucket,
     threads: usize,
 ) -> Result<(Vec<ChunkTableEntry>, Vec<(PathBuf, usize)>), String> {
-    read_pod_input_buffer(job, bucket, threads, |job, input| {
+    read_pod_input_buffer(job, bucket, threads, 12, |_, bytes| {
         Ok(ChunkTableEntry {
-            oid: job.io(input.read_u64())?,
-            chunk: job.io(input.read_i32())?,
+            oid: u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+            chunk: i32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
+        })
+    })
+}
+
+pub(crate) fn read_edge_bucket(
+    job: &Job,
+    bucket: &Bucket,
+    threads: usize,
+) -> Result<(Vec<Edge>, Vec<(PathBuf, usize)>), String> {
+    read_pod_input_buffer(job, bucket, threads, 24, |_, bytes| {
+        Ok(Edge {
+            rep_oid: u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+            member_oid: u64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
+            rep_len: u32::from_ne_bytes(bytes[16..20].try_into().unwrap()),
+            member_len: u32::from_ne_bytes(bytes[20..24].try_into().unwrap()),
         })
     })
 }
@@ -1692,7 +1727,7 @@ mod tests {
         fs::write(&manifest, rows).unwrap();
         let gate = (Mutex::new(0usize), Condvar::new());
         let (mut entries, storage) =
-            read_pod_input_buffer(&job, &Bucket::new(&manifest, None), 2, |job, input| {
+            read_pod_input_buffer(&job, &Bucket::new(&manifest, None), 2, 12, |_, bytes| {
                 let mut arrived = gate.0.lock().unwrap();
                 *arrived += 1;
                 gate.1.notify_all();
@@ -1709,8 +1744,8 @@ mod tests {
                 }
                 drop(arrived);
                 Ok(ChunkTableEntry {
-                    oid: job.io(input.read_u64())?,
-                    chunk: job.io(input.read_i32())?,
+                    oid: u64::from_ne_bytes(bytes[..8].try_into().unwrap()),
+                    chunk: i32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
                 })
             })
             .unwrap();
@@ -1718,6 +1753,36 @@ mod tests {
         assert_eq!(storage, [(paths[0].clone(), 1), (paths[1].clone(), 1)]);
         sort_input_buffer(&mut entries, 2).unwrap();
         assert_eq!(entries, [second, first]);
+        drop(job);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pod_edge_input_preserves_source_partial_bytes_and_zero_record_tail() {
+        let dir = temp_dir("short-pod-input");
+        let job = Job::new(3, 1, 1024, &dir, 0).unwrap();
+        let path = dir.join("volume");
+        let manifest = dir.join("input.tsv");
+        fs::write(
+            &manifest,
+            super::super::storage::manifest_line(&path, &[3]).unwrap(),
+        )
+        .unwrap();
+        for length in [0, 1, 24, 33, 72] {
+            let payload = (0..length).map(|i| (i + 1) as u8).collect::<Vec<_>>();
+            fs::write(&path, &payload).unwrap();
+            let (entries, _) = read_edge_bucket(&job, &Bucket::new(&manifest, None), 2).unwrap();
+            let mut actual = Vec::new();
+            for edge in entries {
+                actual.extend_from_slice(&edge.rep_oid.to_ne_bytes());
+                actual.extend_from_slice(&edge.member_oid.to_ne_bytes());
+                actual.extend_from_slice(&edge.rep_len.to_ne_bytes());
+                actual.extend_from_slice(&edge.member_len.to_ne_bytes());
+            }
+            let mut expected = vec![0; 72];
+            expected[..length].copy_from_slice(&payload);
+            assert_eq!(actual, expected, "physical bytes={length}");
+        }
         drop(job);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1737,6 +1802,7 @@ mod tests {
             &job,
             &Bucket::new(&manifest, None),
             2,
+            12,
             |_, _| Err("overlapping domains must be rejected before file reads".to_owned()),
         );
         assert_eq!(
