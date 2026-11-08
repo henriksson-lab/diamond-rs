@@ -56,10 +56,82 @@ impl Default for AlignConfig {
     }
 }
 
+#[derive(Debug)]
+struct ChunkRecord {
+    // Retain the actual loaded title owner along with its sequence payload.
+    _title: Vec<u8>,
+    sequence: Arc<[Letter]>,
+}
+#[derive(Debug)]
+struct ChunkVolume {
+    records: Vec<ChunkRecord>,
+    oid_to_record: HashMap<i64, usize>,
+    min_oid: i64,
+    max_oid: i64,
+}
+#[derive(Debug)]
+struct ChunkStorage {
+    manifest: PathBuf,
+    volumes: Vec<PathBuf>,
+}
+#[derive(Debug)]
+struct LoadedChunkSequences {
+    blocks: Vec<ChunkVolume>,
+    threads: usize,
+    cleanup: Option<ChunkStorage>,
+    source_destructor: bool,
+}
+impl Drop for LoadedChunkSequences {
+    fn drop(&mut self) {
+        let workers = self.threads.min(self.blocks.len());
+        let blocks = Mutex::new(std::mem::take(&mut self.blocks).into_iter());
+        // Source deletes each real Block and its OID map in bounded workers,
+        // then removes the VolumedFile. No global payload map survives this.
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let blocks = &blocks;
+                let spawn = std::thread::Builder::new().spawn_scoped(scope, move || loop {
+                    let Some(block) = blocks.lock().unwrap().next() else {
+                        break;
+                    };
+                    let ChunkVolume {
+                        records,
+                        oid_to_record,
+                        ..
+                    } = block;
+                    drop(records);
+                    drop(oid_to_record);
+                });
+                if spawn.is_err() && self.source_destructor {
+                    // A std::thread construction failure in Source's noexcept
+                    // destructor invokes its abort-only terminate handler.
+                    crate::util::io::abort_source_process();
+                }
+            }
+        });
+        // A reusable library destructor cannot throw; finish any remaining
+        // payloads locally if its deletion-worker creation failed.
+        drop(blocks);
+        if let Some(storage) = &self.cleanup {
+            for path in &storage.volumes {
+                let _ = fs::remove_file(source_c_path(path).as_ref());
+            }
+            let _ = fs::remove_file(source_c_path(&storage.manifest).as_ref());
+            if let Some(directory) = storage.manifest.parent() {
+                let _ = fs::remove_dir(source_c_path(directory).as_ref());
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChunkSequences {
+    // Explicit in-memory library fixtures retain their former convenience
+    // representation. Canonical file owners leave this map empty.
     sequences: HashMap<u64, Arc<[Letter]>>,
+    loaded: Option<Arc<LoadedChunkSequences>>,
     letters: usize,
+    oids: usize,
     volumes: usize,
 }
 
@@ -68,48 +140,179 @@ impl ChunkSequences {
         volumes: &VolumedFile,
         reader: &mut R,
     ) -> Result<Self, String> {
-        let mut sequences = HashMap::new();
-        let mut letters = 0usize;
-        for volume in &volumes.0 {
-            reader.visit_volume_bytes(&volume.path, &mut |sequence| {
-                let oid = parse_oid(&sequence.id);
-                letters += sequence.sequence.len();
-                sequences.insert(oid, sequence.sequence.into());
-                Ok(())
-            })?;
+        Self::load(volumes, reader, 1, None, Default::default())
+    }
+
+    fn from_manifest<R: SequenceVolumeReader>(
+        path: &Path,
+        reader: &mut R,
+        threads: usize,
+        errors: crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
+        let volumes = read_volumed_file(path, &errors)?;
+        let cleanup = ChunkStorage {
+            manifest: path.to_path_buf(),
+            volumes: volumes.0.iter().map(|volume| volume.path.clone()).collect(),
+        };
+        Self::load(&volumes, reader, threads, Some(cleanup), errors)
+    }
+
+    fn load<R: SequenceVolumeReader>(
+        volumes: &VolumedFile,
+        reader: &mut R,
+        threads: usize,
+        cleanup: Option<ChunkStorage>,
+        errors: crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
+        let mut blocks = Vec::with_capacity(volumes.0.len());
+        if !volumes.0.is_empty() {
+            if let Some(first_reader) = reader.fork_reader() {
+                let slots: Arc<Vec<Mutex<Option<ChunkVolume>>>> =
+                    Arc::new((0..volumes.0.len()).map(|_| Mutex::new(None)).collect());
+                let paths: Arc<Vec<PathBuf>> =
+                    Arc::new(volumes.0.iter().map(|volume| volume.path.clone()).collect());
+                let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut first_reader = Some(first_reader);
+                let mut pool = crate::util::parallel::SimpleThreadPool::new();
+                for _ in 0..threads.min(paths.len()) {
+                    let mut input = first_reader
+                        .take()
+                        .or_else(|| reader.fork_reader())
+                        .ok_or("Chunk reader factory became unavailable.")?;
+                    let slots = Arc::clone(&slots);
+                    let paths = Arc::clone(&paths);
+                    let next = Arc::clone(&next);
+                    let errors = errors.clone();
+                    pool.spawn(move |stop| {
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(path) = paths.get(index) else {
+                                break;
+                            };
+                            match load_chunk_volume(path, input.as_mut()) {
+                                Ok(block) => *slots[index].lock().unwrap() = Some(block),
+                                Err(message) => {
+                                    if errors.source_destructors() {
+                                        // Source ChunkSeqs uses plain std::thread:
+                                        // an input/Block exception terminates the
+                                        // process, rather than reaching main.
+                                        let error = errors.finish::<()>(Err(message)).unwrap_err();
+                                        if let Err(error) =
+                                            crate::util::io::emit_source_perror(&error)
+                                        {
+                                            crate::util::io::abort_source_diagnostic_error(&error);
+                                        }
+                                        crate::util::io::abort_source_process();
+                                    }
+                                    return Err(message);
+                                }
+                            }
+                        }
+                        Ok(())
+                    });
+                }
+                pool.join_all()?;
+                for slot in slots.iter() {
+                    blocks.push(
+                        slot.lock()
+                            .unwrap()
+                            .take()
+                            .ok_or("Chunk volume was not loaded.")?,
+                    );
+                }
+            } else {
+                // Explicit legacy adapters without independent cursor factories
+                // remain fallible and serial; actual CLI readers fork above.
+                for volume in &volumes.0 {
+                    blocks.push(load_chunk_volume(&volume.path, reader)?);
+                }
+            }
         }
+        let oids = blocks.iter().map(|block| block.records.len()).sum();
+        let letters = blocks
+            .iter()
+            .flat_map(|block| &block.records)
+            .map(|record| record.sequence.len())
+            .sum();
+        // Attach filesystem destruction ONLY after every actual volume has
+        // loaded successfully. A failing Source constructor never removes it.
         Ok(Self {
-            sequences,
+            sequences: HashMap::new(),
+            loaded: Some(Arc::new(LoadedChunkSequences {
+                blocks,
+                threads,
+                cleanup,
+                source_destructor: errors.source_destructors(),
+            })),
             letters,
+            oids,
             volumes: volumes.0.len(),
         })
     }
 
-    pub fn get(&self, oid: u64) -> Result<&[Letter], String> {
+    fn record(&self, oid: u64) -> Result<&Arc<[Letter]>, String> {
+        if let Some(loaded) = &self.loaded {
+            let signed = oid as i64;
+            for block in &loaded.blocks {
+                if signed < block.min_oid || signed > block.max_oid {
+                    continue;
+                }
+                if let Some(index) = block.oid_to_record.get(&signed) {
+                    return Ok(&block.records[*index].sequence);
+                }
+            }
+            return Err("ChunkSeqs".into());
+        }
         self.sequences
             .get(&oid)
-            .map(AsRef::as_ref)
-            .ok_or_else(|| "ChunkSeqs".to_string())
-    }
-
-    fn get_shared(&self, oid: u64) -> Result<Arc<[Letter]>, String> {
-        self.sequences
-            .get(&oid)
-            .cloned()
             .ok_or_else(|| "ChunkSeqs".to_owned())
     }
-
-    pub fn oids(&self) -> usize {
-        self.sequences.len()
+    pub fn get(&self, oid: u64) -> Result<&[Letter], String> {
+        self.record(oid).map(AsRef::as_ref)
     }
-
+    fn get_shared(&self, oid: u64) -> Result<Arc<[Letter]>, String> {
+        self.record(oid).cloned()
+    }
+    pub fn oids(&self) -> usize {
+        if self.loaded.is_some() {
+            self.oids
+        } else {
+            self.sequences.len()
+        }
+    }
     pub fn letters(&self) -> usize {
         self.letters
     }
-
     pub fn volumes(&self) -> usize {
         self.volumes
     }
+}
+
+fn load_chunk_volume(
+    path: &Path,
+    reader: &mut dyn SequenceVolumeReader,
+) -> Result<ChunkVolume, String> {
+    let mut records = Vec::new();
+    let mut oid_to_record = HashMap::new();
+    let mut min_oid = i64::MAX;
+    let mut max_oid = i64::MIN;
+    reader.visit_volume_bytes(path, &mut |record| {
+        let oid = parse_oid(&record.id) as i64;
+        min_oid = min_oid.min(oid);
+        max_oid = max_oid.max(oid);
+        oid_to_record.insert(oid, records.len());
+        records.push(ChunkRecord {
+            _title: record.id,
+            sequence: record.sequence.into(),
+        });
+        Ok(())
+    })?;
+    Ok(ChunkVolume {
+        records,
+        oid_to_record,
+        min_oid,
+        max_oid,
+    })
 }
 
 fn parse_oid(id: &[u8]) -> u64 {
@@ -605,8 +808,12 @@ pub fn align_owned<R: SequenceVolumeReader>(
             break;
         }
         let chunk_path = chunks_path.join(chunk.to_string());
-        let volumes = read_volumed_file(&chunk_path.join("bucket.tsv"), &job.io_errors())?;
-        let sequences = ChunkSequences::from_volumes(&volumes, reader)?;
+        let sequences = ChunkSequences::from_manifest(
+            &chunk_path.join("bucket.tsv"),
+            reader,
+            config.threads,
+            job.io_errors(),
+        )?;
         job.log(&format!(
             "Computing alignments. Chunk={}/{} Volumes={} Sequences={} Letters={}",
             chunk + 1,
@@ -858,6 +1065,108 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RealVolumeReader {
+        errors: crate::util::io::IoErrorOwner,
+    }
+    impl SequenceVolumeReader for RealVolumeReader {
+        fn fork_reader(&self) -> Option<Box<dyn SequenceVolumeReader + Send>> {
+            Some(Box::new(self.clone()))
+        }
+        fn read_volume(&mut self, path: &Path) -> Result<Vec<SeedSequence>, String> {
+            let mut records = Vec::new();
+            self.visit_volume_bytes(path, &mut |record| {
+                records.push(SeedSequence {
+                    id: String::from_utf8(record.id).map_err(|e| e.to_string())?,
+                    sequence: record.sequence,
+                });
+                Ok(())
+            })?;
+            Ok(records)
+        }
+        fn visit_volume_bytes(
+            &mut self,
+            path: &Path,
+            visit: &mut dyn FnMut(super::super::seed_table::ByteSeedSequence) -> Result<(), String>,
+        ) -> Result<(), String> {
+            super::super::reader::visit_volume_bytes_owned(
+                path,
+                visit,
+                &mut || Ok(()),
+                &self.errors,
+            )
+        }
+    }
+
+    #[test]
+    fn constructed_chunk_owner_cleans_only_after_last_clone_and_payload_release() {
+        let root = std::env::temp_dir().join(format!(
+            "diamond-chunk-owner-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("0.faa");
+        let second = root.join("1.faa");
+        fs::write(&first, b">4 first\nARNDCQEGH\n").unwrap();
+        fs::write(&second, b">9 second\nARNDCQEGH\n").unwrap();
+        let manifest = root.join("bucket.tsv");
+        let mut rows = super::super::storage::manifest_line(&first, &[1]).unwrap();
+        rows.extend(super::super::storage::manifest_line(&second, &[1]).unwrap());
+        fs::write(&manifest, rows).unwrap();
+        let errors = crate::util::io::IoErrorOwner::default();
+        let mut reader = RealVolumeReader {
+            errors: errors.clone(),
+        };
+        let owner = ChunkSequences::from_manifest(&manifest, &mut reader, 4, errors).unwrap();
+        assert!(
+            owner.sequences.is_empty(),
+            "no global map retains canonical payloads"
+        );
+        assert_eq!(owner.loaded.as_ref().unwrap().blocks.len(), 2);
+        assert_eq!(owner.oids(), 2);
+        let weak = Arc::downgrade(owner.record(4).unwrap());
+        let last = owner.clone();
+        drop(owner);
+        assert!(first.exists() && second.exists() && manifest.exists());
+        assert!(weak.upgrade().is_some());
+        drop(last);
+        assert!(weak.upgrade().is_none());
+        assert!(
+            !root.exists(),
+            "per-volume payload owners die before cache files and directory removal"
+        );
+    }
+
+    #[test]
+    fn failed_chunk_constructor_retains_manifest_and_original_volumes() {
+        let root = std::env::temp_dir().join(format!(
+            "diamond-chunk-ctor-error-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let first = root.join("0.faa");
+        let missing = root.join("missing.faa");
+        fs::write(&first, b">4 first\nARNDCQEGH\n").unwrap();
+        let manifest = root.join("bucket.tsv");
+        let mut rows = super::super::storage::manifest_line(&first, &[1]).unwrap();
+        rows.extend(super::super::storage::manifest_line(&missing, &[1]).unwrap());
+        fs::write(&manifest, rows).unwrap();
+        let errors = crate::util::io::IoErrorOwner::default();
+        let mut reader = RealVolumeReader {
+            errors: errors.clone(),
+        };
+        let result = ChunkSequences::from_manifest(&manifest, &mut reader, 4, errors.clone());
+        let error = errors.finish(result).unwrap_err();
+        assert_eq!(
+            crate::util::io::file_open_error::find(&error).unwrap().path,
+            missing
+        );
+        assert!(first.exists() && manifest.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn chunk_sequence_oid_uses_raw_c_numeric_prefix() {
         assert_eq!(parse_oid(b" +42\xff trailing"), 42);
@@ -877,7 +1186,11 @@ mod tests {
         let job = Job::new(10, 1, 1 << 20, &root, 3).unwrap();
         let chunk = job.base_dir(None).join("chunks/0");
         fs::create_dir_all(&chunk).unwrap();
-        fs::write(chunk.join("bucket.tsv"), "fixture.fa\t2\n").unwrap();
+        fs::write(
+            chunk.join("bucket.tsv"),
+            super::super::storage::manifest_line(&chunk.join("fixture.fa"), &[2]).unwrap(),
+        )
+        .unwrap();
         fs::write(chunk.join("pairs"), []).unwrap();
         let matrix = Arc::new(ScoreMatrix::new("blosum62", 11, 1, 0, 1, 1_000_000_000).unwrap());
         let (_, stats) = align_owned(
@@ -919,7 +1232,11 @@ mod tests {
         let job = Job::new(10, 1, 1 << 20, &root, 3).unwrap();
         let chunk = job.base_dir(None).join("chunks/0");
         fs::create_dir_all(&chunk).unwrap();
-        fs::write(chunk.join("bucket.tsv"), "fixture.fa\t2\n").unwrap();
+        fs::write(
+            chunk.join("bucket.tsv"),
+            super::super::storage::manifest_line(&chunk.join("fixture.fa"), &[2]).unwrap(),
+        )
+        .unwrap();
         let mut pairs = Vec::new();
         for _ in 0..32 {
             pairs.extend_from_slice(&1usize.to_ne_bytes());
@@ -980,7 +1297,11 @@ mod tests {
         let job = Job::new(10, 1, 1 << 20, &root, 3).unwrap();
         let chunk = job.base_dir(None).join("chunks/0");
         fs::create_dir_all(&chunk).unwrap();
-        fs::write(chunk.join("bucket.tsv"), "fixture.fa\t2\n").unwrap();
+        fs::write(
+            chunk.join("bucket.tsv"),
+            super::super::storage::manifest_line(&chunk.join("fixture.fa"), &[2]).unwrap(),
+        )
+        .unwrap();
         let mut pairs = Vec::new();
         pairs.extend_from_slice(&1usize.to_ne_bytes());
         pairs.extend_from_slice(&4u64.to_ne_bytes());

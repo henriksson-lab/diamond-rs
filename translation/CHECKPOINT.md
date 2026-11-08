@@ -1,18 +1,32 @@
 # Translation checkpoint — 2026-11-08
 
-This is an in-progress checkpoint committed at the user’s request. The full translation/parity goal remains open.
+The full native translation/parity goal is active and unachieved. Production
+command dispatch is Rust; the C++ oracle requires an explicit default-off `ffi`
+feature and explicit selection. The adjacent Source tree stays immutable.
 
-Production dispatch uses Rust; the C++ conformance oracle is available only behind the explicit, default-off `ffi` feature. Native command integration, raw sequence-title/taxonomy handling, Source I/O behavior, and macOS CI configuration are included in this checkpoint.
+Latest committed code: `d4fac90`. Its frozen backend/storage batch passes three
+compile profiles and 112 focused tests. The subsequent formatter-only package
+passes default compilation and 51 scoped tests. These are named snapshot checks,
+not proof of final parity.
 
-The current atomic migration of OS arguments, paths, byte-valued options, and their CLI/library callers has **not been compiled or tested as a combined snapshot**. Individual edited batches passed formatting and whitespace checks. Earlier validation recorded in the completion/progress documents applies to its named snapshots, not automatically to this checkpoint. macOS CI has not yet run on a hosted runner.
+The immutable `d4fac90` release matches three natural 9,704-record, two-round
+OID-output controls at one/four threads against pinned Source: exact mapping,
+raw streams, alignment row multiset and stage counters. All cases use one
+cross-process worker. Full artifact comparison found chunk cleanup,
+representative-worker and literal-path gaps; their fixes and bounded parallel
+blocked/accession output are now being translated in the worktree. The combined frozen package now passes default/optional/Windows compilation
+and 101 focused tests; its new release parity remains pending. Source comparison proofs are
+retained under `.tmp/native-post-translation-20261107/external-parallel-controls/`.
 
-Next work: finish central search caller and test-fixture integration, compile the combined batch, then verify remaining parity and platform gaps. The external two-worker scheduling case remains unresolved. Other Source undefined-behavior and unavailable-platform qualifications remain documented in GAPS.md and TRANSLATION_COMPLETION.md.
+Latest hosted run 42478857080 still tests `81214dc`: six of seven jobs passed,
+including both macOS hosts. Its eight Windows text expectations are fixed in
+local commit `894bfbb`; hosted verification awaits a push. Final-snapshot
+integration/profile/platform/RSS checks, broader upstream parity and Source's
+shared two-cross-process-worker scheduling hazard remain open.
 
-Build outputs, temporary validation workspaces, runtime logs, and the adjacent immutable C++ source checkout are excluded from this commit.
-
-The user paused the broader translation goal on 2026-11-08 and prioritized the
-CI/CLI fixes. Current verification processes and all earlier Source captures
-are retained; the pause is not a completion claim.
+Build products, temporary captures, runtime logs and the immutable C++ checkout
+are excluded from commits. The entries below retain earlier checkpoint scopes;
+later evidence supersedes their historical pause or incomplete-batch status.
 
 CI repair follow-through (2026-11-08): addressed failures from hosted runs
 42464375688 and 42466492609. Internal cluster/reassign searches now validate the
@@ -145,3 +159,32 @@ passes default all-target compilation and 51 focused tests (22 multinode,
 29 formatter). Workspace production/test inputs still match that frozen package
 exactly. The previous three-profile package remains the evidence for optional
 and Windows compilation before this small common-formatter substitution.
+
+
+Combined parallel/ownership checkpoint (2026-11-08): frozen package
+`c2d5604704f484c6efb3baa2968ca04ab8752d19679212cb02f82bd67f3095ce`
+passes isolated default, dna/mcl/zstd and Windows GNU all-target compilation.
+All 101 selected tests pass: external77, join11, fetched-renderer1,
+worker-exit2, native blocked-search3 and supplied-block library7. The worker-exit
+parent launches the guarded probe subprocess to verify raw stderr/log bytes,
+status1 and no outer object unwind; ordinary embedded calls return normally.
+Ownership tests verify final-clone payload release before cache removal,
+constructor-failure file retention, configured representative terminal claims,
+literal path bytes, shared radix counts and Source cleanup error grammar.
+Native blocked outputs and supplied protein/translated contexts pass their
+existing exact format controls. Package and workspace source/test bytes match.
+
+The first package `21a3367f...` passed default compilation but stopped at an
+optional DNA module qualification error. The corrected absolute module path is
+the only source difference before the passing batch; the failure capture is
+retained. No new Source case was run during these checks. A new release and
+Native-only comparisons against the preserved Source controls remain necessary
+to prove the three natural artifact fixes. Final integration/profile/platform
+parity and the broader goal remain open.
+
+Additional code follow-up: FileArray still uses recursive create_dir_all where
+Source uses its single-directory mkdir contract (including ignored EEXIST).
+This can change the early error class for a blocked radix directory; normal
+artifact checks do not establish constructor-failure parity. Caller directory
+creation and Source's Windows ignored-result behavior need a coherent callee/
+caller translation before that error-domain gate can close.

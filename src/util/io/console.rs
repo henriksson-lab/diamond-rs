@@ -149,6 +149,14 @@ mod cstdio {
             std::ptr::null_mut()
         }
     }
+    pub(super) fn flush_c_stdout() {
+        let stream = pointer(Kind::Out);
+        if !stream.is_null() {
+            unsafe {
+                libc::fflush(stream);
+            }
+        }
+    }
     pub(super) fn flush(kind: Kind) {
         let mut state = state(kind).lock().unwrap_or_else(|p| p.into_inner());
         if state.failed {
@@ -256,6 +264,15 @@ impl Write for ConsoleWriter {
                 Kind::Err => io::stderr().write_fmt(args),
             }
         }
+    }
+}
+
+/// Source plain fflush(stdout), without cout sentry/failbit behavior.
+pub(crate) fn flush_c_stdout() {
+    if cstdio::SUPPORTED {
+        cstdio::flush_c_stdout();
+    } else {
+        let _ = io::stdout().flush();
     }
 }
 

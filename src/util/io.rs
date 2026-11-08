@@ -3,6 +3,55 @@ use std::io::SeekFrom;
 #[cfg(test)]
 use std::io::Write;
 
+/// Source join_worker handles its own std::exception and exits the standalone
+/// process immediately. Embedded calls retain their typed error and host.
+/// Runtime initialization alone never grants this process ownership policy.
+pub(crate) fn exit_source_worker_error(error: &std::io::Error) {
+    #[cfg(any(unix, windows))]
+    let process_owned = file_sink::owns_process_stdio();
+    #[cfg(not(any(unix, windows)))]
+    let process_owned = false;
+    if !process_owned {
+        return;
+    }
+    let what = if let Some(raw) = RawDiagnosticError::find(error) {
+        Ok(raw.to_vec())
+    } else if let Some(open) = file_open_error::find(error) {
+        open.try_message_bytes()
+    } else if let Some(temp) = temp_file::find_temp_open(error) {
+        temp.try_message_bytes()
+    } else if let Some(stdio) = cstdio_file::StdioError::find(error) {
+        Ok(stdio.message_bytes().to_vec())
+    } else if BadAllocError::find(error).is_some() {
+        Ok(if cfg!(target_env = "msvc") {
+            b"bad allocation".to_vec()
+        } else {
+            b"std::bad_alloc".to_vec()
+        })
+    } else {
+        Ok(error.to_string().into_bytes())
+    };
+    let what = what.unwrap_or_else(|conversion: IoError| conversion.to_string().into_bytes());
+    // A constructor's saved perror precedes the worker's tied cerr catch.
+    let _ = emit_source_perror(error);
+    crate::util::log_stream::flush_tied_stdout();
+    let mut message = b"Error: ".to_vec();
+    message.extend_from_slice(what.split(|byte| *byte == 0).next().unwrap_or_default());
+    message.push(b'\n');
+    {
+        use std::io::Write;
+        let _ = console::stderr().write_all(&message);
+        let mut log = crate::util::log_stream::log_stream()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _ = log.write_bytes(&message).and_then(|stream| stream.flush());
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+    }
+    // Source exit() flushes CRT owners without unwinding worker/file objects.
+    unsafe { libc::exit(1) }
+}
+
 pub mod deserializer;
 pub use deserializer::Deserializer;
 pub mod serializer;
@@ -605,6 +654,69 @@ impl StreamEntity for VecStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_worker_exit_probe() {
+        let Some(marker) = std::env::var_os("DIAMOND_RS_WORKER_EXIT_PROBE_MARKER") else {
+            return;
+        };
+        struct UnwindMarker(std::path::PathBuf);
+        impl Drop for UnwindMarker {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, b"unwound");
+            }
+        }
+        let _marker = UnwindMarker(marker.into());
+        *crate::util::log_stream::log_stream().lock().unwrap() =
+            crate::util::log_stream::MessageStream::new(false, true);
+        // This isolated subprocess owns its descriptors just like main().
+        unsafe {
+            file_sink::enable_process_stdout_ownership();
+        }
+        exit_source_worker_error(
+            &RawDiagnosticError(b"worker \xff\0not printed".to_vec()).into_io(),
+        );
+        panic!("Source process worker catch returned");
+    }
+
+    #[test]
+    fn source_worker_failure_preserves_embedded_host_and_exits_owned_child_without_unwind() {
+        let error = RawDiagnosticError(b"embedded failure".to_vec()).into_io();
+        exit_source_worker_error(&error); // No process ownership in the host.
+        assert_eq!(
+            RawDiagnosticError::find(&error),
+            Some(b"embedded failure".as_slice())
+        );
+        let root = std::env::temp_dir().join(format!(
+            "diamond-worker-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let marker = root.join("unwind-marker");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "util::io::tests::source_worker_exit_probe",
+                "--nocapture",
+            ])
+            .env("DIAMOND_RS_WORKER_EXIT_PROBE_MARKER", &marker)
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(child.status.code(), Some(1));
+        let expected = source_text::expected_text(b"Error: worker \xff\n");
+        assert_eq!(child.stderr, expected);
+        assert_eq!(std::fs::read(root.join("diamond.log")).unwrap(), expected);
+        assert!(
+            !marker.exists(),
+            "Source exit must bypass worker object destruction"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn typed_io_capture_retains_primary_and_returned_stdio_error() {

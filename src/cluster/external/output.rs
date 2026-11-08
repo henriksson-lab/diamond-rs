@@ -7,14 +7,16 @@
 use crate::util::io::source_c_path;
 use std::cmp::Ordering;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use super::external::Job;
 use super::pair_table::{Bucket, RadixedTable, RADIX_BITS, RADIX_COUNT};
 use super::seed_table::VolumedFile;
-use super::storage::BucketWriter;
+use super::storage::{source_child_path, BucketWriter, WorkerBucketBuffers};
 use crate::basic::value::OId;
+use crate::util::io::source_text::{SourceTextInput, TextOutput};
 use crate::util::io::InputFile;
 use crate::util::parallel::{Atomic, FileStack};
 
@@ -162,15 +164,14 @@ fn output_oids_owned(
     output_file: &Path,
     errors: &crate::util::io::IoErrorOwner,
 ) -> Result<OId, String> {
-    let mut output = fs::File::create(source_c_path(&(output_file)).as_ref())
-        .map_err(|_| super::storage::path_error(errors, b"Error opening file: ", output_file))?;
+    let mut output = TextOutput::open(output_file, errors, b"Error opening file: ", false)?;
     let mut clusters = 0;
     for (member, &rep) in merged.iter().enumerate() {
         if rep == member as OId {
             clusters += 1;
         }
         // Source checks fopen alone; fprintf/fclose failures are ignored.
-        let _ = output.write_all(format!("{rep}\t{member}\n").as_bytes());
+        output.write(format!("{rep}\t{member}\n").as_bytes());
     }
     Ok(clusters)
 }
@@ -210,23 +211,34 @@ impl SourceAccMapping {
         bytes.push(0);
         bytes
     }
+    fn empty() -> Self {
+        Self {
+            rep: ACC_MAPPING_NIL,
+            member: ACC_MAPPING_NIL,
+            rep_acc: Vec::new(),
+            member_acc: Vec::new(),
+        }
+    }
     fn deserialize(job: &Job, input: &mut InputFile) -> Result<Self, String> {
-        fn string(job: &Job, input: &mut InputFile) -> Result<Vec<u8>, String> {
-            let mut bytes = Vec::new();
+        let mut record = Self::empty();
+        record.read_into(job, input)?;
+        Ok(record)
+    }
+    fn read_into(&mut self, job: &Job, input: &mut InputFile) -> Result<(), String> {
+        fn string(job: &Job, input: &mut InputFile, bytes: &mut Vec<u8>) -> Result<(), String> {
+            bytes.clear();
             loop {
                 let byte = job.io(input.read_value::<u8>())?;
                 if byte == 0 {
-                    return Ok(bytes);
+                    return Ok(());
                 }
                 bytes.push(byte);
             }
         }
-        Ok(Self {
-            rep: job.io(input.read_u64())?,
-            member: job.io(input.read_u64())?,
-            rep_acc: string(job, input)?,
-            member_acc: string(job, input)?,
-        })
+        self.rep = job.io(input.read_u64())?;
+        self.member = job.io(input.read_u64())?;
+        string(job, input, &mut self.rep_acc)?;
+        string(job, input, &mut self.member_acc)
     }
 }
 
@@ -237,31 +249,17 @@ fn accession_lines(
     errors: &crate::util::io::IoErrorOwner,
     checked_open: bool,
     max_lines: Option<u64>,
+    mut should_read: impl FnMut() -> bool,
     mut visit: impl FnMut(&[u8]) -> Result<(), String>,
 ) -> Result<(), String> {
-    let file = match fs::File::open(source_c_path(&(path)).as_ref()) {
-        Ok(file) => file,
-        Err(_) if !checked_open => return Ok(()),
-        Err(_) => {
-            return Err(super::storage::path_error(
-                errors,
-                b"Error opening file: ",
-                path,
-            ))
-        }
+    let mut input = if checked_open {
+        SourceTextInput::open(path, errors, b"Error opening file: ")?
+    } else {
+        SourceTextInput::open_unchecked(path)
     };
-    let mut reader = BufReader::new(file);
-    let mut line = Vec::new();
-    let mut lines = 0_u64;
-    while max_lines.map_or(true, |limit| lines < limit) {
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        if line.last() == Some(&b'\n') {
-            line.pop();
-        }
+    let mut lines = 0;
+    while max_lines.map_or(true, |limit| lines < limit) && should_read() {
+        let Some(line) = input.line() else { break };
         visit(&line)?;
         lines += 1;
     }
@@ -276,43 +274,69 @@ fn accession_volumes_owned(
     path: &Path,
     errors: &crate::util::io::IoErrorOwner,
 ) -> Result<Vec<(PathBuf, u64)>, String> {
-    // VolumedFile checks ifstream construction, then reads lines without an
-    // exception mask. Preserve that class rather than reporting FileOpenError.
-    let file = fs::File::open(source_c_path(&(path)).as_ref())
-        .map_err(|_| super::storage::path_error(errors, b"Error opening file ", path))?;
-    let mut reader = BufReader::new(file);
-    let mut rows = Vec::new();
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+    Ok(
+        super::external::read_volumed_file_manifest_owned(path, errors)?
+            .0
+            .into_iter()
+            .map(|volume| (volume.path, volume.record_count))
+            .collect(),
+    )
+}
+
+/// Borrow the actual workflow owners while retaining one local worker state
+/// per Source thread. The shared stop/error slots survive every worker join.
+fn scoped_output_workers(
+    job: &Job,
+    count: usize,
+    worker: impl Fn(&AtomicBool) -> Result<(), String> + Sync,
+) -> Result<(), String> {
+    let stop = AtomicBool::new(false);
+    let error = Mutex::new(None);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for _ in 0..count {
+            let work = &worker;
+            let stop = &stop;
+            let error = &error;
+            match std::thread::Builder::new().spawn_scoped(scope, move || {
+                if let Err(message) = work(stop) {
+                    error.lock().unwrap().get_or_insert(message);
+                    stop.store(true, AtomicOrdering::Relaxed);
+                }
+            }) {
+                Ok(handle) => handles.push(handle),
+                Err(failure) => {
+                    error
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(|| job.capture_io::<()>(Err(failure)).unwrap_err());
+                    stop.store(true, AtomicOrdering::Relaxed);
+                    break;
+                }
+            }
         }
-        let mut fields = line
-            .split(u8::is_ascii_whitespace)
-            .filter(|field| !field.is_empty());
-        let file = fields.next().ok_or("Format error in VolumedFile")?;
-        let count = std::str::from_utf8(fields.next().ok_or("Format error in VolumedFile")?)
-            .map_err(|_| "Format error in VolumedFile")?
-            .parse::<u64>()
-            .map_err(|_| "Format error in VolumedFile")?;
-        rows.push((
-            PathBuf::from(
-                errors.capture(
-                    crate::util::io::source_bytes_os(file).map_err(std::io::Error::other),
-                )?,
-            ),
-            count,
-        ));
-    }
-    Ok(rows)
+        for handle in handles {
+            if let Err(panic) = handle.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    });
+    error.into_inner().unwrap().map_or(Ok(()), Err)
 }
 
 pub fn output_accs_round1(
     job: &Job,
     merged: &[OId],
     volumes: &VolumedFile,
+) -> Result<RadixedTable, String> {
+    output_accs_round1_with_threads(job, merged, volumes, 1)
+}
+
+pub fn output_accs_round1_with_threads(
+    job: &Job,
+    merged: &[OId],
+    volumes: &VolumedFile,
+    threads: usize,
 ) -> Result<RadixedTable, String> {
     if volumes.0.len() < job.volumes {
         return Err(format!(
@@ -321,54 +345,82 @@ pub fn output_accs_round1(
             volumes.0.len()
         ));
     }
-    let base_dir = job.root_dir().join("output");
+    let base_dir = source_child_path(&job.root_dir().join("output"), "");
     fs::create_dir_all(source_c_path(&base_dir).as_ref()).map_err(|error| error.to_string())?;
-    let mut output =
-        BucketWriter::new_owned(&base_dir, job.worker_id(), RADIX_COUNT, job.io_errors())?;
+    let output = Arc::new(Mutex::new(BucketWriter::new_file_array_owned(
+        &base_dir,
+        job.worker_id(),
+        RADIX_COUNT,
+        job.io_errors(),
+    )?));
+    let failure = Arc::new(Mutex::new(None));
     let queue = Atomic::new(base_dir.join("queue_round1"));
     let shift = bit_length(job.max_oid).saturating_sub(RADIX_BITS);
-    let mut counts = vec![0_u64; RADIX_COUNT];
-    loop {
-        let index =
-            usize::try_from(queue.fetch_add_one()?).map_err(|_| "Negative output volume index")?;
-        if index >= job.volumes {
-            break;
+    scoped_output_workers(job, threads, |stop| {
+        let mut buffers = WorkerBucketBuffers::new(
+            Arc::clone(&output),
+            RADIX_COUNT,
+            job.io_errors(),
+            Arc::clone(&failure),
+        );
+        // Source's worker monotonic resource retains accession allocations
+        // until BufferArray destruction; moving records avoids copying bytes.
+        let mut arena = Vec::new();
+        while !stop.load(AtomicOrdering::Relaxed) {
+            let index = usize::try_from(queue.fetch_add_one()?)
+                .map_err(|_| "Negative output volume index")?;
+            if index >= job.volumes {
+                break;
+            }
+            job.log(&format!(
+                "Building output (round 1). Volume={}/{}",
+                index + 1,
+                job.volumes
+            ))?;
+            let path = job
+                .root_dir()
+                .join("accessions")
+                .join(format!("{index}.txt"));
+            let mut oid = volumes.0[index].oid_begin;
+            accession_lines(
+                &path,
+                &job.io_errors(),
+                false,
+                None,
+                || true,
+                |accession| {
+                    let rep = *merged
+                        .get(oid as usize)
+                        .ok_or_else(|| format!("Accession OID out of range: {oid}"))?;
+                    let radix =
+                        usize::try_from(rep >> shift).map_err(|_| "Accession radix overflow")?;
+                    if radix >= RADIX_COUNT {
+                        return Err("Accession radix out of range".into());
+                    }
+                    let entry = SourceAccMapping {
+                        rep,
+                        member: oid,
+                        rep_acc: Vec::new(),
+                        member_acc: accession.to_vec(),
+                    };
+                    buffers.write(radix, &entry.serialize())?;
+                    arena.push(entry);
+                    oid += 1;
+                    Ok(())
+                },
+            )?;
         }
-        let volume = &volumes.0[index];
-        job.log(&format!(
-            "Building output (round 1). Volume={}/{}",
-            index + 1,
-            job.volumes
-        ))?;
-        let path = job
-            .root_dir()
-            .join("accessions")
-            .join(format!("{index}.txt"));
-        let mut oid = volume.oid_begin;
-        accession_lines(&path, &job.io_errors(), false, None, |accession| {
-            let rep = *merged
-                .get(oid as usize)
-                .ok_or_else(|| format!("Accession OID out of range: {oid}"))?;
-            let radix = usize::try_from(rep >> shift).map_err(|_| "Accession radix overflow")?;
-            let count = counts
-                .get_mut(radix)
-                .ok_or("Accession radix out of range")?;
-            let entry = SourceAccMapping {
-                rep,
-                member: oid,
-                rep_acc: Vec::new(),
-                member_acc: accession.to_vec(),
-            };
-            output.write(radix, &entry.serialize())?;
-            *count += 1;
-            oid += 1;
-            Ok(())
-        })?;
+        // Source destroys the monotonic resource before BufferArray; its
+        // serialized bytes are already owned by the compression buffers.
+        drop(arena);
+        drop(buffers);
+        Ok(())
+    })?;
+    if let Some(error) = failure.lock().unwrap().take() {
+        return Err(error);
     }
-    let mut table = output.finish()?;
-    for (bucket, count) in table.0.iter_mut().zip(counts) {
-        bucket.records = Some(count);
-    }
+    let table = output.lock().unwrap().buckets();
+    output.lock().unwrap().finish()?;
     Ok(table)
 }
 
@@ -377,25 +429,51 @@ fn radix_cluster_accessions(
     volumes: &[(PathBuf, u64)],
     directory: &Path,
     bits_unsorted: u32,
+    threads: usize,
 ) -> Result<RadixedTable, String> {
-    let mut output =
-        BucketWriter::new_owned(directory, job.worker_id(), RADIX_COUNT, job.io_errors())?;
+    let output = Arc::new(Mutex::new(BucketWriter::new_exclusive_file_array_owned(
+        directory,
+        job.worker_id(),
+        RADIX_COUNT,
+        job.io_errors(),
+    )?));
+    let failure = Arc::new(Mutex::new(None));
+    let next = AtomicUsize::new(0);
     let shift = bits_unsorted - RADIX_BITS;
-    let mut counts = vec![0_u64; RADIX_COUNT];
-    for (path, count) in volumes {
-        let mut input = job.open_input(path, 0)?;
-        for _ in 0..*count {
-            let record = SourceAccMapping::deserialize(job, &mut input)?;
-            let radix = ((record.rep >> shift) & (RADIX_COUNT as u64 - 1)) as usize;
-            output.write(radix, &record.serialize())?;
-            counts[radix] += 1;
+    scoped_output_workers(job, threads.min(volumes.len()), |stop| {
+        let mut buffers = WorkerBucketBuffers::new(
+            Arc::clone(&output),
+            RADIX_COUNT,
+            job.io_errors(),
+            Arc::clone(&failure),
+        );
+        while !stop.load(AtomicOrdering::Relaxed) {
+            let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+            let Some((path, count)) = volumes.get(index) else {
+                break;
+            };
+            let mut input = job.open_input(path, 0)?;
+            // Source reuses one non-POD object for this physical volume;
+            // do not retain a separate full record for every radix write.
+            let mut record = SourceAccMapping::empty();
+            for _ in 0..*count {
+                record.read_into(job, &mut input)?;
+                let radix = ((record.rep >> shift) & (RADIX_COUNT as u64 - 1)) as usize;
+                buffers.write(radix, &record.serialize())?;
+            }
+            drop(record);
+            job.io(input.close())?;
         }
-        job.io(input.close())?;
+        Ok(())
+    })?;
+    if let Some(error) = failure.lock().unwrap().take() {
+        return Err(error);
     }
-    let mut table = output.finish()?;
-    for (bucket, count) in table.0.iter_mut().zip(counts) {
-        bucket.records = Some(count);
-    }
+    let mut timer = crate::util::log_stream::TaskTimer::with_msg("Closing the output files", 1);
+    let table = output.lock().unwrap().buckets();
+    output.lock().unwrap().finish()?;
+    drop(output);
+    timer.finish();
     job.log(&format!(
         "Radix sorted bucket records={}",
         volumes.iter().map(|(_, n)| *n).sum::<u64>()
@@ -407,14 +485,15 @@ fn radix_sort_accessions(
     job: &Job,
     table: RadixedTable,
     bits_unsorted: u32,
+    threads: usize,
 ) -> Result<RadixedTable, String> {
     if bits_unsorted < RADIX_BITS {
         return Ok(table);
     }
     let first = table.first().ok_or("base_path")?;
     let base = super::external::base_path(&first.path)?;
-    let queue = Atomic::new(base.join("radix_sort_queue"));
-    let manifest_path = base.join("radix_sort_out");
+    let queue = Atomic::new(source_child_path(&base, "radix_sort_queue"));
+    let manifest_path = source_child_path(&base, "radix_sort_out");
     let manifest = FileStack::try_new_owned(&manifest_path, job.io_errors())?;
     let mut processed = 0_i64;
     loop {
@@ -439,6 +518,7 @@ fn radix_sort_accessions(
                 &volumes,
                 bucket.path.parent().ok_or("base_path")?,
                 bits_unsorted,
+                threads,
             )?;
             let mut text = Vec::new();
             // Source appends every child, including empty buckets. It neither
@@ -463,22 +543,43 @@ fn radix_sort_accessions(
         }
         processed += 1;
     }
-    let finished = Atomic::new(base.join("radix_sort_finished"));
+    let finished = Atomic::new(source_child_path(&base, "radix_sort_finished"));
     finished.fetch_add(processed)?;
     finished.await_value(table.len() as i64)?;
     RadixedTable::from_manifest_owned(manifest_path, &job.io_errors())
 }
 
-fn read_acc_bucket(job: &Job, bucket: &Bucket) -> Result<Vec<SourceAccMapping>, String> {
-    let mut entries = Vec::new();
-    for (path, count) in accession_volumes_owned(&bucket.path, &job.io_errors())? {
-        let mut input = job.open_input(&path, 0)?;
-        for _ in 0..count {
-            entries.push(SourceAccMapping::deserialize(job, &mut input)?);
+fn read_acc_bucket(
+    job: &Job,
+    bucket: &Bucket,
+    threads: usize,
+) -> Result<Vec<SourceAccMapping>, String> {
+    let volumes = accession_volumes_owned(&bucket.path, &job.io_errors())?;
+    let next = AtomicUsize::new(0);
+    let completed = Mutex::new(Vec::new());
+    scoped_output_workers(job, threads.min(volumes.len()), |stop| {
+        while !stop.load(AtomicOrdering::Relaxed) {
+            let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+            let Some((path, count)) = volumes.get(index) else {
+                break;
+            };
+            let mut input = job.open_input(path, 0)?;
+            let mut records = Vec::new();
+            for _ in 0..*count {
+                records.push(SourceAccMapping::deserialize(job, &mut input)?);
+            }
+            job.io(input.close())?;
+            // Source splices each completed volume's list under its mutex.
+            completed.lock().unwrap().push(records);
         }
-        job.io(input.close())?;
-    }
-    Ok(entries)
+        Ok(())
+    })?;
+    Ok(completed
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 pub fn output_accs(
@@ -487,22 +588,37 @@ pub fn output_accs(
     database: &VolumedFile,
     output_file: &Path,
 ) -> Result<OId, String> {
-    let round1 = output_accs_round1(job, merged, database)?;
+    output_accs_with_threads(job, merged, database, output_file, 1)
+}
+
+pub fn output_accs_with_threads(
+    job: &Job,
+    merged: &[OId],
+    database: &VolumedFile,
+    output_file: &Path,
+    threads: usize,
+) -> Result<OId, String> {
+    let round1 = output_accs_round1_with_threads(job, merged, database, threads)?;
     let round1 = radix_sort_accessions(
         job,
         round1,
         bit_length(job.max_oid).saturating_sub(RADIX_BITS),
+        threads,
     )?;
-    let queue = Atomic::new(job.root_dir().join("output/queue_round2"));
+    let queue = Atomic::new(job.root_dir().join("output").join("queue_round2"));
     let digits = decimal_digits(job.max_oid);
-    let mut cluster_count = 0;
+    let cluster_count = AtomicU64::new(0);
+    // Source's outer monotonic resource retains decoded accession storage
+    // across buckets, through all volume workers and the final count load.
+    // Rust retains the actual record owners without copying their byte data.
+    let mut arena = Vec::new();
     loop {
         let index =
             usize::try_from(queue.fetch_add_one()?).map_err(|_| "Negative output bucket index")?;
         let Some(bucket) = round1.get(index) else {
             break;
         };
-        let mut entries = read_acc_bucket(job, bucket)?;
+        let mut entries = read_acc_bucket(job, bucket, threads)?;
         job.log(&format!(
             "Building output (round 2). Bucket={}/{} Records={} Size={}",
             index + 1,
@@ -523,68 +639,76 @@ pub fn output_accs(
             .rep
             .checked_add(1)
             .ok_or("Accession OID overflow")?;
-        for (volume_index, volume) in database.0.iter().enumerate() {
-            if volume.oid_end <= oid_begin || volume.oid_begin >= oid_end {
-                continue;
-            }
-            let mut position = entries.partition_point(|entry| entry.rep < volume.oid_begin);
-            let mut file_oid = volume.oid_begin;
-            let path = job
-                .root_dir()
-                .join("accessions")
-                .join(format!("{volume_index}.txt"));
-            let mut output: Option<fs::File> = None;
-            let mut opened = false;
-            let mut failed = false;
-            accession_lines(
-                &path,
-                &job.io_errors(),
-                true,
-                Some(oid_end.saturating_sub(volume.oid_begin)),
-                |accession| {
-                    if file_oid >= oid_end || position >= entries.len() {
-                        return Ok(());
-                    }
-                    if entries[position].rep > file_oid {
-                        file_oid += 1;
-                        return Ok(());
-                    }
-                    let begin = position;
-                    while position < entries.len() && entries[position].rep == file_oid {
-                        if !opened {
-                            let mut name = output_file.as_os_str().to_os_string();
-                            name.push(format!(".{:0digits$}", entries[position].rep));
-                            let name = PathBuf::from(name);
-                            output = fs::File::create(source_c_path(&(name)).as_ref()).ok();
-                            failed = output.is_none();
-                            opened = true;
+        let volumes: Vec<_> = database
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, volume)| volume.oid_end > oid_begin && volume.oid_begin < oid_end)
+            .collect();
+        let next = AtomicUsize::new(0);
+        scoped_output_workers(job, threads.min(volumes.len()), |stop| {
+            let mut my_cluster_count = 0;
+            let mut position = 0;
+            while !stop.load(AtomicOrdering::Relaxed) {
+                let index = next.fetch_add(1, AtomicOrdering::Relaxed);
+                let Some(&(volume_index, volume)) = volumes.get(index) else {
+                    break;
+                };
+                // Source keeps one cursor per worker and one output owner per
+                // claimed volume, even if it contains multiple representatives.
+                let mut output: Option<TextOutput> = None;
+                while position < entries.len() && entries[position].rep < volume.oid_begin {
+                    position += 1;
+                }
+                let mut file_oid = volume.oid_begin;
+                let path = job
+                    .root_dir()
+                    .join("accessions")
+                    .join(format!("{volume_index}.txt"));
+                accession_lines(
+                    &path,
+                    &job.io_errors(),
+                    true,
+                    Some(oid_end.saturating_sub(volume.oid_begin)),
+                    || !stop.load(AtomicOrdering::Relaxed),
+                    |accession| {
+                        if position >= entries.len() {
+                            file_oid += 1;
+                            return Ok(());
                         }
-                        if !failed {
-                            if let Some(file) = &mut output {
-                                let mut row = Vec::with_capacity(
-                                    accession.len() + entries[position].member_acc.len() + 2,
-                                );
-                                row.extend_from_slice(accession);
-                                row.push(b'\t');
-                                row.extend_from_slice(&entries[position].member_acc);
-                                row.push(b'\n');
-                                if file.write_all(&row).is_err() {
-                                    failed = true;
-                                }
+                        if entries[position].rep > file_oid {
+                            file_oid += 1;
+                            return Ok(());
+                        }
+                        let begin = position;
+                        while position < entries.len() && entries[position].rep == file_oid {
+                            if output.is_none() {
+                                let mut name = output_file.as_os_str().to_os_string();
+                                name.push(format!(".{:0digits$}", entries[position].rep));
+                                output =
+                                    Some(TextOutput::open_unchecked(&PathBuf::from(name), true));
                             }
+                            let file = output.as_mut().unwrap();
+                            file.write(accession);
+                            file.write(b"\t");
+                            file.write(&entries[position].member_acc);
+                            file.endl();
+                            position += 1;
                         }
-                        position += 1;
-                    }
-                    if position > begin {
-                        cluster_count += 1;
-                    }
-                    file_oid += 1;
-                    Ok(())
-                },
-            )?;
-        }
+                        if position > begin {
+                            my_cluster_count += 1;
+                        }
+                        file_oid += 1;
+                        Ok(())
+                    },
+                )?;
+            }
+            cluster_count.fetch_add(my_cluster_count, AtomicOrdering::Relaxed);
+            Ok(())
+        })?;
+        arena.push(entries);
     }
-    Ok(cluster_count)
+    Ok(cluster_count.load(AtomicOrdering::Relaxed))
 }
 
 pub fn output(
@@ -597,7 +721,7 @@ pub fn output(
     let cluster_count = if config.oid_output {
         output_oids_owned(&merged, &config.output_file, &job.io_errors())?
     } else {
-        output_accs(job, &merged, volumes, &config.output_file)?
+        output_accs_with_threads(job, &merged, volumes, &config.output_file, config.threads)?
     };
     job.log(&format!("Cluster count = {cluster_count}"))?;
     cleanup_round_files(job)?;
@@ -617,25 +741,13 @@ fn cleanup_round_files(job: &Job) -> Result<(), String> {
     }
     for round in (0..job.round_index()).rev() {
         let manifest = job.base_dir(Some(round)).join("reps").join("reps.tsv");
-        if manifest.exists() {
-            let text =
-                fs::read(source_c_path(&manifest).as_ref()).map_err(|error| error.to_string())?;
-            for line in text
-                .split(|&b| b == b'\n')
-                .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-            {
-                if let Some(path) = line
-                    .split(u8::is_ascii_whitespace)
-                    .find(|field| !field.is_empty())
-                {
-                    let path = job.io(crate::util::io::source_bytes_os(path))?;
-                    remove_if_present(Path::new(&path))?;
-                }
-            }
-            remove_if_present(&manifest)?;
-            if let Some(directory) = manifest.parent() {
-                let _ = fs::remove_dir(source_c_path(&(directory)).as_ref());
-            }
+        let reps = super::external::read_volumed_file_manifest_owned(&manifest, &job.io_errors())?;
+        for volume in reps.0 {
+            remove_if_present(&volume.path)?;
+        }
+        remove_if_present(&manifest)?;
+        if let Some(directory) = manifest.parent() {
+            let _ = fs::remove_dir(source_c_path(directory).as_ref());
         }
         for volume in 0..job.volumes {
             remove_if_present(
@@ -752,8 +864,8 @@ mod tests {
         let count = output_oids(&[0, 0, 2, 2, 4], &output_file).unwrap();
         assert_eq!(count, 3);
         assert_eq!(
-            fs::read_to_string(output_file).unwrap(),
-            "0\t0\n0\t1\n2\t2\n2\t3\n4\t4\n"
+            fs::read(output_file).unwrap(),
+            crate::util::io::source_text::expected_text(b"0\t0\n0\t1\n2\t2\n2\t3\n4\t4\n")
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -770,16 +882,16 @@ mod tests {
         let count = output_accs(&job, &[0, 0, 2, 2, 4], &volumes, &prefix).unwrap();
         assert_eq!(count, 3);
         assert_eq!(
-            fs::read_to_string(root.join("clusters.0")).unwrap(),
-            "A\tA\nA\tB\n"
+            fs::read(root.join("clusters.0")).unwrap(),
+            crate::util::io::source_text::expected_text(b"A\tA\nA\tB\n")
         );
         assert_eq!(
-            fs::read_to_string(root.join("clusters.2")).unwrap(),
-            "C\tC\nC\tD\n"
+            fs::read(root.join("clusters.2")).unwrap(),
+            crate::util::io::source_text::expected_text(b"C\tC\nC\tD\n")
         );
         assert_eq!(
-            fs::read_to_string(root.join("clusters.4")).unwrap(),
-            "E\tE\n"
+            fs::read(root.join("clusters.4")).unwrap(),
+            crate::util::io::source_text::expected_text(b"E\tE\n")
         );
         // The actual Source round-one queue is persistent. Inspect the
         // completed manifests instead of invoking that phase twice in a job.
@@ -834,7 +946,10 @@ mod tests {
                 expected.push(b'\n');
             }
         }
-        assert_eq!(fs::read(root.join("clusters.000")).unwrap(), expected);
+        assert_eq!(
+            fs::read(root.join("clusters.000")).unwrap(),
+            crate::util::io::source_text::expected_text(&expected)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -880,6 +995,149 @@ mod tests {
     }
 
     #[test]
+    fn parallel_accession_workers_preserve_raw_titles_and_per_volume_output_owners() {
+        let root = temp_dir("parallel_accessions");
+        let job = Job::new(7, 4, 1 << 20, &root, 0).unwrap();
+        fs::create_dir_all(root.join("accessions")).unwrap();
+        let mut volumes = Vec::new();
+        for volume in 0..4 {
+            let mut text = format!("V{volume}a").into_bytes();
+            text.push(0xff);
+            text.extend_from_slice(format!("\nV{volume}b\n").as_bytes());
+            // Use the actual Source text bytes for its accession ifstream.
+            fs::write(
+                root.join(format!("accessions/{volume}.txt")),
+                crate::util::io::source_text::expected_text(&text),
+            )
+            .unwrap();
+            volumes.push(Volume::new(
+                root.join(format!("db{volume}")),
+                volume * 2,
+                volume * 2 + 2,
+                2,
+            ));
+        }
+        let prefix = root.join("clusters");
+        assert_eq!(
+            output_accs_with_threads(
+                &job,
+                &[0, 0, 2, 2, 4, 4, 6, 6],
+                &VolumedFile(volumes),
+                &prefix,
+                4
+            )
+            .unwrap(),
+            4
+        );
+        for volume in 0..4 {
+            let mut rep = format!("V{volume}a").into_bytes();
+            rep.push(0xff);
+            let mut expected = rep.clone();
+            expected.push(b'\t');
+            expected.extend_from_slice(&rep);
+            expected.push(b'\n');
+            expected.extend_from_slice(&rep);
+            expected.extend_from_slice(format!("\tV{volume}b\n").as_bytes());
+            assert_eq!(
+                fs::read(root.join(format!("clusters.{}", volume * 2))).unwrap(),
+                crate::util::io::source_text::expected_text(&expected)
+            );
+        }
+        // Each claimed original volume is logged once despite four readers.
+        let log = fs::read_to_string(root.join("diamond_job.log")).unwrap();
+        for volume in 1..=4 {
+            assert_eq!(
+                log.matches(&format!("Building output (round 1). Volume={volume}/4"))
+                    .count(),
+                1
+            );
+        }
+        drop(job);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nonpod_radix_workers_reuse_string_buffers_and_publish_exact_shared_counts() {
+        let root = temp_dir("parallel_nonpod_radix");
+        let job = Job::new(7, 4, 1, root.join("job"), 0).unwrap();
+        let mut volumes = Vec::new();
+        let mut expected = Vec::new();
+        for volume in 0..4 {
+            let path = root.join(format!("input{volume}"));
+            let mut bytes = Vec::new();
+            for record in 0..3 {
+                let mapping = SourceAccMapping {
+                    rep: volume + 1,
+                    member: volume * 3 + record,
+                    rep_acc: vec![b'R'; 64 - record as usize * 20],
+                    member_acc: vec![0xfe; 48 + record as usize * 20],
+                };
+                let encoded = mapping.serialize();
+                expected.push(encoded.clone());
+                bytes.extend_from_slice(&encoded);
+            }
+            fs::write(&path, bytes).unwrap();
+            volumes.push((path, 3));
+        }
+        let children =
+            radix_cluster_accessions(&job, &volumes, &root.join("out"), RADIX_BITS, 4).unwrap();
+        assert_eq!(
+            children
+                .iter()
+                .map(|bucket| bucket.records.unwrap())
+                .sum::<u64>(),
+            12
+        );
+        let mut actual = Vec::new();
+        for (radix, bucket) in children.iter().enumerate() {
+            for mapping in read_acc_bucket(&job, bucket, 4).unwrap() {
+                assert_eq!((mapping.rep & 255) as usize, radix);
+                actual.push(mapping.serialize());
+            }
+        }
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert!(volumes.iter().all(|(path, _)| path.exists()));
+        drop(job);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_uses_checked_source_manifest_grammar_after_current_round_removal() {
+        for blank in [false, true] {
+            let root = temp_dir("checked_cleanup");
+            let mut job = Job::new(0, 1, 1 << 20, &root, 0).unwrap();
+            write_round(&job, 0, &[&[0]]);
+            job.next_round().unwrap();
+            write_round(&job, 1, &[&[0]]);
+            let manifest = job.base_dir(Some(0)).join("reps/reps.tsv");
+            if blank {
+                fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+                fs::write(&manifest, b"\n").unwrap();
+            }
+            let error = cleanup_round_files(&job).unwrap_err();
+            if blank {
+                assert_eq!(error, "Format error in VolumedFile");
+            } else {
+                let restored = job.io_errors().finish::<()>(Err(error)).unwrap_err();
+                let mut expected = b"Error opening file ".to_vec();
+                expected.extend_from_slice(
+                    &crate::util::io::source_os_bytes(manifest.as_os_str()).unwrap(),
+                );
+                assert_eq!(
+                    crate::util::io::RawDiagnosticError::find(&restored),
+                    Some(expected.as_slice())
+                );
+            }
+            assert!(!job.base_dir(Some(1)).join("clustering/volume0").exists());
+            assert!(job.base_dir(Some(0)).join("clustering/volume0").exists());
+            drop(job);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn output_logs_merges_and_removes_all_round_inputs() {
         let root = temp_dir("workflow");
         let mut job = Job::new(4, 2, 1 << 20, &root, 0).unwrap();
@@ -909,8 +1167,8 @@ mod tests {
         assert_eq!(summary.merged, [0, 0, 1, 1, 1]);
         assert_eq!(summary.cluster_count, 1);
         assert_eq!(
-            fs::read_to_string(output_file).unwrap(),
-            "0\t0\n0\t1\n1\t2\n1\t3\n1\t4\n"
+            fs::read(output_file).unwrap(),
+            crate::util::io::source_text::expected_text(b"0\t0\n0\t1\n1\t2\n1\t3\n1\t4\n")
         );
         assert!(!rep_volume.exists());
         assert!(!reps_dir.join("reps.tsv").exists());

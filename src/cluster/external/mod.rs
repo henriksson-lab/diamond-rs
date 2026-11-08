@@ -15,8 +15,9 @@ pub use cluster::{
 };
 pub use external::*;
 pub use output::{
-    merge, output, output_accs, output_accs_round1, output_oids, read_clustering, AccMapping,
-    ExternalOutputConfig, ExternalOutputSummary,
+    merge, output, output_accs, output_accs_round1, output_accs_round1_with_threads,
+    output_accs_with_threads, output_oids, read_clustering, AccMapping, ExternalOutputConfig,
+    ExternalOutputSummary,
 };
 pub use pair_table::{
     build_pair_table, get_pairs_mutual_cov, get_pairs_uni_cov, Bucket, PairFileArray,

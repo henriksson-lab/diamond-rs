@@ -2458,3 +2458,32 @@ passes default all-target compilation and 51 focused tests (22 multinode,
 29 formatter). Workspace production/test inputs still match that frozen package
 exactly. The previous three-profile package remains the evidence for optional
 and Windows compilation before this small common-formatter substitution.
+
+
+Combined parallel/ownership checkpoint (2026-11-08): frozen package
+`c2d5604704f484c6efb3baa2968ca04ab8752d19679212cb02f82bd67f3095ce`
+passes isolated default, dna/mcl/zstd and Windows GNU all-target compilation.
+All 101 selected tests pass: external77, join11, fetched-renderer1,
+worker-exit2, native blocked-search3 and supplied-block library7. The worker-exit
+parent launches the guarded probe subprocess to verify raw stderr/log bytes,
+status1 and no outer object unwind; ordinary embedded calls return normally.
+Ownership tests verify final-clone payload release before cache removal,
+constructor-failure file retention, configured representative terminal claims,
+literal path bytes, shared radix counts and Source cleanup error grammar.
+Native blocked outputs and supplied protein/translated contexts pass their
+existing exact format controls. Package and workspace source/test bytes match.
+
+The first package `21a3367f...` passed default compilation but stopped at an
+optional DNA module qualification error. The corrected absolute module path is
+the only source difference before the passing batch; the failure capture is
+retained. No new Source case was run during these checks. A new release and
+Native-only comparisons against the preserved Source controls remain necessary
+to prove the three natural artifact fixes. Final integration/profile/platform
+parity and the broader goal remain open.
+
+Additional code follow-up: FileArray still uses recursive create_dir_all where
+Source uses its single-directory mkdir contract (including ignored EEXIST).
+This can change the early error class for a blocked radix directory; normal
+artifact checks do not establish constructor-failure parity. Caller directory
+creation and Source's Windows ignored-result behavior need a coherent callee/
+caller translation before that error-domain gate can close.

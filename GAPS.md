@@ -33,6 +33,14 @@ not known failures unless the text explicitly says otherwise.
   radix_sort.h:38 supplies sizeof(T) as a typed element count. Rust safely
   decodes one record and preserves the zero-initialized/previous-record bytes
   on EOF; Source overflow behavior is not a parity claim.
+- The immutable d4fac90 release passes three natural 9,704-record controls
+  at one/four threads with one cross-process worker: exact mapping, streams,
+  alignment row multisets and counters. Full artifact comparison reopened
+  concrete chunk destructor, representative-worker and literal path gaps.
+  Those fixes plus bounded parallel blocked/accession output now pass three
+  compile profiles and 101 focused tests. New release comparisons against the
+  preserved Source captures remain pending. FileArray mkdir error semantics
+  remain a concrete code follow-up; full artifact parity is not established.
 - Hosted CI verification, the Source-shared two-worker hazard, and final parity
   gates remain open. No complete-translation claim applies.
 

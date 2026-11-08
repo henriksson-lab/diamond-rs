@@ -8,7 +8,6 @@ use crate::util::io::source_c_path;
 use crate::util::parallel::{Atomic, FileStack};
 use std::cell::RefCell;
 use std::fs;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::external::{Assignment, Edge, Job};
@@ -125,103 +124,144 @@ pub fn compute_closure_from_assignment_file(
     Ok(())
 }
 
-/// C++ file-local `get_reps` using the normal FASTA volume adapter.
+/// Library compatibility entry with an explicit single-thread context.
 pub fn get_reps(job: &Job, volumes: &VolumedFile) -> Result<PathBuf, String> {
+    get_reps_with_threads(job, volumes, 1)
+}
+
+/// Source get_reps creates exactly config.threads workers (not min(volumes,N));
+/// every worker performs its terminal queue claim, including idle workers.
+pub fn get_reps_with_threads(
+    job: &Job,
+    volumes: &VolumedFile,
+    threads: usize,
+) -> Result<PathBuf, String> {
     if job.last_round() {
         return Ok(PathBuf::new());
     }
     let base_dir = job.base_dir(None).join("reps");
     fs::create_dir_all(source_c_path(&base_dir).as_ref()).map_err(|error| error.to_string())?;
     let manifest_path = base_dir.join("reps.tsv");
-    let manifest = FileStack::try_new_owned(&manifest_path, job.io_errors())?;
-    let queue = Atomic::new(base_dir.join("queue"));
-    let mut processed = 0;
-    let mut cluster_count = 0;
-    loop {
-        let index = usize::try_from(queue.fetch_add_one()?)
-            .map_err(|_| "Negative representative volume index")?;
-        let Some(volume) = volumes.0.get(index) else {
-            break;
-        };
-        let representatives = read_clustering_volume(job, index, volume)?;
-        let path = base_dir.join(format!("{index}.faa"));
-        // Source constructs the sequence input before its unchecked ofstream.
-        // A failed output keeps failbit semantics while counters and the
-        // representative manifest still describe the selected input records.
-        let output = RefCell::new((None::<BufWriter<fs::File>>, false));
-        let mut table_oid = volume.oid_begin;
-        let mut table_index = 0usize;
-        let mut next_oid = volume.oid_begin;
-        let mut count = 0u64;
-        super::reader::visit_volume_bytes_owned(
-            &volume.path,
-            &mut |record| {
-                let oid = if job.round_index() > 0 {
-                    job.capture_io(parse_oid_like_atoll_bytes(&record.id))?
-                } else {
-                    next_oid
+    let manifest = std::sync::Arc::new(FileStack::try_new_owned(&manifest_path, job.io_errors())?);
+    let queue = std::sync::Arc::new(Atomic::new(base_dir.join("queue")));
+    let processed = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let cluster_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let volumes = std::sync::Arc::new(volumes.clone());
+    let mut pool = crate::util::parallel::SimpleThreadPool::new();
+    for _ in 0..threads {
+        let job = job.clone();
+        let volumes = std::sync::Arc::clone(&volumes);
+        let manifest = std::sync::Arc::clone(&manifest);
+        let queue = std::sync::Arc::clone(&queue);
+        let processed = std::sync::Arc::clone(&processed);
+        let cluster_count = std::sync::Arc::clone(&cluster_count);
+        let base_dir = base_dir.clone();
+        pool.spawn(move |stop| {
+            loop {
+                let index = usize::try_from(queue.fetch_add_one()?)
+                    .map_err(|_| "Negative representative volume index")?;
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let Some(volume) = volumes.0.get(index) else {
+                    break;
                 };
-                while table_oid < oid {
-                    table_oid += 1;
-                    table_index += 1;
-                }
-                if table_oid != oid || table_index >= representatives.len() {
-                    return Err(format!("Representative table does not contain OID {oid}."));
-                }
-                if representatives[table_index] == oid {
-                    let mut state = output.borrow_mut();
-                    let (stream, failed) = &mut *state;
-                    if !*failed {
-                        if let Some(stream) = stream {
-                            if writeln!(
-                                stream,
-                                ">{oid}\n{}",
-                                sequence_utils::to_string(&record.sequence, AMINO_ACID_ALPHABET,)
-                            )
-                            .is_err()
-                            {
-                                *failed = true;
-                            }
+                job.log(&format!(
+                    "Writing representatives. Volume={}/{} Records={}",
+                    index + 1,
+                    volumes.0.len(),
+                    crate::util::string::format(volume.record_count)
+                ))?;
+                crate::util::io::console::flush_c_stdout();
+                let representatives = read_clustering_volume(&job, index, volume)?;
+                let path = base_dir.join(format!("{index}.faa"));
+                // Source opens the actual input before its unchecked textmode
+                // ofstream; exceptions are disabled and failure stays sticky.
+                let output = RefCell::new(None::<crate::util::io::source_text::TextOutput>);
+                let mut table_oid = volume.oid_begin;
+                let mut table_index = 0usize;
+                let mut next_oid = volume.oid_begin;
+                let mut count = 0u64;
+                super::reader::visit_volume_bytes_while_owned_with_cleanup(
+                    &volume.path,
+                    &mut || !stop.load(std::sync::atomic::Ordering::Relaxed),
+                    &mut |record| {
+                        let oid = if job.round_index() > 0 {
+                            job.capture_io(parse_oid_like_atoll_bytes(&record.id))?
+                        } else {
+                            next_oid
+                        };
+                        while table_oid < oid {
+                            table_oid += 1;
+                            table_index += 1;
                         }
-                    }
-                    count += 1;
-                }
-                next_oid = oid
-                    .checked_add(1)
-                    .ok_or_else(|| "Sequence OID overflow.".to_owned())?;
-                table_oid += 1;
-                table_index += 1;
-                Ok(())
-            },
-            &mut || {
-                let stream = fs::File::create(source_c_path(&path).as_ref())
-                    .ok()
-                    .map(BufWriter::new);
-                let failed = stream.is_none();
-                *output.borrow_mut() = (stream, failed);
-                Ok(())
-            },
-            &job.io_errors(),
-        )?;
-        if let (Some(mut output), _) = output.into_inner() {
-            let _ = output.flush();
-        }
-        manifest.push_bytes(&job.io(super::storage::manifest_line(
-            &path,
-            &[count as u64, volume.oid_begin, volume.oid_end],
-        ))?)?;
-        cluster_count += count;
-        processed += 1;
+                        if table_oid != oid || table_index >= representatives.len() {
+                            return Err(format!(
+                                "Representative table does not contain OID {oid}."
+                            ));
+                        }
+                        if representatives[table_index] == oid {
+                            let mut bytes = format!(">{oid}\n").into_bytes();
+                            bytes.extend_from_slice(
+                                sequence_utils::to_string(&record.sequence, AMINO_ACID_ALPHABET)
+                                    .as_bytes(),
+                            );
+                            bytes.push(b'\n');
+                            if let Some(output) = output.borrow_mut().as_mut() {
+                                output.write(&bytes);
+                            }
+                            count += 1;
+                        }
+                        next_oid = oid.checked_add(1).ok_or("Sequence OID overflow.")?;
+                        table_oid += 1;
+                        table_index += 1;
+                        Ok(())
+                    },
+                    &mut || {
+                        *output.borrow_mut() = Some(
+                            crate::util::io::source_text::TextOutput::open_unchecked(&path, true),
+                        );
+                        Ok(())
+                    },
+                    &mut || {
+                        drop(output.borrow_mut().take());
+                    },
+                    &job.io_errors(),
+                )?;
+                drop(output.into_inner()); // out.close after in.close, before publication.
+                manifest.push_bytes(&job.io(super::storage::manifest_line(
+                    &path,
+                    &[count, volume.oid_begin, volume.oid_end],
+                ))?)?;
+                processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                cluster_count.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        });
     }
-    job.log(&format!("Representatives written: {cluster_count}"))?;
+    pool.join_all()?;
+    job.log(&format!(
+        "Representatives written: {}",
+        cluster_count.load(std::sync::atomic::Ordering::Relaxed)
+    ))?;
     let finished = Atomic::new(base_dir.join("finished"));
-    finished.fetch_add(processed)?;
+    finished.fetch_add(processed.load(std::sync::atomic::Ordering::Relaxed))?;
     finished.await_value(volumes.0.len() as i64)?;
+    drop(manifest);
     Ok(manifest_path)
 }
 
 /// C++ unidirectional `cluster` pass.
 pub fn cluster(job: &Job, edges: &RadixedTable, volumes: &VolumedFile) -> Result<PathBuf, String> {
+    cluster_with_threads(job, edges, volumes, 1)
+}
+
+pub fn cluster_with_threads(
+    job: &Job,
+    edges: &RadixedTable,
+    volumes: &VolumedFile,
+    threads: usize,
+) -> Result<PathBuf, String> {
     let directory = job.base_dir(None).join("clustering");
     let bucket_dir = directory.join("0");
     let mut output = BucketWriter::new_owned(&directory, job.worker_id(), 1, job.io_errors())?;
@@ -280,7 +320,7 @@ pub fn cluster(job: &Job, edges: &RadixedTable, volumes: &VolumedFile) -> Result
         compute_closure_from_assignment_file(job, &manifest, volumes)?;
         closure_finished.fetch_add_one()?;
     }
-    get_reps(job, volumes)
+    get_reps_with_threads(job, volumes, threads)
 }
 
 pub fn cluster_bidirectional(
@@ -288,11 +328,20 @@ pub fn cluster_bidirectional(
     edges: &RadixedTable,
     volumes: &VolumedFile,
 ) -> Result<PathBuf, String> {
+    cluster_bidirectional_with_threads(job, edges, volumes, 1)
+}
+
+pub fn cluster_bidirectional_with_threads(
+    job: &Job,
+    edges: &RadixedTable,
+    volumes: &VolumedFile,
+    threads: usize,
+) -> Result<PathBuf, String> {
     let lock = Atomic::new(job.base_dir(None).join("cluster_bidirectional_lock"));
     let finished = Atomic::new(job.base_dir(None).join("cluster_bidirectional_finished"));
     if lock.fetch_add_one()? != 0 {
         finished.await_value(1)?;
-        return get_reps(job, volumes);
+        return get_reps_with_threads(job, volumes, threads);
     }
     job.log("Computing clustering (bi-directional coverage)")?;
     let count = representative_count(volumes)?;
@@ -337,7 +386,7 @@ pub fn cluster_bidirectional(
         remove_manifest_storage(&manifest, &bucket_storage)?;
     }
     finished.fetch_add_one()?;
-    get_reps(job, volumes)
+    get_reps_with_threads(job, volumes, threads)
 }
 
 fn assign_higher_degree(
@@ -625,8 +674,58 @@ mod tests {
         let manifest = fs::read_to_string(reps).unwrap();
         assert!(manifest.contains("\t2\t0\t4"));
         let fasta = fs::read_to_string(job.base_dir(None).join("reps/0.faa")).unwrap();
-        assert!(fasta.contains(">0\nARND\n"));
-        assert!(fasta.contains(">1\nARND\n"));
+        let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+        assert!(fasta.contains(&format!(">0{newline}ARND{newline}")));
+        assert!(fasta.contains(&format!(">1{newline}ARND{newline}")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn representatives_use_configured_workers_and_source_terminal_claims() {
+        let root = temp_dir("parallel_representatives");
+        let mut job = Job::new(3, 2, 1024, &root, 4).unwrap();
+        job.set_round_count(2);
+        let mut input = Vec::new();
+        fs::create_dir_all(job.base_dir(None).join("clustering")).unwrap();
+        for volume in 0..2 {
+            let path = root.join(format!("input{volume}.faa"));
+            fs::write(&path, b">raw_\xff\nARNDCQEGH\n>raw_\x80\nARNDCQEGH\n").unwrap();
+            input.push(Volume::new(path, volume * 2, volume * 2 + 2, 2));
+            let mut values = Vec::new();
+            for _ in 0..2 {
+                values.extend_from_slice(&(volume * 2).to_ne_bytes());
+            }
+            fs::write(
+                job.base_dir(None)
+                    .join(format!("clustering/volume{volume}")),
+                values,
+            )
+            .unwrap();
+        }
+        let manifest = get_reps_with_threads(&job, &VolumedFile(input.clone()), 4).unwrap();
+        assert_eq!(
+            Atomic::new(job.base_dir(None).join("reps/queue"))
+                .get()
+                .unwrap(),
+            6,
+            "two successful volume claims plus four terminal worker claims"
+        );
+        let volumes =
+            super::super::external::read_volumed_file_manifest_owned(&manifest, &job.io_errors())
+                .unwrap();
+        assert_eq!(volumes.0.len(), 2);
+        let newline = if cfg!(windows) { "\r\n" } else { "\n" };
+        for (index, volume) in volumes.0.iter().enumerate() {
+            assert_eq!(volume.record_count, 1);
+            assert_eq!(
+                fs::read(&volume.path).unwrap(),
+                format!(">{}{newline}ARNDCQEGH{newline}", index * 2).as_bytes()
+            );
+            assert!(
+                input[index].path.exists(),
+                "representative selection does not consume source inputs"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

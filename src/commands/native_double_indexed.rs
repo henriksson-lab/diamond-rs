@@ -581,31 +581,12 @@ impl DoubleIndexedBackend for NativeBackend<'_> {
                 .map(IntermediateFile::reader)
                 .collect::<io::Result<Vec<_>>>()?;
             let mut fetcher = crate::output::join_blocks::StreamJoinFetcher::from_readers(readers)?;
-            for query_id in 0..q.query_count {
+            let mut exhausted = false;
+            let mut last_query = None;
+            let (renderer, mut sink) = writer.joined_parts(matrix);
+            let render = |query_id: usize, matches, aligned| {
                 let query = q.chunk.query(query_id)?;
-                let has_records = fetcher.next() == query_id as u32;
-                if has_records {
-                    fetcher.fetch_next()?;
-                }
-                if !has_records && config.report_unaligned == 0 {
-                    continue;
-                }
-                let frames: Vec<Vec<Letter>> =
-                    query.frames.iter().map(|frame| frame.to_vec()).collect();
-                let matches = if has_records {
-                    merge_query(
-                        &fetcher.buf,
-                        &frames,
-                        query.source.len(),
-                        &q.dictionary,
-                        &matrix,
-                        &q.block_config,
-                        format,
-                    )?
-                } else {
-                    Vec::new()
-                };
-                writer.write_joined_query_bytes(
+                renderer.render_query_bytes(
                     query_id as u32,
                     query.oid.unwrap_or_else(|| {
                         q.query_begin
@@ -622,10 +603,55 @@ impl DoubleIndexedBackend for NativeBackend<'_> {
                     query.self_aln_score,
                     matches,
                     &q.dictionary,
-                    &matrix,
-                )?;
-            }
+                    matrix,
+                    aligned,
+                )
+            };
+            crate::output::join_blocks::run_join_workers(
+                config.threads.max(1) as usize,
+                || {
+                    let payload = crate::output::join_blocks::fetch_join_payload(
+                        &mut fetcher,
+                        &mut exhausted,
+                    )?;
+                    if let Some(payload) = &payload {
+                        last_query = Some(payload.query_id);
+                    }
+                    Ok(payload)
+                },
+                |payload| {
+                    let mut output = crate::commands::blastp::NativeRenderedQuery::join_task();
+                    if config.report_unaligned != 0
+                        && format.code != crate::output::format::FormatCode::Daa
+                    {
+                        for id in payload.unaligned_from..payload.query_id {
+                            output.append(render(id as usize, Vec::new(), false)?);
+                        }
+                    }
+                    let query = q.chunk.query(payload.query_id as usize)?;
+                    let frames: Vec<Vec<Letter>> =
+                        query.frames.iter().map(|frame| frame.to_vec()).collect();
+                    let matches = merge_query(
+                        &payload.buffers,
+                        &frames,
+                        query.source.len(),
+                        &q.dictionary,
+                        matrix,
+                        &q.block_config,
+                        format,
+                    )?;
+                    output.append(render(payload.query_id as usize, matches, true)?);
+                    Ok(output)
+                },
+                |output| sink.write(output),
+            )?;
             fetcher.finish();
+            if config.report_unaligned != 0 && format.code != crate::output::format::FormatCode::Daa
+            {
+                for id in last_query.map_or(0, |id| id + 1)..q.query_count as u32 {
+                    sink.write(render(id as usize, Vec::new(), false)?)?;
+                }
+            }
         }
         for pass in [false, true] {
             for (query_id, &is_aligned) in q.aligned.iter().enumerate() {

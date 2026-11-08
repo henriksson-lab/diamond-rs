@@ -372,15 +372,35 @@ impl Job {
 }
 
 pub fn base_path(file_name: &Path) -> Result<PathBuf, String> {
-    let suffix = Path::new("0").join("bucket.tsv");
-    if !file_name.ends_with(&suffix) {
-        return Err("base_path".to_string());
+    // Source removes an exact string suffix. Component-wise parent traversal
+    // would discard the preceding separator in `seed_table_0//0/bucket.tsv`.
+    let suffix = format!(
+        "{}0{}bucket.tsv",
+        std::path::MAIN_SEPARATOR,
+        std::path::MAIN_SEPARATOR
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = file_name.as_os_str().as_bytes();
+        let prefix = bytes.strip_suffix(suffix.as_bytes()).ok_or("base_path")?;
+        return Ok(PathBuf::from(std::ffi::OsString::from_vec(prefix.to_vec())));
     }
-    Ok(file_name
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or_else(|| Path::new(""))
-        .to_path_buf())
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let units: Vec<u16> = file_name.as_os_str().encode_wide().collect();
+        let suffix: Vec<u16> = suffix.encode_utf16().collect();
+        let prefix = units.strip_suffix(suffix.as_slice()).ok_or("base_path")?;
+        return Ok(PathBuf::from(std::ffi::OsString::from_wide(prefix)));
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let name = file_name.to_str().ok_or("base_path")?;
+        Ok(PathBuf::from(
+            name.strip_suffix(&suffix).ok_or("base_path")?,
+        ))
+    }
 }
 
 pub struct ClusterChunk {
@@ -874,7 +894,9 @@ pub fn build_chunks_with_threads<R: SequenceVolumeReader>(
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    let chunks_dir = job.base_dir(None).join("chunks");
+    let mut chunks_name = job.base_dir(None).join("chunks").into_os_string();
+    chunks_name.push(std::path::MAIN_SEPARATOR.to_string());
+    let chunks_dir = PathBuf::from(chunks_name);
     fs::create_dir_all(source_c_path(&chunks_dir).as_ref()).map_err(|error| error.to_string())?;
     let queue = Atomic::new(chunks_dir.join("queue"));
     let output = Arc::new(Mutex::new(BucketWriter::new_file_array_owned(
@@ -1456,11 +1478,11 @@ pub fn round<B: ExternalPipeline>(
     )?;
     let edges = backend.align(job, chunk_count, volumes_max_oid(volumes))?;
     if config.mutual_cover.is_some() {
-        super::cluster::cluster_bidirectional(job, &edges, volumes)
+        super::cluster::cluster_bidirectional_with_threads(job, &edges, volumes, config.threads)
     } else {
         let edges =
             backend.radix_sort(job, edges, ExternalRecordKind::Edge, OId::BITS - RADIX_BITS)?;
-        super::cluster::cluster(job, &edges, volumes)
+        super::cluster::cluster_with_threads(job, &edges, volumes, config.threads)
     }
 }
 
@@ -1848,14 +1870,34 @@ mod tests {
         assert!(job.last_round());
         assert!(job.base_dir(None).ends_with("round1"));
         assert_eq!(
-            base_path(Path::new("tmp/table/0/bucket.tsv")).unwrap(),
-            PathBuf::from("tmp/table")
+            base_path(&Path::new("tmp").join("table").join("0").join("bucket.tsv")).unwrap(),
+            Path::new("tmp").join("table")
         );
         assert_eq!(
             base_path(Path::new("tmp/table/bucket.tsv")).unwrap_err(),
             "base_path"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn base_path_removes_only_literal_suffix_preserving_trailing_separator() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let base = format!("table{sep}");
+        let full = format!("{base}{sep}0{sep}bucket.tsv");
+        assert_eq!(
+            base_path(Path::new(&full)).unwrap().as_os_str(),
+            std::ffi::OsStr::new(&base)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let raw = std::ffi::OsString::from_vec(b"table_\xff//0/bucket.tsv".to_vec());
+            assert_eq!(
+                base_path(Path::new(&raw)).unwrap().as_os_str().as_bytes(),
+                b"table_\xff/"
+            );
+        }
     }
 
     #[test]
@@ -2460,7 +2502,10 @@ mod tests {
             .expect("first worker owns output");
         assert_eq!(summary.cluster_count, 3);
         assert_eq!(summary.merged, [0, 1, 2]);
-        assert_eq!(fs::read_to_string(output).unwrap(), "0\t0\n1\t1\n2\t2\n");
+        assert_eq!(
+            fs::read(output).unwrap(),
+            crate::util::io::source_text::expected_text(b"0\t0\n1\t1\n2\t2\n")
+        );
         assert_eq!(config.file_buffer_size, 64 * 1024);
         assert_eq!(config.query_or_target_cover, 77.0);
         assert_eq!(config.query_cover, 0.0);

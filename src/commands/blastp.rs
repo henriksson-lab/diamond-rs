@@ -1985,7 +1985,190 @@ pub(crate) struct NativeSearchWriter {
     record_statistics: bool,
 }
 
+/// Immutable per-query formatting state shared by blocked-join workers. DAA
+/// dictionary entries are reserved at the reference-block boundary before this
+/// view is borrowed; workers never mutate or clone the reference dictionary.
+pub(crate) struct NativeQueryRenderer<'a> {
+    config: &'a BlastpConfig,
+    query_mode: i32,
+    context_format: Option<SearchFormat>,
+    tabular: Option<&'a crate::output::blast_tab_format::ByteBlastTabFormat>,
+    daa: bool,
+    ref_ids: &'a std::collections::HashMap<u64, u32>,
+    database_letters: u64,
+}
+
+pub(crate) struct NativeRenderedQuery {
+    bytes: Vec<u8>,
+    aligned_queries: u64,
+    join_task: bool,
+}
+impl NativeRenderedQuery {
+    pub(crate) fn join_task() -> Self {
+        Self {
+            bytes: Vec::new(),
+            aligned_queries: 0,
+            join_task: true,
+        }
+    }
+    pub(crate) fn append(&mut self, other: Self) {
+        self.bytes.extend_from_slice(&other.bytes);
+        self.aligned_queries += other.aligned_queries;
+    }
+}
+
+/// Sole ordered output owner. Query merging and formatting happen before this
+/// commit and do not take its lock or borrow its mutable file stream.
+pub(crate) struct NativeJoinedSink<'a> {
+    output: &'a mut NativeBlockOutput,
+    aligned_queries: &'a mut u64,
+    separator: Option<u8>,
+    seen_task: bool,
+}
+impl NativeJoinedSink<'_> {
+    pub(crate) fn write(&mut self, rendered: NativeRenderedQuery) -> io::Result<()> {
+        if rendered.join_task {
+            if self.seen_task {
+                if let Some(separator) = self.separator {
+                    self.output.write_all(&[separator])?;
+                }
+            }
+            self.seen_task = true;
+        }
+        self.output.write_all(&rendered.bytes)?;
+        *self.aligned_queries += rendered.aligned_queries;
+        Ok(())
+    }
+}
+
+impl NativeQueryRenderer<'_> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_query_bytes<S: super::search_output::SearchSubjects + ?Sized>(
+        &self,
+        query_id: u32,
+        oid: u64,
+        title: &[u8],
+        source: &[Letter],
+        frames: &[&[Letter]],
+        mate: Option<&[Letter]>,
+        quality: &[u8],
+        query_self_aln_score: Option<f64>,
+        matches: Vec<Match>,
+        subjects: &S,
+        matrix: &ScoreMatrix,
+        aligned: bool,
+    ) -> io::Result<NativeRenderedQuery> {
+        if matches.iter().any(|target| target.hsps.is_empty()) {
+            return Err(io::Error::other("generate_output: target with no hsps."));
+        }
+        let dna_frames = [source, &[][..], &[][..], &[][..], &[][..], &[][..]];
+        let frames = if self.query_mode == 4 {
+            &dna_frames[..]
+        } else {
+            frames
+        };
+        let mut bytes = Vec::new();
+        let mut aligned_queries = 0;
+        if self.daa {
+            if aligned {
+                let begin = write_daa_query_record_bytes(
+                    &mut bytes,
+                    title,
+                    source,
+                    if self.query_mode == 2 {
+                        SequenceType::AminoAcid
+                    } else {
+                        SequenceType::Nucleotide
+                    },
+                );
+                for target in matches {
+                    let original = subjects.original_oid(target.target_block_id as usize);
+                    let dict = self.ref_ids.get(&original).copied().ok_or_else(|| {
+                        io::Error::other("Missing reserved DAA reference dictionary entry")
+                    })?;
+                    for hsp in &target.hsps {
+                        write_daa_record_hsp(&mut bytes, hsp, dict);
+                    }
+                }
+                finish_daa_query_record(&mut bytes, begin);
+                aligned_queries = 1;
+            }
+        } else if let Some(format) = self.context_format {
+            bytes = format
+                .query_with_query_mode_state(
+                    query_id,
+                    oid,
+                    title,
+                    source.len() as i32,
+                    frames,
+                    matches,
+                    subjects,
+                    matrix,
+                    self.query_mode,
+                    self.database_letters,
+                    self.config.report_unaligned,
+                    &self.config.sam,
+                    &self.config.tuning.output,
+                    query_self_aln_score,
+                    aligned,
+                )?
+                .0;
+        } else {
+            super::search_output::write_tabular_query_state(
+                &mut bytes,
+                self.tabular.expect("tabular writer"),
+                query_id,
+                oid,
+                title,
+                source,
+                frames,
+                mate,
+                quality,
+                query_self_aln_score,
+                matches,
+                subjects,
+                aligned,
+            )?;
+        }
+        Ok(NativeRenderedQuery {
+            bytes,
+            aligned_queries,
+            join_task: false,
+        })
+    }
+}
+
 impl NativeSearchWriter {
+    pub(crate) fn joined_parts(
+        &mut self,
+        matrix: &ScoreMatrix,
+    ) -> (NativeQueryRenderer<'_>, NativeJoinedSink<'_>) {
+        let database_letters = self.database_letters(matrix);
+        let separator = self
+            .tabular
+            .as_ref()
+            .map(|format| format.format.query_separator)
+            .filter(|separator| *separator != '\0')
+            .map(|separator| separator as u8);
+        (
+            NativeQueryRenderer {
+                config: &self.config,
+                query_mode: self.query_mode,
+                context_format: self.context_format,
+                tabular: self.tabular.as_ref(),
+                daa: self.daa,
+                ref_ids: &self.ref_ids,
+                database_letters,
+            },
+            NativeJoinedSink {
+                output: &mut self.output,
+                aligned_queries: &mut self.aligned_queries,
+                separator,
+                seen_task: false,
+            },
+        )
+    }
+
     pub(crate) fn set_database_letters(&mut self, full_letters: u64) {
         self.output_database_letters = Some(full_letters);
     }
@@ -2234,89 +2417,33 @@ impl NativeSearchWriter {
         matrix: &ScoreMatrix,
     ) -> io::Result<()> {
         let output_statistics = generated_output_statistics(&matches);
-        // DNA is untranslated in Source: only context0 owns the sequence.
-        // Empty contexts are defined for length-only output callbacks, while
-        // character access through them is diagnosed at the actual lookup.
-        let dna_frames = [source, &[][..], &[][..], &[][..], &[][..], &[][..]];
-        let frames = if self.query_mode == 4 {
-            &dna_frames[..]
-        } else {
-            frames
-        };
-        if self.daa {
-            if matches.iter().all(|target| target.hsps.is_empty()) {
-                return Ok(());
-            }
-            let mut bytes = Vec::new();
-            let begin = write_daa_query_record_bytes(
-                &mut bytes,
-                title,
-                source,
-                if self.query_mode != 2 {
-                    SequenceType::Nucleotide
-                } else {
-                    SequenceType::AminoAcid
-                },
-            );
-            for target in matches {
+        let aligned = !matches.is_empty();
+        if self.daa && aligned {
+            for target in &matches {
                 let id = target.target_block_id as usize;
-                let original = subjects.original_oid(id);
-                let dict = if let Some(&dict) = self.ref_ids.get(&original) {
-                    dict
-                } else {
-                    let dict = self.refs.len() as u32;
-                    self.refs.push((
-                        self.config
-                            .archive
-                            .dictionary_title_bytes(subjects.title_bytes(id)?),
-                        subjects.length(id) as u32,
-                    ));
-                    self.ref_ids.insert(original, dict);
-                    dict
-                };
-                for hsp in &target.hsps {
-                    write_daa_record_hsp(&mut bytes, hsp, dict);
-                }
+                self.reserve_archive_subject_bytes(
+                    subjects.original_oid(id),
+                    subjects.title_bytes(id)?,
+                    subjects.length(id),
+                );
             }
-            finish_daa_query_record(&mut bytes, begin);
-            self.output.write_all(&bytes)?;
-            self.aligned_queries += 1;
-        } else if let Some(format) = self.context_format {
-            let (bytes, _) = format.query_with_query_mode(
-                query_id,
-                oid,
-                title,
-                source.len() as i32,
-                frames,
-                matches,
-                subjects,
-                matrix,
-                self.query_mode,
-                self.database_letters(matrix),
-                self.config.report_unaligned,
-                &self.config.sam,
-                &self.config.tuning.output,
-                query_self_aln_score,
-            )?;
-            self.output.write_all(&bytes)?;
-        } else {
-            let mut bytes = Vec::new();
-            super::search_output::write_tabular_query(
-                &mut bytes,
-                self.tabular.as_ref().expect("tabular writer"),
-                query_id,
-                oid,
-                title,
-                source,
-                frames,
-                mate,
-                quality,
-                query_self_aln_score,
-                matches,
-                subjects,
-            )?;
-            self.output.write_all(&bytes)?;
         }
+        let (renderer, mut sink) = self.joined_parts(matrix);
+        let rendered = renderer.render_query_bytes(
+            query_id,
+            oid,
+            title,
+            source,
+            frames,
+            mate,
+            quality,
+            query_self_aln_score,
+            matches,
+            subjects,
+            matrix,
+            aligned,
+        )?;
+        sink.write(rendered)?;
         if self.record_statistics {
             crate::basic::statistics::merge_statistics(&output_statistics);
         }
@@ -6653,6 +6780,70 @@ pub fn run_edges_in_memory(
 mod tests {
     use super::*;
     use crate::basic::value::{MASK_LETTER, SEED_MASK};
+
+    #[test]
+    fn joined_renderer_preserves_fetched_query_after_all_targets_are_culled() {
+        let args = ["diamond", "blastp", "-q", "query.faa", "-d", "database"].map(String::from);
+        let config =
+            crate::commands::dispatch::parse_native_blastp_config(&args, "diamond blastp").unwrap();
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 100).unwrap();
+        let ids = std::collections::HashMap::new();
+        let renderer = NativeQueryRenderer {
+            config: &config,
+            query_mode: 2,
+            context_format: None,
+            tabular: None,
+            daa: true,
+            ref_ids: &ids,
+            database_letters: 100,
+        };
+        let subjects = Block::new();
+        let source = [0, 1, 2];
+        let rendered = renderer
+            .render_query_bytes(
+                0,
+                0,
+                b"query\xff",
+                &source,
+                &[&source],
+                None,
+                &[],
+                None,
+                Vec::new(),
+                &subjects,
+                &matrix,
+                true,
+            )
+            .unwrap();
+        let mut expected = Vec::new();
+        let begin = write_daa_query_record_bytes(
+            &mut expected,
+            b"query\xff",
+            &source,
+            SequenceType::AminoAcid,
+        );
+        finish_daa_query_record(&mut expected, begin);
+        assert_eq!(rendered.bytes, expected);
+        assert_eq!(rendered.aligned_queries, 1);
+        let unaligned = renderer
+            .render_query_bytes(
+                0,
+                0,
+                b"query\xff",
+                &source,
+                &[&source],
+                None,
+                &[],
+                None,
+                Vec::new(),
+                &subjects,
+                &matrix,
+                false,
+            )
+            .unwrap();
+        assert!(unaligned.bytes.is_empty());
+        assert_eq!(unaligned.aligned_queries, 0);
+    }
 
     fn taxonomy_test_dir() -> PathBuf {
         std::env::temp_dir().join(format!(

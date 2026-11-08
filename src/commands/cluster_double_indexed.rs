@@ -548,63 +548,8 @@ impl<'a> DoubleIndexedBackend for Backend<'a> {
         let matrix = &self.matrix;
         let edges = &mut self.edges;
         let format = OutputFormat::edge();
-        let mut merged = if let Some(matches) = q.direct.take() {
-            for query in &matches {
-                crate::basic::statistics::merge_statistics(&blastp::generated_output_statistics(
-                    query,
-                ));
-            }
-            matches
-        } else {
-            let readers = q
-                .files
-                .iter()
-                .map(IntermediateFile::reader)
-                .collect::<io::Result<Vec<_>>>()?;
-            let mut fetcher = crate::output::join_blocks::StreamJoinFetcher::from_readers(readers)?;
-            let mut result = Vec::with_capacity(q.records.len());
-            for (query_id, query) in q.records.iter().enumerate() {
-                if fetcher.next() == query_id as u32 {
-                    fetcher.fetch_next()?;
-                    if q.config.taxon_k != 0 && fetcher.buf.iter().any(|buffer| !buffer.is_empty())
-                    {
-                        // Source asks db->taxids(target_oid) before culling
-                        // the first actual joined target, never on direct/no-hit output.
-                        let mut input = std::io::Cursor::new(
-                            fetcher
-                                .buf
-                                .iter()
-                                .find(|buffer| !buffer.is_empty())
-                                .unwrap(),
-                        );
-                        let record = crate::output::intermediate::IntermediateRecord::read(
-                            &mut input, &format,
-                        )?;
-                        let local = q.dictionary.original_oid(record.target_dict_id as usize);
-                        let oid = owner
-                            .original_oids
-                            .get(local as usize)
-                            .copied()
-                            .unwrap_or(local);
-                        return Err(owner.taxonomy_access(oid));
-                    }
-                    result.push(merge_query(
-                        &fetcher.buf,
-                        &[query.sequence.clone()],
-                        query.sequence.len(),
-                        &q.dictionary,
-                        &matrix,
-                        &q.config,
-                        format,
-                    )?);
-                } else {
-                    result.push(Vec::new());
-                }
-            }
-            fetcher.finish();
-            result
-        };
-        for (query_id, matches) in merged.iter_mut().enumerate() {
+        let convert_edges = |(query_id, matches): (usize, Vec<crate::align::hsp::Match>)| {
+            let mut query_edges = Vec::new();
             let query = &q.records[query_id].sequence;
             for target in matches {
                 let Some(hsp) = target.hsps.first() else {
@@ -615,7 +560,7 @@ impl<'a> DoubleIndexedBackend for Backend<'a> {
                 let subject = database
                     .get(subject_oid as usize)
                     .map_or(&[][..], |record| record.sequence.as_slice());
-                edges.push(InMemorySearchEdge {
+                query_edges.push(InMemorySearchEdge {
                     edge: crate::output::edge::EdgeData {
                         query: q.query_oids[query_id],
                         target: q.dictionary.original_oid(target_id),
@@ -628,6 +573,65 @@ impl<'a> DoubleIndexedBackend for Backend<'a> {
                     identity: hsp.id_percent(),
                 });
             }
+            Ok::<_, io::Error>(query_edges)
+        };
+
+        if let Some(matches) = q.direct.take() {
+            for (query_id, matches) in matches.into_iter().enumerate() {
+                crate::basic::statistics::merge_statistics(&blastp::generated_output_statistics(
+                    &matches,
+                ));
+                edges.extend(convert_edges((query_id, matches))?);
+            }
+        } else {
+            let readers = q
+                .files
+                .iter()
+                .map(IntermediateFile::reader)
+                .collect::<io::Result<Vec<_>>>()?;
+            let mut fetcher = crate::output::join_blocks::StreamJoinFetcher::from_readers(readers)?;
+            let mut exhausted = false;
+            crate::output::join_blocks::run_join_workers(
+                q.config.threads as usize,
+                || crate::output::join_blocks::fetch_join_payload(&mut fetcher, &mut exhausted),
+                |payload| {
+                    let query_id = payload.query_id as usize;
+                    let buffers = payload.buffers;
+                    let query = &q.records[query_id];
+                    if q.config.taxon_k != 0 && buffers.iter().any(|buffer| !buffer.is_empty()) {
+                        // Source asks db->taxids(target_oid) before culling
+                        // the first actual joined target, never on direct/no-hit output.
+                        let mut input = std::io::Cursor::new(
+                            buffers.iter().find(|buffer| !buffer.is_empty()).unwrap(),
+                        );
+                        let record = crate::output::intermediate::IntermediateRecord::read(
+                            &mut input, &format,
+                        )?;
+                        let local = q.dictionary.original_oid(record.target_dict_id as usize);
+                        let oid = owner
+                            .original_oids
+                            .get(local as usize)
+                            .copied()
+                            .unwrap_or(local);
+                        return Err(owner.taxonomy_access(oid));
+                    }
+                    let matches = merge_query(
+                        &buffers,
+                        &[query.sequence.clone()],
+                        query.sequence.len(),
+                        &q.dictionary,
+                        &matrix,
+                        &q.config,
+                        format,
+                    )?;
+                    convert_edges((query_id, matches))
+                },
+                |query_edges| {
+                    edges.extend(query_edges);
+                    Ok(())
+                },
+            )?;
+            fetcher.finish();
         }
 
         write_auxiliary_queries(auxiliary, &q.records, &q.aligned)?;

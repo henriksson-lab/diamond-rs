@@ -159,7 +159,41 @@ pub(crate) fn write_tabular_query<W: Write, S: SearchSubjects + ?Sized>(
     matches: Vec<Match>,
     database: &S,
 ) -> io::Result<u64> {
-    let unaligned = matches.iter().all(|target| target.hsps.is_empty());
+    let aligned = matches.iter().any(|target| !target.hsps.is_empty());
+    write_tabular_query_state(
+        out,
+        format,
+        query_id,
+        query_oid,
+        title,
+        source,
+        frames,
+        mate,
+        quality,
+        query_self_aln_score,
+        matches,
+        database,
+        aligned,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_tabular_query_state<W: Write, S: SearchSubjects + ?Sized>(
+    out: &mut W,
+    format: &crate::output::blast_tab_format::ByteBlastTabFormat,
+    query_id: u32,
+    query_oid: u64,
+    title: &[u8],
+    source: &[Letter],
+    frames: &[&[Letter]],
+    mate: Option<&[Letter]>,
+    quality: &[u8],
+    query_self_aln_score: Option<f64>,
+    matches: Vec<Match>,
+    database: &S,
+    aligned: bool,
+) -> io::Result<u64> {
+    let unaligned = !aligned;
     format.write_query_intro_bytes(out, title, source.len() as i32, source, quality, unaligned)?;
     let needs_self = format
         .format
@@ -475,10 +509,49 @@ impl SearchFormat {
         controls: &super::blastp::SearchOutputOptions,
         query_self_aln_score: Option<f64>,
     ) -> io::Result<(Vec<u8>, u64)> {
+        let aligned = matches.iter().any(|target| !target.hsps.is_empty());
+        self.query_with_query_mode_state(
+            query_id,
+            query_oid,
+            title,
+            source_len,
+            frames,
+            matches,
+            database,
+            matrix,
+            query_mode,
+            db_letters,
+            report_unaligned,
+            sam,
+            controls,
+            query_self_aln_score,
+            aligned,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn query_with_query_mode_state<S: SearchSubjects + ?Sized>(
+        self,
+        query_id: u32,
+        query_oid: u64,
+        title: &[u8],
+        source_len: i32,
+        frames: &[&[Letter]],
+        matches: Vec<Match>,
+        database: &S,
+        matrix: &ScoreMatrix,
+        query_mode: i32,
+        db_letters: u64,
+        report_unaligned: i32,
+        sam: &SamOptions,
+        controls: &super::blastp::SearchOutputOptions,
+        query_self_aln_score: Option<f64>,
+        aligned: bool,
+    ) -> io::Result<(Vec<u8>, u64)> {
         let translated = query_mode == 3;
         let blastn = query_mode == 4;
         let mut out = Vec::new();
-        let unaligned = matches.iter().all(|target| target.hsps.is_empty());
+        let unaligned = !aligned;
         if unaligned && !self.report_unaligned(report_unaligned) {
             return Ok((out, 0));
         }

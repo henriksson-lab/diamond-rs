@@ -31,6 +31,26 @@ pub(crate) fn path_error(errors: &IoErrorOwner, prefix: &[u8], path: &Path) -> S
         .unwrap_err()
 }
 
+// FileArray concatenates separators as std::string bytes. Path::join would
+// suppress the extra separator when Source's seed-table base already ends in
+// one, changing stored manifest names even though both paths open the same file.
+pub(crate) fn source_child_path(base: &Path, name: &str) -> PathBuf {
+    let mut path = base.as_os_str().to_owned();
+    path.push(std::path::MAIN_SEPARATOR.to_string());
+    path.push(name);
+    PathBuf::from(path)
+}
+fn file_array_directory(base: &Path, radix: usize) -> PathBuf {
+    let mut path = source_child_path(base, &radix.to_string()).into_os_string();
+    path.push(std::path::MAIN_SEPARATOR.to_string());
+    PathBuf::from(path)
+}
+fn file_array_path(base: &Path, radix: usize, name: &str) -> PathBuf {
+    let mut path = file_array_directory(base, radix).into_os_string();
+    path.push(name);
+    PathBuf::from(path)
+}
+
 const BUFFER_BYTES: usize = 65_536;
 const MAX_VOLUME_BYTES: u64 = 1 << 30;
 
@@ -119,12 +139,18 @@ impl BucketWriter {
     ) -> Result<Self, String> {
         let mut buckets = Vec::with_capacity(count);
         for radix in 0..count {
-            let dir = directory.join(radix.to_string());
+            let dir = file_array_directory(directory, radix);
             fs::create_dir_all(source_c_path(&dir).as_ref()).map_err(|error| error.to_string())?;
             // FileArray opens every initial volume before its FileStack,
             // including buckets which will receive no records.
-            let file = Self::open_volume(&dir.join(format!("worker_{worker}_volume_0")), &errors)?;
-            let stack = FileStack::try_new_owned(dir.join("bucket.tsv"), errors.clone())?;
+            let file = Self::open_volume(
+                &file_array_path(directory, radix, &format!("worker_{worker}_volume_0")),
+                &errors,
+            )?;
+            let stack = FileStack::try_new_owned(
+                file_array_path(directory, radix, "bucket.tsv"),
+                errors.clone(),
+            )?;
             buckets.push(BucketOutput {
                 file: Some(file),
                 stack: Some(stack),
@@ -154,7 +180,7 @@ impl BucketWriter {
         Self::new_storage_owned(directory, worker, count, errors, false)
     }
 
-    fn new_exclusive_file_array_owned(
+    pub(crate) fn new_exclusive_file_array_owned(
         directory: &Path,
         worker: i64,
         count: usize,
@@ -165,14 +191,14 @@ impl BucketWriter {
         Ok(owner)
     }
 
-    fn buckets(&self) -> RadixedTable {
+    pub(crate) fn buckets(&self) -> RadixedTable {
         RadixedTable(
             self.buckets
                 .iter()
                 .enumerate()
                 .map(|(radix, bucket)| {
                     Bucket::new(
-                        self.directory.join(radix.to_string()).join("bucket.tsv"),
+                        file_array_path(&self.directory, radix, "bucket.tsv"),
                         self.exclusive.then_some(bucket.records_total),
                     )
                 })
@@ -273,10 +299,14 @@ impl BucketWriter {
     }
 
     fn volume_path(&self, radix: usize) -> PathBuf {
-        self.directory.join(radix.to_string()).join(format!(
-            "worker_{}_volume_{}",
-            self.worker, self.buckets[radix].volume
-        ))
+        file_array_path(
+            &self.directory,
+            radix,
+            &format!(
+                "worker_{}_volume_{}",
+                self.worker, self.buckets[radix].volume
+            ),
+        )
     }
 
     fn open_volume(path: &Path, errors: &IoErrorOwner) -> Result<OutputFile, String> {
@@ -398,7 +428,7 @@ impl BucketWriter {
             self.flush(radix)?;
             self.buckets[radix].buffer_active = false;
             self.publish(radix, false)?;
-            let manifest = self.directory.join(radix.to_string()).join("bucket.tsv");
+            let manifest = file_array_path(&self.directory, radix, "bucket.tsv");
             // Other process workers can still append. Read aggregate counts
             // only after the stage's shared completion barrier.
             buckets.push(Bucket::new(
@@ -431,7 +461,7 @@ impl BucketWriter {
                 self.buckets[radix].buffer_active = false;
             }
             buckets.push(Bucket::new(
-                self.directory.join(radix.to_string()).join("bucket.tsv"),
+                file_array_path(&self.directory, radix, "bucket.tsv"),
                 None,
             ));
         }
@@ -581,9 +611,11 @@ fn spill(
     }
     // Source reads exclusive cumulative counters directly from the real file
     // owner BEFORE closing it. No manifest reopen or post-close recount occurs.
+    let mut timer = crate::util::log_stream::TaskTimer::with_msg("Closing the output files", 1);
     let children = output.lock().unwrap().buckets();
     output.lock().unwrap().finish()?;
     drop(output);
+    timer.finish();
     job.log(&format!("Radix sorted bucket records={count}"))?;
     // One eight-bit pass only. Source retains the old input bucket here and
     // does not recursively split a skewed child which still exceeds its limit.
@@ -610,8 +642,8 @@ pub fn radix_sort_with_threads(
         return Ok(table);
     }
     let base = base_path(&table[0].path)?;
-    let queue = Atomic::new(base.join("radix_sort_queue"));
-    let out_path = base.join("radix_sort_out");
+    let queue = Atomic::new(source_child_path(&base, "radix_sort_queue"));
+    let out_path = source_child_path(&base, "radix_sort_out");
     let out = FileStack::try_new_owned(&out_path, job.io_errors())?;
     let mut processed = 0;
     loop {
@@ -649,7 +681,7 @@ pub fn radix_sort_with_threads(
         }
         processed += 1;
     }
-    let finished = Atomic::new(base.join("radix_sort_finished"));
+    let finished = Atomic::new(source_child_path(&base, "radix_sort_finished"));
     finished.fetch_add(processed)?;
     finished.await_value(table.len() as i64)?;
     RadixedTable::from_manifest_owned(out_path, &job.io_errors())
@@ -775,6 +807,29 @@ mod tests {
         let manifest = root.join("bucket.tsv");
         fs::write(&manifest, manifest_line(&path, &[u64::MAX]).unwrap()).unwrap();
         assert_eq!(manifest_records(&manifest).unwrap(), vec![(path, u64::MAX)]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_array_preserves_source_repeated_separators_in_stored_names() {
+        let root = temp_dir();
+        let mut base = root.as_os_str().to_owned();
+        base.push(std::path::MAIN_SEPARATOR.to_string());
+        let mut files =
+            BucketWriter::new_file_array_owned(&PathBuf::from(base), 3, 1, IoErrorOwner::default())
+                .unwrap();
+        let mut expected = root.as_os_str().to_owned();
+        let sep = std::path::MAIN_SEPARATOR;
+        expected.push(format!("{sep}{sep}0{sep}bucket.tsv"));
+        assert_eq!(files.buckets()[0].path.as_os_str(), expected.as_os_str());
+        let mut counter = root.as_os_str().to_owned();
+        counter.push(format!("{sep}{sep}radix_sort_queue"));
+        assert_eq!(
+            source_child_path(&files.directory, "radix_sort_queue").as_os_str(),
+            counter.as_os_str()
+        );
+        files.finish().unwrap();
+        drop(files);
         fs::remove_dir_all(root).unwrap();
     }
 

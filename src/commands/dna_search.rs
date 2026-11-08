@@ -621,70 +621,145 @@ impl DoubleIndexedBackend for DnaBackend<'_> {
         } else {
             None
         };
-        let mut direct = direct.map(Vec::into_iter);
-        for (id, query) in queries.iter().enumerate() {
-            // Source TranslatedSequence(Sequence) initializes frame0 and
-            // default-constructs five empty (length0,null data) Sequence views.
-            let frames = vec![
-                query.sequence.clone(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ];
-            let matches = if let Some(direct) = direct.as_mut() {
-                direct.next().unwrap_or_default()
-            } else if let Some(fetcher) = fetcher.as_mut() {
-                if fetcher.next() == id as u32 {
-                    fetcher.fetch_next()?;
-                    merge_query(
-                        &fetcher.buf,
+        if joined_output {
+            let mut fetcher = fetcher.take().unwrap();
+            let mut exhausted = false;
+            let mut trailing_from = 0usize;
+            let (renderer, mut sink) = writer.joined_parts(matrix);
+            let render = |id: usize, matches: Vec<crate::align::hsp::Match>, aligned: bool| {
+                let query = &queries[id];
+                // Only context zero owns untranslated DNA sequence data.
+                let frames = vec![
+                    query.sequence.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ];
+                let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let self_score = query
+                    .sequence
+                    .iter()
+                    .filter(|&&l| (l & crate::basic::value::LETTER_MASK) < 4)
+                    .count() as f64
+                    * f64::from(options.dna.reward);
+                renderer.render_query_bytes(
+                    id as u32,
+                    if config.tuning.self_search {
+                        query_oids[id]
+                    } else {
+                        query_begin + query_oids[id]
+                    },
+                    &query.id,
+                    &query.sequence,
+                    &frame_refs,
+                    None,
+                    query.quality.as_deref().unwrap_or(&[]),
+                    Some(matrix.bitscore(self_score)),
+                    matches,
+                    &dictionary,
+                    matrix,
+                    aligned,
+                )
+            };
+            let report_unaligned = config.report_unaligned != 0
+                && !matches!(
+                    config.outfmt.first().map(Vec::as_slice),
+                    Some(b"100" | b"daab")
+                );
+            crate::output::join_blocks::run_join_workers(
+                config.threads as usize,
+                || {
+                    let payload = crate::output::join_blocks::fetch_join_payload(
+                        &mut fetcher,
+                        &mut exhausted,
+                    )?;
+                    if let Some(payload) = &payload {
+                        trailing_from = payload.query_id as usize + 1;
+                    }
+                    Ok(payload)
+                },
+                |payload| {
+                    let id = payload.query_id as usize;
+                    let query = &queries[id];
+                    let frames = vec![
+                        query.sequence.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ];
+                    let matches = merge_query(
+                        &payload.buffers,
                         &frames,
                         query.sequence.len(),
                         &dictionary,
-                        &matrix,
+                        matrix,
                         config,
                         format,
-                    )?
+                    )?;
+                    let mut task = crate::commands::blastp::NativeRenderedQuery::join_task();
+                    if report_unaligned {
+                        for missing in payload.unaligned_from as usize..id {
+                            task.append(render(missing, Vec::new(), false)?);
+                        }
+                    }
+                    task.append(render(id, matches, true)?);
+                    Ok(task)
+                },
+                |rendered| sink.write(rendered),
+            )?;
+            fetcher.finish();
+            if report_unaligned {
+                for missing in trailing_from..queries.len() {
+                    sink.write(render(missing, Vec::new(), false)?)?;
+                }
+            }
+        } else {
+            let mut direct = direct.map(Vec::into_iter);
+            for (id, query) in queries.iter().enumerate() {
+                // Source TranslatedSequence(Sequence) initializes frame0 and
+                // default-constructs five empty (length0,null data) Sequence views.
+                let frames = vec![
+                    query.sequence.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ];
+                let matches = if let Some(direct) = direct.as_mut() {
+                    direct.next().unwrap_or_default()
                 } else {
                     Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-            let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
-            let self_score = query
-                .sequence
-                .iter()
-                .filter(|&&l| (l & crate::basic::value::LETTER_MASK) < 4)
-                .count() as f64
-                * f64::from(options.dna.reward);
-            (if joined_output {
-                NativeSearchWriter::write_joined_query_bytes
-            } else {
-                NativeSearchWriter::write_query_bytes
-            })(
-                writer,
-                id as u32,
-                if config.tuning.self_search {
-                    query_oids[id]
-                } else {
-                    query_begin + query_oids[id]
-                },
-                &query.id,
-                &query.sequence,
-                &frame_refs,
-                None,
-                query.quality.as_deref().unwrap_or(&[]),
-                Some(matrix.bitscore(self_score)),
-                matches,
-                &dictionary,
-                &matrix,
-            )?;
-        }
-        if let Some(fetcher) = fetcher.as_mut() {
-            fetcher.finish();
+                };
+                let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                let self_score = query
+                    .sequence
+                    .iter()
+                    .filter(|&&l| (l & crate::basic::value::LETTER_MASK) < 4)
+                    .count() as f64
+                    * f64::from(options.dna.reward);
+                writer.write_query_bytes(
+                    id as u32,
+                    if config.tuning.self_search {
+                        query_oids[id]
+                    } else {
+                        query_begin + query_oids[id]
+                    },
+                    &query.id,
+                    &query.sequence,
+                    &frame_refs,
+                    None,
+                    query.quality.as_deref().unwrap_or(&[]),
+                    Some(matrix.bitscore(self_score)),
+                    matches,
+                    &dictionary,
+                    &matrix,
+                )?;
+            }
         }
         for pass in [false, true] {
             for (id, query) in queries.iter().enumerate() {

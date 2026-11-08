@@ -454,7 +454,14 @@ where
         sketch_size = i32::MAX;
     }
 
-    let base_dir = job.base_dir(None).join(format!("seed_table_{shape_index}"));
+    let mut base_name = job
+        .base_dir(None)
+        .join(format!("seed_table_{shape_index}"))
+        .into_os_string();
+    // Source keeps this trailing separator; FileArray adds another one when
+    // serializing its bucket names. Preserve that lexical byte protocol.
+    base_name.push(std::path::MAIN_SEPARATOR.to_string());
+    let base_dir = PathBuf::from(base_name);
     fs::create_dir_all(source_c_path(&base_dir).as_ref()).map_err(|error| error.to_string())?;
     let accessions = job.root_dir().join("accessions");
     let write_accessions = job.round_index() == 0 && shape_index == 0;

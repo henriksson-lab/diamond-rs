@@ -260,6 +260,183 @@ impl<R: Read> StreamJoinFetcher<R> {
     }
 }
 
+/// One actual fetched Source query task, including its preceding unaligned
+/// range. Keep one replacement buffer slot per reference block in the fetcher.
+pub(crate) struct JoinPayload {
+    pub query_id: u32,
+    pub unaligned_from: u32,
+    pub buffers: Vec<Vec<u8>>,
+}
+
+pub(crate) fn fetch_join_payload<R: Read>(
+    fetcher: &mut StreamJoinFetcher<R>,
+    exhausted: &mut bool,
+) -> io::Result<Option<JoinPayload>> {
+    if *exhausted {
+        return Ok(None);
+    }
+    let more = fetcher.fetch_next()?;
+    *exhausted = !more;
+    if fetcher.query_id == FINISHED {
+        return Ok(None);
+    }
+    let blocks = fetcher.block_count();
+    Ok(Some(JoinPayload {
+        query_id: fetcher.query_id,
+        unaligned_from: fetcher.unaligned_from,
+        buffers: std::mem::replace(&mut fetcher.buf, vec![Vec::new(); blocks]),
+    }))
+}
+
+struct JoinWorkState<P, O> {
+    produce: P,
+    tail: usize,
+    head: usize,
+    done: bool,
+    flushing: bool,
+    ready: std::collections::BTreeMap<usize, O>,
+    error: Option<io::Error>,
+}
+
+/// Source TaskQueue's bounded fetch/work/ordered-write contract. Only claiming
+/// the next input and advancing queue state hold the scheduling mutex. Query
+/// merging and rendering execute on independent scoped workers, and the sole
+/// ordered flusher writes outside that mutex. No database/query owner is cloned.
+pub(crate) fn run_join_workers<J, O, P, W, C>(
+    threads: usize,
+    produce: P,
+    work: W,
+    consume: C,
+) -> io::Result<()>
+where
+    J: Send,
+    O: Send,
+    P: FnMut() -> io::Result<Option<J>> + Send,
+    W: Fn(J) -> io::Result<O> + Sync,
+    C: FnMut(O) -> io::Result<()> + Send,
+{
+    use std::sync::{Condvar, Mutex};
+    if threads == 0 {
+        return Err(io::Error::other("Join worker count must be positive."));
+    }
+    let limit = threads
+        .checked_mul(3)
+        .ok_or_else(|| io::Error::other("Join queue size overflow."))?;
+    let state = Mutex::new(JoinWorkState {
+        produce,
+        tail: 0,
+        head: 0,
+        done: false,
+        flushing: false,
+        ready: std::collections::BTreeMap::new(),
+        error: None,
+    });
+    let available = Condvar::new();
+    let consume = Mutex::new(consume);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let state = &state;
+            let available = &available;
+            let consume = &consume;
+            let work = &work;
+            let spawned = std::thread::Builder::new().spawn_scoped(scope, move || {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+                        loop {
+                            let (ordinal, job) = {
+                                let mut state =
+                                    state.lock().unwrap_or_else(|error| error.into_inner());
+                                while !state.done
+                                    && state.error.is_none()
+                                    && state.tail - state.head >= limit
+                                {
+                                    state = available
+                                        .wait(state)
+                                        .unwrap_or_else(|error| error.into_inner());
+                                }
+                                if state.done || state.error.is_some() {
+                                    return Ok(());
+                                }
+                                let Some(job) = (state.produce)()? else {
+                                    state.done = true;
+                                    available.notify_all();
+                                    return Ok(());
+                                };
+                                let ordinal = state.tail;
+                                state.tail += 1;
+                                (ordinal, job)
+                            };
+                            let output = work(job)?;
+                            let mut next = {
+                                let mut state =
+                                    state.lock().unwrap_or_else(|error| error.into_inner());
+                                if state.error.is_some() {
+                                    return Ok(());
+                                }
+                                state.ready.insert(ordinal, output);
+                                let head = state.head;
+                                if !state.flushing && state.ready.contains_key(&head) {
+                                    state.flushing = true;
+                                    state.ready.remove(&head)
+                                } else {
+                                    None
+                                }
+                            };
+                            while let Some(output) = next {
+                                (consume.lock().unwrap_or_else(|error| error.into_inner()))(
+                                    output,
+                                )?;
+                                let mut state =
+                                    state.lock().unwrap_or_else(|error| error.into_inner());
+                                state.head += 1;
+                                available.notify_all();
+                                if state.error.is_some() {
+                                    return Ok(());
+                                }
+                                let head = state.head;
+                                next = state.ready.remove(&head);
+                                if next.is_none() {
+                                    state.flushing = false;
+                                }
+                            }
+                        }
+                    }));
+                let failure = match result {
+                    Ok(Ok(())) => return,
+                    Ok(Err(error)) => error,
+                    Err(_) => io::Error::other("Join worker panicked."),
+                };
+                // Source catches here and exits the executable immediately.
+                // Embedded/library callers retain the original typed error.
+                crate::util::io::exit_source_worker_error(&failure);
+                let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+                if state.error.is_none() {
+                    state.error = Some(failure);
+                }
+                available.notify_all();
+            });
+            if let Err(error) = spawned {
+                let mut shared = state.lock().unwrap_or_else(|error| error.into_inner());
+                if shared.error.is_none() {
+                    shared.error = Some(error);
+                }
+                available.notify_all();
+                break;
+            }
+        }
+    });
+    let state = state
+        .into_inner()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(error) = state.error {
+        return Err(error);
+    }
+    if state.head != state.tail || !state.ready.is_empty() {
+        return Err(io::Error::other("Missing joined query output."));
+    }
+    Ok(())
+}
+
 /// Translation of C++ `join_query`, with format/culling/database-global work
 /// represented by explicit callback and configuration arguments.
 pub fn join_query<D: JoinBlocksDb, C: JoinQueryCallbacks>(
@@ -491,6 +668,69 @@ mod tests {
     use crate::align::hsp::Hsp;
     use crate::dp::swipe::HspValues;
     use crate::util::interval::Interval;
+
+    #[test]
+    fn native_join_workers_overlap_and_commit_in_bounded_input_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let first_wave = std::sync::Barrier::new(3);
+        let outstanding = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let mut next = 0;
+        let mut committed = Vec::new();
+        run_join_workers(
+            3,
+            || {
+                if next == 30 {
+                    return Ok(None);
+                }
+                let id = next;
+                next += 1;
+                let count = outstanding.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                Ok(Some(id))
+            },
+            |id| {
+                // This cannot complete with a serial work callback or one held
+                // under the scheduler/ordered-output mutex.
+                if id < 3 {
+                    first_wave.wait();
+                }
+                Ok(id)
+            },
+            |id| {
+                committed.push(id);
+                outstanding.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(committed, (0..30).collect::<Vec<_>>());
+        assert!((3..=9).contains(&peak.load(Ordering::SeqCst)));
+        assert_eq!(outstanding.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_join_workers_preserve_embedded_typed_errors_and_wake_waiters() {
+        let mut next = 0;
+        let error = run_join_workers(
+            3,
+            || {
+                let id = next;
+                next += 1;
+                Ok(Some(id))
+            },
+            |id| {
+                if id == 2 {
+                    Err(io::Error::from_raw_os_error(5))
+                } else {
+                    Ok(id)
+                }
+            },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+    }
 
     #[derive(Debug)]
     struct TestDb;

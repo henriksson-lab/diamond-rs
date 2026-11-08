@@ -976,49 +976,16 @@ impl crate::run::double_indexed::owned::DoubleIndexedBackend for MppBackend<'_, 
                 query_mode,
             )?;
             output.set_database_letters(full_letters);
+            for entry in &dictionary.entries {
+                output.reserve_archive_subject_bytes(entry.oid, &entry.title, entry.len);
+            }
             let mut fetcher = crate::output::join_blocks::StreamJoinFetcher::from_readers(files)?;
-            for query_id in 0..query_count {
-                let has_records = fetcher.next() == query_id as u32;
-                if has_records {
-                    fetcher.fetch_next()?;
-                }
-                if !has_records && config.report_unaligned == 0 {
-                    continue;
-                }
-                if has_records {
-                    for (payload, mapping) in fetcher.buf.iter_mut().zip(&mappings) {
-                        remap_payload(payload, mapping, &format)?;
-                    }
-                }
-                if config.taxon_k != 0 {
-                    if let Some(owner) = cluster_owner {
-                        if let Some(payload) =
-                            fetcher.buf.iter().find(|payload| !payload.is_empty())
-                        {
-                            let mut input = std::io::Cursor::new(payload);
-                            let record = IntermediateRecord::read(&mut input, &format)?;
-                            return Err(owner.taxonomy_access(
-                                dictionary.original_oid(record.target_dict_id as usize),
-                            ));
-                        }
-                    }
-                }
+            let mut exhausted = false;
+            let mut last_query = None;
+            let (renderer, mut sink) = output.joined_parts(matrix);
+            let render = |query_id: usize, matches, aligned| {
                 let query = chunk.query(query_id)?;
-                let frames: Vec<_> = query.frames.iter().map(|frame| frame.to_vec()).collect();
-                let matches = if has_records {
-                    super::merge_query(
-                        &fetcher.buf,
-                        &frames,
-                        query.source.len(),
-                        &dictionary,
-                        &matrix,
-                        config,
-                        format,
-                    )?
-                } else {
-                    Vec::new()
-                };
-                output.write_joined_query_bytes(
+                renderer.render_query_bytes(
                     query_id as u32,
                     query.oid.unwrap_or(
                         query_begin
@@ -1035,10 +1002,70 @@ impl crate::run::double_indexed::owned::DoubleIndexedBackend for MppBackend<'_, 
                     query.self_aln_score,
                     matches,
                     &dictionary,
-                    &matrix,
-                )?;
-            }
+                    matrix,
+                    aligned,
+                )
+            };
+            crate::output::join_blocks::run_join_workers(
+                config.threads.max(1) as usize,
+                || {
+                    let payload = crate::output::join_blocks::fetch_join_payload(
+                        &mut fetcher,
+                        &mut exhausted,
+                    )?;
+                    if let Some(payload) = &payload {
+                        last_query = Some(payload.query_id);
+                    }
+                    Ok(payload)
+                },
+                |mut payload| {
+                    for (bytes, mapping) in payload.buffers.iter_mut().zip(&mappings) {
+                        remap_payload(bytes, mapping, &format)?;
+                    }
+                    if config.taxon_k != 0 {
+                        if let Some(owner) = cluster_owner {
+                            if let Some(bytes) =
+                                payload.buffers.iter().find(|bytes| !bytes.is_empty())
+                            {
+                                let mut input = std::io::Cursor::new(bytes);
+                                let record = IntermediateRecord::read(&mut input, &format)?;
+                                return Err(owner.taxonomy_access(
+                                    dictionary.original_oid(record.target_dict_id as usize),
+                                ));
+                            }
+                        }
+                    }
+                    let mut output = crate::commands::blastp::NativeRenderedQuery::join_task();
+                    if config.report_unaligned != 0
+                        && format.code != crate::output::format::FormatCode::Daa
+                    {
+                        for id in payload.unaligned_from..payload.query_id {
+                            output.append(render(id as usize, Vec::new(), false)?);
+                        }
+                    }
+                    let query = chunk.query(payload.query_id as usize)?;
+                    let frames: Vec<_> = query.frames.iter().map(|frame| frame.to_vec()).collect();
+                    let matches = super::merge_query(
+                        &payload.buffers,
+                        &frames,
+                        query.source.len(),
+                        &dictionary,
+                        matrix,
+                        config,
+                        format,
+                    )?;
+                    output.append(render(payload.query_id as usize, matches, true)?);
+                    Ok(output)
+                },
+                |output| sink.write(output),
+            )?;
             fetcher.finish();
+            if config.report_unaligned != 0 && format.code != crate::output::format::FormatCode::Daa
+            {
+                for id in last_query.map_or(0, |id| id + 1)..query_count as u32 {
+                    sink.write(render(id as usize, Vec::new(), false)?)?;
+                }
+            }
             output.finish_multiprocessing_chunk()?;
             queues.finish_join(&work, &token)?;
             for reference in 0..partition.len() {

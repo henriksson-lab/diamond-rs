@@ -1410,3 +1410,86 @@ passes default all-target compilation and 51 focused tests (22 multinode,
 29 formatter). Workspace production/test inputs still match that frozen package
 exactly. The previous three-profile package remains the evidence for optional
 and Windows compilation before this small common-formatter substitution.
+
+
+## Natural parallel controls and reopened ownership gaps (2026-11-08)
+
+Immutable release `d4fac90` (package `c8fe6a37...`, binary
+`c1f400dc57bf994231f47b94b183374d8cb0c1dcddea9e1ab16c5d29e48f3db1`)
+passes three natural 9,704-record / 32-volume / two-round OID-output controls:
+legacy one-thread reuse, one-thread task-size-one and four-thread task-size-one.
+All cases use one cross-process worker.
+All mapping bytes, raw stdout/stderr, raw alignment row multisets, counters and
+coverage match their pinned Source captures. Exactly two new Source cases were
+captured once; the earlier legacy Source capture was reused. Every process is
+terminal and reaped, and every generated artifact difference is retained.
+Evidence: `.tmp/native-post-translation-20261107/external-parallel-controls/d4fac90-proof.json`.
+
+These are defined-output passes, not complete artifact parity. Full comparisons
+found retained chunk cache files absent in Source, a serial representative queue
+(Source p4 terminal count36 versus native33), and missing repeated separators
+in serialized seed paths. Those concrete code gaps are being translated in the
+next batch. Elapsed seconds Source/native were 44.04/46.28, 39.68/46.80 and
+36.21/41.14. Peak RSS KiB were 133016/190200, 172740/191016 and 322100/306056.
+These are measured points, not a performance parity claim. Thread-name/file-order
+and elapsed-time differences remain separately visible, not normalized away.
+
+The next code batch also replaces serial joins with bounded parallel fetch,
+merge/cull and rendering in ordinary, DNA, multiprocessing and supplied-owner
+clustering. Only ordered commits serialize. Readonly prepared DAA dictionaries
+avoid full per-worker copies; explicit fetched state preserves Source's empty
+DAA record after all targets are culled. CLI join-worker errors use Source's
+raw stderr/log catch and CRT exit1; embedded callers preserve typed errors.
+External accession construction, non-POD radix/loading and final volume output
+now use configured workers and retained Source text/stream owners. Prior-round
+cleanup always parses the required manifest, including Source error grammar.
+These changes await their combined frozen-package verification.
+
+The non-POD input allocator has a narrow Source race boundary: input_buffer.h
+workers allocate both pmr list nodes and strings through one shared monotonic
+resource before the splice mutex. GNU11 memory_resource::do_allocate mutates
+its current buffer/available fields without synchronization. Concurrent
+allocation schedules can race; this does not invalidate every multithread run
+or excuse unrelated record/order differences. Rust uses independent owned
+records and retains the actual decoded storage through the enclosing phase.
+
+Output callback traits in align/output.rs are library reference surfaces, not
+production backend implementations. Source generate_output has concrete
+counterparts in NativeSearchWriter/NativeQueryRenderer and the real format
+printers, preserving physical OIDs/raw title, sequence, self-score, taxonomy,
+mate and quality owners. Direct final statistics are counted once; intermediate
+emission does not count them, and the final join owns its counters. Legacy
+capture feeds these real owners rather than a target-ID side table. The shared
+generate_intermediate_output is invoked by the real block writer. No missing
+workflow was identified merely from test-only callback trait implementations;
+this is an explicit alternate Source-function mapping, not a trait-integration
+claim. Full translation/parity completion remains unproven.
+
+
+Combined parallel/ownership checkpoint (2026-11-08): frozen package
+`c2d5604704f484c6efb3baa2968ca04ab8752d19679212cb02f82bd67f3095ce`
+passes isolated default, dna/mcl/zstd and Windows GNU all-target compilation.
+All 101 selected tests pass: external77, join11, fetched-renderer1,
+worker-exit2, native blocked-search3 and supplied-block library7. The worker-exit
+parent launches the guarded probe subprocess to verify raw stderr/log bytes,
+status1 and no outer object unwind; ordinary embedded calls return normally.
+Ownership tests verify final-clone payload release before cache removal,
+constructor-failure file retention, configured representative terminal claims,
+literal path bytes, shared radix counts and Source cleanup error grammar.
+Native blocked outputs and supplied protein/translated contexts pass their
+existing exact format controls. Package and workspace source/test bytes match.
+
+The first package `21a3367f...` passed default compilation but stopped at an
+optional DNA module qualification error. The corrected absolute module path is
+the only source difference before the passing batch; the failure capture is
+retained. No new Source case was run during these checks. A new release and
+Native-only comparisons against the preserved Source controls remain necessary
+to prove the three natural artifact fixes. Final integration/profile/platform
+parity and the broader goal remain open.
+
+Additional code follow-up: FileArray still uses recursive create_dir_all where
+Source uses its single-directory mkdir contract (including ignored EEXIST).
+This can change the early error class for a blocked radix directory; normal
+artifact checks do not establish constructor-failure parity. Caller directory
+creation and Source's Windows ignored-result behavior need a coherent callee/
+caller translation before that error-domain gate can close.
