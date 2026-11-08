@@ -365,7 +365,7 @@ impl TaskSet {
     }
 
     pub fn finish(&self) {
-        self.inner.finish();
+        self.inner.finish(&self.thread_pool.inner.state);
     }
 
     pub fn finished(&self) -> bool {
@@ -396,7 +396,11 @@ impl TaskSet {
 }
 
 impl TaskSetInner {
-    fn finish(&self) {
+    fn finish(&self, state: &StdMutex<ThreadPoolState>) {
+        // Source TaskSet::finish holds the same mutex as run_set's predicate
+        // and Condvar::wait. Atomics alone can lose the final notification
+        // between a waiter's predicate check and its wait registration.
+        let _state = state.lock().unwrap();
         let finished = self.finished.fetch_add(1, Ordering::Relaxed) + 1;
         if finished == self.total.load(Ordering::Relaxed) {
             self.cv.notify_all();
@@ -424,12 +428,12 @@ impl ThreadPoolTask {
         }
     }
 
-    fn run(mut self) {
+    fn run(mut self, state: &StdMutex<ThreadPoolState>) {
         if let Some(f) = self.f.take() {
             f();
         }
         if let Some(task_set) = self.task_set {
-            task_set.finish();
+            task_set.finish(state);
         }
     }
 }
@@ -510,7 +514,7 @@ impl ThreadPool {
                     self.pop_task_locked(&mut state, Self::PRIORITY_COUNT - 1)
                 };
                 if let Some(task) = task {
-                    task.run();
+                    task.run(&self.inner.state);
                 } else {
                     break;
                 }
@@ -568,7 +572,7 @@ impl ThreadPool {
             }
 
             if let Some(task) = task {
-                task.run();
+                task.run(&self.inner.state);
             }
         }
     }
@@ -821,6 +825,36 @@ mod tests {
         assert!(task_set.finished());
         assert_eq!(seen.load(Ordering::Relaxed), 8);
         assert_eq!(pool.queue_len(0), 0);
+    }
+
+    #[test]
+    fn task_set_successor_chain_wakes_idle_workers_on_final_completion() {
+        fn enqueue_next(tasks: &Arc<TaskSet>, seen: &Arc<AtomicI64>, remaining: usize) {
+            let next = Arc::clone(tasks);
+            let seen = Arc::clone(seen);
+            tasks.enqueue(move || {
+                // Match the external alignment chain: enqueue the next input
+                // task before processing the current one, with idle workers
+                // repeatedly waiting while the final task completes.
+                if remaining > 1 {
+                    enqueue_next(&next, &seen, remaining - 1);
+                }
+                std::thread::yield_now();
+                seen.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        for _ in 0..32 {
+            let pool = ThreadPool::default();
+            let tasks = Arc::new(TaskSet::new(&pool, 1));
+            let seen = Arc::new(AtomicI64::new(0));
+            enqueue_next(&tasks, &seen, 64);
+            pool.run(4, false, Some(&tasks));
+            pool.join();
+            assert!(tasks.finished());
+            assert_eq!(tasks.total(), 64);
+            assert_eq!(seen.load(Ordering::Relaxed), 64);
+            assert_eq!(pool.queue_len(1), 0);
+        }
     }
 
     #[test]

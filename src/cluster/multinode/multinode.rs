@@ -6,9 +6,13 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use super::data::{get_reps, GetRepsConfig, RepresentativeJob, SequenceRecord, SequenceSource};
+use super::data::{
+    get_reps_path, ByteSequenceRecord, GetRepsConfig, RepresentativeJob, SequenceRecord,
+    SequenceSource,
+};
 use super::output::{merge, MergeConfig, MultinodeOutputJob, Volume};
-use crate::basic::value::{OId, AMINO_ACID_ALPHABET, LETTER_MASK};
+use super::source_io::{read_text, Fields};
+use crate::basic::value::{OId, AMINO_ACID_ALPHABET};
 use crate::cluster::cascaded::helpers::{
     cluster_steps, default_round_approx_id, default_round_cov,
 };
@@ -16,13 +20,15 @@ use crate::cluster::external::external::ClusterStats;
 use crate::cluster::helpers::round_value;
 use crate::config::Sensitivity;
 use crate::masking::MaskingAlgo;
+use crate::util::io::{source_c_path, IoErrorOwner};
 use crate::util::parallel::{Atomic, FileStack};
-use crate::util::sequence::seqid;
+use crate::util::sequence::seqid_bytes;
 
 pub const CASCADED_ROUND_MAX_EVALUE: f64 = 0.001;
 
 #[derive(Debug)]
 pub struct Job {
+    errors: IoErrorOwner,
     pub max_oid: OId,
     pub mem_limit: u64,
     root_dir: PathBuf,
@@ -36,11 +42,21 @@ pub struct Job {
 
 impl Job {
     pub fn new(max_oid: OId, mem_limit: u64, root_dir: impl AsRef<Path>) -> Result<Self, String> {
+        Self::new_with_errors(max_oid, mem_limit, root_dir, IoErrorOwner::default())
+    }
+    fn new_with_errors(
+        max_oid: OId,
+        mem_limit: u64,
+        root_dir: impl AsRef<Path>,
+        errors: IoErrorOwner,
+    ) -> Result<Self, String> {
         let root_dir = root_dir.as_ref().to_path_buf();
-        fs::create_dir_all(root_dir.join("round0")).map_err(|error| error.to_string())?;
-        let log_file = FileStack::new(root_dir.join("diamond_job.log"));
+        fs::create_dir_all(source_c_path(&root_dir.join("round0")).as_ref())
+            .map_err(|error| error.to_string())?;
+        let log_file = FileStack::try_new_owned(root_dir.join("diamond_job.log"), errors.clone())?;
         let worker_id = Atomic::new(root_dir.join("worker_id")).fetch_add_one()?;
         Ok(Self {
+            errors,
             max_oid,
             mem_limit,
             root_dir,
@@ -71,13 +87,14 @@ impl Job {
 
     /// C++ `Job::log(const char*, ...)` after formatting its varargs.
     pub fn log(&self, message: &str) -> Result<(), String> {
-        let line = format!(
-            "[{}, {}] {}\n",
-            self.worker_id,
-            self.start.elapsed().as_secs(),
-            message
-        );
-        self.log_file.push_string(&line).map(|_| ())
+        self.log_bytes(message.as_bytes())
+    }
+    pub fn log_bytes(&self, message: &[u8]) -> Result<(), String> {
+        let mut line =
+            format!("[{}, {}] ", self.worker_id, self.start.elapsed().as_secs()).into_bytes();
+        line.extend_from_slice(message);
+        line.push(b'\n');
+        self.log_file.push_bytes(&line).map(|_| ())
     }
 
     /// C++ `Job::log(const ClusterStats&)` overload.
@@ -106,7 +123,8 @@ impl Job {
 
     pub fn next_round(&mut self) -> Result<(), String> {
         self.round += 1;
-        fs::create_dir_all(self.base_dir()).map_err(|error| error.to_string())
+        fs::create_dir_all(source_c_path(&self.base_dir()).as_ref())
+            .map_err(|error| error.to_string())
     }
 
     pub const fn round(&self) -> i32 {
@@ -135,6 +153,9 @@ impl Job {
 }
 
 impl RepresentativeJob for Job {
+    fn io_errors(&self) -> IoErrorOwner {
+        self.errors.clone()
+    }
     fn last_round(&self) -> bool {
         self.last_round()
     }
@@ -153,6 +174,9 @@ impl RepresentativeJob for Job {
 }
 
 impl MultinodeOutputJob for Job {
+    fn io_errors(&self) -> IoErrorOwner {
+        self.errors.clone()
+    }
     fn max_oid(&self) -> OId {
         self.max_oid
     }
@@ -179,32 +203,36 @@ pub struct VolumedFile(pub Vec<Volume>);
 
 impl VolumedFile {
     pub fn from_manifest(path: &Path) -> Result<Self, String> {
-        let text = fs::read_to_string(path)
-            .map_err(|_| format!("Error opening file {}", path.display()))?;
+        Self::from_manifest_owned(path, &IoErrorOwner::default())
+    }
+    pub fn from_manifest_io(path: &Path) -> std::io::Result<Self> {
+        let errors = IoErrorOwner::default();
+        errors.finish(Self::from_manifest_owned(path, &errors))
+    }
+    fn from_manifest_owned(path: &Path, errors: &IoErrorOwner) -> Result<Self, String> {
+        let text = read_text(path, errors, b"Error opening file ")?;
         let mut volumes = Vec::new();
-        let mut next_oid = 0;
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() < 2 {
-                return Err("Format error in VolumedFile".to_owned());
-            }
-            let record_count = fields[1]
-                .parse::<OId>()
-                .map_err(|_| "Format error in VolumedFile".to_owned())?;
-            let (oid_begin, oid_end) = if fields.len() >= 4 {
-                (
-                    fields[2]
-                        .parse::<OId>()
-                        .map_err(|_| "Format error in VolumedFile".to_owned())?,
-                    fields[3]
-                        .parse::<OId>()
-                        .map_err(|_| "Format error in VolumedFile".to_owned())?,
-                )
+        let mut next_oid = 0u64;
+        for line in text.lines() {
+            let mut fields = Fields::new(line);
+            let path = fields.word().ok_or("Format error in VolumedFile")?;
+            let record_count = fields.number().ok_or("Format error in VolumedFile")?;
+            let begin = fields.number().unwrap_or(0);
+            let end = fields.number().unwrap_or(0);
+            let (oid_begin, oid_end) = if begin == 0 && end == 0 {
+                (next_oid, next_oid.wrapping_add(record_count))
             } else {
-                (next_oid, next_oid + record_count)
+                (begin, end)
             };
-            next_oid += record_count;
-            volumes.push(Volume::new(fields[0], oid_begin, oid_end, record_count));
+            next_oid = next_oid.wrapping_add(record_count);
+            let path = errors
+                .capture(crate::util::io::source_bytes_os(path).map_err(std::io::Error::other))?;
+            volumes.push(Volume::new(
+                PathBuf::from(path),
+                oid_begin,
+                oid_end,
+                record_count,
+            ));
         }
         volumes.sort_by_key(|volume| volume.oid_begin);
         Ok(Self(volumes))
@@ -409,10 +437,23 @@ pub fn run_block_combos<B: MultinodeBackend>(
     config: &MultinodeConfig,
     backend: &mut B,
 ) -> Result<String, String> {
+    run_block_combos_path(job, volumes, config, backend)?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "Representative path is not UTF-8; use run_block_combos_path".to_owned())
+}
+
+pub fn run_block_combos_path<B: MultinodeBackend>(
+    job: &Job,
+    volumes: &VolumedFile,
+    config: &MultinodeConfig,
+    backend: &mut B,
+) -> Result<PathBuf, String> {
     let base_dir = job.base_dir().join("alignments");
-    fs::create_dir_all(&base_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(source_c_path(&base_dir).as_ref()).map_err(|error| error.to_string())?;
     if job.round() == 0 {
-        fs::create_dir_all(job.root_dir().join("accessions")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(source_c_path(&job.root_dir().join("accessions")).as_ref())
+            .map_err(|error| error.to_string())?;
     }
     let n = volumes.0.len() as i64;
     let queue = Atomic::new(base_dir.join("queue"));
@@ -460,7 +501,7 @@ pub fn run_block_combos<B: MultinodeBackend>(
     } else {
         concat_done.await_value(1)?;
     }
-    get_reps(
+    get_reps_path(
         job,
         &volumes.0,
         GetRepsConfig {
@@ -478,22 +519,29 @@ fn finalize_block_combos<B: MultinodeBackend>(
     n: i64,
 ) -> Result<(), String> {
     let alignment_path = job.base_dir().join("alignments.tsv");
-    job.log(&format!(
-        "Concatenating alignment files to {}",
-        alignment_path.display()
-    ))?;
+    let mut message = b"Concatenating alignment files to ".to_vec();
+    message.extend_from_slice(
+        &job.errors.capture(
+            crate::util::io::source_os_bytes(alignment_path.as_os_str())
+                .map(|bytes| bytes.into_owned())
+                .map_err(std::io::Error::other),
+        )?,
+    );
+    job.log_bytes(&message)?;
     let mut alignment = BufWriter::new(
-        File::create(&alignment_path)
-            .map_err(|_| format!("Error opening file {}", alignment_path.display()))?,
+        File::create(source_c_path(&alignment_path).as_ref()).map_err(|_| {
+            super::source_io::path_error(&job.errors, b"Error opening file ", &alignment_path)
+        })?,
     );
     for i in 0..n {
         for j in i..n {
             let path = base_dir.join(format!("{i}_{j}.tsv"));
-            let bytes =
-                fs::read(&path).map_err(|_| format!("Error opening file {}", path.display()))?;
-            alignment
-                .write_all(&bytes)
-                .map_err(|_| format!("Error writing {}", alignment_path.display()))?;
+            let bytes = fs::read(source_c_path(&path).as_ref()).map_err(|_| {
+                super::source_io::path_error(&job.errors, b"Error opening file ", &path)
+            })?;
+            alignment.write_all(&bytes).map_err(|_| {
+                super::source_io::path_error(&job.errors, b"Error writing ", &alignment_path)
+            })?;
         }
     }
     alignment.flush().map_err(|error| error.to_string())?;
@@ -505,7 +553,7 @@ fn finalize_block_combos<B: MultinodeBackend>(
         for oid in 0..=volumes.max_oid() {
             text.push_str(&format!("{oid}\n"));
         }
-        fs::write(&oid_path, text).map_err(|error| error.to_string())?;
+        fs::write(source_c_path(&oid_path).as_ref(), text).map_err(|error| error.to_string())?;
     }
     job.log("Running greedy vertex cover")?;
     let database = if job.round() == 0 {
@@ -527,6 +575,18 @@ pub fn round<B: MultinodeBackend>(
     config: &mut MultinodeConfig,
     backend: &mut B,
 ) -> Result<String, String> {
+    round_path(job, volumes, config, backend)?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "Representative path is not UTF-8; use round_path".to_owned())
+}
+
+pub fn round_path<B: MultinodeBackend>(
+    job: &mut Job,
+    volumes: &VolumedFile,
+    config: &mut MultinodeConfig,
+    backend: &mut B,
+) -> Result<PathBuf, String> {
     if let Some(mutual_cover) = config.mutual_cover {
         config.min_length_ratio = if config.sensitivity < Sensitivity::Linclust40 {
             (mutual_cover / 100.0 + 0.05).min(1.0)
@@ -540,13 +600,33 @@ pub fn round<B: MultinodeBackend>(
         config.sensitivity
     ))?;
     job.set_round(volumes.sparse_records());
-    run_block_combos(job, volumes, config, backend)
+    run_block_combos_path(job, volumes, config, backend)
 }
 
 pub fn multinode<B: MultinodeBackend>(
     config: &mut MultinodeConfig,
     input: &VolumedFile,
     backend: &mut B,
+) -> Result<OId, String> {
+    multinode_io(config, input, backend).map_err(|error| error.to_string())
+}
+
+/// Canonical retained-library entry point preserving raw diagnostic causes.
+/// Source's historical command wrapper does not call this pipeline.
+pub fn multinode_io<B: MultinodeBackend>(
+    config: &mut MultinodeConfig,
+    input: &VolumedFile,
+    backend: &mut B,
+) -> std::io::Result<OId> {
+    let errors = IoErrorOwner::default();
+    let result = multinode_owned(config, input, backend, &errors);
+    errors.finish(result)
+}
+fn multinode_owned<B: MultinodeBackend>(
+    config: &mut MultinodeConfig,
+    input: &VolumedFile,
+    backend: &mut B,
+    errors: &IoErrorOwner,
 ) -> Result<OId, String> {
     if config.output_file.as_os_str().is_empty() {
         return Err("Option missing: output file (--out/-o)".to_owned());
@@ -555,7 +635,12 @@ pub fn multinode<B: MultinodeBackend>(
         return Err("Thread count must be positive.".to_owned());
     }
     config.file_buffer_size = 64 * 1024;
-    let mut job = Job::new(input.max_oid(), config.memory_limit, &config.root_dir)?;
+    let mut job = Job::new_with_errors(
+        input.max_oid(),
+        config.memory_limit,
+        &config.root_dir,
+        errors.clone(),
+    )?;
     if job.worker_id() == 0 {
         job.log(&format!(
             "{} coverage = {}",
@@ -582,8 +667,9 @@ pub fn multinode<B: MultinodeBackend>(
     } else {
         startup_done.await_value(1)?;
     }
-    let input_volumes = VolumedFile::from_manifest(&job.root_dir().join("input.tsv"))?;
-    let mut representatives = String::new();
+    let input_volumes =
+        VolumedFile::from_manifest_owned(&job.root_dir().join("input.tsv"), &job.errors)?;
+    let mut representatives = PathBuf::new();
     for (index, step) in steps.iter().enumerate() {
         config.sensitivity = sensitivity_from_step(step)?;
         let round_values = if config.round_approx_id.is_empty() {
@@ -605,9 +691,9 @@ pub fn multinode<B: MultinodeBackend>(
         let volumes = if index == 0 {
             input_volumes.clone()
         } else {
-            VolumedFile::from_manifest(Path::new(&representatives))?
+            VolumedFile::from_manifest_owned(&representatives, &job.errors)?
         };
-        representatives = round(&mut job, &volumes, config, backend)?;
+        representatives = round_path(&mut job, &volumes, config, backend)?;
         if index + 1 < steps.len() {
             job.next_round()?;
         }
@@ -633,37 +719,27 @@ fn write_accessions<B: SequenceSource>(
     index: i64,
     backend: &B,
 ) -> Result<(), String> {
-    let records = backend.read_records(&volume.path)?;
-    let mut text = records
-        .iter()
-        .map(|record| seqid(&record.id))
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !records.is_empty() {
-        text.push('\n');
+    let path = job
+        .root_dir()
+        .join("accessions")
+        .join(format!("{index}.txt"));
+    // Source checks the output before constructing its sequence input.
+    let mut output =
+        super::source_io::TextOutput::open(&path, &job.errors, b"Error opening file ", true)?;
+    let records = backend.read_records_bytes_with_errors(&volume.path, &job.errors)?;
+    for record in records {
+        output.write(&seqid_bytes(&record.id));
+        output.endl();
     }
-    fs::write(
-        job.root_dir()
-            .join("accessions")
-            .join(format!("{index}.txt")),
-        text,
-    )
-    .map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn write_representative_ids(job: &Job, volumes: &VolumedFile, path: &Path) -> Result<(), String> {
-    let text =
-        fs::read_to_string(path).map_err(|_| format!("Error opening file {}", path.display()))?;
+    let text = read_text(path, &job.errors, b"Error opening file ")?;
     let mut per_volume = vec![String::new(); volumes.0.len()];
     let mut all = String::new();
-    let mut fields = text.split_whitespace();
-    while let (Some(rep), Some(member)) = (fields.next(), fields.next()) {
-        let rep = rep
-            .parse::<OId>()
-            .map_err(|_| "Invalid cluster representative.".to_owned())?;
-        let member = member
-            .parse::<OId>()
-            .map_err(|_| "Invalid cluster member.".to_owned())?;
+    let mut fields = Fields::from_text(&text);
+    while let (Some(rep), Some(member)) = (fields.number(), fields.number()) {
         if rep != member {
             continue;
         }
@@ -676,10 +752,14 @@ fn write_representative_ids(job: &Job, volumes: &VolumedFile, path: &Path) -> Re
         all.push_str(&format!("{rep}\n"));
     }
     for (index, text) in per_volume.into_iter().enumerate() {
-        fs::write(job.base_dir().join(format!("rep_ids{index}")), text)
-            .map_err(|error| error.to_string())?;
+        fs::write(
+            source_c_path(&job.base_dir().join(format!("rep_ids{index}"))).as_ref(),
+            text,
+        )
+        .map_err(|error| error.to_string())?;
     }
-    fs::write(job.base_dir().join("rep_ids"), all).map_err(|error| error.to_string())
+    fs::write(source_c_path(&job.base_dir().join("rep_ids")).as_ref(), all)
+        .map_err(|error| error.to_string())
 }
 
 fn prepare_inputs<B: SequenceSource>(
@@ -690,11 +770,11 @@ fn prepare_inputs<B: SequenceSource>(
     job.log(&format!("Memory limit = {}", job.mem_limit))?;
     let block_size = (job.mem_limit / 20).max(1);
     job.log(&format!("Block size = {block_size}"))?;
-    let mut records = Vec::<SequenceRecord>::new();
+    let mut records = Vec::<ByteSequenceRecord>::new();
     let mut letters = 0_u64;
     for (index, volume) in volumes.0.iter().enumerate() {
         job.log(&format!("Indexing volume {index}/{}", volumes.0.len()))?;
-        let volume_records = backend.read_records(&volume.path)?;
+        let volume_records = backend.read_records_bytes_with_errors(&volume.path, &job.errors)?;
         letters = letters.saturating_add(
             volume_records
                 .iter()
@@ -703,7 +783,7 @@ fn prepare_inputs<B: SequenceSource>(
         );
         records.extend(volume_records);
     }
-    let mut blocks: Vec<Vec<SequenceRecord>> = vec![Vec::new()];
+    let mut blocks: Vec<Vec<ByteSequenceRecord>> = vec![Vec::new()];
     let mut sizes = vec![0_u64];
     for record in records {
         let length = record.sequence.len() as u64;
@@ -720,7 +800,7 @@ fn prepare_inputs<B: SequenceSource>(
         blocks.clear();
         sizes.clear();
     }
-    let mut manifest = String::new();
+    let mut manifest = Vec::new();
     let mut output_volumes = Vec::new();
     let mut oid = 0_u64;
     let mut boundaries = vec![0_u64];
@@ -729,28 +809,50 @@ fn prepare_inputs<B: SequenceSource>(
         let begin = oid;
         let mut output = Vec::new();
         for record in block {
-            output.extend_from_slice(format!(">{oid}\n").as_bytes());
-            for &letter in &record.sequence {
-                output.push(
-                    *AMINO_ACID_ALPHABET
-                        .get((letter & LETTER_MASK) as usize)
-                        .unwrap_or(&b'X'),
-                );
-            }
-            output.push(b'\n');
+            let mut buffer = crate::util::text_buffer::TextBuffer::new();
+            crate::util::sequence::format_bytes(
+                &record.sequence,
+                oid.to_string().as_bytes(),
+                None,
+                &mut buffer,
+                "fasta",
+                &crate::basic::value::ValueTraits::new(
+                    AMINO_ACID_ALPHABET,
+                    crate::basic::value::MASK_LETTER,
+                    b"UO-",
+                    crate::basic::value::SequenceType::AminoAcid,
+                ),
+                160,
+            )?;
+            output.extend_from_slice(buffer.data());
             oid += 1;
         }
-        fs::write(&path, output).map_err(|error| error.to_string())?;
-        manifest.push_str(&format!("{}\t{}\n", path.display(), block.len()));
+        fs::write(source_c_path(&path).as_ref(), output).map_err(|error| error.to_string())?;
+        manifest.extend_from_slice(
+            &job.errors.capture(
+                crate::util::io::source_os_bytes(path.as_os_str())
+                    .map(|v| v.into_owned())
+                    .map_err(std::io::Error::other),
+            )?,
+        );
+        manifest.extend_from_slice(format!("\t{}\n", block.len()).as_bytes());
         output_volumes.push(Volume::new(path, begin, oid, block.len() as OId));
         boundaries.push(oid);
     }
-    fs::write(job.root_dir().join("input.tsv"), manifest).map_err(|error| error.to_string())?;
+    fs::write(
+        source_c_path(&job.root_dir().join("input.tsv")).as_ref(),
+        manifest,
+    )
+    .map_err(|error| error.to_string())?;
     let mut boundary_bytes = Vec::with_capacity(boundaries.len() * 8);
     for boundary in &boundaries {
         boundary_bytes.extend_from_slice(&boundary.to_ne_bytes());
     }
-    fs::write(job.base_dir().join("blocks"), boundary_bytes).map_err(|error| error.to_string())?;
+    fs::write(
+        source_c_path(&job.base_dir().join("blocks")).as_ref(),
+        boundary_bytes,
+    )
+    .map_err(|error| error.to_string())?;
     job.log(&format!(
         "Sequences in database = {}\nLetters in database = {}\nDatabase blocks:\n{}",
         volumes.max_oid() + 1,

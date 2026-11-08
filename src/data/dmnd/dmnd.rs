@@ -303,24 +303,51 @@ impl Chunk {
     }
 }
 
-pub fn to_chunk(line: &str) -> Result<Chunk, String> {
-    let mut fields = line.split_whitespace();
-    let i = fields
-        .next()
-        .ok_or_else(|| "Missing chunk index".to_string())?
-        .parse()
-        .map_err(|_| "Invalid chunk index".to_string())?;
-    let offset = fields
-        .next()
-        .ok_or_else(|| "Missing chunk offset".to_string())?
-        .parse()
-        .map_err(|_| "Invalid chunk offset".to_string())?;
-    let n_seqs = fields
-        .next()
-        .ok_or_else(|| "Missing chunk sequence count".to_string())?
-        .parse()
-        .map_err(|_| "Invalid chunk sequence count".to_string())?;
+/// Source `std::stoull(token)` accepts a decimal prefix, optional sign, and
+/// C whitespace. It checks the unsigned magnitude before applying the sign.
+fn chunk_unsigned(token: &[u8]) -> io::Result<u64> {
+    let mut c_token = token.to_vec();
+    c_token.push(0);
+    let start = c_token.as_ptr().cast::<libc::c_char>();
+    let mut end = std::ptr::null_mut();
+    let value = unsafe { libc::strtoull(start, &mut end, 10) };
+    if end == start.cast_mut() {
+        return Err(io::Error::other("stoull"));
+    }
+    let consumed = unsafe { end.offset_from(start) } as usize;
+    // This is the ERANGE condition for base ten, independent of the CRT's
+    // thread-local errno accessor. Do not mistake a valid ULLONG_MAX for overflow.
+    let mut magnitude = 0u64;
+    for &byte in &c_token[..consumed] {
+        if byte.is_ascii_digit() {
+            magnitude = magnitude
+                .checked_mul(10)
+                .and_then(|n| n.checked_add(u64::from(byte - b'0')))
+                .ok_or_else(|| io::Error::other("stoull"))?;
+        }
+    }
+    Ok(value as u64)
+}
+
+/// Canonical raw record parser used by partition files and MPP work records.
+/// Source splits on literal spaces, retaining empty fields (not Unicode whitespace).
+pub fn to_chunk_bytes(line: &[u8]) -> io::Result<Chunk> {
+    let mut fields = line.split(|&byte| byte == b' ');
+    let mut next = || {
+        fields.next().ok_or_else(|| {
+            // Source indexes a missing vector element here; keep the safe native
+            // boundary explicit rather than manufacturing a chunk from invalid reads.
+            io::Error::other("Missing chunk field")
+        })
+    };
+    let i = chunk_unsigned(next()?)? as i32;
+    let offset = chunk_unsigned(next()?)? as usize;
+    let n_seqs = chunk_unsigned(next()?)? as usize as i64;
     Ok(Chunk::new(i, offset, n_seqs))
+}
+
+pub fn to_chunk(line: &str) -> Result<Chunk, String> {
+    to_chunk_bytes(line.as_bytes()).map_err(|error| error.to_string())
 }
 
 pub fn chunk_to_string(chunk: &Chunk) -> String {
@@ -1134,13 +1161,40 @@ impl DatabaseFile {
         Ok(())
     }
 
-    pub fn load_partition(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+    /// Source uses an unchecked text ifstream, including silent open/read failure.
+    /// Retain its real text-mode owner so Windows newline handling and raw paths
+    /// do not pass through a UTF-8 decoder or a second file open.
+    pub fn load_partition_io(&mut self, path: &Path) -> io::Result<()> {
+        let input = crate::util::io::file::File::open_path(path, "r");
         self.clear_partition();
-        let input = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        for line in input.lines() {
-            self.partition.chunks.push(to_chunk(line)?);
+        let Ok(mut input) = input else {
+            return Ok(());
+        };
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let count = input.read_max(&mut byte).unwrap_or(0);
+            if count == 0 {
+                // getline accepts an unterminated final row only at EOF;
+                // a read failure sets badbit and discards a partial row.
+                if input.read_at_eof().unwrap_or(false) && !line.is_empty() {
+                    self.partition.chunks.push(to_chunk_bytes(&line)?);
+                }
+                break;
+            }
+            if byte[0] == b'\n' {
+                self.partition.chunks.push(to_chunk_bytes(&line)?);
+                line.clear();
+            } else {
+                line.push(byte[0]);
+            }
         }
         Ok(())
+    }
+
+    pub fn load_partition(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        self.load_partition_io(path.as_ref())
+            .map_err(|error| error.to_string())
     }
 
     pub fn clear_partition(&mut self) {
@@ -1742,6 +1796,76 @@ mod tests {
         );
         assert_eq!(db.get_n_partition_chunks(), 2);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn partition_chunks_follow_source_unsigned_prefix_and_space_grammar() {
+        assert_eq!(
+            to_chunk_bytes(b"4294967295x 12\xff 9\0ignored raw\xff annotation").unwrap(),
+            Chunk::new(-1, 12, 9)
+        );
+        assert_eq!(to_chunk_bytes(b"4\t12 9 7").unwrap(), Chunk::new(4, 9, 7));
+        assert_eq!(
+            to_chunk_bytes(b"-1 -1 -1").unwrap(),
+            Chunk::new(-1, usize::MAX, usize::MAX as i64)
+        );
+        assert_eq!(
+            chunk_unsigned(b"18446744073709551615suffix").unwrap(),
+            u64::MAX
+        );
+        assert_eq!(chunk_unsigned(b"-18446744073709551615").unwrap(), 1);
+        for input in [
+            b"1  2 3".as_slice(),
+            b"1 2 nope".as_slice(),
+            b"18446744073709551616 2 3".as_slice(),
+            b"1 2 -18446744073709551616".as_slice(),
+        ] {
+            assert_eq!(to_chunk_bytes(input).unwrap_err().to_string(), "stoull");
+        }
+    }
+
+    #[test]
+    fn partition_loader_preserves_raw_annotations_and_unchecked_open() {
+        let path = fixture_path("raw_partition_database");
+        write_fixture(&path);
+        let mut db = DatabaseFile::open(&path).unwrap();
+        let partition_path = fixture_path("raw_partition");
+        std::fs::write(&partition_path, b"4 12 9 annotation\xff\n5 20 7\xff").unwrap();
+        db.load_partition_io(&partition_path).unwrap();
+        assert_eq!(
+            db.partition.chunks,
+            [Chunk::new(4, 12, 9), Chunk::new(5, 20, 7)]
+        );
+        // Source constructs the failed ifstream before clearing and silently
+        // leaves an empty partition; it does not report a checked InputFile error.
+        std::fs::remove_file(&partition_path).unwrap();
+        db.load_partition_io(&partition_path).unwrap();
+        assert_eq!(db.partition, DatabasePartition::default());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partition_loader_accepts_raw_os_path_and_source_c_prefix() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = fixture_path("raw_path_partition_database");
+        write_fixture(&path);
+        let mut db = DatabaseFile::open(&path).unwrap();
+        let directory = fixture_path("raw_path_partition_dir");
+        std::fs::create_dir_all(&directory).unwrap();
+        let (partition_path, _) =
+            crate::util::test_os_path_or_unicode(&directory, b"partition\xff", "partition-é");
+        let mut bytes = partition_path.clone().into_os_string().into_vec();
+        std::fs::write(&partition_path, b"3 8 2").unwrap();
+        bytes.extend_from_slice(b"\0not-part-of-open-path");
+        db.load_partition_io(Path::new(&std::ffi::OsString::from_vec(bytes)))
+            .unwrap();
+        assert_eq!(db.partition.chunks, [Chunk::new(3, 8, 2)]);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(partition_path).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

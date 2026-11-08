@@ -1,8 +1,10 @@
 //! Final multinode clustering merge from
 //! `diamond/src/cluster/multinode/output.cpp`.
 
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use super::source_io::{read_text, Fields, TextOutput};
+use crate::util::io::IoErrorOwner;
+#[cfg(test)]
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::basic::value::OId;
@@ -36,6 +38,9 @@ pub struct MergeConfig {
 
 /// Narrow ownership adapter for the `Job` surface used by this source file.
 pub trait MultinodeOutputJob {
+    fn io_errors(&self) -> IoErrorOwner {
+        IoErrorOwner::default()
+    }
     fn max_oid(&self) -> OId;
     fn root_dir(&self) -> &Path;
     fn base_dir(&self, round: i32) -> PathBuf;
@@ -45,37 +50,26 @@ pub trait MultinodeOutputJob {
 
 /// C++ file-local `read_clusters`.
 pub fn read_clusters(path: &Path, max_oid: OId) -> Result<Vec<OId>, String> {
-    let bytes =
-        fs::read(path).map_err(|_| format!("Error opening clustering file: {}", path.display()))?;
+    read_clusters_owned(path, max_oid, &IoErrorOwner::default())
+}
+
+pub fn read_clusters_io(path: &Path, max_oid: OId) -> std::io::Result<Vec<OId>> {
+    let errors = IoErrorOwner::default();
+    errors.finish(read_clusters_owned(path, max_oid, &errors))
+}
+fn read_clusters_owned(
+    path: &Path,
+    max_oid: OId,
+    errors: &IoErrorOwner,
+) -> Result<Vec<OId>, String> {
+    let bytes = read_text(path, errors, b"Error opening clustering file: ")?;
     let len = usize::try_from(max_oid)
         .ok()
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| "Clustering OID range does not fit in memory.".to_owned())?;
     let mut mapping = vec![NIL; len];
-    let mut fields = bytes
-        .split(u8::is_ascii_whitespace)
-        .filter(|field| !field.is_empty());
-    loop {
-        let Some(rep_text) = fields.next() else {
-            break;
-        };
-        let Some(member_text) = fields.next() else {
-            break;
-        };
-        let Ok(rep) = std::str::from_utf8(rep_text)
-            .ok()
-            .unwrap_or("")
-            .parse::<OId>()
-        else {
-            break;
-        };
-        let Ok(member) = std::str::from_utf8(member_text)
-            .ok()
-            .unwrap_or("")
-            .parse::<OId>()
-        else {
-            break;
-        };
+    let mut fields = Fields::from_text(&bytes);
+    while let (Some(rep), Some(member)) = (fields.number(), fields.number()) {
         let member = usize::try_from(member)
             .ok()
             .filter(|member| *member < mapping.len())
@@ -87,7 +81,15 @@ pub fn read_clusters(path: &Path, max_oid: OId) -> Result<Vec<OId>, String> {
 
 /// C++ file-local `chain_round`.
 pub fn chain_round(mapping: &mut [OId], path: &Path, max_oid: OId) -> Result<(), String> {
-    let next = read_clusters(path, max_oid)?;
+    chain_round_owned(mapping, path, max_oid, &IoErrorOwner::default())
+}
+fn chain_round_owned(
+    mapping: &mut [OId],
+    path: &Path,
+    max_oid: OId,
+    errors: &IoErrorOwner,
+) -> Result<(), String> {
+    let next = read_clusters_owned(path, max_oid, errors)?;
     for centroid in mapping {
         if *centroid != NIL {
             let index = usize::try_from(*centroid)
@@ -102,12 +104,17 @@ pub fn chain_round(mapping: &mut [OId], path: &Path, max_oid: OId) -> Result<(),
 
 /// C++ file-local `build_merged`.
 pub fn build_merged<J: MultinodeOutputJob>(job: &J) -> Result<Vec<OId>, String> {
-    let mut mapping = read_clusters(&job.base_dir(0).join("clusters.tsv"), job.max_oid())?;
+    let mut mapping = read_clusters_owned(
+        &job.base_dir(0).join("clusters.tsv"),
+        job.max_oid(),
+        &job.io_errors(),
+    )?;
     for round in 1..=job.round() {
-        chain_round(
+        chain_round_owned(
             &mut mapping,
             &job.base_dir(round).join("clusters.tsv"),
             job.max_oid(),
+            &job.io_errors(),
         )?;
     }
     Ok(mapping)
@@ -119,19 +126,20 @@ pub fn output_oids<J: MultinodeOutputJob>(
     merged: &[OId],
     output_file: &Path,
 ) -> Result<OId, String> {
-    let file = File::create(output_file)
-        .map_err(|_| format!("Error opening output file: {}", output_file.display()))?;
-    let mut output = BufWriter::new(file);
+    let mut output = TextOutput::open(
+        output_file,
+        &job.io_errors(),
+        b"Error opening output file: ",
+        false,
+    )?;
     let mut cluster_count = 0;
     for oid in 0..=job.max_oid() {
         let centroid = merged[oid as usize];
         if centroid == oid {
             cluster_count += 1;
         }
-        writeln!(output, "{}\t{}", centroid as i64, oid as i64)
-            .map_err(|error| error.to_string())?;
+        output.write(format!("{}\t{}\n", centroid as i64, oid as i64).as_bytes());
     }
-    output.flush().map_err(|error| error.to_string())?;
     Ok(cluster_count)
 }
 
@@ -152,18 +160,9 @@ pub fn output_accs<J: MultinodeOutputJob>(
             .root_dir()
             .join("accessions")
             .join(format!("{volume_index}.txt"));
-        let bytes = fs::read(&path)
-            .map_err(|_| format!("Error opening accessions file: {}", path.display()))?;
+        let bytes = read_text(&path, &job.io_errors(), b"Error opening accessions file: ")?;
         let mut oid = volume.oid_begin;
-        let line_count = if bytes.is_empty() {
-            0
-        } else {
-            bytes
-                .split(|byte| *byte == b'\n')
-                .count()
-                .saturating_sub(usize::from(bytes.last() == Some(&b'\n')))
-        };
-        for line in bytes.split(|byte| *byte == b'\n').take(line_count) {
+        for line in bytes.lines() {
             if oid >= volume.oid_end {
                 break;
             }
@@ -172,9 +171,12 @@ pub fn output_accs<J: MultinodeOutputJob>(
         }
     }
 
-    let file = File::create(output_file)
-        .map_err(|_| format!("Error opening output file: {}", output_file.display()))?;
-    let mut output = BufWriter::new(file);
+    let mut output = TextOutput::open(
+        output_file,
+        &job.io_errors(),
+        b"Error opening output file: ",
+        true,
+    )?;
     let mut cluster_count = 0;
     for oid in 0..=job.max_oid() {
         let centroid = merged[oid as usize];
@@ -182,17 +184,14 @@ pub fn output_accs<J: MultinodeOutputJob>(
             .ok()
             .filter(|index| *index < accessions.len())
             .ok_or_else(|| format!("Cluster representative OID out of bounds: {centroid}"))?;
-        output
-            .write_all(&accessions[centroid_index])
-            .and_then(|_| output.write_all(b"\t"))
-            .and_then(|_| output.write_all(&accessions[oid as usize]))
-            .and_then(|_| output.write_all(b"\n"))
-            .map_err(|error| error.to_string())?;
+        output.write(&accessions[centroid_index]);
+        output.write(b"\t");
+        output.write(&accessions[oid as usize]);
+        output.write(b"\n");
         if centroid == oid {
             cluster_count += 1;
         }
     }
-    output.flush().map_err(|error| error.to_string())?;
     Ok(cluster_count)
 }
 

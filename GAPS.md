@@ -12,15 +12,18 @@ not known failures unless the text explicitly says otherwise.
 
 ## Active translation batch (2026-11-08)
 
-- Raw OS arguments, filesystem paths, late byte-valued options, and their native
-  callers have been migrated together. Combined compilation is still being
-  corrected; no final-snapshot parity claim applies yet.
-- Greedy vertex cover still needs its raw mapping/edge and numeric tokenizer
-  translation integrated. The reusable TSV file/join facade also needs raw
-  content support, and actual Source TSV worker failures must preserve the
-  upstream abort boundary. These code changes are currently in progress.
-- The raw-path CLI comparison harness is prepared but has not executed Source
-  or Native. Hosted macOS runtime and the external two-worker gate remain open.
+- Raw OS arguments/paths and GVC/TSV byte content are integrated. The retained
+  18 raw-OS, six GVC and thirteen TSV controls match Source; their broader
+  combination/platform scope remains qualified.
+- Current code work covers partition-file byte/numeric semantics, retained
+  multinode library path/content handling, external volume-read stopping, and
+  Source's parallel alignment tasks and per-worker output-buffer ownership.
+- The combined batch passes isolated default/optional/Windows compilation and
+  86 focused tests. Nested DP work still uses global Rayon rather than the
+  external alignment pool; volume-building parallel dispatch and retained
+  multinode streaming-owner semantics also remain code follow-ups.
+- Hosted CI verification, the Source-shared two-worker hazard, and final parity
+  gates remain open. No complete-translation claim applies.
 
 ## Current implementation and remaining evidence (2026-11-08)
 
@@ -30,7 +33,7 @@ is no automatic production C++ fallback. Earlier adapter-missing statements
 below are historical and superseded; unchecked validation items remain evidence
 gates, not proof that their code is absent. Current results and explicit Source
 compatibility boundaries are in `TRANSLATION_COMPLETION.md` and
-`translation/progress.md`. The overall translation goal is unachieved and paused by the user; current priority is CI/CLI fixes.
+`translation/progress.md`. The overall translation goal is unachieved. The user resumed translation work while hosted CI is monitored.
 
 The latest external two-worker gate remains unresolved: a late unconditional
 empty-chunk allocation can disagree with another worker's captured chunk count.
@@ -83,22 +86,17 @@ and focused checks. Windows runtime/ACP diagnostic bytes, further raw-byte title
 integration and final-snapshot broader workflows remain open. These selected
 controls do not establish full platform or command-combination parity.
 
-## Remaining raw argv and filename integration
+## Raw argv and filename evidence
 
-The executable still collects `std::env::args()` into `Vec<String>`. On Unix,
-a valid non-UTF-8 argument therefore fails before dispatch. Pinned Source
-copies `char**` bytes into strings and passes filename bytes to POSIX stat/open;
-this is a defined input domain, separate from the qualified XML escape-table
-undefined behavior. Current raw record/title/taxonomy evidence does not close
-this filename/argument gap.
+The executable now uses OS-native arguments and paths through the connected
+parser, input/output owners, diagnostics and invocation metadata. The 18 retained
+raw-OS CLI controls match Source exactly, including full DMND/DAA artifacts and
+the unknown-output-format diagnostic. There is no lossy argument encoding.
 
-Completion needs an end-to-end raw argument and OS-native path model through
-parser/configuration, input/output owners, typed filename diagnostics and
-invocation metadata. `args_os()` alone is insufficient while downstream fields
-and constructors require `String`/`&str`. No private Unicode encoding, descriptor
-aliasing or lossily rewritten path is an acceptable substitute. Existing String
-library APIs can remain checked adapters. Windows ACP versus wide-path behavior
-retains its separate explicit compatibility qualification.
+Checked String library adapters remain available. The retained multinode library
+and partition-file follow-ups have their own code scope and do not invalidate
+or broaden those CLI captures. Windows ACP versus wide-path support and Source's
+XML escape-table undefined behavior retain their explicit qualifications.
 
 ## Priority order
 

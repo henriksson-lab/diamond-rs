@@ -1,7 +1,7 @@
 # End-to-end translation completion
 
-Goal established 2026-11-06; paused by the user on 2026-11-08, not achieved.
-Current priority: finish the CI/CLI fixes and their running verification.
+Goal established 2026-11-06; not achieved. The user resumed translation work
+on 2026-11-08 while the next hosted CI run is monitored.
 
 Completion requires native Rust implementations integrated into the executable
 and library, verified parity against pinned upstream DIAMOND, and no production
@@ -17,19 +17,31 @@ by test doubles leaves its production integration incomplete.
 
 ## Current integration checkpoint (2026-11-08)
 
-Commit `c194d6e` is an explicitly uncompiled work-in-progress checkpoint, not a
-completion claim. The subsequent raw OS argument/path and byte-option batch
-has reached library compilation in an isolated package without adjacent C++
-sources. The latest full-target check (`350883bb…`) stopped on one stale SAM
-invocation fixture; that fixture is corrected in the worktree. Optional and
-Windows checks, focused tests, and actual raw-path CLI comparisons have not yet
-run for this batch.
+The raw OS argument/path, byte-option, GVC and TSV integration batch is now
+committed. Isolated default and optional-feature checks, Windows cross-checks,
+focused I/O tests and all optional integration targets passed in their recorded
+snapshots, including all 20 frozen regression hashes. All 18 raw-OS CLI controls
+match the preserved Source captures exactly; the six GVC and thirteen TSV
+controls also match. These are bounded comparisons, not universal parity.
 
-Static review also found connected byte-content gaps in greedy vertex cover
-and the reusable TSV facade, plus a Source worker-exception behavior mismatch.
-Those translations are in progress. Earlier passing snapshots below do not
-prove these new changes. See `translation/CHECKPOINT.md` for the committed
-checkpoint's scope; the overall goal remains active.
+CI follow-ups `cdbd43e` and `437fc9e` repair workflow option projection, independent
+zstd-frame reset, platform fixture assumptions and Windows test handle
+inheritance. The workflow now has seven jobs covering four native hosts, musl,
+and two 32-bit targets. Both hosted macOS spill checks passed in run 42472717649;
+verification of the latest CI repair remains pending.
+
+Resumed code work addresses raw partition-file parsing, retained multinode
+library byte/path semantics, and external clustering's volume read boundary
+and parallel alignment ownership. The frozen corrective package `5c816812…`
+passes isolated default/optional/Windows all-target checks and 86 focused tests.
+The activated task pool also now preserves Source's completion-notification
+mutex; the FileArray owner avoids allocating worker-local codec state.
+Multinode remains a retained library translation;
+Source's inactive CLI call is not made into a new command. The shared external
+two-worker empty-chunk scheduling hazard remains an explicit open boundary.
+Nested DP still needs the actual external pool carrier; parallel volume building
+and the retained multinode collection facade's streaming ownership remain code
+follow-ups. No full parallel or platform parity claim is made for this batch.
 
 ## Current coverage (2026-11-08)
 

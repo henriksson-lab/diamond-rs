@@ -48,3 +48,24 @@ Local isolated default/optional/Windows compilation, protocol, numerical,
 archive-library, stdout/help, and deprecated-command checks passed. Workflow YAML
 and shell syntax checks passed. Fresh hosted verification of this batch remains
 pending; the broader translation goal stays paused.
+
+The user resumed translation work while monitoring the pushed CI run on
+2026-11-08. The ten-minute check of run 42477158649 found Windows cutoff tests
+blocked by inherited CRT handles. Commit 6e18720 serializes the Windows test
+harness and removes the archive-only guard; internal parallel application cases
+remain enabled. Other hosted jobs were still running at the last check.
+
+The resumed translation batch adds raw unsigned-prefix partition parsing,
+retained multinode library byte/path and text-stream semantics, a pre-read OID
+boundary for external volumes, and Source TaskSet alignment dispatch with
+per-worker codec buffers. The concrete command shares its scoring owner across
+those tasks. Source-equivalent locking closes a task-completion lost-wakeup
+window; the shared file-array owner allocates no worker codec state.
+
+Corrective package 5c816812dceb517e2933f01288a0379034bc0325b7c1d13050a56c29edb30fe2
+passed isolated default/optional/Windows all-target checks and 86 focused tests
+(53 external, 21 multinode, 11 DMND, one successor-chain regression). The original
+failed snapshot remains preserved. These checks do not establish fresh C++
+parity for the new parallel branch. Nested DP pool reuse, parallel volume
+building, retained multinode streaming ownership, and the Source-shared
+two-worker scheduling hazard remain open; the translation goal is not achieved.

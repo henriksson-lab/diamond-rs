@@ -1,8 +1,9 @@
 //! External-clustering alignment stage from `cluster/external/align.cpp`.
 
 use crate::util::io::source_c_path;
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use super::external::{ClusterStats, Edge, Job, PairEntryShort};
 use super::pair_table::{RadixedTable, RADIX_BITS, RADIX_COUNT};
 use super::seed_table::{SequenceVolumeReader, Volume, VolumedFile};
-use super::storage::BucketWriter;
+use super::storage::{BucketWriter, WorkerBucketBuffers};
 use crate::basic::statistics::Statistics;
 use crate::basic::value::Letter;
 use crate::dp::swipe::{
@@ -18,7 +19,7 @@ use crate::dp::swipe::{
 };
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::hash::hash64;
-use crate::util::parallel::Atomic;
+use crate::util::parallel::{Atomic, TaskSet, ThreadPool};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlignConfig {
@@ -68,8 +69,8 @@ impl ChunkSequences {
         let mut sequences = HashMap::new();
         let mut letters = 0usize;
         for volume in &volumes.0 {
-            reader.visit_volume(&volume.path, &mut |sequence| {
-                let oid = parse_oid(&sequence.id)?;
+            reader.visit_volume_bytes(&volume.path, &mut |sequence| {
+                let oid = parse_oid(&sequence.id);
                 letters += sequence.sequence.len();
                 sequences.insert(oid, sequence.sequence);
                 Ok(())
@@ -102,45 +103,12 @@ impl ChunkSequences {
     }
 }
 
-fn parse_oid(id: &str) -> Result<u64, String> {
-    let token = id.split_whitespace().next().unwrap_or("");
-    let digits = token
-        .strip_prefix('+')
-        .unwrap_or(token)
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    if digits.is_empty() {
-        return Err(format!("Invalid sequence OID: {id}"));
-    }
-    digits
-        .parse::<u64>()
-        .map_err(|_| format!("Invalid sequence OID: {id}"))
-}
-
-#[derive(Debug)]
-struct EdgeFileArray(BucketWriter);
-
-impl EdgeFileArray {
-    fn new(
-        base_dir: impl AsRef<Path>,
-        worker_id: i64,
-        errors: crate::util::io::IoErrorOwner,
-    ) -> Result<Self, String> {
-        Ok(Self(BucketWriter::new_owned(
-            base_dir.as_ref(),
-            worker_id,
-            RADIX_COUNT,
-            errors,
-        )?))
-    }
-    fn write_msb(&mut self, edge: Edge) -> Result<(), String> {
-        let radix = (hash64(edge.member_oid) >> (64 - RADIX_BITS)) as usize;
-        self.0.write(radix, &encode_edge(edge))
-    }
-    fn finish(&mut self) -> Result<RadixedTable, String> {
-        self.0.finish()
-    }
+fn parse_oid(id: &[u8]) -> u64 {
+    // ChunkSeqs stores std::atoll(ids[j]); it accepts signs, numeric prefixes,
+    // empty/nonnumeric strings and arbitrary bytes after the numeric prefix.
+    let mut terminated = crate::util::sequence::c_string_bytes(id).to_vec();
+    terminated.push(0);
+    unsafe { libc::atoll(terminated.as_ptr().cast()) as u64 }
 }
 
 fn encode_edge(edge: Edge) -> [u8; 24] {
@@ -338,45 +306,54 @@ fn visit_pair_batches_input(
     visitor: &mut dyn FnMut(Vec<PairEntryShort>) -> Result<(), String>,
 ) -> Result<(), String> {
     let total = errors.capture(input.file_size().map_err(std::io::Error::other))? as u64;
-    let mut position = 0u64;
-    loop {
-        let mut header = [0; std::mem::size_of::<usize>()];
-        if errors.capture(
-            input
-                .read_raw(&mut header[..1])
-                .map_err(std::io::Error::other),
-        )? == 0
-        {
-            break;
-        }
-        errors.capture(
-            input
-                .read_exact(&mut header[1..])
-                .map_err(std::io::Error::other),
-        )?;
-        let count = usize::from_ne_bytes(header);
-        let bytes = count.checked_mul(16).ok_or("Pair batch size overflow.")?;
-        position += header.len() as u64;
-        if bytes as u64 > total.saturating_sub(position) {
-            return Err("Short PairEntryShort batch.".into());
-        }
-        let mut batch = Vec::new();
-        batch
-            .try_reserve(count)
-            .map_err(|error| error.to_string())?;
-        for _ in 0..count {
-            let mut pair = [0; 16];
-            errors.capture(input.read_values(&mut pair).map_err(std::io::Error::other))?;
-            position += pair.len() as u64;
-            batch.push(PairEntryShort {
-                rep_oid: u64::from_ne_bytes(pair[..8].try_into().unwrap()),
-                member_oid: u64::from_ne_bytes(pair[8..].try_into().unwrap()),
-            });
-        }
+    let mut position = 0;
+    while let Some(batch) = next_pair_batch(input, errors, total, &mut position)? {
         visitor(batch)?;
     }
     errors.capture(input.close().map_err(std::io::Error::other))?;
     Ok(())
+}
+
+fn next_pair_batch(
+    input: &mut crate::util::io::InputFile,
+    errors: &crate::util::io::IoErrorOwner,
+    total: u64,
+    position: &mut u64,
+) -> Result<Option<Vec<PairEntryShort>>, String> {
+    let mut header = [0; std::mem::size_of::<usize>()];
+    if errors.capture(
+        input
+            .read_raw(&mut header[..1])
+            .map_err(std::io::Error::other),
+    )? == 0
+    {
+        return Ok(None);
+    }
+    errors.capture(
+        input
+            .read_exact(&mut header[1..])
+            .map_err(std::io::Error::other),
+    )?;
+    let count = usize::from_ne_bytes(header);
+    let bytes = count.checked_mul(16).ok_or("Pair batch size overflow.")?;
+    *position += header.len() as u64;
+    if bytes as u64 > total.saturating_sub(*position) {
+        return Err("Short PairEntryShort batch.".into());
+    }
+    let mut batch = Vec::new();
+    batch
+        .try_reserve(count)
+        .map_err(|error| error.to_string())?;
+    for _ in 0..count {
+        let mut pair = [0; 16];
+        errors.capture(input.read_values(&mut pair).map_err(std::io::Error::other))?;
+        *position += pair.len() as u64;
+        batch.push(PairEntryShort {
+            rep_oid: u64::from_ne_bytes(pair[..8].try_into().unwrap()),
+            member_oid: u64::from_ne_bytes(pair[8..].try_into().unwrap()),
+        });
+    }
+    Ok(Some(batch))
 }
 
 #[cfg(test)]
@@ -401,21 +378,202 @@ fn alignment_output_path(prefix: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// C++ `External::align` with file-backed cross-process chunk claims.
+/// Compatibility library entry; the native command supplies its existing Arc
+/// through align_owned, so no scoring matrix is copied by the production path.
 pub fn align<R: SequenceVolumeReader>(
     job: &Job,
     chunk_count: usize,
-    _db_size: i64,
+    db_size: i64,
     score_matrix: &ScoreMatrix,
     config: &AlignConfig,
     reader: &mut R,
 ) -> Result<(RadixedTable, ClusterStats), String> {
-    if config.threads == 0 {
-        return Err("Alignment thread count must be positive.".to_string());
+    align_owned(
+        job,
+        chunk_count,
+        db_size,
+        Arc::new(score_matrix.clone()),
+        config,
+        reader,
+    )
+}
+
+struct AlignmentOutput {
+    file: crate::util::io::cstdio_file::OwnedCstdio,
+    failed: bool,
+}
+impl Write for AlignmentOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if !self.failed {
+            self.failed = !self
+                .file
+                .write_text_output(bytes)
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.failed {
+            self.failed = !self
+                .file
+                .flush_text_output()
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(())
+    }
+    fn write_fmt(&mut self, arguments: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+        let mut row = Vec::new();
+        row.write_fmt(arguments)?;
+        self.write_all(&row)?;
+        self.flush() // The sole caller is Source's per-HSP std::endl row.
+    }
+}
+impl Drop for AlignmentOutput {
+    fn drop(&mut self) {
+        let _ = self.file.close_file_role();
+    }
+}
+
+struct PairInput {
+    input: crate::util::io::InputFile,
+    total: u64,
+    position: u64,
+}
+struct AlignChunkOwner {
+    sequences: ChunkSequences,
+    input: Mutex<PairInput>,
+    files: Arc<Mutex<BucketWriter>>,
+    matrix: Arc<ScoreMatrix>,
+    config: AlignConfig,
+    errors: crate::util::io::IoErrorOwner,
+    failure: Arc<Mutex<Option<String>>>,
+    statistics: Mutex<ClusterStats>,
+}
+thread_local! {
+    // ThreadPool workers are freshly created for each chunk. Their actual TLS
+    // destructor flushes BufferArray before ThreadPool::join returns.
+    static ALIGN_BUFFERS: RefCell<Option<WorkerBucketBuffers>> = const { RefCell::new(None) };
+}
+impl AlignChunkOwner {
+    fn enqueue(self: &Arc<Self>, tasks: &Arc<TaskSet>) {
+        let owner = Arc::clone(self);
+        let tasks_for_task = Arc::clone(tasks);
+        tasks.enqueue(move || {
+            if owner.failure.lock().unwrap().is_some() {
+                return;
+            }
+            if let Err(message) = owner.run_task(&tasks_for_task) {
+                if owner.errors.source_destructors() {
+                    let error = owner.errors.finish::<()>(Err(message)).unwrap_err();
+                    if let Err(error) = crate::util::io::emit_source_perror(&error) {
+                        crate::util::io::abort_source_diagnostic_error(&error);
+                    }
+                    crate::util::io::abort_source_process();
+                }
+                owner.failure.lock().unwrap().get_or_insert(message);
+            }
+        });
+    }
+    fn run_task(self: &Arc<Self>, tasks: &Arc<TaskSet>) -> Result<(), String> {
+        ALIGN_BUFFERS.with(|slot| {
+            if slot.borrow().is_none() {
+                *slot.borrow_mut() = Some(WorkerBucketBuffers::new(
+                    Arc::clone(&self.files),
+                    RADIX_COUNT,
+                    self.errors.clone(),
+                    Arc::clone(&self.failure),
+                ));
+            }
+        });
+        // Source creates this per-task ofstream before reading a header, even
+        // for the single EOF task. No idle worker invents an empty output file.
+        let mut alignment_output = if let Some(prefix) = &self.config.alignment_output {
+            let path = alignment_output_path(prefix);
+            Some(AlignmentOutput {
+                file: crate::util::io::cstdio_file::OwnedCstdio::open_file_role_path(&path, "a")
+                    .map_err(|_| {
+                        super::storage::path_error(
+                            &self.errors,
+                            b"Failed to open alignment output file: ",
+                            &path,
+                        )
+                    })?,
+                failed: false,
+            })
+        } else {
+            None
+        };
+        let batch = {
+            let mut input = self.input.lock().unwrap();
+            let PairInput {
+                input,
+                total,
+                position,
+            } = &mut *input;
+            next_pair_batch(input, &self.errors, *total, position)?
+        };
+        let Some(batch) = batch else {
+            return Ok(());
+        };
+        // Exactly one successor is pending, in Source FIFO header/payload
+        // order; it becomes runnable before this task starts expensive DP.
+        self.enqueue(tasks);
+        let mut stats = ClusterStats::default();
+        let mut begin = 0;
+        while begin < batch.len() {
+            let mut end = begin + 1;
+            while end < batch.len() && batch[end].rep_oid == batch[begin].rep_oid {
+                end += 1;
+            }
+            let mut edges = Vec::new();
+            align_rep(
+                &self.sequences,
+                &batch[begin..end],
+                &self.matrix,
+                &self.config,
+                &mut edges,
+                alignment_output.as_mut().map(|file| file as &mut dyn Write),
+                &mut stats,
+            )?;
+            ALIGN_BUFFERS.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let buffers = slot.as_mut().unwrap();
+                for edge in edges {
+                    let radix = (hash64(edge.member_oid) >> (64 - RADIX_BITS)) as usize;
+                    buffers.write(radix, &encode_edge(edge))?;
+                }
+                Ok::<_, String>(())
+            })?;
+            begin = end;
+        }
+        self.statistics.lock().unwrap().add(&stats);
+        Ok(())
+    }
+}
+
+/// Actual native command owner, using the translated priority TaskSet and
+/// sharing the already initialized scoring matrix across all worker tasks.
+pub fn align_owned<R: SequenceVolumeReader>(
+    job: &Job,
+    chunk_count: usize,
+    _db_size: i64,
+    score_matrix: Arc<ScoreMatrix>,
+    config: &AlignConfig,
+    reader: &mut R,
+) -> Result<(RadixedTable, ClusterStats), String> {
+    let threads = i32::try_from(config.threads)
+        .map_err(|_| "Alignment thread count exceeds signed32 range.")?;
+    if threads <= 0 {
+        return Err("Alignment thread count must be positive.".into());
     }
     let chunks_path = job.base_dir(None).join("chunks");
     let alignment_path = job.base_dir(None).join("alignments");
-    let mut output_files = EdgeFileArray::new(&alignment_path, job.worker_id(), job.io_errors())?;
+    let output = Arc::new(Mutex::new(BucketWriter::new_file_array_owned(
+        &alignment_path,
+        job.worker_id(),
+        RADIX_COUNT,
+        job.io_errors(),
+    )?));
     let mut all_stats = ClusterStats::default();
     let queue = Atomic::new(chunks_path.join("align_queue"));
     let mut processed = 0;
@@ -426,69 +584,50 @@ pub fn align<R: SequenceVolumeReader>(
         }
         let chunk_path = chunks_path.join(chunk.to_string());
         let volumes = read_volumed_file(&chunk_path.join("bucket.tsv"), &job.io_errors())?;
-        let chunk_sequences = ChunkSequences::from_volumes(&volumes, reader)?;
+        let sequences = ChunkSequences::from_volumes(&volumes, reader)?;
         job.log(&format!(
             "Computing alignments. Chunk={}/{} Volumes={} Sequences={} Letters={}",
             chunk + 1,
             chunk_count,
-            chunk_sequences.volumes(),
-            chunk_sequences.oids(),
-            chunk_sequences.letters()
+            sequences.volumes(),
+            sequences.oids(),
+            sequences.letters()
         ))?;
         let pairs_path = chunk_path.join("pairs");
-        let mut pairs_input =
-            job.open_input(&pairs_path, crate::util::io::InputFile::NO_AUTODETECT)?;
-        let path = config
-            .alignment_output
-            .as_deref()
-            .map(alignment_output_path);
-        let mut alignment_output = if let Some(path) = &path {
-            Some(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(source_c_path(&(path)).as_ref())
-                    .map_err(|_| {
-                        super::storage::path_error(
-                            &job.io_errors(),
-                            b"Failed to open alignment output file: ",
-                            &path,
-                        )
-                    })?,
-            )
-        } else {
-            None
-        };
-        visit_pair_batches_input(&mut pairs_input, &job.io_errors(), &mut |batch| {
-            let mut begin = 0usize;
-            while begin < batch.len() {
-                let rep_oid = batch[begin].rep_oid;
-                let mut end = begin + 1;
-                while end < batch.len() && batch[end].rep_oid == rep_oid {
-                    end += 1;
-                }
-                let mut edges = Vec::new();
-                align_rep(
-                    &chunk_sequences,
-                    &batch[begin..end],
-                    score_matrix,
-                    config,
-                    &mut edges,
-                    alignment_output.as_mut().map(|file| file as &mut dyn Write),
-                    &mut all_stats,
-                )?;
-                for edge in edges {
-                    output_files.write_msb(edge)?;
-                }
-                begin = end;
-            }
-            Ok(())
-        })?;
-        processed += 1;
+        let mut input = job.open_input(&pairs_path, crate::util::io::InputFile::NO_AUTODETECT)?;
+        let total = job.io(input.file_size())? as u64;
+        let failure = Arc::new(Mutex::new(None));
+        let owner = Arc::new(AlignChunkOwner {
+            sequences,
+            input: Mutex::new(PairInput {
+                input,
+                total,
+                position: 0,
+            }),
+            files: Arc::clone(&output),
+            matrix: Arc::clone(&score_matrix),
+            config: config.clone(),
+            errors: job.io_errors(),
+            failure,
+            statistics: Mutex::new(ClusterStats::default()),
+        });
+        let pool = ThreadPool::default();
+        let tasks = Arc::new(TaskSet::new(&pool, 1));
+        owner.enqueue(&tasks);
+        pool.run(threads, true, Some(&tasks));
+        pool.join();
+        if let Some(error) = owner.failure.lock().unwrap().clone() {
+            return Err(error);
+        }
+        all_stats.add(&owner.statistics.lock().unwrap());
+        job.io(owner.input.lock().unwrap().input.close())?;
         fs::remove_file(source_c_path(&pairs_path).as_ref()).map_err(|error| error.to_string())?;
+        drop(owner); // Actual sequence owner is freed after close/remove.
+        processed += 1;
     }
     job.log_stats(&all_stats)?;
-    let table = output_files.finish()?;
+    let table = output.lock().unwrap().finish()?;
+    drop(output);
     let finished = Atomic::new(alignment_path.join("finished"));
     finished.fetch_add(processed)?;
     finished.await_value(chunk_count as i64)?;
@@ -694,6 +833,117 @@ mod tests {
                 },
             ])
         }
+    }
+
+    #[test]
+    fn chunk_sequence_oid_uses_raw_c_numeric_prefix() {
+        assert_eq!(parse_oid(b" +42\xff trailing"), 42);
+        assert_eq!(parse_oid(b"-7 description"), (-7_i64) as u64);
+        assert_eq!(parse_oid(b"9\0-1"), 9);
+        assert_eq!(parse_oid(b"\xffnot a number"), 0);
+        assert_eq!(parse_oid(b""), 0);
+    }
+
+    #[test]
+    fn parallel_taskset_has_one_eof_task_and_no_idle_output_owners() {
+        let root = std::env::temp_dir().join(format!(
+            "diamond-align-empty-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let job = Job::new(10, 1, 1 << 20, &root, 3).unwrap();
+        let chunk = job.base_dir(None).join("chunks/0");
+        fs::create_dir_all(&chunk).unwrap();
+        fs::write(chunk.join("bucket.tsv"), "fixture.fa\t2\n").unwrap();
+        fs::write(chunk.join("pairs"), []).unwrap();
+        let matrix = Arc::new(ScoreMatrix::new("blosum62", 11, 1, 0, 1, 1_000_000_000).unwrap());
+        let (_, stats) = align_owned(
+            &job,
+            1,
+            10,
+            matrix,
+            &AlignConfig {
+                threads: 4,
+                alignment_output: Some(root.join("aln")),
+                ..Default::default()
+            },
+            &mut FixtureReader,
+        )
+        .unwrap();
+        let files: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("aln."))
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "only the actual EOF task opens its thread output"
+        );
+        assert_eq!(fs::metadata(&files[0]).unwrap().len(), 0);
+        assert_eq!(stats.extensions_computed, 0);
+        assert!(!chunk.join("pairs").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parallel_pair_batches_are_consumed_once_and_flush_worker_members() {
+        let root = std::env::temp_dir().join(format!(
+            "diamond-align-parallel-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let job = Job::new(10, 1, 1 << 20, &root, 3).unwrap();
+        let chunk = job.base_dir(None).join("chunks/0");
+        fs::create_dir_all(&chunk).unwrap();
+        fs::write(chunk.join("bucket.tsv"), "fixture.fa\t2\n").unwrap();
+        let mut pairs = Vec::new();
+        for _ in 0..32 {
+            pairs.extend_from_slice(&1usize.to_ne_bytes());
+            pairs.extend_from_slice(&4u64.to_ne_bytes());
+            pairs.extend_from_slice(&9u64.to_ne_bytes());
+        }
+        fs::write(chunk.join("pairs"), pairs).unwrap();
+        let matrix = Arc::new(ScoreMatrix::new("blosum62", 11, 1, 0, 1, 1_000_000_000).unwrap());
+        let (table, stats) = align_owned(
+            &job,
+            1,
+            10,
+            matrix,
+            &AlignConfig {
+                threads: 4,
+                alignment_output: Some(root.join("aln")),
+                ..Default::default()
+            },
+            &mut FixtureReader,
+        )
+        .unwrap();
+        assert_eq!(stats.extensions_computed, 32);
+        assert_eq!(stats.hits_filtered, 32);
+        let files: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("aln."))
+            .collect();
+        assert!(!files.is_empty() && files.len() <= 4);
+        let lines: usize = files
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap().lines().count())
+            .sum();
+        assert_eq!(lines, 32);
+        let records: u64 = table
+            .iter()
+            .map(|b| {
+                super::super::storage::manifest_records(&b.path)
+                    .unwrap()
+                    .iter()
+                    .map(|(_, n)| *n)
+                    .sum::<u64>()
+            })
+            .sum();
+        assert_eq!(records, 64); // The one HSP emits both Source directions.
+        assert!(!chunk.join("pairs").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

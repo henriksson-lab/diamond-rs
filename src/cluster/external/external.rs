@@ -743,38 +743,45 @@ pub fn build_chunks<R: SequenceVolumeReader>(
                 if volume.oid_end != 0 && (volume.oid_end <= first || volume.oid_begin > last) {
                     continue;
                 }
-                let mut sequential_oid = volume.oid_begin;
-                reader.visit_volume_bytes(&volume.path, &mut |record| {
-                    let oid = if job.round_index() > 0 {
-                        parse_oid_like_atoll(&record.id)
-                    } else {
-                        sequential_oid
-                    };
-                    sequential_oid = oid.wrapping_add(1);
-                    let Some(chunks) = wanted.get(&oid) else {
-                        return Ok(());
-                    };
-                    buffer.clear();
-                    crate::util::sequence::format(
-                        &record.sequence,
-                        &oid.to_string(),
-                        None,
-                        &mut buffer,
-                        "fasta",
-                        &traits,
-                        160,
-                    )?;
-                    for &chunk in chunks {
-                        // Source BufferArray's byte-string overload counts
-                        // FASTA bytes, not sequences, in this volume manifest.
-                        output.write_count(
-                            chunk as usize,
-                            buffer.data(),
-                            buffer.data().len() as u64,
+                // Source checks file_oid < oid_end before read_seq, then uses
+                // the current record's numeric title only in later rounds.
+                let sequential_oid = std::cell::Cell::new(volume.oid_begin);
+                let oid_end = last.wrapping_add(1);
+                reader.visit_volume_bytes_while(
+                    &volume.path,
+                    &mut || sequential_oid.get() < oid_end,
+                    &mut |record| {
+                        let oid = if job.round_index() > 0 {
+                            parse_oid_like_atoll(&record.id)
+                        } else {
+                            sequential_oid.get()
+                        };
+                        sequential_oid.set(oid.wrapping_add(1));
+                        let Some(chunks) = wanted.get(&oid) else {
+                            return Ok(());
+                        };
+                        buffer.clear();
+                        crate::util::sequence::format(
+                            &record.sequence,
+                            &oid.to_string(),
+                            None,
+                            &mut buffer,
+                            "fasta",
+                            &traits,
+                            160,
                         )?;
-                    }
-                    Ok(())
-                })?;
+                        for &chunk in chunks {
+                            // Source BufferArray's byte-string overload counts
+                            // FASTA bytes, not sequences, in this volume manifest.
+                            output.write_count(
+                                chunk as usize,
+                                buffer.data(),
+                                buffer.data().len() as u64,
+                            )?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
         }
         remove_manifest_storage(&bucket.path, &storage);
@@ -1512,6 +1519,53 @@ mod tests {
             let path = job.base_dir(None).join("edges.tsv");
             fs::write(&path, []).map_err(|error| error.to_string())?;
             Ok(RadixedTable(vec![Bucket::new(path, Some(0))]))
+        }
+    }
+
+    #[test]
+    fn chunk_builder_stops_before_bad_tail_in_original_and_numeric_oid_rounds() {
+        for round in 0..=1 {
+            let dir = temp_dir("chunk-read-boundary");
+            let mut job = Job::new(0, 1, 1 << 20, &dir, 2).unwrap();
+            if round > 0 {
+                job.next_round().unwrap();
+            }
+            let oid = if round == 0 { 0 } else { 7 };
+            let input = dir.join("volume.faa");
+            fs::write(&input, b">7\nARND\n>invalid-tail\n!\n").unwrap();
+            let mut table_writer = super::super::storage::BucketWriter::new_owned(
+                &dir.join("chunk-table"),
+                job.worker_id(),
+                1,
+                job.io_errors(),
+            )
+            .unwrap();
+            let mut entry = Vec::new();
+            ChunkTableEntry::new(oid, 0).serialize(&mut entry);
+            table_writer.write(0, &entry).unwrap();
+            let table = table_writer.finish().unwrap();
+            let database = VolumedFile(vec![Volume::new(&input, 0, 10, 2)]);
+            let outputs = build_chunks(
+                &job,
+                &database,
+                &table,
+                1,
+                &mut super::super::seed_table::FastaVolumeReader,
+            )
+            .unwrap();
+            let mut fasta = Vec::new();
+            for manifest in outputs {
+                for (path, count) in read_manifest(&manifest).unwrap() {
+                    let mut source = open_input(&path).unwrap();
+                    let mut data = vec![0; count];
+                    source.read_values(&mut data).unwrap();
+                    fasta.extend(data);
+                }
+            }
+            assert_eq!(fasta, format!(">{oid}\nARND\n").as_bytes());
+            drop(table_writer);
+            drop(job);
+            fs::remove_dir_all(dir).unwrap();
         }
     }
 

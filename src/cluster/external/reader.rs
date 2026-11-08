@@ -35,6 +35,18 @@ pub fn visit_volume_bytes_owned(
     on_open: &mut dyn FnMut() -> Result<(), String>,
     errors: &crate::util::io::IoErrorOwner,
 ) -> Result<(), String> {
+    visit_volume_bytes_while_owned(path, &mut || true, visit, on_open, errors)
+}
+
+/// Evaluate Source's loop condition before reading each record from the retained
+/// owner. A false condition does not decode or validate a trailing record.
+pub fn visit_volume_bytes_while_owned(
+    path: &Path,
+    should_read: &mut dyn FnMut() -> bool,
+    visit: &mut dyn FnMut(ByteSeedSequence) -> Result<(), String>,
+    on_open: &mut dyn FnMut() -> Result<(), String>,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<(), String> {
     let (kind, resolved) = errors.capture(detect_type_source_with_buffer(
         &[path.to_path_buf()],
         Flags::NONE,
@@ -54,6 +66,9 @@ pub fn visit_volume_bytes_owned(
                 ))?;
             on_open()?;
             for oid in 0..file.sequence_count() {
+                if !should_read() {
+                    break;
+                }
                 let (sequence, id) = errors.capture(file.record_bytes_io(oid))?;
                 visit(ByteSeedSequence { id, sequence })?;
             }
@@ -69,46 +84,34 @@ pub fn visit_volume_bytes_owned(
             )?;
             on_open()?;
             for oid in 0..file.sequence_count() {
+                if !should_read() {
+                    break;
+                }
                 let (sequence, id) = errors.capture(file.record_at_bytes_io(oid))?;
                 visit(ByteSeedSequence { id, sequence })?;
             }
             Ok(())
         }
         SequenceFileType::Fasta => {
-            // External FileArray volumes contain concatenated zlib members;
-            // InputFile implements Source's member chaining and codec sniffing.
-            let file = errors.capture(
-                crate::util::io::InputFile::with_source_profile_path(&resolved, 0, 65_536)
-                    .map_err(std::io::Error::other),
+            let mut file = errors.capture(
+                crate::data::fasta::fasta_file::FastaFile::open_source_with_buffer(
+                    &[resolved],
+                    Default::default(),
+                    65_536,
+                ),
             )?;
-            // FastaFile's constructor guesses the decoded format before it
-            // returns. Retain that same input owner for subsequent records.
-            let file = errors.capture(crate::data::fasta::prepare_decoded_sequence_reader(file))?;
+            file.set_io_errors(errors.clone());
             on_open()?;
-            // InputFile's Read adapter retains the concrete IoError chain.
-            // Visitor errors have already crossed their own String boundary;
-            // do not replace any caller-owned typed error with that String.
-            let mut visitor_error = None;
-            let loaded = crate::data::fasta::for_each_prepared_sequence_reader_bytes(
-                file,
-                crate::basic::value::SequenceType::AminoAcid,
-                8192,
-                |record| {
-                    visit(ByteSeedSequence {
-                        id: record.id,
-                        sequence: record.sequence,
-                    })
-                    .map_err(|error| {
-                        visitor_error = Some(error);
-                        std::io::Error::other("Sequence volume visitor failed")
-                    })
-                },
-            );
-            if let Some(error) = visitor_error {
-                Err(error)
-            } else {
-                errors.capture(loaded)
+            while should_read() {
+                let Some(record) = errors.capture(file.read_seq_bytes_io())? else {
+                    break;
+                };
+                visit(ByteSeedSequence {
+                    id: record.id,
+                    sequence: record.sequence,
+                })?;
             }
+            errors.capture(file.close_io())
         }
     }
 }
@@ -140,6 +143,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ids, vec![b"q\xff description".to_vec()]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pre_read_condition_skips_trailing_invalid_sequence_but_keeps_constructor() {
+        let path = std::env::temp_dir().join(format!(
+            "diamond-volume-stop-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b">first\nARND\n>invalid\n!\n").unwrap();
+        let read = std::cell::Cell::new(false);
+        let mut opened = false;
+        visit_volume_bytes_while_owned(
+            &path,
+            &mut || !read.get(),
+            &mut |record| {
+                assert_eq!(record.id, b"first");
+                read.set(true);
+                Ok(())
+            },
+            &mut || {
+                opened = true;
+                Ok(())
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(opened && read.get());
+        opened = false;
+        visit_volume_bytes_while_owned(
+            &path,
+            &mut || false,
+            &mut |_| panic!("false pre-read condition must not visit a record"),
+            &mut || {
+                opened = true;
+                Ok(())
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(opened);
+        // An unrestricted visit still validates and rejects the bad tail.
+        assert!(visit_volume_bytes_owned(
+            &path,
+            &mut |_| Ok(()),
+            &mut || Ok(()),
+            &Default::default()
+        )
+        .is_err());
         std::fs::remove_file(path).unwrap();
     }
 

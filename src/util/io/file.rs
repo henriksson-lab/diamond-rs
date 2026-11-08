@@ -214,6 +214,13 @@ impl File {
         // Source returns fread's count even when ferror is set.
         file.read_file_role(ptr).map(|(count, _)| count)
     }
+    /// Actual C stream EOF indicator, distinct from the positional eof helper.
+    pub(crate) fn read_at_eof(&mut self) -> IoResult<bool> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| IoError::path_message(b"Error reading file ", &self.file_name))?
+            .eof()
+    }
     pub fn read(&mut self, count: usize) -> IoResult<&[u8]> {
         let mut bytes = std::mem::take(&mut self.scratch);
         bytes.resize(count, 0);

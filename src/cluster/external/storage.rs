@@ -36,7 +36,7 @@ const MAX_VOLUME_BYTES: u64 = 1 << 30;
 
 #[derive(Debug, Default)]
 struct BucketOutput {
-    compressed: CompressedBuffer,
+    compressed: Option<CompressedBuffer>,
     buffer_active: bool,
     pending_records: u64,
     file: Option<OutputFile>,
@@ -105,6 +105,16 @@ impl BucketWriter {
         count: usize,
         errors: IoErrorOwner,
     ) -> Result<Self, String> {
+        Self::new_storage_owned(directory, worker, count, errors, true)
+    }
+
+    fn new_storage_owned(
+        directory: &Path,
+        worker: i64,
+        count: usize,
+        errors: IoErrorOwner,
+        local_buffers: bool,
+    ) -> Result<Self, String> {
         let mut buckets = Vec::with_capacity(count);
         for radix in 0..count {
             let dir = directory.join(radix.to_string());
@@ -116,7 +126,8 @@ impl BucketWriter {
             buckets.push(BucketOutput {
                 file: Some(file),
                 stack: Some(stack),
-                buffer_active: true,
+                compressed: local_buffers.then(CompressedBuffer::default),
+                buffer_active: local_buffers,
                 ..BucketOutput::default()
             });
         }
@@ -127,6 +138,56 @@ impl BucketWriter {
             error: None,
             errors,
         })
+    }
+
+    /// FileArray owner without a caller-local BufferArray. Compression belongs
+    /// to the worker owners below; this owner retains only files and manifests.
+    pub(crate) fn new_file_array_owned(
+        directory: &Path,
+        worker: i64,
+        count: usize,
+        errors: IoErrorOwner,
+    ) -> Result<Self, String> {
+        Self::new_storage_owned(directory, worker, count, errors, false)
+    }
+
+    fn append_worker_member(
+        &mut self,
+        radix: usize,
+        bytes: &[u8],
+        records: u64,
+        errors: &IoErrorOwner,
+    ) -> Result<(), String> {
+        // A worker's noexcept destructor uses its cleanup exception slot; the
+        // enclosing file owner must not overwrite an already pending primary.
+        let previous = std::mem::replace(&mut self.errors, errors.clone());
+        let result = self.append_member(radix, bytes, records);
+        self.errors = previous;
+        result
+    }
+
+    fn append_member(&mut self, radix: usize, bytes: &[u8], records: u64) -> Result<(), String> {
+        let path = self.volume_path(radix);
+        let bucket = self.buckets.get_mut(radix).ok_or("Invalid output radix")?;
+        if bucket.file.is_none() {
+            bucket.file = Some(Self::open_volume(&path, &self.errors)?);
+        }
+        self.errors.capture(
+            bucket
+                .file
+                .as_mut()
+                .unwrap()
+                .write_raw(bytes)
+                .map_err(std::io::Error::other),
+        )?;
+        bucket.volume_bytes += bytes.len() as u64;
+        bucket.volume_records += records;
+        if bucket.volume_bytes >= MAX_VOLUME_BYTES {
+            self.publish(radix, true)?;
+            self.buckets[radix].file =
+                Some(Self::open_volume(&self.volume_path(radix), &self.errors)?);
+        }
+        Ok(())
     }
 
     /// Preserve the older infallible callback API while retaining the first
@@ -159,13 +220,21 @@ impl BucketWriter {
         self.errors.capture(
             bucket
                 .compressed
+                .as_mut()
+                .expect("local BufferArray owner")
                 .write(bytes)
                 .map_err(std::io::Error::other),
         )?;
         bucket.buffer_active = true;
         bucket.pending_records += records;
         // BufferArray tests CompressedBuffer::size(), not the input size.
-        if bucket.compressed.size() >= BUFFER_BYTES {
+        if bucket
+            .compressed
+            .as_ref()
+            .expect("local BufferArray owner")
+            .size()
+            >= BUFFER_BYTES
+        {
             self.flush(radix)?;
         }
         Ok(())
@@ -196,20 +265,40 @@ impl BucketWriter {
         if bucket.file.is_none() {
             bucket.file = Some(Self::open_volume(&path, &self.errors)?);
         }
-        self.errors
-            .capture(bucket.compressed.finish().map_err(std::io::Error::other))?;
+        self.errors.capture(
+            bucket
+                .compressed
+                .as_mut()
+                .expect("local BufferArray owner")
+                .finish()
+                .map_err(std::io::Error::other),
+        )?;
         self.errors.capture(
             bucket
                 .file
                 .as_mut()
                 .unwrap()
-                .write_raw(bucket.compressed.data())
+                .write_raw(
+                    bucket
+                        .compressed
+                        .as_ref()
+                        .expect("local BufferArray owner")
+                        .data(),
+                )
                 .map_err(std::io::Error::other),
         )?;
-        bucket.volume_bytes += bucket.compressed.size() as u64;
+        bucket.volume_bytes += bucket
+            .compressed
+            .as_ref()
+            .expect("local BufferArray owner")
+            .size() as u64;
         bucket.volume_records += bucket.pending_records;
         bucket.pending_records = 0;
-        bucket.compressed.clear();
+        bucket
+            .compressed
+            .as_mut()
+            .expect("local BufferArray owner")
+            .clear();
         if bucket.volume_bytes >= MAX_VOLUME_BYTES {
             self.publish(radix, true)?;
             // FileArray::write replaces a full volume immediately, even if
@@ -498,6 +587,88 @@ pub fn radix_sort(
     RadixedTable::from_manifest_owned(out_path, &job.io_errors())
 }
 
+/// One actual Source thread-local BufferArray sharing a FileArray. Each worker
+/// retains its own codec state through all tasks on that thread, then flushes
+/// every radix (including empty members) before the enclosing FileArray closes.
+pub(crate) struct WorkerBucketBuffers {
+    files: std::sync::Arc<std::sync::Mutex<BucketWriter>>,
+    buffers: Vec<CompressedBuffer>,
+    records: Vec<u64>,
+    errors: IoErrorOwner,
+    failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl WorkerBucketBuffers {
+    pub(crate) fn new(
+        files: std::sync::Arc<std::sync::Mutex<BucketWriter>>,
+        count: usize,
+        errors: IoErrorOwner,
+        failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    ) -> Self {
+        Self {
+            files,
+            buffers: (0..count).map(|_| CompressedBuffer::default()).collect(),
+            records: vec![0; count],
+            errors,
+            failure,
+        }
+    }
+
+    pub(crate) fn write(&mut self, radix: usize, bytes: &[u8]) -> Result<(), String> {
+        self.errors.capture(
+            self.buffers[radix]
+                .write(bytes)
+                .map_err(std::io::Error::other),
+        )?;
+        self.records[radix] += 1;
+        if self.buffers[radix].size() >= BUFFER_BYTES {
+            self.flush(radix, true)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, radix: usize, reset: bool) -> Result<(), String> {
+        self.errors
+            .capture(self.buffers[radix].finish().map_err(std::io::Error::other))?;
+        self.files.lock().unwrap().append_worker_member(
+            radix,
+            self.buffers[radix].data(),
+            self.records[radix],
+            &self.errors,
+        )?;
+        if reset {
+            self.buffers[radix].clear();
+            self.records[radix] = 0;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WorkerBucketBuffers {
+    fn drop(&mut self) {
+        let source = self.errors.source_destructors();
+        if source {
+            if let Err(error) = self.errors.emit_pending_perror() {
+                crate::util::io::abort_source_diagnostic_error(&error);
+            }
+            self.errors = self.errors.cleanup_owner();
+        }
+        for radix in 0..self.buffers.len() {
+            if let Err(message) = self.flush(radix, false) {
+                if source {
+                    let error = self.errors.finish::<()>(Err(message)).unwrap_err();
+                    if let Err(error) = crate::util::io::emit_source_perror(&error) {
+                        crate::util::io::abort_source_diagnostic_error(&error);
+                    }
+                    crate::util::io::abort_source_process();
+                }
+                self.failure.lock().unwrap().get_or_insert(message);
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +755,25 @@ mod tests {
         assert_eq!(Path::new(&open.path), missing);
         assert!(!root.join("0/worker_5_volume_0").exists());
         assert!(!root.join("1/worker_5_volume_0").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_array_owner_allocates_no_worker_codec_state() {
+        let root = temp_dir();
+        let mut files =
+            BucketWriter::new_file_array_owned(&root, 8, 3, IoErrorOwner::default()).unwrap();
+        assert!(files
+            .buckets
+            .iter()
+            .all(|bucket| bucket.compressed.is_none()));
+        assert!(files.buckets.iter().all(|bucket| !bucket.buffer_active));
+        files.finish().unwrap();
+        drop(files);
+        assert!((0..3).all(|radix| !root
+            .join(radix.to_string())
+            .join("worker_8_volume_0")
+            .exists()));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -99,6 +99,22 @@ pub trait SequenceVolumeReader {
     ) -> Result<(), String> {
         self.visit_volume(path, &mut |record| visitor(record.into()))
     }
+    /// Legacy library readers can only adapt their eager read_volume contract.
+    /// Actual file-backed readers override this to check before each input read.
+    fn visit_volume_bytes_while(
+        &mut self,
+        path: &Path,
+        should_read: &mut dyn FnMut() -> bool,
+        visitor: &mut dyn FnMut(ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for record in self.read_volume(path)? {
+            if !should_read() {
+                break;
+            }
+            visitor(record.into())?;
+        }
+        Ok(())
+    }
     fn visit_volume_bytes_with_open(
         &mut self,
         path: &Path,
@@ -119,6 +135,20 @@ impl SequenceVolumeReader for FastaVolumeReader {
         visitor: &mut dyn FnMut(ByteSeedSequence) -> Result<(), String>,
     ) -> Result<(), String> {
         super::reader::visit_volume_bytes_owned(path, visitor, &mut || Ok(()), &Default::default())
+    }
+    fn visit_volume_bytes_while(
+        &mut self,
+        path: &Path,
+        should_read: &mut dyn FnMut() -> bool,
+        visitor: &mut dyn FnMut(ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        super::reader::visit_volume_bytes_while_owned(
+            path,
+            should_read,
+            visitor,
+            &mut || Ok(()),
+            &Default::default(),
+        )
     }
     fn visit_volume_bytes_with_open(
         &mut self,

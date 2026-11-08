@@ -1,6 +1,7 @@
 //! Concrete adapters for Source's shared external linclust job pipeline.
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::basic::reduction::Reduction;
 use crate::basic::shape::Shape;
@@ -26,6 +27,20 @@ impl SequenceVolumeReader for Reader {
         visitor: &mut dyn FnMut(external::seed_table::ByteSeedSequence) -> Result<(), String>,
     ) -> Result<(), String> {
         external::reader::visit_volume_bytes_owned(path, visitor, &mut || Ok(()), &self.errors)
+    }
+    fn visit_volume_bytes_while(
+        &mut self,
+        path: &Path,
+        should_read: &mut dyn FnMut() -> bool,
+        visitor: &mut dyn FnMut(external::seed_table::ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        external::reader::visit_volume_bytes_while_owned(
+            path,
+            should_read,
+            visitor,
+            &mut || Ok(()),
+            &self.errors,
+        )
     }
     fn visit_volume_bytes_with_open(
         &mut self,
@@ -85,7 +100,7 @@ impl SeedMasker for Masker {
 struct Pipeline {
     reader: Reader,
     masker: Masker,
-    matrix: ScoreMatrix,
+    matrix: Arc<ScoreMatrix>,
     sensitivity: Cell<Sensitivity>,
     threads: usize,
     member_cover: f64,
@@ -105,6 +120,15 @@ impl SequenceVolumeReader for Pipeline {
         visitor: &mut dyn FnMut(external::seed_table::ByteSeedSequence) -> Result<(), String>,
     ) -> Result<(), String> {
         self.reader.visit_volume_bytes(path, visitor)
+    }
+    fn visit_volume_bytes_while(
+        &mut self,
+        path: &Path,
+        should_read: &mut dyn FnMut() -> bool,
+        visitor: &mut dyn FnMut(external::seed_table::ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.reader
+            .visit_volume_bytes_while(path, should_read, visitor)
     }
     fn visit_volume_bytes_with_open(
         &mut self,
@@ -235,12 +259,16 @@ impl ExternalPipeline for Pipeline {
         chunk_count: usize,
         max_oid: u64,
     ) -> Result<RadixedTable, String> {
-        self.matrix.set_db_letters(1_000_000_000);
-        external::align::align(
+        Arc::get_mut(&mut self.matrix)
+            .expect(
+                "External alignment workers must release the scoring matrix before the next round",
+            )
+            .set_db_letters(1_000_000_000);
+        external::align::align_owned(
             job,
             chunk_count,
             i64::try_from(max_oid).map_err(|_| "External OID exceeds signed64 range".to_owned())?,
-            &self.matrix,
+            Arc::clone(&self.matrix),
             &external::AlignConfig {
                 threads: self.threads,
                 approx_min_identity: self.approx_min_id,
@@ -310,7 +338,7 @@ pub(crate) fn run(
             ),
             tuning.max_motif_len,
         ),
-        matrix,
+        matrix: Arc::new(matrix),
         sensitivity: Cell::new(Sensitivity::Default),
         threads: setup.threads,
         member_cover: setup.member_cover,
