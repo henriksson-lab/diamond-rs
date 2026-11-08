@@ -1,0 +1,4 @@
+domain_query	379	0	77	+	single_domain	78	0	77	78	78	255	AS:i:174	ZR:i:441	ZE:f:4.30e-59
+domain_query	379	0	77	+	reordered	379	301	378	78	78	255	AS:i:174	ZR:i:441	ZE:f:2.66e-55
+domain_query	379	308	378	+	reordered	379	0	70	71	71	255	AS:i:171	ZR:i:432	ZE:f:5.53e-54
+domain_query	379	158	227	+	reordered	379	151	220	70	70	255	AS:i:163	ZR:i:413	ZE:f:3.29e-51

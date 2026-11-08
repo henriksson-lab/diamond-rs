@@ -1,0 +1,82 @@
+[
+	{
+	"qseqid":"translated_query",
+	"sseqid":"single_domain",
+	"sallseqid":["single_domain","single_alias"],
+	"stitle":"single_domain first description",
+	"salltitles":["single_domain first description","single_alias alternate description"],
+	"bitscore":176
+	},
+	{
+	"qseqid":"translated_query",
+	"sseqid":"sp|R001|main",
+	"sallseqid":["sp|R001|main","tr|A001|alt","lastAlias"],
+	"stitle":"sp|R001|main main <alpha>& title >preAlias early title",
+	"salltitles":["sp|R001|main main <alpha>& title >preAlias early title","tr|A001|alt second <beta>& title","lastAlias third title"],
+	"bitscore":176
+	},
+	{
+	"qseqid":"translated_query",
+	"sseqid":"sp|R001|main",
+	"sallseqid":["sp|R001|main","tr|A001|alt","lastAlias"],
+	"stitle":"sp|R001|main main <alpha>& title >preAlias early title",
+	"salltitles":["sp|R001|main main <alpha>& title >preAlias early title","tr|A001|alt second <beta>& title","lastAlias third title"],
+	"bitscore":169
+	},
+	{
+	"qseqid":"translated_query",
+	"sseqid":"sp|R001|main",
+	"sallseqid":["sp|R001|main","tr|A001|alt","lastAlias"],
+	"stitle":"sp|R001|main main <alpha>& title >preAlias early title",
+	"salltitles":["sp|R001|main main <alpha>& title >preAlias early title","tr|A001|alt second <beta>& title","lastAlias third title"],
+	"bitscore":162
+	},
+	{
+	"qseqid":"translated_query",
+	"sseqid":"gapped_refraw",
+	"sallseqid":["gapped_refraw","gapped_alt","lastGap"],
+	"stitle":"gapped_refraw raw separator two",
+	"salltitles":["gapped_refraw raw separator two","gapped_alt second title","lastGap final title"],
+	"bitscore":157
+	}
+	{
+	"qseqid":"reverse_query",
+	"sseqid":"single_domain",
+	"sallseqid":["single_domain","single_alias"],
+	"stitle":"single_domain first description",
+	"salltitles":["single_domain first description","single_alias alternate description"],
+	"bitscore":176
+	},
+	{
+	"qseqid":"reverse_query",
+	"sseqid":"sp|R001|main",
+	"sallseqid":["sp|R001|main","tr|A001|alt","lastAlias"],
+	"stitle":"sp|R001|main main <alpha>& title >preAlias early title",
+	"salltitles":["sp|R001|main main <alpha>& title >preAlias early title","tr|A001|alt second <beta>& title","lastAlias third title"],
+	"bitscore":176
+	},
+	{
+	"qseqid":"reverse_query",
+	"sseqid":"sp|R001|main",
+	"sallseqid":["sp|R001|main","tr|A001|alt","lastAlias"],
+	"stitle":"sp|R001|main main <alpha>& title >preAlias early title",
+	"salltitles":["sp|R001|main main <alpha>& title >preAlias early title","tr|A001|alt second <beta>& title","lastAlias third title"],
+	"bitscore":169
+	},
+	{
+	"qseqid":"reverse_query",
+	"sseqid":"sp|R001|main",
+	"sallseqid":["sp|R001|main","tr|A001|alt","lastAlias"],
+	"stitle":"sp|R001|main main <alpha>& title >preAlias early title",
+	"salltitles":["sp|R001|main main <alpha>& title >preAlias early title","tr|A001|alt second <beta>& title","lastAlias third title"],
+	"bitscore":162
+	},
+	{
+	"qseqid":"reverse_query",
+	"sseqid":"gapped_refraw",
+	"sallseqid":["gapped_refraw","gapped_alt","lastGap"],
+	"stitle":"gapped_refraw raw separator two",
+	"salltitles":["gapped_refraw raw separator two","gapped_alt second title","lastGap final title"],
+	"bitscore":157
+	}
+]

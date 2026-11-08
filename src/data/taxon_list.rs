@@ -3,9 +3,11 @@ use std::io::{BufRead, Read, Write};
 
 use crate::basic::value::{OId, TaxId};
 use crate::data::compact_array::CompactArray;
-use crate::util::algo::{join_sorted_lists, write_varuint32, ExternalSorter};
-use crate::util::io::TextInputFile;
+use crate::util::algo::{
+    join_sorted_lists, write_varuint32, ExternalSortField, ExternalSortValue, ExternalSorter,
+};
 use crate::util::sequence::{get_accession, AccessionParsing};
+use crate::util::string::{CharDelimiter, Tokenizer};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaxonList {
@@ -13,6 +15,70 @@ pub struct TaxonList {
 }
 
 impl TaxonList {
+    pub fn write_from_file<W: Write>(
+        acc2oid: &mut ExternalSorter<(String, OId)>,
+        mapping_path: &str,
+        seqs: OId,
+        no_parse_seqids: bool,
+        output: &mut W,
+    ) -> Result<TaxonListWrite, String> {
+        Self::write_from_file_path(
+            acc2oid,
+            std::path::Path::new(mapping_path),
+            seqs,
+            no_parse_seqids,
+            output,
+        )
+    }
+    pub fn write_from_source_file<W: Write>(
+        acc2oid: &mut ExternalSorter<(String, OId)>,
+        mapping_path: &str,
+        seqs: OId,
+        no_parse_seqids: bool,
+        output: &mut W,
+    ) -> Result<TaxonListWrite, String> {
+        Self::write_from_source_file_path(
+            acc2oid,
+            std::path::Path::new(mapping_path),
+            seqs,
+            no_parse_seqids,
+            output,
+        )
+    }
+    pub fn write_from_source_file_with_buffer_size<W: Write>(
+        acc2oid: &mut ExternalSorter<(String, OId)>,
+        mapping_path: &str,
+        seqs: OId,
+        no_parse_seqids: bool,
+        output: &mut W,
+        buffer_size: usize,
+    ) -> Result<TaxonListWrite, String> {
+        Self::write_from_source_file_with_buffer_size_path(
+            acc2oid,
+            std::path::Path::new(mapping_path),
+            seqs,
+            no_parse_seqids,
+            output,
+            buffer_size,
+        )
+    }
+    pub(crate) fn write_from_source_file_bytes_with_buffer_size<W: Write>(
+        acc2oid: &mut ExternalSorter<(Vec<u8>, OId)>,
+        mapping_path: &str,
+        seqs: OId,
+        no_parse_seqids: bool,
+        output: &mut W,
+        buffer_size: usize,
+    ) -> Result<TaxonListWrite, String> {
+        Self::write_from_source_file_bytes_with_buffer_size_path(
+            acc2oid,
+            std::path::Path::new(mapping_path),
+            seqs,
+            no_parse_seqids,
+            output,
+            buffer_size,
+        )
+    }
     pub fn new(data: Vec<u8>, size: usize, data_size: usize) -> Result<Self, String> {
         Ok(Self {
             array: CompactArray::new(data, size, data_size)?,
@@ -91,15 +157,104 @@ impl TaxonList {
     /// Streaming counterpart of C++ `TaxonList::build`. Both sides of the
     /// accession join and the resulting OID relation use `ExternalSorter`, so
     /// taxonomy-enabled `makedb` does not retain the accession tables in RAM.
-    pub fn write_from_file<W: Write>(
+    pub fn write_from_file_path<W: Write>(
         acc2oid: &mut ExternalSorter<(String, OId)>,
-        mapping_path: &str,
+        mapping_path: &std::path::Path,
         seqs: OId,
         no_parse_seqids: bool,
         output: &mut W,
     ) -> Result<TaxonListWrite, String> {
-        let mut acc2taxid = ExternalSorter::<(String, TaxId)>::default();
-        let acc_stats = load_mapping_path(&mut acc2taxid, mapping_path, no_parse_seqids)?;
+        Self::write_from_file_profile(
+            acc2oid,
+            mapping_path,
+            seqs,
+            no_parse_seqids,
+            output,
+            false,
+            1 << 20,
+        )
+    }
+
+    pub fn write_from_source_file_path<W: Write>(
+        acc2oid: &mut ExternalSorter<(String, OId)>,
+        mapping_path: &std::path::Path,
+        seqs: OId,
+        no_parse_seqids: bool,
+        output: &mut W,
+    ) -> Result<TaxonListWrite, String> {
+        Self::write_from_file_profile(
+            acc2oid,
+            mapping_path,
+            seqs,
+            no_parse_seqids,
+            output,
+            true,
+            1 << 20,
+        )
+    }
+
+    pub fn write_from_source_file_with_buffer_size_path<W: Write>(
+        acc2oid: &mut ExternalSorter<(String, OId)>,
+        mapping_path: &std::path::Path,
+        seqs: OId,
+        no_parse_seqids: bool,
+        output: &mut W,
+        buffer_size: usize,
+    ) -> Result<TaxonListWrite, String> {
+        Self::write_from_file_profile(
+            acc2oid,
+            mapping_path,
+            seqs,
+            no_parse_seqids,
+            output,
+            true,
+            buffer_size,
+        )
+    }
+
+    pub(crate) fn write_from_source_file_bytes_with_buffer_size_path<W: Write>(
+        acc2oid: &mut ExternalSorter<(Vec<u8>, OId)>,
+        mapping_path: &std::path::Path,
+        seqs: OId,
+        no_parse_seqids: bool,
+        output: &mut W,
+        buffer_size: usize,
+    ) -> Result<TaxonListWrite, String> {
+        Self::write_from_file_profile(
+            acc2oid,
+            mapping_path,
+            seqs,
+            no_parse_seqids,
+            output,
+            true,
+            buffer_size,
+        )
+    }
+
+    fn write_from_file_profile<K: AccessionKey, W: Write>(
+        acc2oid: &mut ExternalSorter<(K, OId)>,
+        mapping_path: &std::path::Path,
+        seqs: OId,
+        no_parse_seqids: bool,
+        output: &mut W,
+        source_profile: bool,
+        buffer_size: usize,
+    ) -> Result<TaxonListWrite, String>
+    where
+        (K, OId): ExternalSortValue + Sync,
+        (K, TaxId): ExternalSortValue + Sync,
+    {
+        let mut acc2taxid = ExternalSorter::<(K, TaxId)>::in_directory_with_io(
+            acc2oid.temporary_directory(),
+            acc2oid.io_options(),
+        );
+        let acc_stats = load_mapping_path(
+            &mut acc2taxid,
+            mapping_path,
+            no_parse_seqids,
+            source_profile,
+            buffer_size,
+        )?;
         let entries_in_accession_to_taxid_file = acc2taxid.count();
         let accessions_in_database = acc2oid.count();
 
@@ -107,7 +262,10 @@ impl TaxonList {
             .try_init_read()
             .map_err(|error| error.to_string())?;
         acc2oid.try_init_read().map_err(|error| error.to_string())?;
-        let mut oid2taxid = ExternalSorter::<(OId, TaxId)>::default();
+        let mut oid2taxid = ExternalSorter::<(OId, TaxId)>::in_directory_with_io(
+            acc2oid.temporary_directory(),
+            acc2oid.io_options(),
+        );
         let mut acc_matched = 0usize;
 
         // Exact state transitions of `SortedListJoiner`: duplicate accessions
@@ -136,7 +294,12 @@ impl TaxonList {
                 break;
             }
             if acc2taxid.current().unwrap().0 == db_row.0 {
-                return Err(format!("Duplicate keys: {}", db_row.0));
+                let mut message = b"Duplicate keys: ".to_vec();
+                message.extend_from_slice(db_row.0.bytes());
+                return acc2oid
+                    .io_options()
+                    .errors
+                    .capture(Err(crate::util::io::RawDiagnosticError(message).into_io()));
             }
             advance_to_matching_accession(acc2oid, &mut acc2taxid)?;
         }
@@ -180,10 +343,14 @@ impl TaxonList {
     }
 }
 
-fn advance_to_matching_accession(
-    acc2oid: &mut ExternalSorter<(String, OId)>,
-    acc2taxid: &mut ExternalSorter<(String, TaxId)>,
-) -> Result<(), String> {
+fn advance_to_matching_accession<K: AccessionKey>(
+    acc2oid: &mut ExternalSorter<(K, OId)>,
+    acc2taxid: &mut ExternalSorter<(K, TaxId)>,
+) -> Result<(), String>
+where
+    (K, OId): ExternalSortValue + Sync,
+    (K, TaxId): ExternalSortValue + Sync,
+{
     while acc2oid.good() && acc2taxid.good() {
         match acc2oid
             .current()
@@ -285,13 +452,12 @@ pub fn load_mapping_file<R: BufRead>(
             }
             (fields[0].to_string(), fields[1])
         };
+        let taxid = Tokenizer::new(taxid, CharDelimiter::new('\t'))
+            .read_i32()
+            .map_err(|_| format!("Malformed input in line {line_count}"))?;
         if accession.is_empty() {
             return Err(format!("Empty accession field in line {line_count}"));
         }
-        let taxid = taxid
-            .trim_start_matches(|c: char| c.is_ascii_whitespace())
-            .parse::<TaxId>()
-            .map_err(|_| format!("Malformed input in line {line_count}"))?;
         if !no_parse_seqids {
             if let Some(i) = accession.find(":PDB=") {
                 accession.truncate(i);
@@ -308,59 +474,112 @@ pub fn load_mapping_file<R: BufRead>(
     Ok((rows, stats))
 }
 
-fn load_mapping_path(
-    sorter: &mut ExternalSorter<(String, TaxId)>,
-    mapping_path: &str,
-    no_parse_seqids: bool,
-) -> Result<AccessionParsing, String> {
-    let mut input =
-        TextInputFile::from_file_name_default(mapping_path).map_err(|error| error.to_string())?;
-    input.getline().map_err(|error| error.to_string())?;
-    let format = mapping_file_format(&input.line)?;
-    let mut stats = AccessionParsing::default();
-    let mut last = String::new();
+trait AccessionKey: Ord + Clone + Sync + ExternalSortField {
+    fn from_bytes(bytes: Vec<u8>) -> Result<Self, String>;
+    fn bytes(&self) -> &[u8];
+}
+impl AccessionKey for String {
+    fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        String::from_utf8(bytes).map_err(|error| error.to_string())
+    }
+    fn bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+impl AccessionKey for Vec<u8> {
+    fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        Ok(bytes)
+    }
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+}
 
-    while !input.eof() {
-        input.getline().map_err(|error| error.to_string())?;
-        if input.line.is_empty() {
+fn load_mapping_path<K: AccessionKey>(
+    sorter: &mut ExternalSorter<(K, TaxId)>,
+    mapping_path: &std::path::Path,
+    no_parse_seqids: bool,
+    source_profile: bool,
+    buffer_size: usize,
+) -> Result<AccessionParsing, String>
+where
+    (K, TaxId): ExternalSortValue + Sync,
+{
+    let errors = sorter.io_options().errors;
+    let mut input = errors.capture(
+        (if source_profile {
+            crate::util::io::InputFile::with_source_profile_path(mapping_path, 0, buffer_size)
+        } else {
+            crate::util::io::InputFile::new_path(mapping_path, 0)
+        })
+        .map_err(std::io::Error::other),
+    )?;
+    let getline = |input: &mut crate::util::io::InputFile| -> Result<(Vec<u8>, bool), String> {
+        let mut bytes = Vec::new();
+        let terminated = errors.capture(
+            input
+                .read_to(&mut bytes, b'\n')
+                .map_err(std::io::Error::other),
+        )?;
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        Ok((bytes, !terminated))
+    };
+    let (header, mut eof) = getline(&mut input)?;
+    let format = mapping_file_format(
+        std::str::from_utf8(crate::util::sequence::c_string_bytes(&header)).unwrap_or(""),
+    )?;
+    let mut stats = AccessionParsing::default();
+    let mut last = Vec::new();
+    let mut line_count = 1;
+    while !eof {
+        let (line, end) = getline(&mut input)?;
+        eof = end;
+        line_count += 1;
+        if line.is_empty() {
             break;
         }
-        let fields: Vec<&str> = input.line.split('\t').collect();
+        let fields: Vec<&[u8]> = crate::util::sequence::c_string_bytes(&line)
+            .split(|&byte| byte == b'\t')
+            .collect();
         let (mut accession, taxid) = if format == 0 {
             if fields.len() < 3 {
-                return Err(format!("Malformed input in line {}", input.line_count));
+                return Err(format!("Malformed input in line {line_count}"));
             }
-            (fields[1].to_string(), fields[2])
+            (fields[1].to_vec(), fields[2])
         } else {
             if fields.len() < 2 {
-                return Err(format!("Malformed input in line {}", input.line_count));
+                return Err(format!("Malformed input in line {line_count}"));
             }
-            (fields[0].to_string(), fields[1])
+            (fields[0].to_vec(), fields[1])
         };
+        let taxid = std::str::from_utf8(taxid)
+            .ok()
+            .and_then(|value| {
+                Tokenizer::new(value, CharDelimiter::new('\t'))
+                    .read_i32()
+                    .ok()
+            })
+            .ok_or_else(|| format!("Malformed input in line {line_count}"))?;
         if accession.is_empty() {
-            return Err(format!(
-                "Empty accession field in line {}",
-                input.line_count
-            ));
+            return Err(format!("Empty accession field in line {line_count}"));
         }
-        let taxid = taxid
-            .trim_start_matches(|c: char| c.is_ascii_whitespace())
-            .parse::<TaxId>()
-            .map_err(|_| format!("Malformed input in line {}", input.line_count))?;
         if !no_parse_seqids {
-            if let Some(i) = accession.find(":PDB=") {
+            if let Some(i) = accession.windows(5).position(|bytes| bytes == b":PDB=") {
                 accession.truncate(i);
                 stats.pdb_suffix += 1;
             }
-            accession = get_accession(&accession, &mut stats);
+            accession = crate::util::sequence::get_accession_bytes(&accession, &mut stats);
         }
         if accession != last {
             sorter
-                .try_push((accession.clone(), taxid))
+                .try_push((K::from_bytes(accession.clone())?, taxid))
                 .map_err(|error| error.to_string())?;
         }
         last = accession;
     }
+    errors.capture(input.close().map_err(std::io::Error::other))?;
     Ok(stats)
 }
 
@@ -374,6 +593,44 @@ pub fn serialize_taxid_set(tax_ids: &BTreeSet<TaxId>, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_mapping_join_preserves_non_utf8_accession_bytes() {
+        let path = std::env::temp_dir().join(format!(
+            "diamond-byte-taxonomy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"accession.version\ttaxid\nA\xff\t7\n").unwrap();
+        let mut accessions = ExternalSorter::<(Vec<u8>, OId)>::default();
+        accessions.try_push((b"A\xff".to_vec(), 0)).unwrap();
+        let mut bytes = Vec::new();
+        let written = TaxonList::write_from_source_file_bytes_with_buffer_size(
+            &mut accessions,
+            path.to_str().unwrap(),
+            1,
+            true,
+            &mut bytes,
+            64,
+        )
+        .unwrap();
+        // Source legacy/dmnd/io.h serializes count and taxid with
+        // util/algo/varint.h:28, whose one-byte form is (value << 1) | 1.
+        assert_eq!(bytes, [3, 15]);
+        assert_eq!(
+            TaxonList::new(bytes.clone(), 1, bytes.len())
+                .unwrap()
+                .get(0)
+                .unwrap(),
+            [7]
+        );
+        assert_eq!(written.stats.database_accessions_mapped_to_taxid, 1);
+        assert_eq!(written.stats.database_sequences_mapped_to_taxid, 1);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn test_mapping_file_format() {
@@ -414,7 +671,24 @@ mod tests {
     }
 
     #[test]
+    fn mapping_taxids_use_source_int64_then_int32_cast() {
+        let (rows, _) = load_mapping_file(
+            b"accession.version\ttaxid\nA\t2147483648\nB\t-2147483649\n".as_slice(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(rows, vec![("A".into(), i32::MIN), ("B".into(), i32::MAX)]);
+        assert!(
+            load_mapping_file(b"accession.version\ttaxid\nA\t12junk\n".as_slice(), true).is_err()
+        );
+    }
+
+    #[test]
     fn test_load_mapping_file_errors() {
+        assert_eq!(
+            load_mapping_file(b"accession.version\ttaxid\n\tx\n".as_slice(), false).unwrap_err(),
+            "Malformed input in line 2"
+        );
         assert!(load_mapping_file("bad\theader\n".as_bytes(), false)
             .unwrap_err()
             .starts_with("Accession mapping file header"));

@@ -23,6 +23,20 @@ impl ShapeConfig {
     }
 
     pub fn from_codes(codes: &[String], count: u32, reduction: &Reduction) -> Result<Self, String> {
+        Self::from_codes_impl(codes, count, reduction)
+    }
+    pub fn from_codes_bytes(
+        codes: &[Vec<u8>],
+        count: u32,
+        reduction: &Reduction,
+    ) -> Result<Self, String> {
+        Self::from_codes_impl(codes, count, reduction)
+    }
+    fn from_codes_impl<T: AsRef<[u8]>>(
+        codes: &[T],
+        count: u32,
+        reduction: &Reduction,
+    ) -> Result<Self, String> {
         let mut cfg = Self::new();
         let max_shapes = if count == 0 {
             codes.len()
@@ -31,7 +45,7 @@ impl ShapeConfig {
         };
 
         for (i, code) in codes.iter().take(max_shapes).enumerate() {
-            cfg.shapes[cfg.n] = Shape::from_code(code, reduction);
+            cfg.shapes[cfg.n] = Shape::from_code_bytes(code.as_ref(), reduction);
             if cfg.shapes[cfg.n].weight != cfg.shapes[0].weight {
                 return Err("Seed shape weight has to be uniform.".to_string());
             }

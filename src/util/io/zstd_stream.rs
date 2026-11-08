@@ -3,6 +3,8 @@
 use std::fs::File as StdFile;
 use std::io::Read;
 
+use zstd_pure_rs::common::error::{ERR_getErrorCode, ErrorCode};
+use zstd_pure_rs::compress::zstd_compress::ZSTD_CCtx_setPledgedSrcSize;
 use zstd_pure_rs::decompress::zstd_decompress::ZSTD_decompressContinue_into_history;
 use zstd_pure_rs::prelude::{
     ERR_getErrorName, ERR_isError, ZSTD_CStream, ZSTD_DStream, ZSTD_compressStream,
@@ -15,6 +17,7 @@ use super::{InputStreamBuffer, IoError, IoResult, OutputStreamBuffer, StreamEnti
 pub struct ZstdSink<S: StreamEntity> {
     prev: OutputStreamBuffer<S>,
     stream: Option<Box<ZSTD_CStream>>,
+    input_seen: bool,
 }
 
 impl<S: StreamEntity> std::fmt::Debug for ZstdSink<S> {
@@ -35,6 +38,7 @@ impl<S: StreamEntity> ZstdSink<S> {
         Self {
             prev,
             stream: Some(stream),
+            input_seen: false,
         }
     }
 }
@@ -66,6 +70,7 @@ impl<S: StreamEntity> StreamEntity for ZstdSink<S> {
                 }
                 output_position
             };
+            self.input_seen |= input_position != 0;
             self.prev.flush_count(output_position)?;
             if input_position == input_before && output_position == 0 {
                 return Err(IoError::Other(
@@ -80,6 +85,17 @@ impl<S: StreamEntity> StreamEntity for ZstdSink<S> {
         let Some(stream) = self.stream.as_mut() else {
             return Ok(());
         };
+        // Restore upstream endStream's implicit zero pledge on first e_end.
+        // The pure backend bypasses generic initialization for this case.
+        if !self.input_seen {
+            let result = ZSTD_CCtx_setPledgedSrcSize(stream, 0);
+            if ERR_isError(result) {
+                return Err(IoError::Other(format!(
+                    "ZSTD_endStream: {}",
+                    ERR_getErrorName(result)
+                )));
+            }
+        }
         loop {
             let (remaining, output_position) = {
                 let (buffer, _) = self.prev.write_buffer_range();
@@ -97,6 +113,14 @@ impl<S: StreamEntity> StreamEntity for ZstdSink<S> {
             if remaining == 0 {
                 break;
             }
+            // Source's ZSTD_endStream loop cannot finish with a zero output
+            // buffer. Preserve constructor/open ordering, then fail safely at
+            // the actual compressed close boundary instead of hanging.
+            if output_position == 0 && self.prev.buffer_size() == 0 {
+                return Err(IoError::Other(
+                    "Source zero-capacity output cannot make progress.".into(),
+                ));
+            }
         }
         // Match C++ ordering: release/clear the stream after a successful end,
         // but before closing the predecessor.
@@ -108,6 +132,9 @@ impl<S: StreamEntity> StreamEntity for ZstdSink<S> {
         self.prev.flush()
     }
 
+    fn file_path(&self) -> &std::path::Path {
+        self.prev.file_path()
+    }
     fn file_name(&self) -> &str {
         self.prev.file_name()
     }
@@ -116,8 +143,28 @@ impl<S: StreamEntity> StreamEntity for ZstdSink<S> {
         self.prev.file_size()
     }
 
+    #[cfg(any(unix, windows))]
+    fn shared_stdio(&mut self) -> IoResult<Option<super::cstdio_file::SharedCstdio>> {
+        self.prev.shared_stdio()
+    }
+
     fn file(&mut self) -> IoResult<&mut StdFile> {
         self.prev.file()
+    }
+
+    fn clone_file(&mut self) -> IoResult<StdFile> {
+        self.prev.clone_file()
+    }
+}
+
+/// Source's frozen streaming oracle uses libzstd1.4.8. The native decoder
+/// reports the same stable structured error code, whose corruption label was
+/// renamed in newer libzstd releases. Preserve the Source-facing protocol while
+/// leaving the low-level whole-buffer convenience API's backend labels intact.
+fn source_stream_error_name(error: usize) -> &'static str {
+    match ERR_getErrorCode(error) {
+        ErrorCode::CorruptionDetected => "Corrupted block detected",
+        _ => ERR_getErrorName(error),
     }
 }
 
@@ -219,8 +266,8 @@ impl<S: StreamEntity> StreamEntity for ZstdSource<S> {
             let produced_len = ZSTD_decompressContinue_into_history(stream, &self.compressed_chunk)
                 .map_err(|error| {
                     IoError::Other(format!(
-                        "ZSTD_decompressContinue: {}",
-                        ERR_getErrorName(error)
+                        "ZSTD_decompressStream: {}",
+                        source_stream_error_name(error)
                     ))
                 })?
                 .len();
@@ -251,6 +298,9 @@ impl<S: StreamEntity> StreamEntity for ZstdSource<S> {
         Ok(self.eos)
     }
 
+    fn file_path(&self) -> &std::path::Path {
+        self.prev.file_path()
+    }
     fn file_name(&self) -> &str {
         self.prev.file_name()
     }
@@ -259,8 +309,17 @@ impl<S: StreamEntity> StreamEntity for ZstdSource<S> {
         self.prev.file_size()
     }
 
+    #[cfg(any(unix, windows))]
+    fn shared_stdio(&mut self) -> IoResult<Option<super::cstdio_file::SharedCstdio>> {
+        self.prev.shared_stdio()
+    }
+
     fn file(&mut self) -> IoResult<&mut StdFile> {
         self.prev.file()
+    }
+
+    fn clone_file(&mut self) -> IoResult<StdFile> {
+        self.prev.clone_file()
     }
 }
 
@@ -349,11 +408,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_frame_has_standard_magic_and_roundtrips() {
-        let encoded = compressed(b"");
-        // Zstandard frames use this little-endian magic in the upstream C++
-        // implementation and in the Rust zstd backend.
-        assert!(encoded.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]));
+    fn empty_sink_frame_matches_source_and_roundtrips() {
+        let mut sink = ZstdSink::new(OutputStreamBuffer::new(VecStream::default()));
+        sink.write(b"").unwrap();
+        sink.close().unwrap();
+        let encoded = sink.prev.into_inner().unwrap().data().to_vec();
+        // Exact Source create/init/end protocol, checked with libzstd1.4.8
+        // and1.5.7. Empty writes must not suppress first-end initialization.
+        assert_eq!(encoded, [0x28, 0xb5, 0x2f, 0xfd, 0x20, 0, 1, 0, 0]);
 
         let mut whole_output = [];
         assert_eq!(zstd_decompress(&encoded, &mut whole_output).unwrap(), 0);
@@ -391,6 +453,50 @@ mod tests {
         }
         assert_eq!(streamed, expected);
         assert!(source.eof().unwrap());
+    }
+
+    #[test]
+    fn malformed_members_preserve_source_stream_errors() {
+        // Actual ZSTD_decompressStream errors from libzstd1.4.8, the API
+        // called by Source ZstdSource::read. The native decoder uses its
+        // bufferless dependency internally but exposes that Source protocol.
+        let cases: &[(&[u8], &str)] = &[
+            (&[0; 16], "Unknown frame descriptor"),
+            (
+                &[
+                    0x28, 0xb5, 0x2f, 0xfd, 0x08, 0x58, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+                "Unsupported frame parameter",
+            ),
+            (
+                &[
+                    0x28, 0xb5, 0x2f, 0xfd, 0, 0x58, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+                "Corrupted block detected",
+            ),
+            (
+                &[
+                    0x28, 0xb5, 0x2f, 0xfd, 1, 0x58, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                ],
+                "Dictionary mismatch",
+            ),
+            (
+                &[0x28, 0xb5, 0x2f, 0xfd, 4, 0x58, 9, 0, 0, 0x61, 0, 0, 0, 0],
+                "Restored data doesn't match checksum",
+            ),
+        ];
+        for &(encoded, error) in cases {
+            // Small input blocks exercise the actual staged decoder rather
+            // than a whole-buffer convenience decompressor.
+            let input =
+                InputStreamBuffer::with_buffer_size(VecStream::from_vec(encoded.to_vec()), 0, 3);
+            let mut source = ZstdSource::new(input).unwrap();
+            let mut output = [0; 128];
+            assert_eq!(
+                source.read(&mut output).unwrap_err().to_string(),
+                format!("ZSTD_decompressStream: {error}")
+            );
+        }
     }
 
     #[test]

@@ -1,169 +1,172 @@
 //! Translation of `diamond/src/util/io/file.{h,cpp}`.
+//!
+//! This Source class has its own stdio contract: reads and fopen failures are
+//! ordinary exceptions, writes/seeks retain perror, and fclose is unchecked.
 
-use super::{IoError, IoResult};
-use std::fs::{File as StdFile, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-
-#[cfg(unix)]
+use super::cstdio_file::OwnedCstdio;
 use super::TempFileData;
+use super::{IoError, IoResult};
+use std::fs::File as StdFile;
+use std::io::SeekFrom;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct File {
-    file: Option<StdFile>,
+    file: Option<OwnedCstdio>,
     auto_delete: bool,
     unlinked: bool,
-    file_name: String,
-    // Safe instance-owned equivalent of C++ `read(size_t)`'s static MemBuffer.
+    file_name: PathBuf,
+    // Safe instance-owned equivalent of C++ read(size_t)'s static MemBuffer.
     scratch: Vec<u8>,
 }
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Temporary;
 
+fn path_bytes(path: &Path) -> IoResult<Vec<u8>> {
+    super::path_diagnostic_bytes(path)
+}
+fn ordinary_error(prefix: &[u8], path: &Path, reason: &[u8]) -> IoError {
+    let mut message = prefix.to_vec();
+    let bytes = match path_bytes(path) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    message.extend_from_slice(&bytes);
+    message.extend_from_slice(b". ");
+    message.extend_from_slice(reason);
+    IoError::RawDetails(super::RawDiagnosticError(message))
+}
+fn open_error(error: IoError, path: &Path, temporary: bool) -> IoError {
+    match error {
+        IoError::FileOpenDetails(error) => ordinary_error(
+            if temporary {
+                b"Error opening temporary file "
+            } else {
+                b"Error opening file "
+            },
+            path,
+            &error.reason,
+        ),
+        error => error,
+    }
+}
 impl File {
-    /// C++ `File(const string&, const char*)`.
     pub fn new(name: &str, mode: &str) -> IoResult<Self> {
-        Self::open(name, mode)
+        Self::open_path(Path::new(name), mode)
     }
-
-    /// C++ overload `File(Temporary)`.
-    pub fn new_temporary(_temporary: Temporary) -> IoResult<Self> {
-        Self::temporary()
+    pub fn new_path(name: &Path, mode: &str) -> IoResult<Self> {
+        Self::open_path(name, mode)
     }
-
     pub fn open(name: &str, mode: &str) -> IoResult<Self> {
-        let mut options = OpenOptions::new();
-        if mode.contains('r') {
-            options.read(true);
-        }
-        if mode.contains('w') {
-            options.write(true).create(true).truncate(true);
-        }
-        if mode.contains('a') {
-            options.append(true).create(true);
-        }
-        if mode.contains('+') {
-            options.read(true).write(true);
-        }
-        let file = options
-            .open(name)
-            .map_err(|error| IoError::Other(format!("Error opening file {name}. {error}")))?;
+        Self::open_path(Path::new(name), mode)
+    }
+    pub fn open_path(name: &Path, mode: &str) -> IoResult<Self> {
+        let file =
+            OwnedCstdio::open_file_role_path(name, mode).map_err(|e| open_error(e, name, false))?;
         Ok(Self {
             file: Some(file),
             auto_delete: false,
             unlinked: false,
-            file_name: name.to_string(),
+            file_name: name.to_owned(),
             scratch: Vec::new(),
         })
     }
-
+    pub fn new_temporary(_: Temporary) -> IoResult<Self> {
+        Self::temporary()
+    }
     pub fn temporary() -> IoResult<Self> {
         #[cfg(unix)]
-        {
-            let mut data = TempFileData::init(true)?;
-            let file = data.take_file()?;
-            return Ok(Self {
-                file: Some(file),
-                auto_delete: true,
-                unlinked: data.unlinked,
-                file_name: data.name.clone(),
-                scratch: Vec::new(),
-            });
-        }
+        let mut data = TempFileData::init(true)?;
         #[cfg(not(unix))]
-        {
-            let mut path = std::env::temp_dir();
-            path.push(format!(
-                "diamond-rs-{}-{}.tmp",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let name = path.to_string_lossy().into_owned();
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|error| {
-                    IoError::Other(format!("Error opening temporary file {name}. {error}"))
-                })?;
-            Ok(Self {
-                file: Some(file),
-                auto_delete: true,
-                unlinked: false,
-                file_name: name,
-                scratch: Vec::new(),
-            })
-        }
+        let data = TempFileData::init(true)?;
+        #[cfg(unix)]
+        let descriptor = data.take_file()?;
+        #[cfg(unix)]
+        let mut file = OwnedCstdio::from_file_path(&data.name, descriptor, "w+b", 0)
+            .map_err(|e| open_error(e, &data.name, true))?;
+        #[cfg(not(unix))]
+        let mut file = OwnedCstdio::open_file_role_path(&data.name, "w+b")
+            .map_err(|e| open_error(e, &data.name, true))?;
+        file.set_file_role_buffer(64 * super::MEGABYTES)?;
+        Ok(Self {
+            file: Some(file),
+            auto_delete: true,
+            unlinked: data.unlinked,
+            file_name: data.name,
+            scratch: Vec::new(),
+        })
     }
-
     pub fn close(&mut self) -> IoResult<()> {
-        let was_open = self.file.take().is_some();
-        if was_open && self.auto_delete && !self.unlinked {
-            if let Err(error) = std::fs::remove_file(&self.file_name) {
-                eprintln!(
-                    "Warning: Failed to delete temporary file {}: {error}",
-                    self.file_name
-                );
+        if let Some(mut file) = self.file.take() {
+            // Source File::close explicitly ignores fclose's return value.
+            let _ = file.close_file_role();
+            if self.auto_delete
+                && !self.unlinked
+                && std::fs::remove_file(super::source_c_path(&self.file_name).as_ref()).is_err()
+            {
+                let mut message = b"Warning: Failed to delete temporary file ".to_vec();
+                message.extend_from_slice(&path_bytes(
+                    super::source_c_path(&self.file_name).as_ref(),
+                )?);
+                message.push(b'\n');
+                // Source uses fprintf(stderr), without a cout tie or errno suffix.
+                super::console::write_perror(&message);
             }
         }
         Ok(())
     }
-
     pub fn write(&mut self, ptr: &[u8]) -> IoResult<()> {
-        self.file
+        let file = self
+            .file
             .as_mut()
-            .ok_or_else(|| IoError::FileWrite(self.file_name.clone()))?
-            .write_all(ptr)
-            .map_err(|_| IoError::FileWrite(self.file_name.clone()))
+            .ok_or_else(|| IoError::path_message(b"Error writing file ", &self.file_name))?;
+        file.write_bytes(ptr).map_err(|error| match error {
+            IoError::StdioDetails(mut error) => {
+                error.message = b"Error writing to temporary file ".to_vec();
+                let bytes = match path_bytes(&self.file_name) {
+                    Ok(bytes) => bytes,
+                    Err(conversion) => return conversion,
+                };
+                error.message.extend_from_slice(&bytes);
+                IoError::StdioDetails(error)
+            }
+            error => error,
+        })
     }
-
-    /// Header template `write(const T&)`.
     pub fn write_value<T: FilePrimitive>(&mut self, value: T) -> IoResult<()> {
         self.write(&value.to_ne_bytes_vec())
     }
-
-    /// Header template `read(T&)`, returned by value for safe Rust ownership.
     pub fn read_value<T: FilePrimitive>(&mut self) -> IoResult<T> {
         let mut bytes = vec![0; T::SIZE];
         self.read_exact(&mut bytes)?;
         T::from_ne_bytes_slice(&bytes)
     }
-
     pub fn seek(&mut self, position: i64, origin: SeekFrom) -> IoResult<()> {
-        let target = match origin {
-            SeekFrom::Start(_) if position < 0 => {
-                return Err(IoError::Other("Error calling fseek.".to_string()));
-            }
-            SeekFrom::Start(_) => SeekFrom::Start(position as u64),
-            SeekFrom::End(_) => SeekFrom::End(position),
-            SeekFrom::Current(_) => SeekFrom::Current(position),
-        };
         self.file
             .as_mut()
-            .ok_or_else(|| IoError::Other("Error calling fseek.".to_string()))?
-            .seek(target)
-            .map(|_| ())
-            .map_err(|_| IoError::Other("Error calling fseek.".to_string()))
+            .ok_or_else(|| IoError::Other("Error calling fseek.".into()))?
+            .seek(position, origin)
     }
-
     pub fn tell(&mut self) -> IoResult<i64> {
-        self.file
-            .as_mut()
-            .ok_or_else(|| {
-                IoError::Other(format!(
-                    "Error executing ftell on stream {}",
-                    self.file_name
-                ))
-            })?
-            .stream_position()
-            .map(|position| position as i64)
-            .map_err(|_| IoError::Other("Error calling ftell.".to_string()))
+        let file = self.file.as_mut().ok_or_else(|| {
+            IoError::path_message(b"Error executing ftell on stream ", &self.file_name)
+        })?;
+        file.position().map_err(|error| {
+            #[cfg(windows)]
+            if let IoError::StdioDetails(mut error) = error {
+                // Source WIN32 _ftelli64 throws without calling perror.
+                error.perror = None;
+                error.message = b"Error executing ftell on stream ".to_vec();
+                let bytes = match path_bytes(&self.file_name) {
+                    Ok(bytes) => bytes,
+                    Err(conversion) => return conversion,
+                };
+                error.message.extend_from_slice(&bytes);
+                return IoError::StdioDetails(error);
+            }
+            error
+        })
     }
-
     pub fn size(&mut self) -> IoResult<i64> {
         let position = self.tell()?;
         self.seek(0, SeekFrom::End(0))?;
@@ -171,29 +174,46 @@ impl File {
         self.seek(position, SeekFrom::Start(0))?;
         Ok(size)
     }
-
+    /// Rust-only descriptor compatibility view. Actual Source operations retain FILE.
     pub fn file(&mut self) -> IoResult<&mut StdFile> {
         self.file
             .as_mut()
-            .ok_or_else(|| IoError::Other(format!("Closed file {}", self.file_name)))
+            .ok_or_else(|| IoError::path_message(b"Closed file ", &self.file_name))?
+            .legacy_file()
     }
-
     pub fn read_exact(&mut self, ptr: &mut [u8]) -> IoResult<()> {
-        self.file
+        let file = self
+            .file
             .as_mut()
-            .ok_or_else(|| IoError::FileRead(self.file_name.clone()))?
-            .read_exact(ptr)
-            .map_err(|_| IoError::FileRead(self.file_name.clone()))
+            .ok_or_else(|| IoError::path_message(b"Error reading file ", &self.file_name))?;
+        let (count, saved_errno) = file.read_file_role(ptr)?;
+        if count == ptr.len() {
+            Ok(())
+        } else {
+            // Only Source's short exact-read branch evaluates strerror(errno).
+            let reason = unsafe { libc::strerror(saved_errno) };
+            let reason = if reason.is_null() {
+                Vec::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(reason) }
+                    .to_bytes()
+                    .to_vec()
+            };
+            Err(ordinary_error(
+                b"Error reading file ",
+                &self.file_name,
+                &reason,
+            ))
+        }
     }
-
     pub fn read_max(&mut self, ptr: &mut [u8]) -> IoResult<usize> {
-        self.file
+        let file = self
+            .file
             .as_mut()
-            .ok_or_else(|| IoError::FileRead(self.file_name.clone()))?
-            .read(ptr)
-            .map_err(|_| IoError::FileRead(self.file_name.clone()))
+            .ok_or_else(|| IoError::path_message(b"Error reading file ", &self.file_name))?;
+        // Source returns fread's count even when ferror is set.
+        file.read_file_role(ptr).map(|(count, _)| count)
     }
-
     pub fn read(&mut self, count: usize) -> IoResult<&[u8]> {
         let mut bytes = std::mem::take(&mut self.scratch);
         bytes.resize(count, 0);
@@ -202,28 +222,24 @@ impl File {
         result?;
         Ok(&self.scratch)
     }
-
-    /// Rust compatibility helper; equivalent to testing `tell() == size()`.
+    /// Rust extension; Source File exposes no eof member.
     pub fn eof(&mut self) -> IoResult<bool> {
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| IoError::FileRead(self.file_name.clone()))?;
-        let position = file
-            .stream_position()
-            .map_err(|_| IoError::Other("Error calling ftell.".to_string()))?;
-        let length = file
-            .metadata()
-            .map_err(|_| IoError::FileRead(self.file_name.clone()))?
-            .len();
-        Ok(position >= length)
+        Ok(self.tell()? >= self.size()?)
     }
-
-    pub fn file_name(&self) -> &str {
+    pub fn file_path(&self) -> &Path {
         &self.file_name
     }
+    pub fn try_file_name(&self) -> IoResult<&str> {
+        self.file_name
+            .to_str()
+            .ok_or_else(|| IoError::Other("File name is not UTF-8; use file_path.".into()))
+    }
+    /// Checked legacy String API; actual raw-path callers use file_path.
+    pub fn file_name(&self) -> &str {
+        self.try_file_name()
+            .expect("File name is not UTF-8; use file_path or try_file_name")
+    }
 }
-
 impl Drop for File {
     fn drop(&mut self) {
         let _ = self.close();
@@ -269,6 +285,31 @@ mod tests {
     }
 
     #[test]
+    fn file_role_retains_stdio_buffer_until_seek_or_unchecked_close() {
+        let path = named_path("buffered");
+        let mut file = File::open_path(&path, "w+b").unwrap();
+        file.write(b"x").unwrap();
+        assert_eq!(file.tell().unwrap(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert_eq!(file.size().unwrap(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1);
+        file.close().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_role_read_max_ignores_directory_fread_error() {
+        let mut file = File::open_path(&std::env::temp_dir(), "rb").unwrap();
+        assert_eq!(file.read_max(&mut [0; 1]).unwrap(), 0);
+        let IoError::RawDetails(error) = file.read_exact(&mut [0; 1]).unwrap_err() else {
+            panic!("read is ordinary exception")
+        };
+        assert!(error.message_bytes().starts_with(b"Error reading file "));
+        file.close().unwrap();
+    }
+
+    #[test]
     fn named_file_binary_seek_size_and_position_restore() {
         let path = named_path("binary");
         let _ = std::fs::remove_file(&path);
@@ -299,10 +340,14 @@ mod tests {
         assert_eq!(file.read_max(&mut bytes).unwrap(), 2);
         assert_eq!(&bytes[..2], b"xy");
         file.seek(0, SeekFrom::Start(0)).unwrap();
-        assert_eq!(
-            file.read_exact(&mut bytes).unwrap_err(),
-            IoError::FileRead(name.into_owned())
-        );
+        let error = file.read_exact(&mut bytes).unwrap_err();
+        let IoError::RawDetails(error) = error else {
+            panic!("Source File read must be an ordinary raw exception")
+        };
+        let mut prefix = b"Error reading file ".to_vec();
+        prefix.extend_from_slice(name.as_bytes());
+        prefix.extend_from_slice(b". ");
+        assert!(error.message_bytes().starts_with(&prefix));
         drop(file);
         std::fs::remove_file(path).unwrap();
     }
@@ -313,14 +358,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let name = path.to_string_lossy();
         let mut file = File::new(&name, "w+b").unwrap();
-        assert_eq!(
-            file.seek(-1, SeekFrom::Start(0)).unwrap_err(),
-            IoError::Other("Error calling fseek.".to_string())
-        );
+        let IoError::StdioDetails(error) = file.seek(-1, SeekFrom::Start(0)).unwrap_err() else {
+            panic!("fseek must preserve saved perror")
+        };
+        assert_eq!(error.message, b"Error calling fseek.");
+        assert!(error.perror.is_some());
         file.close().unwrap();
         assert_eq!(
             file.write(b"x").unwrap_err(),
-            IoError::FileWrite(name.into_owned())
+            IoError::path_message(b"Error writing file ", Path::new(name.as_ref()))
         );
         let _ = std::fs::remove_file(path);
     }

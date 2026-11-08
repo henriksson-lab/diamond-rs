@@ -5,6 +5,7 @@ pub mod edge;
 pub mod format;
 pub mod intermediate;
 pub mod join_blocks;
+pub(crate) mod live_sink;
 pub mod output_format;
 pub mod output_sink;
 pub mod paf;
@@ -53,7 +54,7 @@ pub fn get_segment_flag_hsp(m: &Hsp) -> u8 {
         }) as u8
 }
 
-pub fn get_segment_flag_context(m: &HspContext) -> u8 {
+pub fn get_segment_flag_context<T>(m: &HspContext<T>) -> u8 {
     let rev = get_rev_flag(m.frame());
     (get_length_flag(m.score())
         | (get_length_flag(m.oriented_query_range().begin as u32) << 2)
@@ -113,3 +114,6 @@ mod tests {
         assert_eq!(get_segment_flag_context(&ctx), get_segment_flag_hsp(&hsp));
     }
 }
+
+#[cfg(test)]
+mod byte_tests;

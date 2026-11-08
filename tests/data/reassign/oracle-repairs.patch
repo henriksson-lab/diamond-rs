@@ -1,0 +1,38 @@
+--- upstream/src/cluster/reassign.cpp
++++ diagnostic/src/cluster/reassign.cpp
+@@ -36,6 +36,18 @@
+ 
+ namespace Cluster {
+ 
++template<typename It, typename It2>
++int64_t checked_update_clustering(It clustering, It2 mapping, It2 query_begin, It2 query_end, It2 db_begin) {
++	const uint64_t n = query_end - query_begin;
++	int64_t k = 0;
++	for (OId i = 0; i < n; ++i)
++		if (mapping[i] != Mapback::NIL_VALUE && clustering[query_begin[i]] != db_begin[mapping[i]]) {
++			clustering[query_begin[i]] = (typename It::value_type)db_begin[mapping[i]];
++			++k;
++		}
++	return k;
++}
++
+ void reassign() {
+ 	config.database.require();
+ 	config.clustering.require();
+@@ -59,6 +71,7 @@
+ 	timer.go("Creating member database");
+ 	shared_ptr<FastaFile> member_db(db->sub_db(members.cbegin(), members.cend()));
+ 	member_db->set_seqinfo_ptr(0);
++	member_db->flags() |= SequenceFile::Flags::ALL;
+ 
+ 	timer.go("Creating centroid database");
+ 	shared_ptr<FastaFile> centroid_db(db->sub_db(centroids.cbegin(), centroids.cend()));
+@@ -81,7 +94,7 @@
+ 	Search::run(centroid_db, member_db, mapback);
+ 
+ 	timer.go("Updating clustering");
+-	const int64_t n = update_clustering(clustering.begin(), mapback->centroid_id.cbegin(), members.cbegin(), members.cend(), centroids.cbegin());
++	const int64_t n = checked_update_clustering(clustering.begin(), mapback->centroid_id.cbegin(), members.cbegin(), members.cend(), centroids.cbegin());
+ 	timer.finish();
+ 	
+ 	message_stream << "Reassigned members: " << n << '/' << members.size() << endl;

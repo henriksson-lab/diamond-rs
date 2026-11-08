@@ -10,8 +10,8 @@ use crate::util::algo::Edge;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CascadedHelpersConfig {
-    pub cluster_steps: Vec<String>,
-    pub connected_component_depth: Vec<String>,
+    pub cluster_steps: Vec<Vec<u8>>,
+    pub connected_component_depth: Vec<Vec<u8>>,
 }
 
 /// Upstream `Cascaded::get_key()`.
@@ -53,15 +53,22 @@ pub fn cluster_steps_with_config(
     approx_id: f64,
     linear: bool,
     config: &CascadedHelpersConfig,
-) -> Vec<String> {
+) -> Vec<Vec<u8>> {
     if !config.cluster_steps.is_empty() {
         return config.cluster_steps.clone();
     }
-    cluster_steps(approx_id, linear)
+    cluster_steps_bytes(approx_id, linear)
 }
 
-pub fn is_linclust(steps: &[String]) -> bool {
-    steps.iter().all(|step| step.ends_with("_lin"))
+pub fn cluster_steps_bytes(approx_id: f64, linear: bool) -> Vec<Vec<u8>> {
+    cluster_steps(approx_id, linear)
+        .into_iter()
+        .map(String::into_bytes)
+        .collect()
+}
+
+pub fn is_linclust<T: AsRef<[u8]>>(steps: &[T]) -> bool {
+    steps.iter().all(|step| step.as_ref().ends_with(b"_lin"))
 }
 
 pub fn default_round_approx_id(_steps: i32) -> Vec<String> {
@@ -76,15 +83,17 @@ struct RoundCcdParser;
 
 impl RoundCcdParser {
     /// Private C++ `round_ccd(const string&)` overload.
-    fn round_ccd(depth: &str) -> Result<i32, String> {
+    fn round_ccd(depth: &[u8]) -> Result<i32, String> {
         // `stringstream >> int` accepts leading whitespace, but the following
         // `!eof()` rejects any trailing character, including whitespace.
-        let value = depth.trim_start();
-        if value.is_empty() || value.trim_end().len() != value.len() {
+        let value = depth.trim_ascii_start();
+        if value.is_empty() || value.trim_ascii_end().len() != value.len() {
             return Err("Invalid number format for --connected-component-depth".to_string());
         }
-        value
-            .parse::<i32>()
+        std::str::from_utf8(value)
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .ok_or(())
             .map_err(|_| "Invalid number format for --connected-component-depth".to_string())
     }
 }
@@ -220,8 +229,11 @@ fn decode_edges(bytes: &[u8]) -> Result<Vec<EdgeData>, String> {
 mod tests {
     use super::*;
 
-    fn strings(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_string()).collect()
+    fn strings(values: &[&str]) -> Vec<Vec<u8>> {
+        values
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect()
     }
 
     fn edge_bytes(edges: &[EdgeData]) -> Vec<u8> {
@@ -234,17 +246,20 @@ mod tests {
 
     #[test]
     fn cluster_step_thresholds_and_override_are_exact() {
-        assert_eq!(cluster_steps(90.0, false), strings(&["faster_lin", "fast"]));
         assert_eq!(
-            cluster_steps(80.0, false),
+            cluster_steps_bytes(90.0, false),
+            strings(&["faster_lin", "fast"])
+        );
+        assert_eq!(
+            cluster_steps_bytes(80.0, false),
             strings(&["faster_lin", "fast_lin", "fast"])
         );
         assert_eq!(
-            cluster_steps(79.999, false),
+            cluster_steps_bytes(79.999, false),
             strings(&["faster_lin", "fast_lin", "linclust-40_lin", "default"])
         );
         assert_eq!(
-            cluster_steps(39.999, false),
+            cluster_steps_bytes(39.999, false),
             strings(&[
                 "faster_lin",
                 "fast_lin",
@@ -254,7 +269,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            cluster_steps(39.999, true),
+            cluster_steps_bytes(39.999, true),
             strings(&["faster_lin", "fast_lin", "linclust-20_lin"])
         );
         let config = CascadedHelpersConfig {
@@ -265,7 +280,7 @@ mod tests {
             cluster_steps_with_config(0.0, false, &config),
             config.cluster_steps
         );
-        assert!(is_linclust(&[]));
+        assert!(is_linclust(&[] as &[Vec<u8>]));
         assert!(is_linclust(&strings(&["a_lin", "b_lin"])));
         assert!(!is_linclust(&strings(&["a_lin", "default"])));
     }

@@ -6,3 +6,5 @@ pub mod main;
 pub mod tools;
 
 pub use config::{Algo, Config as SearchConfig, ConfigInput as SearchConfigInput, Round};
+
+pub mod multiprocessing;

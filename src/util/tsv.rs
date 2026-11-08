@@ -9,8 +9,11 @@ pub enum Type {
 
 pub mod record;
 pub use record::{FromTsvRecord, Record, RecordField, RecordIterator, TsvType, TsvValue};
+pub mod streaming;
 pub mod tsv;
-pub use tsv::{count_lines, count_lines_str};
+pub use tsv::{
+    count_lines, count_lines_str, count_lines_with_buffer, count_lines_with_source_buffer,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidType;

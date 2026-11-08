@@ -5,7 +5,7 @@
 //! facilities implemented in other source files.
 
 use crate::basic::value::OId;
-use crate::cluster::cascaded::helpers::cluster_steps;
+use crate::cluster::cascaded::helpers::cluster_steps_bytes;
 use crate::cluster::realign::DatabaseMetadata;
 use crate::config::Sensitivity;
 use crate::data::sequence_file::SequenceFileFlags;
@@ -16,24 +16,24 @@ pub const MAPBACK_NIL: OId = OId::MAX;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReassignConfig {
-    pub database: String,
-    pub clustering: String,
+    pub database: std::path::PathBuf,
+    pub clustering: std::path::PathBuf,
     pub member_cover: Option<f64>,
     pub mutual_cover: Option<f64>,
     pub approx_min_id: Option<f64>,
-    pub soft_masking: Option<String>,
-    pub masking: Option<String>,
+    pub soft_masking: Option<Vec<u8>>,
+    pub masking: Option<Vec<u8>>,
     pub diag_filter_id: Option<f64>,
     pub diag_filter_cov: Option<f64>,
-    pub cluster_steps: Vec<String>,
+    pub cluster_steps: Vec<Vec<u8>>,
     pub db_size: Option<u64>,
 }
 
 impl Default for ReassignConfig {
     fn default() -> Self {
         Self {
-            database: String::new(),
-            clustering: String::new(),
+            database: std::path::PathBuf::new(),
+            clustering: std::path::PathBuf::new(),
             member_cover: None,
             mutual_cover: None,
             approx_min_id: None,
@@ -56,6 +56,11 @@ pub struct ReassignSearchConfig {
     pub query_cover: f64,
     pub subject_cover: f64,
     pub sensitivity: Sensitivity,
+    pub approx_min_id: f64,
+    pub masking: Vec<u8>,
+    pub soft_masking: Vec<u8>,
+    pub diag_filter_id: Option<f64>,
+    pub diag_filter_cov: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,11 +80,32 @@ pub struct ReassignSummary {
 }
 
 pub trait ReassignBackend {
+    fn io_errors(&self) -> crate::util::io::IoErrorOwner {
+        Default::default()
+    }
+
     fn open_database(
         &mut self,
         path: &str,
         flags: SequenceFileFlags,
     ) -> Result<DatabaseMetadata, String>;
+    fn open_database_path(
+        &mut self,
+        path: &std::path::Path,
+        flags: SequenceFileFlags,
+    ) -> Result<DatabaseMetadata, String> {
+        self.open_database(
+            path.to_str()
+                .ok_or("Legacy backend requires UTF-8 paths; override open_database_path")?,
+            flags,
+        )
+    }
+    fn read_clustering_path(&mut self, path: &std::path::Path) -> Result<Vec<OId>, String> {
+        self.read_clustering(
+            path.to_str()
+                .ok_or("Legacy backend requires UTF-8 paths; override read_clustering_path")?,
+        )
+    }
     fn open_output(&mut self) -> Result<(), String>;
     fn read_clustering(&mut self, path: &str) -> Result<Vec<OId>, String>;
     /// Mirrors `sub_db(ids)` followed by `set_seqinfo_ptr(0)`.
@@ -90,6 +116,11 @@ pub trait ReassignBackend {
         config: &ReassignSearchConfig,
         consume: &mut dyn FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String>;
+    /// Source reports the real reassignment result before generating output.
+    /// Generic library backends need not bind a process-global message stream.
+    fn report_reassigned(&mut self, _reassigned: usize, _members: usize) -> Result<(), String> {
+        Ok(())
+    }
     fn init_random_access(&mut self) -> Result<(), String>;
     fn write_clustering(&mut self, clustering: &[OId]) -> Result<(), String>;
     fn close_database(&mut self) -> Result<(), String>;
@@ -212,8 +243,8 @@ fn initialize_thresholds(config: &mut ReassignConfig) -> Result<(), String> {
     let approx_min_id = *config.approx_min_id.get_or_insert(50.0);
     config
         .soft_masking
-        .get_or_insert_with(|| "tantan".to_owned());
-    config.masking.get_or_insert_with(|| "0".to_owned());
+        .get_or_insert_with(|| b"tantan".to_vec());
+    config.masking.get_or_insert_with(|| b"0".to_vec());
     if approx_min_id >= 90.0 && config.mutual_cover.is_none() {
         config.diag_filter_id.get_or_insert(approx_min_id - 10.0);
         let member_cover = config.member_cover.unwrap_or(DEFAULT_MEMBER_COVER);
@@ -228,22 +259,8 @@ fn initialize_thresholds(config: &mut ReassignConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_sensitivity(name: &str) -> Result<Sensitivity, String> {
-    match name {
-        "faster" => Ok(Sensitivity::Faster),
-        "fast" => Ok(Sensitivity::Fast),
-        "default" => Ok(Sensitivity::Default),
-        "linclust-40" => Ok(Sensitivity::Linclust40),
-        "linclust-20" => Ok(Sensitivity::Linclust20),
-        "shapes-6x10" => Ok(Sensitivity::Shapes6x10),
-        "shapes-30x10" => Ok(Sensitivity::Shapes30x10),
-        "mid-sensitive" => Ok(Sensitivity::MidSensitive),
-        "sensitive" => Ok(Sensitivity::Sensitive),
-        "more-sensitive" => Ok(Sensitivity::MoreSensitive),
-        "very-sensitive" => Ok(Sensitivity::VerySensitive),
-        "ultra-sensitive" => Ok(Sensitivity::UltraSensitive),
-        _ => Err(format!("Invalid sensitivity level: {name}")),
-    }
+fn parse_sensitivity(name: &[u8]) -> Result<Sensitivity, String> {
+    crate::basic::config::sensitivity_from_bytes(name).map_err(|error| error.to_string())
 }
 
 /// Execute C++ `Cluster::reassign()` with global state made explicit.
@@ -251,10 +268,10 @@ pub fn reassign<B: ReassignBackend>(
     config: &mut ReassignConfig,
     backend: &mut B,
 ) -> Result<ReassignSummary, String> {
-    if config.database.is_empty() {
+    if config.database.as_os_str().is_empty() {
         return Err("Database file is required for reassignment.".to_owned());
     }
-    if config.clustering.is_empty() {
+    if config.clustering.as_os_str().is_empty() {
         return Err("Clustering file is required for reassignment.".to_owned());
     }
     initialize_thresholds(config)?;
@@ -265,11 +282,11 @@ pub fn reassign<B: ReassignBackend>(
     let flags = SequenceFileFlags::NEED_LETTER_COUNT
         | SequenceFileFlags::ACC_TO_OID_MAPPING
         | SequenceFileFlags::OID_TO_ACC_MAPPING;
-    let database = backend.open_database(&config.database, flags)?;
+    let database = backend.open_database_path(&config.database, flags)?;
     config.db_size = Some(database.letters);
     let execution = (|| {
         backend.open_output()?;
-        let mut clustering = backend.read_clustering(&config.clustering)?;
+        let mut clustering = backend.read_clustering_path(&config.clustering)?;
         if clustering.len() != database.sequence_count as usize {
             return Err("Invalid/incomplete clustering.".to_owned());
         }
@@ -278,15 +295,18 @@ pub fn reassign<B: ReassignBackend>(
         backend.create_subdatabase(SubDatabase::Centroids, &centroids)?;
         backend.reset_statistics();
         let steps = if config.cluster_steps.is_empty() {
-            cluster_steps(config.approx_min_id.unwrap(), false)
+            cluster_steps_bytes(config.approx_min_id.unwrap(), false)
         } else {
             config.cluster_steps.clone()
         };
-        let sensitivity = parse_sensitivity(
-            steps
-                .last()
-                .ok_or_else(|| "No clustering sensitivity step configured.".to_owned())?,
-        )?;
+        let sensitivity =
+            backend
+                .io_errors()
+                .capture(crate::basic::config::sensitivity_from_bytes(
+                    steps
+                        .last()
+                        .ok_or_else(|| "No clustering sensitivity step configured.".to_owned())?,
+                ))?;
         let search = ReassignSearchConfig {
             command: "blastp",
             max_target_seqs: 1,
@@ -295,6 +315,11 @@ pub fn reassign<B: ReassignBackend>(
             query_cover: coverage_cutoff,
             subject_cover: config.mutual_cover.map_or(0.0, |_| coverage_cutoff),
             sensitivity,
+            approx_min_id: config.approx_min_id.unwrap(),
+            masking: config.masking.clone().unwrap(),
+            soft_masking: config.soft_masking.clone().unwrap(),
+            diag_filter_id: config.diag_filter_id,
+            diag_filter_cov: config.diag_filter_cov,
         };
         let mut mapback = Mapback::new(members.len());
         backend.run_search(&search, &mut |bytes| {
@@ -306,6 +331,7 @@ pub fn reassign<B: ReassignBackend>(
         })?;
         let reassigned_count =
             update_clustering(&mut clustering, &mapback.centroid_id, &members, &centroids)?;
+        backend.report_reassigned(reassigned_count, members.len())?;
         if database.titles_lazy {
             backend.init_random_access()?;
         }
@@ -453,7 +479,7 @@ mod tests {
         );
         assert_eq!(
             (cfg.soft_masking.as_deref(), cfg.masking.as_deref()),
-            (Some("tantan"), Some("0"))
+            (Some(b"tantan".as_slice()), Some(b"0".as_slice()))
         );
         let flags = backend.flags.unwrap();
         assert!(

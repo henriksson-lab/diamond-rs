@@ -103,6 +103,26 @@ pub trait GlobalRankingBackend {
         targets: &[RankedTarget],
         iterated: bool,
     ) -> Result<QueryOutput, String>;
+    /// Concrete backends may execute a bounded group of independent queries
+    /// concurrently. None retains the original per-worker adapter schedule.
+    fn align_batch(
+        &mut self,
+        _queries: &[(BlockId, &[RankedTarget])],
+        _iterated: bool,
+    ) -> Result<Option<Vec<QueryOutput>>, String> {
+        Ok(None)
+    }
+    /// Execute a batch through a concrete live ordered writer. Returned bits
+    /// describe real alignments in input job order; bytes have already passed
+    /// through that writer. Existing backends retain their original schedule.
+    fn align_batch_ordered(
+        &mut self,
+        _queries: &[(BlockId, &[RankedTarget])],
+        _skipped: &[(BlockId, Option<Vec<u8>>)],
+        _iterated: bool,
+    ) -> Result<Option<Vec<bool>>, String> {
+        Ok(None)
+    }
     fn write_output(&mut self, bytes: &[u8]) -> Result<(), String>;
     fn merge_worker_statistics(&mut self, _worker: usize) {}
     fn clear_target_sequences(&mut self);
@@ -260,6 +280,54 @@ fn run_workers<B: GlobalRankingBackend>(
     if worker_count == 0 {
         return Ok(());
     }
+    let batch_size = worker_count.saturating_mul(64).max(1);
+    if !jobs.is_empty() {
+        let batch: Vec<_> = jobs[..jobs.len().min(batch_size)]
+            .iter()
+            .map(|job| (job.query, job.targets.as_slice()))
+            .collect();
+        if let Some(first) =
+            backend.align_batch_ordered(&batch, initial_null, intermediate_output)?
+        {
+            let mut first = Some(first);
+            for chunk in jobs.chunks(batch_size) {
+                let bits = if let Some(first) = first.take() {
+                    first
+                } else {
+                    let batch: Vec<_> = chunk
+                        .iter()
+                        .map(|job| (job.query, job.targets.as_slice()))
+                        .collect();
+                    backend
+                        .align_batch_ordered(&batch, initial_null, intermediate_output)?
+                        .ok_or_else(|| {
+                            "Ranking backend changed ordered execution mode".to_owned()
+                        })?
+                };
+                if bits.len() != chunk.len() {
+                    return Err("Ranking backend returned the wrong ordered batch size".into());
+                }
+                for (job, aligned) in chunk.iter().zip(bits) {
+                    if aligned && config.track_aligned_queries {
+                        let value = config
+                            .query_aligned
+                            .get_mut(job.query as usize)
+                            .ok_or_else(|| "Ranked query block ID out of range".to_owned())?;
+                        if !*value {
+                            *value = true;
+                            if count_new_alignments {
+                                config.iteration_query_aligned = config
+                                    .iteration_query_aligned
+                                    .checked_add(1)
+                                    .ok_or_else(|| "Aligned query count overflow".to_owned())?;
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+    }
     let mut pending = BTreeMap::new();
     let mut next_output = 0;
     for &(query, ref output) in initial_null {
@@ -270,6 +338,63 @@ fn run_workers<B: GlobalRankingBackend>(
             query,
             output.clone(),
         )?;
+    }
+    // Keep output staging bounded independently of the query-block size.
+    // Existing adapters retain their original worker callbacks and schedule.
+    let batch_size = worker_count.saturating_mul(64).max(1);
+    if !jobs.is_empty() {
+        let first_end = jobs.len().min(batch_size);
+        let batch: Vec<_> = jobs[..first_end]
+            .iter()
+            .map(|job| (job.query, job.targets.as_slice()))
+            .collect();
+        if let Some(first) = backend.align_batch(&batch, intermediate_output)? {
+            let mut first = Some(first);
+            for chunk in jobs.chunks(batch_size) {
+                let outputs = if let Some(outputs) = first.take() {
+                    outputs
+                } else {
+                    let batch: Vec<_> = chunk
+                        .iter()
+                        .map(|job| (job.query, job.targets.as_slice()))
+                        .collect();
+                    backend
+                        .align_batch(&batch, intermediate_output)?
+                        .ok_or_else(|| "Ranking backend changed batch execution mode".to_owned())?
+                };
+                if outputs.len() != chunk.len() {
+                    return Err("Ranking backend returned the wrong batch size".to_owned());
+                }
+                for (job, output) in chunk.iter().zip(outputs) {
+                    if output.aligned && config.track_aligned_queries {
+                        let aligned = config
+                            .query_aligned
+                            .get_mut(job.query as usize)
+                            .ok_or_else(|| "Ranked query block ID out of range".to_owned())?;
+                        if !*aligned {
+                            *aligned = true;
+                            if count_new_alignments {
+                                config.iteration_query_aligned = config
+                                    .iteration_query_aligned
+                                    .checked_add(1)
+                                    .ok_or_else(|| "Aligned query count overflow".to_owned())?;
+                            }
+                        }
+                    }
+                    push_ordered(
+                        backend,
+                        &mut pending,
+                        &mut next_output,
+                        job.query,
+                        output.bytes,
+                    )?;
+                }
+            }
+            if !pending.is_empty() {
+                return Err(format!("Missing query output before query {next_output}"));
+            }
+            return Ok(());
+        }
     }
     for worker in 0..worker_count {
         align_worker(

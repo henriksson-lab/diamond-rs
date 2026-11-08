@@ -4,6 +4,7 @@
 //! module uses owned state and explicit readers/writers while preserving its
 //! ordered-map look-ahead behavior.
 
+use crate::output::format::format_default_float;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -106,31 +107,6 @@ fn parse_alignment_line(line: &str) -> Result<(String, String), String> {
     ))
 }
 
-fn format_default_float(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_owned();
-    }
-    let exponent = value.abs().log10().floor() as i32;
-    if !(-4..6).contains(&exponent) {
-        let raw = format!("{value:.5e}");
-        let (mantissa, exponent) = raw.split_once('e').expect("scientific format has e");
-        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
-        let exponent: i32 = exponent.parse().expect("scientific exponent is numeric");
-        format!("{mantissa}e{exponent:+03}")
-    } else {
-        let decimals = (5 - exponent).max(0) as usize;
-        let formatted = format!("{value:.decimals$}");
-        if decimals == 0 {
-            formatted
-        } else {
-            formatted
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_owned()
-        }
-    }
-}
-
 /// Load the next query group from the ordered family map.
 pub fn fetch_map<R: BufRead>(
     map_in: &mut LineInput<R>,
@@ -161,17 +137,25 @@ pub fn fetch_map<R: BufRead>(
         let fam_idx = if let Some(&idx) = state.fam2idx.get(&family) {
             idx
         } else {
-            let idx = u8::try_from(state.fam2idx.len())
-                .map_err(|_| "more than 256 families in one query".to_owned())?;
+            // Source explicitly narrows the map size to uint8_t. Families
+            // beyond 256 alias an earlier count row; the vectors still grow
+            // once per distinct family, as in its emplace_back calls.
+            let idx = state.fam2idx.len() as u8;
             state.fam2idx.insert(family, idx);
             state.totals.push([0; 10]);
             state.counts.push([0; 10]);
             idx
         };
-        if !identity.is_finite() || identity < 0.0 {
-            return Err("identity must be a finite non-negative value".to_owned());
+        // id is float, but Source's 100.0 literal promotes it to double
+        // before multiplication and truncation to int. Multiplying in f32
+        // can round a value onto the next identity-bin boundary.
+        let scaled = (f64::from(identity) * 100.0).trunc();
+        if !scaled.is_finite() || scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
+            return Err("Source roc-id identity-to-int conversion is undefined.".to_owned());
         }
-        let bin = (((identity * 100.0) as i32) / 10).min(9) as usize;
+        let bin = ((scaled as i32) / 10).min(9);
+        let bin = usize::try_from(bin)
+            .map_err(|_| "Source roc-id identity bin is outside its count array.".to_owned())?;
         state.acc2id.entry(target).or_default().push(Assoc {
             id: bin as u8,
             fam_idx,

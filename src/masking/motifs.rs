@@ -159,6 +159,10 @@ pub fn reapply_motifs(seq: &mut [Letter], saved: &[MotifMaskEntry]) {
 ///   those positions with `MASK_LETTER` — the same hard-mask the C++
 ///   `MaskingTable::add` applies via `std::fill`
 pub fn mask_motifs(seq: &mut [Letter]) -> Vec<MotifMaskEntry> {
+    mask_motifs_with_limit(seq, MAX_MOTIF_LEN)
+}
+
+pub fn mask_motifs_with_limit(seq: &mut [Letter], max_motif_len: usize) -> Vec<MotifMaskEntry> {
     let mut saved = Vec::new();
     let len = seq.len();
     if len < MOTIF_LEN {
@@ -217,7 +221,7 @@ pub fn mask_motifs(seq: &mut [Letter]) -> Vec<MotifMaskEntry> {
         // motifs whose merged span exceeds the cap are skipped entirely,
         // matching C++ `if (i->second - i->first <= config.max_motif_len)`
         // (`diamond/src/masking/masking.cpp:126`).
-        if b - a <= MAX_MOTIF_LEN {
+        if b - a <= max_motif_len {
             for p in a..b {
                 to_mask.insert(p);
             }

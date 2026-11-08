@@ -122,7 +122,8 @@ fn fill_hauser_correction(
         scores.add(seq[h], score_matrix);
         h += 1;
     }
-    while n < window + 1 && h < len {
+    // Source stores its signed setting in unsigned before this addition.
+    while n < (window as u32).wrapping_add(1) as usize && h < len {
         n += 1;
         scores.add(seq[h], score_matrix);
         set_correction(
@@ -202,7 +203,17 @@ pub(crate) fn hauser_correction_into(
     output: &mut Vec<i8>,
     values_scratch: &mut Vec<f32>,
 ) {
-    fill_hauser_correction(seq, score_matrix, 40, values_scratch, output);
+    hauser_correction_into_with_window(seq, score_matrix, 40, output, values_scratch);
+}
+
+pub(crate) fn hauser_correction_into_with_window(
+    seq: &[Letter],
+    score_matrix: &ScoreMatrix,
+    window: usize,
+    output: &mut Vec<i8>,
+    values_scratch: &mut Vec<f32>,
+) {
+    fill_hauser_correction(seq, score_matrix, window, values_scratch, output);
 }
 
 impl Deref for HauserCorrection {

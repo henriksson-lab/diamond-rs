@@ -32,7 +32,24 @@ impl PairwiseFormat {
         query_translated: bool,
         blastn_command: bool,
     ) -> io::Result<()> {
-        super::pairwise::print_match_context(
+        self.print_match_bytes(
+            writer,
+            record,
+            score_matrix,
+            query_translated,
+            blastn_command,
+        )
+    }
+
+    pub fn print_match_bytes<W: Write, T: AsRef<[u8]>>(
+        &self,
+        writer: &mut W,
+        record: &HspContext<T>,
+        score_matrix: &ScoreMatrix,
+        query_translated: bool,
+        blastn_command: bool,
+    ) -> io::Result<()> {
+        super::pairwise::print_match_context_bytes(
             writer,
             record,
             score_matrix,
@@ -55,7 +72,17 @@ impl PairwiseFormat {
         query_len: i32,
         unaligned: bool,
     ) -> io::Result<()> {
-        super::pairwise::print_query_intro(writer, query_title, query_len, unaligned)
+        self.print_query_intro_bytes(writer, query_title.as_bytes(), query_len, unaligned)
+    }
+
+    pub fn print_query_intro_bytes<W: Write>(
+        &self,
+        writer: &mut W,
+        query_title: &[u8],
+        query_len: i32,
+        unaligned: bool,
+    ) -> io::Result<()> {
+        super::pairwise::print_query_intro_bytes(writer, query_title, query_len, unaligned)
     }
 
     /// C++ `PairwiseFormat::print_query_epilog` (intentionally empty).

@@ -13,6 +13,32 @@ pub use super::intermediate::{IntermediateRecord, OutputFormat, FINISHED};
 use crate::align::hsp::Hsp as AlignHsp;
 use crate::basic::value::Letter;
 
+/// C++ `Null_format`: the ordinary transcript pipeline with inherited no-op
+/// output callbacks. Cloning preserves its stateless constructor state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NullFormat;
+
+impl NullFormat {
+    pub fn output_format_spec(&self) -> OutputFormatSpec {
+        OutputFormatSpec::null_format()
+    }
+
+    pub fn print_match<W: std::io::Write>(
+        &self,
+        _writer: &mut W,
+        _context: &crate::align::hsp::HspContext,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+    pub fn print_match_bytes<W: std::io::Write>(
+        &self,
+        _writer: &mut W,
+        _context: &crate::align::hsp::ByteHspContext,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Matches C++ `print_hsp` as it exists in `output_format.cpp`.
 ///
 /// The upstream function's pairwise rendering and stdout write are commented

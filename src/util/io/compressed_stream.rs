@@ -91,10 +91,10 @@ impl<S: StreamEntity> StreamEntity for ZlibSource<S> {
                     FlushDecompress::None,
                 )
                 .map_err(|_| {
-                    IoError::Other(format!(
-                        "Error reading gzip-compressed input file. The file may be corrupted: {}",
-                        self.prev.file_name()
-                    ))
+                    IoError::path_message(
+                        b"Error reading gzip-compressed input file. The file may be corrupted: ",
+                        self.prev.file_path(),
+                    )
                 })?;
             let consumed = (stream.total_in() - input_before) as usize;
             let produced = (stream.total_out() - output_before_total) as usize;
@@ -104,10 +104,10 @@ impl<S: StreamEntity> StreamEntity for ZlibSource<S> {
             if status == Status::StreamEnd {
                 self.stream = None;
             } else if consumed == 0 && produced == 0 {
-                return Err(IoError::Other(format!(
-                    "Error reading gzip-compressed input file. The file may be corrupted: {}",
-                    self.prev.file_name()
-                )));
+                return Err(IoError::path_message(
+                    b"Error reading gzip-compressed input file. The file may be corrupted: ",
+                    self.prev.file_path(),
+                ));
             }
         }
         Ok(output_position)
@@ -135,6 +135,9 @@ impl<S: StreamEntity> StreamEntity for ZlibSource<S> {
         Ok(self.eos)
     }
 
+    fn file_path(&self) -> &std::path::Path {
+        self.prev.file_path()
+    }
     fn file_name(&self) -> &str {
         self.prev.file_name()
     }
@@ -143,8 +146,17 @@ impl<S: StreamEntity> StreamEntity for ZlibSource<S> {
         self.prev.file_size()
     }
 
+    #[cfg(any(unix, windows))]
+    fn shared_stdio(&mut self) -> IoResult<Option<super::cstdio_file::SharedCstdio>> {
+        self.prev.shared_stdio()
+    }
+
     fn file(&mut self) -> IoResult<&mut StdFile> {
         self.prev.file()
+    }
+
+    fn clone_file(&mut self) -> IoResult<StdFile> {
+        self.prev.clone_file()
     }
 }
 
@@ -173,6 +185,13 @@ impl<S: StreamEntity> ZlibSink<S> {
     }
 
     pub fn deflate_loop(&mut self, ptr: &[u8], finish: bool) -> IoResult<()> {
+        // Source retries deflate forever when avail_out is always zero,
+        // including empty-stream close. Diagnose only at that codec boundary.
+        if self.prev.buffer_size() == 0 {
+            return Err(IoError::Other(
+                "Source zero-capacity output cannot make progress.".into(),
+            ));
+        }
         let stream = self
             .stream
             .as_mut()
@@ -187,10 +206,16 @@ impl<S: StreamEntity> ZlibSink<S> {
             let input_before = stream.total_in();
             let output_before = stream.total_out();
             let (status, output_capacity) = {
-                let (output, capacity) = self.prev.write_buffer_range();
+                let (output, capacity) = self.prev.write_buffer_range_bounded(Self::CHUNK_SIZE);
                 let status = stream
                     .compress(&ptr[input_position..], output, flush)
                     .map_err(|_| IoError::Other("deflate error".to_string()))?;
+                let produced = (stream.total_out() - output_before) as usize;
+                // Pin the gzip OS metadata to the Unix reference executable;
+                // it is outside the payload CRC and has no decoding effect.
+                if output_before <= 9 && output_before + produced as u64 > 9 {
+                    output[(9 - output_before) as usize] = 3;
+                }
                 (status, capacity)
             };
             let consumed = (stream.total_in() - input_before) as usize;
@@ -231,6 +256,9 @@ impl<S: StreamEntity> StreamEntity for ZlibSink<S> {
         self.prev.flush()
     }
 
+    fn file_path(&self) -> &std::path::Path {
+        self.prev.file_path()
+    }
     fn file_name(&self) -> &str {
         self.prev.file_name()
     }
@@ -239,8 +267,17 @@ impl<S: StreamEntity> StreamEntity for ZlibSink<S> {
         self.prev.file_size()
     }
 
+    #[cfg(any(unix, windows))]
+    fn shared_stdio(&mut self) -> IoResult<Option<super::cstdio_file::SharedCstdio>> {
+        self.prev.shared_stdio()
+    }
+
     fn file(&mut self) -> IoResult<&mut StdFile> {
         self.prev.file()
+    }
+
+    fn clone_file(&mut self) -> IoResult<StdFile> {
+        self.prev.clone_file()
     }
 }
 

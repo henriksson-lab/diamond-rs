@@ -34,7 +34,16 @@ impl SamFormat {
         query_title: &str,
         unaligned: bool,
     ) -> io::Result<()> {
-        super::sam::print_query_intro(writer, query_title, unaligned)
+        self.print_query_intro_bytes(writer, query_title.as_bytes(), unaligned)
+    }
+
+    pub fn print_query_intro_bytes<W: Write>(
+        &self,
+        writer: &mut W,
+        query_title: &[u8],
+        unaligned: bool,
+    ) -> io::Result<()> {
+        super::sam::print_query_intro_bytes(writer, query_title, unaligned)
     }
 
     /// Matches `SamFormat::print_match`. C++ derives one title-policy boolean
@@ -49,8 +58,27 @@ impl SamFormat {
         view_command: bool,
         sam_qlen_field: bool,
     ) -> io::Result<()> {
+        self.print_match_bytes(
+            writer,
+            record,
+            score_matrix,
+            salltitles,
+            view_command,
+            sam_qlen_field,
+        )
+    }
+
+    pub fn print_match_bytes<W: Write, T: AsRef<[u8]>>(
+        &self,
+        writer: &mut W,
+        record: &HspContext<T>,
+        score_matrix: &ScoreMatrix,
+        salltitles: bool,
+        view_command: bool,
+        sam_qlen_field: bool,
+    ) -> io::Result<()> {
         let long_titles = salltitles || view_command;
-        super::sam::print_match_context(
+        super::sam::print_match_context_bytes(
             writer,
             record,
             score_matrix,
@@ -69,7 +97,15 @@ impl SamFormat {
         mode: u32,
         invocation: &str,
     ) -> io::Result<()> {
-        super::sam::print_header(writer, mode, invocation)
+        self.print_header_bytes(writer, mode, invocation.as_bytes())
+    }
+    pub fn print_header_bytes<W: Write>(
+        &self,
+        writer: &mut W,
+        mode: u32,
+        invocation: &[u8],
+    ) -> io::Result<()> {
+        super::sam::print_header_bytes(writer, mode, invocation)
     }
 }
 

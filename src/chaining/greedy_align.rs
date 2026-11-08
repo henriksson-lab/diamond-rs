@@ -30,6 +30,7 @@ pub struct GreedyAlignConfig {
     pub min_nodes: usize,
     pub max_gap: i32,
     pub no_merge_hsps: bool,
+    pub stacked_hsp_ratio: f64,
 }
 
 impl Default for GreedyAlignConfig {
@@ -41,6 +42,7 @@ impl Default for GreedyAlignConfig {
             min_nodes: 200,
             max_gap: 2_000,
             no_merge_hsps: false,
+            stacked_hsp_ratio: DEFAULT_CHAINING_STACKED_HSP_RATIO,
         }
     }
 }
@@ -657,7 +659,7 @@ impl<'a> Aligner<'a> {
         d_idx: usize,
         e_idx: usize,
         space_penalty: f64,
-        _max_i: i32,
+        max_i: i32,
     ) -> i32 {
         let d = self.diags.nodes[d_idx].clone();
         let e = self.diags.nodes[e_idx].clone();
@@ -748,6 +750,9 @@ impl<'a> Aligner<'a> {
                 prefix_score_begin,
             ));
         }
+        if self.log && prefix_score > d.score {
+            let _ = writeln!(io::stdout().lock(), "Link n={} d={} i_end={} max_i={} shift={} space={} prefix_score={} link_score={} path_min={}", e_idx, e.diag(), e.query_end(), max_i, shift, space, prefix_score, _link_score, path_min);
+        }
         prefix_score
     }
 
@@ -764,6 +769,9 @@ impl<'a> Aligner<'a> {
             }
             let d = self.diags.nodes[node].clone();
             let dd = d.diag();
+            if self.log {
+                let _ = writeln!(io::stdout().lock(), "Node {} Score={}", node, d.score);
+            }
             self.window.entry(dd).or_insert(node);
 
             let mut max_j = 0;
@@ -787,6 +795,13 @@ impl<'a> Aligner<'a> {
                 if e.subject_end() - (d.subject_end() - (e.diag() - d.diag()).min(0))
                     >= REVERSE_LINK_MIN_OVERHANG
                 {
+                    if self.log {
+                        let _ = writeln!(
+                            io::stdout().lock(),
+                            "Computing reverse link node={}",
+                            e_node
+                        );
+                    }
                     self.get_approximate_link(e_node, node, space_penalty, max_j);
                 }
             }
@@ -817,10 +832,27 @@ impl<'a> Aligner<'a> {
                 if e.subject_end() - (d.subject_end() - (e.diag() - d.diag()).min(0))
                     >= REVERSE_LINK_MIN_OVERHANG
                 {
+                    if self.log {
+                        let _ = writeln!(
+                            io::stdout().lock(),
+                            "Computing reverse link node={}",
+                            e_node
+                        );
+                    }
                     self.get_approximate_link(e_node, node, space_penalty, max_i);
                 }
             }
             self.window.insert(dd, node);
+            if self.log {
+                let d = &self.diags.nodes[node];
+                let _ = writeln!(
+                    io::stdout().lock(),
+                    "Prefix_score={} path_max={} path_min={}\n",
+                    d.prefix_score,
+                    d.path_max,
+                    d.path_min
+                );
+            }
         }
     }
 
@@ -874,8 +906,37 @@ impl<'a> Aligner<'a> {
         }
         self.diags.sort();
         self.diags.prune_with_range_cover(config.range_cover);
+        if self.log {
+            let mut out = io::stdout().lock();
+            let _ = self.diags.print(self.query, self.subject, &mut out);
+            let _ = writeln!(out, "\n");
+        }
         self.forward_pass(0..self.diags.nodes.len(), true, space_penalty);
-        self.backtrace_all(ts, cutoff, max_shift)
+        let mut hsps = Vec::new();
+        let score = self.backtrace_all_with_hsps(
+            &mut hsps,
+            ts,
+            cutoff,
+            max_shift,
+            config.stacked_hsp_ratio,
+        );
+        if self.log {
+            hsps.sort_by_key(|hsp| hsp.query_range.begin);
+            for hsp in &mut hsps {
+                crate::output::output_format::print_hsp(hsp, self.query);
+            }
+            let mut out = io::stdout().lock();
+            let _ = writeln!(out, "\nSmith-Waterman:");
+            let _ = smith_waterman(
+                self.query,
+                self.subject,
+                &self.diags,
+                self.score_matrix,
+                &mut out,
+            );
+            let _ = writeln!(out, "\n");
+        }
+        score
     }
 
     /// Matches C++ `Aligner::run(const vector<DiagonalSegment>&, Loc)`.
@@ -885,6 +946,17 @@ impl<'a> Aligner<'a> {
         segments: &[DiagonalSegment],
         band: i32,
     ) -> i32 {
+        if self.log && !segments.is_empty() {
+            let first = segments[0].diag();
+            let last = segments[segments.len() - 1].diag();
+            let _ = writeln!(
+                io::stdout().lock(),
+                "***** Seed hit run {}\t{}\t{}",
+                first,
+                last,
+                last - first
+            );
+        }
         self.diags.init();
         self.diags.load(segments);
         self.run(ts, SPACE_PENALTY, 19, band)
@@ -945,6 +1017,17 @@ pub fn run_with_config(
         );
     }
     let mut aligner = Aligner::new(query, subject, log, frame, score_matrix);
+    if log && !segments.is_empty() {
+        let first = segments[0].diag();
+        let last = segments[segments.len() - 1].diag();
+        let _ = writeln!(
+            io::stdout().lock(),
+            "***** Seed hit run {}\t{}\t{}",
+            first,
+            last,
+            last - first
+        );
+    }
     let mut ts = Vec::new();
     aligner.diags.init();
     aligner.diags.load(segments);

@@ -54,7 +54,7 @@ pub fn write_sam_record<W: Write>(writer: &mut W, r: &SamRecord<'_>) -> io::Resu
     )
 }
 
-pub fn print_md(r: &HspContext) -> String {
+pub fn print_md<T>(r: &HspContext<T>) -> String {
     let mut buf = String::new();
     let mut matches = 0u32;
     let mut del = 0u32;
@@ -72,7 +72,7 @@ pub fn print_md(r: &HspContext) -> String {
                     buf.push('0');
                     del = 0;
                 }
-                buf.push(AMINO_ACID_ALPHABET[i.letter as usize] as char);
+                buf.push(r.alphabet()[i.letter as usize] as char);
             }
             EditOperation::Deletion => {
                 if matches > 0 {
@@ -82,7 +82,7 @@ pub fn print_md(r: &HspContext) -> String {
                 if del == 0 {
                     buf.push('^');
                 }
-                buf.push(AMINO_ACID_ALPHABET[i.letter as usize] as char);
+                buf.push(r.alphabet()[i.letter as usize] as char);
                 del += 1;
             }
             _ => {}
@@ -94,7 +94,7 @@ pub fn print_md(r: &HspContext) -> String {
     buf
 }
 
-pub fn print_cigar(r: &HspContext) -> String {
+pub fn print_cigar<T>(r: &HspContext<T>) -> String {
     let map = [0usize, 1, 2, 0, 3, 4];
     let letter = ['M', 'I', 'D', '\\', '/'];
     let mut buf = String::new();
@@ -121,20 +121,31 @@ pub fn print_cigar(r: &HspContext) -> String {
 }
 
 /// Matches C++ `SamFormat::print_match(const HspContext&)`.
-pub fn print_match_context<W: Write>(
+pub fn print_match_context_bytes<W: Write, T: AsRef<[u8]>>(
     writer: &mut W,
-    r: &HspContext,
+    r: &HspContext<T>,
     score_matrix: &ScoreMatrix,
     full_titles: bool,
     all_titles: bool,
     sam_qlen_field: bool,
 ) -> io::Result<()> {
-    let query_id = r
-        .query_title
-        .split(|c: char| ID_DELIMITERS.contains(c))
-        .next()
-        .unwrap_or("");
-    let target_title = print_title(&r.target_title, full_titles, all_titles, "<>", false);
+    let query_id = crate::util::sequence::seqid_bytes(r.query_title.as_ref());
+    let target_title = super::format::print_title_bytes(
+        r.target_title.as_ref(),
+        full_titles,
+        all_titles,
+        b"<>",
+        false,
+    );
+    let sam_bit_score = score_matrix.bitscore(r.score() as f64);
+    if score_matrix.source_dna_statistics().is_some() && !sam_bit_score.is_finite() {
+        // Source's static blastn global yields NaN, then SAM casts it to u32.
+        // Reject that actual float-to-integer UB boundary rather than emit a
+        // fabricated AS score from the independent nucleotide HSP model.
+        return Err(io::Error::other(
+            "Nucleotide SAM AS tag converts a non-finite Source global bit score to an integer.",
+        ));
+    }
     let frame = Frame::from_index(r.frame() as i32);
     let query_range = r.query_range();
     let query = r.query_index(r.hsp.frame);
@@ -155,7 +166,7 @@ pub fn print_match_context<W: Write>(
         .iter()
         .map(|&l| {
             let x = l as i32;
-            let c = AMINO_ACID_ALPHABET[(x & 127) as usize] as char;
+            let c = r.alphabet()[(x & 127) as usize] as char;
             if (x & 128) == 0 {
                 c
             } else {
@@ -164,15 +175,16 @@ pub fn print_match_context<W: Write>(
         })
         .collect();
 
+    writer.write_all(&query_id)?;
+    writer.write_all(b"\t0\t")?;
+    writer.write_all(&target_title)?;
     write!(
         writer,
-        "{}\t0\t{}\t{}\t255\t{}\t*\t0\t0\t{}\t*\tAS:i:{}\tNM:i:{}\tZL:i:{}\tZR:i:{}\tZE:f:{}\tZI:i:{}\tZF:i:{}\tZS:i:{}\tMD:Z:{}",
-        query_id,
-        target_title,
+        "\t{}\t255\t{}\t*\t0\t0\t{}\t*\tAS:i:{}\tNM:i:{}\tZL:i:{}\tZR:i:{}\tZE:f:{}\tZI:i:{}\tZF:i:{}\tZS:i:{}\tMD:Z:{}",
         r.subject_range().begin + 1,
         print_cigar(r),
         seq_str,
-        score_matrix.bitscore(r.score() as f64) as u32,
+        sam_bit_score as u32,
         r.length().wrapping_sub(r.identities()),
         r.subject_len,
         r.score(),
@@ -189,23 +201,29 @@ pub fn print_match_context<W: Write>(
 }
 
 /// Matches C++ `SamFormat::print_query_intro()`.
-pub fn print_query_intro<W: Write>(
+pub fn print_query_intro_bytes<W: Write>(
     writer: &mut W,
-    query_title: &str,
+    query_title: &[u8],
     unaligned: bool,
 ) -> io::Result<()> {
     if unaligned {
-        let query_id = query_title
-            .split(|c: char| ID_DELIMITERS.contains(c))
-            .next()
-            .unwrap_or("");
-        writeln!(writer, "{}\t4\t*\t0\t255\t*\t*\t0\t0\t*\t*", query_id)?;
+        let query_id = crate::util::sequence::seqid_bytes(query_title);
+        writer.write_all(&query_id)?;
+        writeln!(writer, "\t4\t*\t0\t255\t*\t*\t0\t0\t*\t*")?;
     }
     Ok(())
 }
 
 /// Matches C++ `SamFormat::print_header()`.
 pub fn print_header<W: Write>(writer: &mut W, mode: u32, invocation: &str) -> io::Result<()> {
+    print_header_bytes(writer, mode, invocation.as_bytes())
+}
+
+pub fn print_header_bytes<W: Write>(
+    writer: &mut W,
+    mode: u32,
+    invocation: &[u8],
+) -> io::Result<()> {
     let mode_str = match mode {
         2 => "BlastP",
         3 => "BlastX",
@@ -213,11 +231,9 @@ pub fn print_header<W: Write>(writer: &mut W, mode: u32, invocation: &str) -> io
         _ => "",
     };
     writeln!(writer, "@HD\tVN:1.5\tSO:query")?;
-    writeln!(
-        writer,
-        "@PG\tPN:DIAMOND\tVN:{}\tCL:{}",
-        VERSION_STRING, invocation
-    )?;
+    write!(writer, "@PG\tPN:DIAMOND\tVN:{}\tCL:", VERSION_STRING)?;
+    writer.write_all(invocation)?;
+    writer.write_all(b"\n")?;
     writeln!(writer, "@mm\t{}", mode_str)?;
     writeln!(writer, "@CO\t{}-like alignments", mode_str)?;
     writeln!(
@@ -451,4 +467,31 @@ mod tests {
             io::ErrorKind::InvalidData
         );
     }
+}
+
+// String compatibility entry points share the raw renderer.
+pub fn print_match_context<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    score_matrix: &ScoreMatrix,
+    full_titles: bool,
+    all_titles: bool,
+    sam_qlen_field: bool,
+) -> io::Result<()> {
+    print_match_context_bytes(
+        writer,
+        r,
+        score_matrix,
+        full_titles,
+        all_titles,
+        sam_qlen_field,
+    )
+}
+
+pub fn print_query_intro<W: Write>(
+    writer: &mut W,
+    query_title: &str,
+    unaligned: bool,
+) -> io::Result<()> {
+    print_query_intro_bytes(writer, query_title.as_bytes(), unaligned)
 }

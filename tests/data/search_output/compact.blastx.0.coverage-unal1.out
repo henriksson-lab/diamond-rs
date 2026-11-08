@@ -1,0 +1,19 @@
+BLASTP 2.3.0+
+
+
+Query= translated_query <alpha>& description
+
+Length=1137
+
+
+***** No hits found *****
+
+
+Query= reverse_query
+
+Length=1137
+
+
+***** No hits found *****
+
+

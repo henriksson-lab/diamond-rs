@@ -239,7 +239,14 @@ impl<T> Matrix<T>
 where
     T: Clone + Default + Display + FromStr + PartialEq,
 {
-    pub fn out(&self) -> String {
+    /// Source stream insertion for owned primitive numeric values and custom
+    /// static Display types. The output-only 'static bound permits safe
+    /// primitive downcasts, preserving signed NaNs before text formatting.
+    /// Storage, constructors, and input parsing retain their existing bounds.
+    pub fn out(&self) -> String
+    where
+        T: 'static,
+    {
         let mut out = String::new();
         match getFormat() {
             Format::GENERAL => match alp_ioutil::getFormat() {
@@ -252,7 +259,7 @@ where
                             if j != 0 {
                                 out.push('\t');
                             }
-                            out.push_str(&self.getMatrix()[i][j].to_string());
+                            out.push_str(&alp_ioutil::format_value(&self.getMatrix()[i][j]));
                         }
                     }
                 }
@@ -267,7 +274,7 @@ where
                             if j != 0 {
                                 out.push('\t');
                             }
-                            out.push_str(&self.getMatrix()[i][j].to_string());
+                            out.push_str(&alp_ioutil::format_value(&self.getMatrix()[i][j]));
                         }
                     }
                     out.push_str("\t! matrix elements");
@@ -285,7 +292,7 @@ where
                         if j != i {
                             out.push('\t');
                         }
-                        out.push_str(&self.getMatrix()[i][j].to_string());
+                        out.push_str(&alp_ioutil::format_value(&self.getMatrix()[i][j]));
                     }
                 }
             }
@@ -314,27 +321,22 @@ where
     }
 
     fn in_machine(&mut self, input: &str) {
-        let mut lines = input.lines();
-        let Some(first_line) = lines.next() else {
+        if input.is_empty() {
             alp_ioutil::abort_msg("Njn::Matrix::in : bad n for the MACHINE");
-        };
-        let mut v: Vec<T> = first_line
-            .split_whitespace()
-            .map(|x| {
-                x.parse::<T>().unwrap_or_else(|_| {
-                    alp_ioutil::abort_msg("Njn::Matrix::in : bad value for the MACHINE")
-                })
-            })
-            .collect();
+        }
+        let (first_line, remainder) = input.split_once('\n').unwrap_or((input, ""));
+        let (mut v, first_eof) = alp_ioutil::read_values::<T>(first_line);
+        if !first_eof {
+            alp_ioutil::abort_msg("Njn::Matrix::in : bad value for the MACHINE");
+        }
         let n = v.len();
         if n == 0 {
             alp_ioutil::abort_msg("Njn::Matrix::in : bad n for the MACHINE");
         }
-        for token in lines.flat_map(|line| line.split_whitespace()) {
-            v.push(token.parse::<T>().unwrap_or_else(|_| {
-                alp_ioutil::abort_msg("Njn::Matrix::in : bad value for the MACHINE")
-            }));
-        }
+        // Source checks the first-line stringstream's eofbit again after
+        // extracting the remainder from istr. Thus a later malformed token
+        // only ends extraction; the final rectangular-size check still applies.
+        v.extend(alp_ioutil::read_values::<T>(remainder).0);
         let m = v.len() / n;
         if m * n != v.len() {
             alp_ioutil::abort_msg("Njn::Matrix::in : rows for the MACHINE have different lengths.");
@@ -348,18 +350,14 @@ where
         if !alp_ioutil::getLine(input, &mut offset, &mut s, alp_ioutil::getTerminator()) {
             alp_ioutil::abort_msg("Njn::Matrix::in : bad m");
         }
-        let m: usize = s
-            .split_whitespace()
-            .next()
-            .and_then(|x| x.parse().ok())
+        let mut dimension_offset = 0;
+        let m: usize = alp_ioutil::read_value(&s, &mut dimension_offset)
             .unwrap_or_else(|| alp_ioutil::abort_msg("Njn::Matrix::in : bad m"));
         if !alp_ioutil::getLine(input, &mut offset, &mut s, alp_ioutil::getTerminator()) {
             alp_ioutil::abort_msg("Njn::Matrix::in : bad n");
         }
-        let n: usize = s
-            .split_whitespace()
-            .next()
-            .and_then(|x| x.parse().ok())
+        let mut dimension_offset = 0;
+        let n: usize = alp_ioutil::read_value(&s, &mut dimension_offset)
             .unwrap_or_else(|| alp_ioutil::abort_msg("Njn::Matrix::in : bad n"));
 
         if m != self.getM() || n != self.getN() {
@@ -371,11 +369,9 @@ where
             if !alp_ioutil::getLine(input, &mut offset, &mut s, alp_ioutil::getTerminator()) {
                 alp_ioutil::abort_msg(&format!("Njn::Matrix::in : bad d_matrix_p [{}][0]", i));
             }
-            let mut tokens = s.split_whitespace();
+            let mut value_offset = 0;
             for j in 0..self.getN() {
-                self.d_matrix_p[i][j] = tokens
-                    .next()
-                    .and_then(|x| x.parse::<T>().ok())
+                self.d_matrix_p[i][j] = alp_ioutil::read_value(&s, &mut value_offset)
                     .unwrap_or_else(|| {
                         alp_ioutil::abort_msg(&format!(
                             "Njn::Matrix::in : bad d_matrix_p [{}][{}]",
@@ -387,27 +383,23 @@ where
     }
 
     fn in_symmetric(&mut self, input: &str) {
-        let mut lines = input.lines();
-        let Some(first_line) = lines.next() else {
+        if input.is_empty() {
             alp_ioutil::abort_msg("Njn::Matrix::in : bad n for the MatrixIO::SYMMETRIC");
-        };
-        let mut v: Vec<T> = first_line
-            .split_whitespace()
-            .map(|x| {
-                x.parse::<T>().unwrap_or_else(|_| {
-                    alp_ioutil::abort_msg("Njn::Matrix::in : bad value for the MatrixIO::SYMMETRIC")
-                })
-            })
-            .collect();
+        }
+        let (first_line, remainder) = input.split_once('\n').unwrap_or((input, ""));
+        let (mut v, first_eof) = alp_ioutil::read_values::<T>(first_line);
+        if !first_eof {
+            alp_ioutil::abort_msg("Njn::Matrix::in : bad value for the MatrixIO::SYMMETRIC");
+        }
         let m = v.len();
         let n = m;
         if n == 0 {
             alp_ioutil::abort_msg("Njn::Matrix::in : bad n for the MatrixIO::SYMMETRIC");
         }
-        for token in lines.flat_map(|line| line.split_whitespace()) {
-            v.push(token.parse::<T>().unwrap_or_else(|_| {
-                alp_ioutil::abort_msg("Njn::Matrix::in : bad value for the MatrixIO::SYMMETRIC")
-            }));
+        let (rest, rest_eof) = alp_ioutil::read_values::<T>(remainder);
+        v.extend(rest);
+        if !rest_eof {
+            alp_ioutil::abort_msg("Njn::Matrix::in : bad value for the MatrixIO::SYMMETRIC");
         }
         if m * (m + 1) / 2 != v.len() {
             alp_ioutil::abort_msg(
@@ -433,7 +425,7 @@ where
 
 impl<T> fmt::Display for Matrix<T>
 where
-    T: Clone + Default + Display + FromStr + PartialEq,
+    T: Clone + Default + Display + FromStr + PartialEq + 'static,
 {
     fn fmt(&self, ostr_: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(ostr_, "{}", self.out())

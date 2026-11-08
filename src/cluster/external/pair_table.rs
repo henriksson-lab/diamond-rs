@@ -1,14 +1,18 @@
 //! Pair-table construction from `diamond/src/cluster/external/pair_table.cpp`
 //! and its inline `build_pair_table.h` algorithms.
 
+use crate::util::io::source_c_path;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use super::external::{Job, PairEntry};
+use super::storage::BucketWriter;
 use crate::util::hash::hash64;
 use crate::util::io::{CompressedBuffer, InputFile};
+use crate::util::parallel::Atomic;
 
 pub const RADIX_BITS: u32 = 8;
 pub const RADIX_COUNT: usize = 1 << RADIX_BITS;
@@ -85,8 +89,15 @@ impl Bucket {
     }
 
     pub fn record_count(&self) -> Result<u64, String> {
-        self.records
-            .ok_or_else(|| format!("Record count not set for bucket: {}", self.path.display()))
+        self.record_count_owned(&Default::default())
+    }
+    pub(crate) fn record_count_owned(
+        &self,
+        errors: &crate::util::io::IoErrorOwner,
+    ) -> Result<u64, String> {
+        self.records.ok_or_else(|| {
+            super::storage::path_error(errors, b"Record count not set for bucket: ", &self.path)
+        })
     }
 }
 
@@ -109,24 +120,33 @@ impl DerefMut for RadixedTable {
 
 impl RadixedTable {
     pub fn from_manifest(path: impl AsRef<Path>) -> Result<Self, String> {
-        let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
-        let mut buckets = Vec::new();
-        let mut fields = text.split_whitespace();
-        while let Some(path) = fields.next() {
-            let records = fields
-                .next()
-                .ok_or_else(|| "Format error in RadixedTable".to_owned())?
-                .parse::<u64>()
-                .map_err(|_| "Format error in RadixedTable".to_owned())?;
-            buckets.push(Bucket::new(path, Some(records)));
-        }
-        Ok(Self(buckets))
+        Self::from_manifest_owned(path, &Default::default())
+    }
+
+    pub fn from_manifest_owned(
+        path: impl AsRef<Path>,
+        errors: &crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
+        Ok(Self(
+            super::storage::manifest_records_owned(path.as_ref(), errors)?
+                .into_iter()
+                .map(|(path, n)| Bucket::new(path, Some(n)))
+                .collect(),
+        ))
     }
 
     pub fn max_buckets(&self, mem_limit: u64, record_size: usize) -> Result<u64, String> {
+        self.max_buckets_owned(mem_limit, record_size, &Default::default())
+    }
+    fn max_buckets_owned(
+        &self,
+        mem_limit: u64,
+        record_size: usize,
+        errors: &crate::util::io::IoErrorOwner,
+    ) -> Result<u64, String> {
         let mut counts = self
             .iter()
-            .map(Bucket::record_count)
+            .map(|bucket| bucket.record_count_owned(errors))
             .collect::<Result<Vec<_>, _>>()?;
         counts.sort_unstable_by(|a, b| b.cmp(a));
         let mut sum = 0_u64;
@@ -164,39 +184,87 @@ pub struct PairFileArray {
     base_dir: PathBuf,
     worker_id: i64,
     pairs: Vec<Vec<PairEntry>>,
+    bounded: Option<RefCell<BucketWriter>>,
 }
 
 impl PairFileArray {
     pub fn new(base_dir: impl AsRef<Path>, worker_id: i64) -> Result<Self, String> {
         let base_dir = base_dir.as_ref().to_path_buf();
         for radix in 0..RADIX_COUNT {
-            fs::create_dir_all(base_dir.join(radix.to_string()))
+            fs::create_dir_all(source_c_path(&(base_dir.join(radix.to_string()))).as_ref())
                 .map_err(|error| error.to_string())?;
         }
         Ok(Self {
             base_dir,
             worker_id,
             pairs: vec![Vec::new(); RADIX_COUNT],
+            bounded: None,
+        })
+    }
+
+    pub fn new_bounded(base_dir: impl AsRef<Path>, worker_id: i64) -> Result<Self, String> {
+        Self::new_bounded_owned(
+            base_dir,
+            worker_id,
+            crate::util::io::IoErrorOwner::default(),
+        )
+    }
+
+    pub fn new_bounded_owned(
+        base_dir: impl AsRef<Path>,
+        worker_id: i64,
+        errors: crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            base_dir: base_dir.as_ref().into(),
+            worker_id,
+            pairs: vec![Vec::new(); RADIX_COUNT],
+            bounded: Some(RefCell::new(BucketWriter::new_owned(
+                base_dir.as_ref(),
+                worker_id,
+                RADIX_COUNT,
+                errors,
+            )?)),
         })
     }
 
     pub fn write_msb(&mut self, entry: PairEntry) {
         let radix = (hash64(entry.rep_oid) >> (64 - RADIX_BITS)) as usize;
-        self.pairs[radix].push(entry);
+        if let Some(writer) = &self.bounded {
+            writer
+                .borrow_mut()
+                .write_deferred(radix, &encode_pair_entry(entry));
+        } else {
+            self.pairs[radix].push(entry);
+        }
     }
 
     pub fn entries(&self, radix: usize) -> &[PairEntry] {
         &self.pairs[radix]
     }
 
+    /// Source per-worker BufferArray flush, retaining the enclosing
+    /// round-local FileArray owner until External::round closes it.
+    fn flush_unpublished(&self) -> Result<RadixedTable, String> {
+        if let Some(writer) = &self.bounded {
+            return writer.borrow_mut().flush_unpublished();
+        }
+        // Preserve the older explicit in-memory writer's library behavior.
+        self.finish()
+    }
+
     pub fn finish(&self) -> Result<RadixedTable, String> {
+        if let Some(writer) = &self.bounded {
+            return writer.borrow_mut().finish();
+        }
         let mut buckets = Vec::with_capacity(RADIX_COUNT);
         for radix in 0..RADIX_COUNT {
             let directory = self.base_dir.join(radix.to_string());
             let manifest = directory.join("bucket.tsv");
             let entries = &self.pairs[radix];
             if entries.is_empty() {
-                fs::write(&manifest, []).map_err(|error| error.to_string())?;
+                fs::write(source_c_path(&manifest).as_ref(), [])
+                    .map_err(|error| error.to_string())?;
             } else {
                 let volume = directory.join(format!("worker_{}_volume_0", self.worker_id));
                 let mut compressed = CompressedBuffer::new();
@@ -206,10 +274,12 @@ impl PairFileArray {
                         .map_err(|error| error.to_string())?;
                 }
                 compressed.finish().map_err(|error| error.to_string())?;
-                fs::write(&volume, compressed.data()).map_err(|error| error.to_string())?;
+                fs::write(source_c_path(&volume).as_ref(), compressed.data())
+                    .map_err(|error| error.to_string())?;
                 fs::write(
-                    &manifest,
-                    format!("{}\t{}\n", volume.display(), entries.len()),
+                    source_c_path(&manifest).as_ref(),
+                    super::storage::manifest_line(&volume, &[entries.len() as u64])
+                        .map_err(|e| e.to_string())?,
                 )
                 .map_err(|error| error.to_string())?;
             }
@@ -298,7 +368,8 @@ pub fn build_pair_table(
     output_files: &mut PairFileArray,
     config: PairTableConfig,
 ) -> Result<RadixedTable, String> {
-    let max_concurrent = seed_table.max_buckets(job.mem_limit, SeedEntry::ENCODED_SIZE)?;
+    let max_concurrent =
+        seed_table.max_buckets_owned(job.mem_limit, SeedEntry::ENCODED_SIZE, &job.io_errors())?;
     let concurrent_buckets = usize::try_from(max_concurrent)
         .unwrap_or(usize::MAX)
         .min(config.threads)
@@ -308,13 +379,20 @@ pub fn build_pair_table(
         "Building pair table. Concurrent buckets={concurrent_buckets} Workers per bucket={bucket_workers}"
     ))?;
     let _shift = bit_length(max_oid as u64).saturating_sub(RADIX_BITS);
-    let _queue_path = job
+    let queue_path = job
         .base_dir(None)
         .join(format!("seed_table_{shape}"))
         .join("build_pair_table_queue");
 
-    for (bucket_index, bucket) in seed_table.iter().enumerate() {
-        let (mut entries, volume_paths) = read_seed_bucket(bucket)?;
+    let queue = Atomic::new(queue_path);
+    let mut processed = 0;
+    loop {
+        let bucket_index =
+            usize::try_from(queue.fetch_add_one()?).map_err(|error| error.to_string())?;
+        let Some(bucket) = seed_table.get(bucket_index) else {
+            break;
+        };
+        let (mut entries, volume_paths) = read_seed_bucket(job, bucket)?;
         job.log(&format!(
             "Building pair table. Bucket={}/{} Records={} Size={}",
             bucket_index + 1,
@@ -338,47 +416,38 @@ pub fn build_pair_table(
             begin = end;
         }
         for path in volume_paths {
-            fs::remove_file(path).map_err(|error| error.to_string())?;
+            fs::remove_file(source_c_path(&(path)).as_ref()).map_err(|error| error.to_string())?;
         }
-        fs::remove_file(&bucket.path).map_err(|error| error.to_string())?;
+        fs::remove_file(source_c_path(&bucket.path).as_ref()).map_err(|error| error.to_string())?;
         if let Some(parent) = bucket.path.parent() {
-            let _ = fs::remove_dir(parent);
+            let _ = fs::remove_dir(source_c_path(&(parent)).as_ref());
         }
+        processed += 1;
     }
-    output_files.finish()
+    let table = output_files.flush_unpublished()?;
+    let finished = Atomic::new(
+        job.base_dir(None)
+            .join(format!("seed_table_{shape}/pair_table_finished")),
+    );
+    finished.fetch_add(processed)?;
+    finished.await_value(seed_table.len() as i64)?;
+    Ok(table)
 }
 
 fn bit_length(value: u64) -> u32 {
     u64::BITS - value.leading_zeros()
 }
 
-fn read_seed_bucket(bucket: &Bucket) -> Result<(Vec<SeedEntry>, Vec<PathBuf>), String> {
-    let manifest = fs::read_to_string(&bucket.path).map_err(|error| error.to_string())?;
+fn read_seed_bucket(job: &Job, bucket: &Bucket) -> Result<(Vec<SeedEntry>, Vec<PathBuf>), String> {
     let mut entries = Vec::new();
     let mut paths = Vec::new();
-    for line in manifest.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 2 {
-            return Err("Format error in VolumedFile".to_owned());
-        }
-        let path = PathBuf::from(fields[0]);
-        let count = fields[1]
-            .parse::<usize>()
-            .map_err(|_| "Format error in VolumedFile".to_owned())?;
-        let mut input = InputFile::new(
-            path.to_str()
-                .ok_or_else(|| "Non-UTF-8 seed volume path".to_owned())?,
-            0,
-        )
-        .map_err(|error| error.to_string())?;
+    for (path, count) in super::external::read_manifest_owned(&bucket.path, &job.io_errors())? {
+        let mut input = job.open_input(&path, 0)?;
         for _ in 0..count {
             entries.push(SeedEntry {
-                seed: input.read_u64().map_err(|error| error.to_string())?,
-                oid: input.read_i64().map_err(|error| error.to_string())?,
-                len: input.read_i32().map_err(|error| error.to_string())?,
+                seed: job.io(input.read_u64())?,
+                oid: job.io(input.read_i64())?,
+                len: job.io(input.read_i32())?,
             });
         }
         paths.push(path);
@@ -407,6 +476,43 @@ mod tests {
         let mut pairs: Vec<_> = output.pairs.iter().flatten().copied().collect();
         pairs.sort_unstable();
         pairs
+    }
+
+    #[test]
+    fn bounded_pair_worker_flush_does_not_publish_round_owned_volumes() {
+        let root = temp_dir("round_owner_publication");
+        let mut output = PairFileArray::new_bounded(&root, 7).unwrap();
+        let entry = PairEntry {
+            rep_oid: 4,
+            member_oid: 9,
+            rep_len: 100,
+            member_len: 90,
+        };
+        output.write_msb(entry);
+        let radix = (hash64(entry.rep_oid) >> (64 - RADIX_BITS)) as usize;
+        let handles = output.flush_unpublished().unwrap();
+        let manifest = &handles[radix].path;
+        assert!(fs::read(manifest).unwrap().is_empty());
+        let volume = root.join(radix.to_string()).join("worker_7_volume_0");
+        // Source OutputFile retains these small compressed bytes until the
+        // enclosing FileArray closes, after the worker completion barrier.
+        assert_eq!(volume.metadata().unwrap().len(), 0);
+        output.finish().unwrap();
+        let rows = super::super::storage::manifest_records(manifest).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, 1);
+        let mut input = InputFile::source_new(volume.to_str().unwrap(), 0).unwrap();
+        let mut decoded = [0; 24];
+        assert_eq!(input.read_raw(&mut decoded).unwrap(), decoded.len());
+        assert_eq!(decoded.as_slice(), encode_pair_entry(entry).as_slice());
+        input.close().unwrap();
+        output.finish().unwrap();
+        assert_eq!(
+            super::super::storage::manifest_records(manifest).unwrap(),
+            rows
+        );
+        drop(output);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -511,6 +617,9 @@ mod tests {
         .unwrap();
 
         let job = Job::new(3, 1, 1 << 20, root.join("job"), 5).unwrap();
+        // The real seed builder creates this stage directory before the pair
+        // queue is opened, even when radix manifests live in child buckets.
+        fs::create_dir_all(job.base_dir(None).join("seed_table_0")).unwrap();
         let table = RadixedTable(vec![Bucket::new(&manifest, Some(seeds.len() as u64))]);
         let pair_dir = root.join("pairs");
         let mut output = PairFileArray::new(&pair_dir, job.worker_id()).unwrap();

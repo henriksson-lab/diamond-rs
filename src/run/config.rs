@@ -78,15 +78,15 @@ pub struct ConfigInput {
     pub target_indexed: bool,
     /// `None` means `--iterate` was absent; `Some([])` means it was supplied
     /// without explicit sensitivity levels.
-    pub iterate: Option<Vec<String>>,
+    pub iterate: Option<Vec<Vec<u8>>>,
     pub multiprocessing: bool,
     pub lin_stage1_query: bool,
     pub lin_stage1_target: bool,
     pub sensitivity: Sensitivity,
-    pub unaligned: String,
-    pub aligned_file: String,
-    pub taxonlist: String,
-    pub taxon_exclude: String,
+    pub unaligned: std::path::PathBuf,
+    pub aligned_file: std::path::PathBuf,
+    pub taxonlist: Vec<u8>,
+    pub taxon_exclude: Vec<u8>,
     pub global_ranking_targets: i64,
     pub frame_shift: i32,
     pub algo: Algo,
@@ -114,10 +114,10 @@ impl Default for ConfigInput {
             lin_stage1_query: false,
             lin_stage1_target: false,
             sensitivity: Sensitivity::Default,
-            unaligned: String::new(),
-            aligned_file: String::new(),
-            taxonlist: String::new(),
-            taxon_exclude: String::new(),
+            unaligned: std::path::PathBuf::new(),
+            aligned_file: std::path::PathBuf::new(),
+            taxonlist: Vec::new(),
+            taxon_exclude: Vec::new(),
             global_ranking_targets: 0,
             frame_shift: 0,
             algo: Algo::Auto,
@@ -169,6 +169,12 @@ impl Config<()> {
     pub fn from_input(input: &ConfigInput) -> Result<Self, String> {
         Self::new(input, |_| Ok(()))
     }
+    pub fn from_input_with_io_owner(
+        input: &ConfigInput,
+        errors: &crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
+        Self::new_with_io_owner(input, |_| Ok(()), errors)
+    }
 }
 
 impl<O> Config<O> {
@@ -179,7 +185,21 @@ impl<O> Config<O> {
     where
         F: FnOnce(&mut i64) -> Result<O, String>,
     {
-        let mut sensitivity = build_rounds(input)?;
+        Self::new_with_io_owner(
+            input,
+            init_output,
+            &crate::util::io::IoErrorOwner::default(),
+        )
+    }
+    pub fn new_with_io_owner<F>(
+        input: &ConfigInput,
+        init_output: F,
+        errors: &crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce(&mut i64) -> Result<O, String>,
+    {
+        let mut sensitivity = build_rounds(input, errors)?;
         sensitivity.sort();
         if sensitivity.windows(2).any(|rounds| rounds[0] == rounds[1]) {
             return Err(
@@ -204,8 +224,8 @@ impl<O> Config<O> {
             format!("Running iterated search mode with sensitivity steps: {steps}")
         });
         let track_aligned_queries = iteration_message.is_some()
-            || !input.unaligned.is_empty()
-            || !input.aligned_file.is_empty();
+            || !input.unaligned.as_os_str().is_empty()
+            || !input.aligned_file.as_os_str().is_empty();
 
         validate_modes(input)?;
 
@@ -268,7 +288,10 @@ impl<O> Config<O> {
     pub fn free(&mut self) {}
 }
 
-fn build_rounds(input: &ConfigInput) -> Result<Vec<Round>, String> {
+fn build_rounds(
+    input: &ConfigInput,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<Vec<Round>, String> {
     let mut rounds = Vec::new();
     if let Some(iterate) = &input.iterate {
         if input.multiprocessing {
@@ -285,6 +308,10 @@ fn build_rounds(input: &ConfigInput) -> Result<Vec<Round>, String> {
         }
 
         if iterate.is_empty() {
+            // The pinned source uses std::map::at for this absent schedule.
+            if input.sensitivity == Sensitivity::Shapes6x10 {
+                return Err("map::at".to_owned());
+            }
             rounds.push(Round::new(Sensitivity::Faster, true));
             rounds.extend(
                 iterated_sens(input.sensitivity)
@@ -297,11 +324,14 @@ fn build_rounds(input: &ConfigInput) -> Result<Vec<Round>, String> {
                 input.lin_stage1_query || input.lin_stage1_target,
             );
             for value in iterate {
-                let (name, linearize) = match value.strip_suffix("_lin") {
+                let (name, linearize) = match value.strip_suffix(b"_lin") {
                     Some(name) => (name, true),
-                    None => (value.as_str(), false),
+                    None => (value.as_slice(), false),
                 };
-                let round = Round::new(parse_sensitivity(name)?, linearize);
+                let round = Round::new(
+                    errors.capture(crate::basic::config::sensitivity_from_bytes(name))?,
+                    linearize,
+                );
                 if round >= target {
                     return Err(
                         "Sensitivity levels set for --iterate must be below target sensitivity."
@@ -351,7 +381,10 @@ fn validate_modes(input: &ConfigInput) -> Result<(), String> {
     Ok(())
 }
 
-fn derive_min_length_ratio(input: &ConfigInput, rounds: &[Round]) -> Result<f64, String> {
+pub(crate) fn derive_min_length_ratio(
+    input: &ConfigInput,
+    rounds: &[Round],
+) -> Result<f64, String> {
     if input.query_cover >= 50.0
         && input.query_cover == input.subject_cover
         && input.min_length_ratio == 0.0
@@ -377,24 +410,10 @@ fn derive_min_length_ratio(input: &ConfigInput, rounds: &[Round]) -> Result<f64,
 }
 
 fn parse_sensitivity(value: &str) -> Result<Sensitivity, String> {
-    match value {
-        "faster" => Ok(Sensitivity::Faster),
-        "fast" => Ok(Sensitivity::Fast),
-        "default" => Ok(Sensitivity::Default),
-        "linclust-40" => Ok(Sensitivity::Linclust40),
-        "linclust-20" => Ok(Sensitivity::Linclust20),
-        "shapes-6x10" => Ok(Sensitivity::Shapes6x10),
-        "shapes-30x10" => Ok(Sensitivity::Shapes30x10),
-        "mid-sensitive" => Ok(Sensitivity::MidSensitive),
-        "sensitive" => Ok(Sensitivity::Sensitive),
-        "more-sensitive" => Ok(Sensitivity::MoreSensitive),
-        "very-sensitive" => Ok(Sensitivity::VerySensitive),
-        "ultra-sensitive" => Ok(Sensitivity::UltraSensitive),
-        _ => Err(format!("Invalid sensitivity level: {value}")),
-    }
+    crate::basic::config::sensitivity_from_string(value)
 }
 
-fn sensitivity_name(value: Sensitivity) -> &'static str {
+pub(crate) fn sensitivity_name(value: Sensitivity) -> &'static str {
     match value {
         Sensitivity::Faster => "faster",
         Sensitivity::Fast => "fast",
@@ -414,6 +433,26 @@ fn sensitivity_name(value: Sensitivity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_iteration_error_retains_bytes_after_mode_checks() {
+        let errors = crate::util::io::IoErrorOwner::default();
+        let mut input = ConfigInput {
+            iterate: Some(vec![b"invalid\xff".to_vec()]),
+            multiprocessing: true,
+            ..ConfigInput::default()
+        };
+        assert_eq!(
+            Config::from_input_with_io_owner(&input, &errors).unwrap_err(),
+            "Iterated search is not compatible with --multiprocessing."
+        );
+        input.multiprocessing = false;
+        let error = errors
+            .finish(Config::from_input_with_io_owner(&input, &errors))
+            .unwrap_err();
+        let raw = crate::util::io::RawDiagnosticError::find(&error).unwrap();
+        assert!(raw.starts_with(b"Invalid value for string field: invalid\xff."));
+    }
 
     #[test]
     fn round_inline_operators_match_cpp_ordering() {
@@ -476,7 +515,7 @@ mod tests {
     #[test]
     fn explicit_iteration_suffix_and_duplicate_rules_match_cpp() {
         let input = ConfigInput {
-            iterate: Some(vec!["fast_lin".into(), "default".into()]),
+            iterate: Some(vec![b"fast_lin".to_vec(), b"default".to_vec()]),
             sensitivity: Sensitivity::Sensitive,
             ..ConfigInput::default()
         };
@@ -488,7 +527,7 @@ mod tests {
         );
 
         let duplicate = ConfigInput {
-            iterate: Some(vec!["fast".into(), "fast".into()]),
+            iterate: Some(vec![b"fast".to_vec(), b"fast".to_vec()]),
             sensitivity: Sensitivity::Sensitive,
             ..ConfigInput::default()
         };

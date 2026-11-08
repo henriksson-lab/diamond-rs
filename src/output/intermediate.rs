@@ -26,12 +26,15 @@ impl OutputFormat {
         Self::new(FormatCode::Daa, HspValues::TRANSCRIPT)
     }
 
-    pub fn tabular() -> Self {
-        Self::new(FormatCode::Tabular, HspValues::TRANSCRIPT)
+    pub fn edge() -> Self {
+        Self::new(
+            FormatCode::Edge,
+            crate::output::format::OutputFormatSpec::edge_format().hsp_values,
+        )
     }
 
-    pub fn edge() -> Self {
-        Self::new(FormatCode::Tabular, HspValues::COORDS)
+    pub fn tabular() -> Self {
+        Self::new(FormatCode::Tabular, HspValues::TRANSCRIPT)
     }
 }
 

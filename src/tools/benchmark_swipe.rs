@@ -67,14 +67,21 @@ fn next_random(state: &mut u64) -> u32 {
 /// is supplied by callers rather than hard-wired into tests.
 pub fn swipe_cell_update(iterations: usize, seed: u64) -> BenchmarkResult {
     let mut random = seed;
+    swipe_cell_update_with_rng(iterations, &mut || next_random(&mut random))
+}
+
+pub fn swipe_cell_update_with_rng(
+    iterations: usize,
+    random: &mut impl FnMut() -> u32,
+) -> BenchmarkResult {
     let mut query = [0u8; ROW_LEN];
     for value in &mut query {
-        *value = (next_random(&mut random) % PROFILE_ROWS as u32) as u8;
+        *value = (random() % PROFILE_ROWS as u32) as u8;
     }
     let mut profile = [[0i8; CHANNELS]; PROFILE_ROWS];
     for row in &mut profile {
         for value in row {
-            *value = (next_random(&mut random) % 20) as i8 - 10;
+            *value = (random() % 20) as i8 - 10;
         }
     }
     let mut diagonal = [Cell::default(); ROW_LEN];

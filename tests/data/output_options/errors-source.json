@@ -1,0 +1,358 @@
+[
+  {
+    "options": [
+      "--header",
+      "bad"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--header",
+      "bad",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd (type: Diamond database, sequences: 3, letters: 536)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file...  [0s]\nLoading query sequences...  [0s]\nError: Invalid value for string field: bad. Permitted values: 0, simple, verbose\n"
+  },
+  {
+    "options": [
+      "--header",
+      "simple",
+      "verbose"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--header",
+      "simple",
+      "verbose",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd (type: Diamond database, sequences: 3, letters: 536)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file...  [0s]\nLoading query sequences...  [0s]\nError: Invalid header format: simple verbose\n"
+  },
+  {
+    "options": [
+      "--header=simple"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--header=simple",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid option: header=simple\n"
+  },
+  {
+    "options": [
+      "--compress"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--compress",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid parameter count for option '--compress'\n"
+  },
+  {
+    "options": [
+      "--compress",
+      "1",
+      "0"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--compress",
+      "1",
+      "0",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid parameter count for option '--compress'\n"
+  },
+  {
+    "options": [
+      "--compress=1"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--compress=1",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid option: compress=1\n"
+  },
+  {
+    "options": [
+      "--compress",
+      "bad"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--compress",
+      "bad",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd (type: Diamond database, sequences: 3, letters: 536)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file... Error: Invalid compression algorithm: bad\n"
+  },
+  {
+    "options": [
+      "--compress",
+      "zstd"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--compress",
+      "zstd",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd (type: Diamond database, sequences: 3, letters: 536)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file... Error: Executable was not compiled with ZStd support.\n"
+  },
+  {
+    "options": [
+      "--file-buffer-size"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--file-buffer-size",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid parameter count for option '--file-buffer-size'\n"
+  },
+  {
+    "options": [
+      "--file-buffer-size",
+      "7",
+      "8"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--file-buffer-size",
+      "7",
+      "8",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid parameter count for option '--file-buffer-size'\n"
+  },
+  {
+    "options": [
+      "--file-buffer-size=7"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--file-buffer-size=7",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid option: file-buffer-size=7\n"
+  },
+  {
+    "options": [
+      "--no-auto-append",
+      "1"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--no-auto-append",
+      "1",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid parameter count for option '--no-auto-append'\n"
+  },
+  {
+    "options": [
+      "--no-auto-append=1"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--no-auto-append=1",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.out"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid option: no-auto-append=1\n"
+  },
+  {
+    "format": "100",
+    "compression": "0",
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "100",
+      "--compress",
+      "0",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.daa"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\nError: Compression is not supported for DAA format.\n"
+  },
+  {
+    "format": "100",
+    "compression": "1",
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "100",
+      "--compress",
+      "1",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.daa"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\nError: Compression is not supported for DAA format.\n"
+  },
+  {
+    "format": "100",
+    "compression": "zstd",
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "100",
+      "--compress",
+      "zstd",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/error.daa"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\nError: Compression is not supported for DAA format.\n"
+  }
+]

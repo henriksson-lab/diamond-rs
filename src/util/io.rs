@@ -9,11 +9,24 @@ pub mod serializer;
 pub use serializer::Serializer;
 pub mod file;
 pub use file::{File, FilePrimitive, Temporary};
+pub mod file_open_error;
+pub use file_open_error::{path_diagnostic_bytes, FileOpenError};
 pub mod file_source;
 pub use file_source::FileSource;
 pub mod file_sink;
 pub use file_sink::FileSink;
+pub(crate) mod console;
+pub mod cstdio_file;
+#[cfg(any(
+    all(target_os = "linux", any(target_env = "gnu", target_env = "musl")),
+    target_vendor = "apple"
+))]
+mod posix_stdio_bindings;
 pub mod temp_file;
+#[cfg(windows)]
+mod windows_crt_bindings;
+#[cfg(windows)]
+mod windows_cstdio;
 pub use temp_file::{TempFile, TempFileData, TempFileHandler, TEMP_FILE_HANDLER};
 pub mod output_file;
 pub use output_file::{decompress, decompress_file, Compressor, OutputFile};
@@ -28,11 +41,11 @@ pub use output_stream_buffer::OutputStreamBuffer;
 pub mod input_stream_buffer;
 pub use input_stream_buffer::InputStreamBuffer;
 pub mod text_input_file;
-pub use text_input_file::TextInputFile;
+pub use text_input_file::{ByteTextInputFile, TextInputFile};
 pub mod input_file;
 pub use input_file::{detect_compressor, InputFile, InputFileStream};
 
-const DEFAULT_FILE_BUFFER_SIZE: usize = 1 << 20;
+pub(crate) const DEFAULT_FILE_BUFFER_SIZE: usize = 1 << 20;
 pub const MEGABYTES: usize = 1 << 20;
 pub const GIGABYTES: usize = 1 << 30;
 pub const KILOBYTES: usize = 1 << 10;
@@ -79,10 +92,203 @@ pub(crate) fn duplicate_standard_handle(which: u32) -> std::io::Result<StdFile> 
     }
 }
 
+/// A command exception whose terminal diagnostic was emitted while its
+/// invocation-owned Source log was still alive. Retain the original cause for
+/// callers while preventing the outer CLI facade from reporting it twice.
+#[derive(Debug)]
+pub(crate) struct ReportedIoError(std::io::Error);
+impl std::fmt::Display for ReportedIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+impl std::error::Error for ReportedIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl ReportedIoError {
+    pub(crate) fn wrap(error: std::io::Error) -> std::io::Error {
+        std::io::Error::new(error.kind(), Self(error))
+    }
+    pub(crate) fn contains(error: &(dyn std::error::Error + 'static)) -> bool {
+        let mut current = Some(error);
+        while let Some(error) = current {
+            if error.is::<Self>() {
+                return true;
+            }
+            if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                if let Some(inner) = io.get_ref() {
+                    current = Some(inner);
+                    continue;
+                }
+            }
+            current = error.source();
+        }
+        false
+    }
+}
+
+/// Only the perror portion of an exception has already been emitted. Its
+/// ordinary Source catch (and log) must still run unless it is FileOpen.
+#[derive(Debug)]
+pub(crate) struct PerrorEmittedError(std::io::Error);
+impl std::fmt::Display for PerrorEmittedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+impl std::error::Error for PerrorEmittedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl PerrorEmittedError {
+    pub(crate) fn wrap(error: std::io::Error) -> std::io::Error {
+        if Self::contains(&error) {
+            error
+        } else {
+            std::io::Error::new(error.kind(), Self(error))
+        }
+    }
+    pub(crate) fn contains(error: &(dyn std::error::Error + 'static)) -> bool {
+        let mut current = Some(error);
+        while let Some(error) = current {
+            if error.is::<Self>() {
+                return true;
+            }
+            if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                if let Some(inner) = io.get_ref() {
+                    current = Some(inner);
+                    continue;
+                }
+            }
+            current = error.source();
+        }
+        false
+    }
+}
+
+/// Captured Source perror bytes, before any generic exception catch. There
+/// is no cout tie here; a later cerr/what diagnostic owns that separate flush.
+pub(crate) fn source_perror_bytes(
+    error: &(dyn std::error::Error + 'static),
+) -> IoResult<Option<Vec<u8>>> {
+    if PerrorEmittedError::contains(error) || ReportedIoError::contains(error) {
+        return Ok(None);
+    }
+    let mut bytes = if let Some(temp) = temp_file::find_temp_open(error) {
+        temp.reason.clone()
+    } else if let Some(open) = file_open_error::find(error) {
+        let mut bytes = b"\n".to_vec();
+        bytes.extend_from_slice(&open.try_message_bytes()?);
+        bytes.extend_from_slice(b": ");
+        bytes.extend_from_slice(&open.reason);
+        bytes
+    } else {
+        let Some(stdio) = cstdio_file::StdioError::find(error) else {
+            return Ok(None);
+        };
+        let Some(perror) = &stdio.perror else {
+            return Ok(None);
+        };
+        perror.clone()
+    };
+    if let Some(nul) = bytes.iter().position(|&byte| byte == 0) {
+        bytes.truncate(nul);
+    }
+    bytes.push(b'\n');
+    Ok(Some(bytes))
+}
+
+pub(crate) fn emit_source_perror(error: &(dyn std::error::Error + 'static)) -> IoResult<bool> {
+    if let Some(bytes) = source_perror_bytes(error)? {
+        console::write_perror(&bytes);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Report only a diagnostic-codec failure at a Source noexcept boundary.
+/// The argument must be the conversion error, never the original user-path
+/// error; raw typed messages are retained and fallback text is ASCII only.
+pub(crate) fn abort_source_diagnostic_error(error: &(dyn std::error::Error + 'static)) -> ! {
+    let text;
+    let message = if let Some(bytes) = RawDiagnosticError::find(error) {
+        bytes
+    } else {
+        text = error.to_string();
+        if text.is_ascii() {
+            text.as_bytes()
+        } else {
+            b"Source diagnostic encoding failed."
+        }
+    };
+    let mut bytes = b"Error: ".to_vec();
+    bytes.extend_from_slice(message);
+    bytes.push(b'\n');
+    let _ = std::io::Write::write_all(&mut console::stderr(), &bytes);
+    let _ = std::io::Write::flush(&mut console::stderr());
+    abort_source_process()
+}
+
+/// Source's terminate handler calls std::abort in the selected C runtime.
+/// In particular, Windows must use that CRT's abort behavior and SIGABRT path.
+pub(crate) fn abort_source_process() -> ! {
+    #[cfg(any(unix, windows))]
+    unsafe {
+        libc::abort()
+    }
+    #[cfg(not(any(unix, windows)))]
+    std::process::abort()
+}
+
+/// Concrete native counterpart of a failed Source allocation. Keeping its
+/// class through io::Error distinguishes it from an OS I/O failure with ENOMEM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadAllocError(pub String);
+impl Default for BadAllocError {
+    fn default() -> Self {
+        Self("std::bad_alloc".into())
+    }
+}
+impl std::fmt::Display for BadAllocError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for BadAllocError {}
+impl BadAllocError {
+    pub fn into_io(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::OutOfMemory, self)
+    }
+    pub fn find<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a Self> {
+        let mut current = Some(error);
+        while let Some(error) = current {
+            if let Some(allocation) = error.downcast_ref::<Self>() {
+                return Some(allocation);
+            }
+            if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                if let Some(inner) = io.get_ref() {
+                    current = Some(inner);
+                    continue;
+                }
+            }
+            current = error.source();
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IoError {
     UnsupportedOperation,
     FileOpen(String),
+    RawDetails(RawDiagnosticError),
+    FileOpenDetails(FileOpenError),
+    TemporaryFileOpenDetails(temp_file::TempFileOpenError),
+    StdioDetails(cstdio_file::StdioError),
     FileRead(String),
     FileWrite(String),
     EndOfStream,
@@ -93,8 +299,12 @@ pub enum IoError {
 impl std::fmt::Display for IoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            IoError::RawDetails(error) => std::fmt::Display::fmt(error, f),
             IoError::UnsupportedOperation => f.write_str("Unsupported I/O operation."),
             IoError::FileOpen(file_name) => write!(f, "Error opening file {file_name}"),
+            IoError::FileOpenDetails(error) => std::fmt::Display::fmt(error, f),
+            IoError::TemporaryFileOpenDetails(error) => std::fmt::Display::fmt(error, f),
+            IoError::StdioDetails(error) => std::fmt::Display::fmt(error, f),
             IoError::FileRead(file_name) => write!(f, "Error reading file {file_name}"),
             IoError::FileWrite(file_name) => write!(f, "Error writing file {file_name}"),
             IoError::EndOfStream => f.write_str("Unexpected end of input."),
@@ -106,7 +316,108 @@ impl std::fmt::Display for IoError {
     }
 }
 
-impl std::error::Error for IoError {}
+impl IoError {
+    pub fn path_message(prefix: &[u8], path: &std::path::Path) -> Self {
+        let path = match path_diagnostic_bytes(path) {
+            Ok(bytes) => bytes,
+            Err(error) => return error,
+        };
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(&path);
+        Self::RawDetails(RawDiagnosticError(bytes))
+    }
+    pub fn file_open(path: impl AsRef<std::path::Path>, error: std::io::Error) -> Self {
+        Self::FileOpenDetails(FileOpenError::new(path, error))
+    }
+}
+impl std::error::Error for IoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RawDetails(error) => Some(error),
+            Self::FileOpenDetails(error) => Some(error),
+            Self::TemporaryFileOpenDetails(error) => Some(error),
+            Self::StdioDetails(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// The C pathname boundary used by Source fopen/stat/remove calls.
+/// Retained owners keep the complete path; only the individual OS operation
+/// consumes this prefix, just as std::string::c_str() does in Source.
+pub fn source_c_path(path: &std::path::Path) -> std::borrow::Cow<'_, std::path::Path> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        return match bytes.iter().position(|&byte| byte == 0) {
+            Some(end) => std::borrow::Cow::Borrowed(std::path::Path::new(
+                std::ffi::OsStr::from_bytes(&bytes[..end]),
+            )),
+            None => std::borrow::Cow::Borrowed(path),
+        };
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        return match units.iter().position(|&unit| unit == 0) {
+            Some(end) => std::borrow::Cow::Owned(std::path::PathBuf::from(
+                std::ffi::OsString::from_wide(&units[..end]),
+            )),
+            None => std::borrow::Cow::Borrowed(path),
+        };
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        match path
+            .to_str()
+            .and_then(|text| text.find('\0').map(|end| &text[..end]))
+        {
+            Some(prefix) => std::borrow::Cow::Borrowed(std::path::Path::new(prefix)),
+            None => std::borrow::Cow::Borrowed(path),
+        }
+    }
+}
+
+/// Convert an OS argument to the pinned Source narrow-string domain.
+/// Unix borrows the original bytes; Windows uses the CRT ANSI code page,
+/// independently of the retained wide path used by native filename opens.
+pub fn source_os_bytes(value: &std::ffi::OsStr) -> IoResult<std::borrow::Cow<'_, [u8]>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(std::borrow::Cow::Borrowed(value.as_bytes()))
+    }
+    #[cfg(windows)]
+    {
+        windows_cstdio::source_os_bytes(value).map(std::borrow::Cow::Owned)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        value
+            .to_str()
+            .map(|text| std::borrow::Cow::Borrowed(text.as_bytes()))
+            .ok_or(IoError::UnsupportedOperation)
+    }
+}
+pub fn source_bytes_os(bytes: &[u8]) -> IoResult<std::ffi::OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(std::ffi::OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(windows)]
+    {
+        windows_cstdio::source_bytes_os(bytes)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        String::from_utf8(bytes.to_vec())
+            .map(Into::into)
+            .map_err(|error| IoError::Other(error.to_string()))
+    }
+}
 
 pub type IoResult<T> = Result<T, IoError>;
 
@@ -142,12 +453,36 @@ pub trait StreamEntity {
         Ok(())
     }
 
+    /// Canonical OS path. Forwarding streams delegate this directly.
+    fn file_path(&self) -> &std::path::Path {
+        std::path::Path::new(self.file_name())
+    }
+    /// Legacy UTF-8 accessor. Actual Source file operations use file_path.
     fn file_name(&self) -> &str {
         ""
+    }
+    #[cfg(unix)]
+    fn file_name_bytes(&self) -> &[u8] {
+        use std::os::unix::ffi::OsStrExt;
+        self.file_path().as_os_str().as_bytes()
     }
 
     fn file(&mut self) -> IoResult<&mut StdFile> {
         Err(IoError::UnsupportedOperation)
+    }
+
+    /// Source FILE alias service. Ordinary streams retain their existing
+    /// independent descriptor constructors unless they expose a shared owner.
+    #[cfg(any(unix, windows))]
+    fn shared_stdio(&mut self) -> IoResult<Option<cstdio_file::SharedCstdio>> {
+        Ok(None)
+    }
+
+    fn clone_file(&mut self) -> IoResult<StdFile> {
+        let name = self.file_path().to_path_buf();
+        self.file()?
+            .try_clone()
+            .map_err(|error| IoError::file_open(name, error))
     }
 
     fn data(&self) -> &[u8] {
@@ -269,6 +604,37 @@ impl StreamEntity for VecStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_io_capture_retains_primary_and_returned_stdio_error() {
+        let details = cstdio_file::StdioError {
+            operation: cstdio_file::StdioOperation::Read,
+            path: "primary".to_owned(),
+            raw_os_error: Some(5),
+            perror: Some(b"Input/output error".to_vec()),
+            message: b"Error reading file primary".to_vec(),
+        };
+        let owner = IoErrorOwner::default().with_source_destructors();
+        let returned = owner
+            .capture_io::<()>(Err(std::io::Error::other(IoError::StdioDetails(
+                details.clone(),
+            ))))
+            .unwrap_err();
+        assert_eq!(cstdio_file::StdioError::find(&returned), Some(&details));
+        let restored = owner
+            .finish::<()>(Err("transport String".into()))
+            .unwrap_err();
+        assert_eq!(cstdio_file::StdioError::find(&restored), Some(&details));
+        // Source-mode finish leaves an owned copy for later noexcept cleanup.
+        let restored_again = owner
+            .finish::<()>(Err("transport String".into()))
+            .unwrap_err();
+        assert_eq!(
+            cstdio_file::StdioError::find(&restored_again),
+            Some(&details)
+        );
+        assert_eq!(returned.to_string(), "Error reading file primary");
+    }
 
     #[test]
     fn test_serializer_deserializer_roundtrip() {
@@ -481,16 +847,21 @@ mod tests {
 
     #[test]
     fn test_compressed_buffer_roundtrip_and_clear() {
+        let compressor = if cfg!(feature = "zstd") {
+            Compressor::Zstd
+        } else {
+            Compressor::Zlib
+        };
         let mut compressed = CompressedBuffer::new();
         compressed.write(b"abc").unwrap();
         compressed.write_value(7u16).unwrap();
         compressed.write(b"xyzxyzxyz").unwrap();
         compressed.finish().unwrap();
         assert!(compressed.size() > 0);
-        assert_eq!(detect_compressor(compressed.data()), Compressor::Zlib);
+        assert_eq!(detect_compressor(compressed.data()), compressor);
 
         let mut out = [0u8; 32];
-        let n = decompress(compressed.data(), &mut out, Compressor::Zlib).unwrap();
+        let n = decompress(compressed.data(), &mut out, compressor).unwrap();
         let mut expected = Vec::new();
         expected.extend_from_slice(b"abc");
         expected.extend_from_slice(&7u16.to_ne_bytes());
@@ -501,7 +872,7 @@ mod tests {
         assert_eq!(compressed.size(), 0);
         compressed.write(b"second").unwrap();
         compressed.finish().unwrap();
-        let n = decompress(compressed.data(), &mut out, Compressor::Zlib).unwrap();
+        let n = decompress(compressed.data(), &mut out, compressor).unwrap();
         assert_eq!(&out[..n], b"second");
     }
 
@@ -691,7 +1062,8 @@ mod tests {
         std::fs::remove_file(&data.name).unwrap();
 
         let dir = TempFile::get_temp_dir().unwrap();
-        assert!(!dir.is_empty());
+        // Source's empty configured directory names the current directory.
+        assert_eq!(dir, "");
 
         let mut tmp = TempFile::new(true).unwrap();
         #[cfg(not(unix))]
@@ -987,5 +1359,159 @@ mod tests {
         unlinked.close().unwrap();
 
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+pub mod std_stream;
+
+/// A Source std::exception diagnostic can contain arbitrary accession bytes.
+/// Display is a convenience for String APIs; native reporting uses the
+/// retained bytes and never round-trips the diagnostic through UTF-8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawDiagnosticError(pub Vec<u8>);
+
+impl std::fmt::Display for RawDiagnosticError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&String::from_utf8_lossy(self.message_bytes()))
+    }
+}
+
+impl std::error::Error for RawDiagnosticError {}
+
+impl RawDiagnosticError {
+    pub fn message_bytes(&self) -> &[u8] {
+        self.0.split(|&byte| byte == 0).next().unwrap_or_default()
+    }
+    pub fn into_io(self) -> std::io::Error {
+        std::io::Error::other(self)
+    }
+
+    pub fn find<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a [u8]> {
+        let mut current = Some(error);
+        while let Some(error) = current {
+            if let Some(raw) = error.downcast_ref::<Self>() {
+                return Some(raw.message_bytes());
+            }
+            if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                if let Some(inner) = io.get_ref() {
+                    current = Some(inner);
+                    continue;
+                }
+            }
+            current = error.source();
+        }
+        None
+    }
+}
+
+/// Two owners of the same concrete error: its source chain and raw diagnostic
+/// remain available both to ordinary propagation and noexcept owner cleanup.
+#[derive(Debug)]
+struct SharedIoError(std::sync::Arc<std::io::Error>);
+impl std::fmt::Display for SharedIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for SharedIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// Invocation-owned transport for fatal concrete I/O through translated
+/// backend traits whose public error type remains String. Call capture only
+/// when that failure is immediately propagated; finish restores its type.
+#[derive(Clone, Default, Debug)]
+pub struct IoErrorOwner {
+    primary: std::sync::Arc<std::sync::Mutex<Option<std::io::Error>>>,
+    source_destructors: bool,
+}
+impl IoErrorOwner {
+    /// Opt the actual Source command owner into noexcept destructor behavior.
+    /// Ordinary reusable library owners retain fallible extension methods.
+    pub(crate) fn with_source_destructors(&self) -> Self {
+        Self {
+            primary: self.primary.clone(),
+            source_destructors: true,
+        }
+    }
+    pub(crate) fn source_destructors(&self) -> bool {
+        self.source_destructors
+    }
+    pub(crate) fn cleanup_owner(&self) -> Self {
+        Self {
+            primary: Default::default(),
+            source_destructors: self.source_destructors,
+        }
+    }
+    pub(crate) fn emit_pending_perror(&self) -> IoResult<()> {
+        let mut pending = self
+            .primary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(error) = pending.take() {
+            let emitted = match emit_source_perror(&error) {
+                Ok(emitted) => emitted,
+                Err(conversion) => {
+                    *pending = Some(error);
+                    return Err(conversion);
+                }
+            };
+            *pending = Some(if emitted {
+                PerrorEmittedError::wrap(error)
+            } else {
+                error
+            });
+        }
+        Ok(())
+    }
+    /// Save the actual typed failure before a Source owner can be destroyed.
+    /// Returning another shared handle preserves the public io::Result API.
+    pub(crate) fn capture_io<T>(&self, result: std::io::Result<T>) -> std::io::Result<T> {
+        result.map_err(|error| {
+            let kind = error.kind();
+            let error = std::sync::Arc::new(error);
+            *self
+                .primary
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                Some(std::io::Error::new(kind, SharedIoError(error.clone())));
+            std::io::Error::new(kind, SharedIoError(error))
+        })
+    }
+    pub fn capture<T>(&self, result: std::io::Result<T>) -> Result<T, String> {
+        result.map_err(|error| {
+            let message = error.to_string();
+            *self
+                .primary
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(error);
+            message
+        })
+    }
+    pub fn finish<T>(&self, result: Result<T, String>) -> std::io::Result<T> {
+        self.finish_with_kind(result, std::io::ErrorKind::Other)
+    }
+    /// Restore captured I/O errors while retaining the caller's existing kind
+    /// for validation errors that originated in a String-returning adapter.
+    pub fn finish_with_kind<T>(
+        &self,
+        result: Result<T, String>,
+        fallback_kind: std::io::ErrorKind,
+    ) -> std::io::Result<T> {
+        let error = self
+            .primary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let result = result.map_err(|message| {
+            error.unwrap_or_else(|| std::io::Error::new(fallback_kind, message))
+        });
+        if self.source_destructors {
+            self.capture_io(result)
+        } else {
+            result
+        }
     }
 }

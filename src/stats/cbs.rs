@@ -42,7 +42,7 @@ pub enum MatrixAdjustRule {
     UserSpecifiedRelEntropy = 4,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CbsThresholds {
     pub query_match_distance_threshold: f64,
     pub length_ratio_threshold: f64,
@@ -80,6 +80,33 @@ impl Default for CbsThresholds {
 }
 
 impl CbsMode {
+    /// Validate the command surface of both Source build profiles.
+    /// Numerical kernels retain the experimental mode 6 enum, but CBS::COUNT
+    /// follows the explicitly assigned entry 5, so both CLIs reject code 6.
+    pub fn from_search_code(
+        code: u32,
+        query_translated: bool,
+        global_ranking_targets: i64,
+    ) -> Result<Self, String> {
+        if global_ranking_targets > 0 && code >= 2 {
+            return Err("Global ranking is not supported in this mode.".to_string());
+        }
+        if code >= 6 {
+            return Err(
+                "Invalid value for --comp-based-stats. Permitted values: 0, 1, 2, 3, 4, 5."
+                    .to_string(),
+            );
+        }
+        let mode = Self::parse(&code.to_string());
+        if query_translated && !mode.support_translated() {
+            return Err(
+                "This mode of composition based stats is not supported for translated searches."
+                    .to_string(),
+            );
+        }
+        Ok(mode)
+    }
+
     pub fn parse(s: &str) -> Self {
         match s {
             "0" => CbsMode::Disabled,
@@ -371,7 +398,7 @@ impl TargetMatrix {
                 for i in 0..AMINO_ACID_COUNT {
                     for j in 0..AMINO_ACID_COUNT {
                         scaled_input[i * AMINO_ACID_COUNT + j] =
-                            score_matrix.score(i as Letter, j as Letter) * adjustment.matrix_scale;
+                            score_matrix.matrix32_scaled()[i * 32 + j];
                     }
                 }
                 if blast_composition_based_stats(
@@ -381,7 +408,9 @@ impl TargetMatrix {
                     AMINO_ACID_COUNT,
                     query_comp,
                     &target_comp,
-                    score_matrix.lambda(),
+                    score_matrix
+                        .ungapped_lambda()
+                        .unwrap_or_else(|| score_matrix.lambda()),
                     adjustment.matrix_scale as f64,
                     freq_ratios,
                 )

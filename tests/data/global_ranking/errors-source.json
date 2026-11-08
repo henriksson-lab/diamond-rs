@@ -1,0 +1,246 @@
+[
+  {
+    "flags": [
+      "--global-ranking"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "--global-ranking",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid parameter count for option '-g/--global-ranking'\n",
+    "stdout": ""
+  },
+  {
+    "flags": [
+      "--global-ranking",
+      "1",
+      "2"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "--global-ranking",
+      "1",
+      "2",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid parameter count for option '-g/--global-ranking'\n",
+    "stdout": ""
+  },
+  {
+    "flags": [
+      "--global-ranking=2"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "--global-ranking=2",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid option: global-ranking=2\n",
+    "stdout": ""
+  },
+  {
+    "flags": [
+      "-g"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "-g",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid parameter count for option '-g/--global-ranking'\n",
+    "stdout": ""
+  },
+  {
+    "flags": [
+      "-g2",
+      "--comp-based-stats",
+      "2"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "-g2",
+      "--comp-based-stats",
+      "2",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\nError: Global ranking is not supported in this mode.\n",
+    "stdout": ""
+  },
+  {
+    "flags": [
+      "-g2",
+      "-f",
+      "100"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "-g2",
+      "-f",
+      "100",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 1\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: /data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107\nError: The DAA format is not supported in global ranking mode.\n",
+    "stdout": "\u001b[0;39m"
+  },
+  {
+    "flags": [
+      "-g2",
+      "--frameshift",
+      "15"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "-g2",
+      "--frameshift",
+      "15",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\nError: Global ranking is not supported in this mode.\n",
+    "stdout": ""
+  },
+  {
+    "flags": [
+      "-g2",
+      "--range-culling"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "-g2",
+      "--range-culling",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\nError: Global ranking is not supported in this mode.\n",
+    "stdout": ""
+  },
+  {
+    "flags": [
+      "-g2",
+      "--multiprocessing"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "-g2",
+      "--multiprocessing",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\nError: Global ranking is not supported in this mode.\n",
+    "stdout": ""
+  },
+  {
+    "flags": [
+      "--global-ranking",
+      "-1"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "--global-ranking",
+      "-1",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 1\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: /data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: /data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd (type: Diamond database, sequences: 7, letters: 1033)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file...  [0s]\nLoading query sequences...  [0s]\nMasking queries...  [0.014s]\nAlgorithm: Double-indexed\nAllocating global ranking table... Error: cannot create std::vector larger than max_size()\n",
+    "stdout": "\u001b[0;39m"
+  },
+  {
+    "flags": [
+      "--global-ranking",
+      "9223372036854775807"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastx",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.fna",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd",
+      "-p1",
+      "--global-ranking",
+      "9223372036854775807",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 1\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: /data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: /data/henriksson/github/claude/diamond-rs/.tmp/native-global-ranking-20261107/reference.dmnd (type: Diamond database, sequences: 7, letters: 1033)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file...  [0s]\nLoading query sequences...  [0s]\nMasking queries...  [0.012s]\nAlgorithm: Double-indexed\nAllocating global ranking table... Error: cannot create std::vector larger than max_size()\n",
+    "stdout": "\u001b[0;39m"
+  }
+]

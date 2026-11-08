@@ -1,26 +1,77 @@
 use crate::basic::value::TaxId;
-use crate::data::blastdb::taxdmp::read_names_dmp;
+use crate::data::blastdb::taxdmp::read_names_dmp_path;
 
 // Preserve the established `data::taxonomy::{Rank, TaxonomyNodes}` API while
 // mirroring the upstream `data/taxonomy_nodes.{h,cpp}` source boundary.
 pub use crate::data::taxonomy_nodes::{Rank, TaxonomyNodes};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Taxonomy {
-    pub name: Vec<String>,
+pub struct Taxonomy<N = String> {
+    pub name: Vec<N>,
 }
 
 impl Taxonomy {
     pub fn init(&mut self, namesdmp: &str) -> Result<usize, String> {
-        if namesdmp.is_empty() {
-            return Ok(0);
-        }
-        self.load_names(namesdmp)
+        self.init_path(std::path::Path::new(namesdmp))
+    }
+    pub fn init_source(&mut self, file_name: &str, buffer_size: usize) -> Result<usize, String> {
+        self.init_source_path(std::path::Path::new(file_name), buffer_size)
+    }
+    pub fn init_source_io(
+        &mut self,
+        file_name: &str,
+        buffer_size: usize,
+    ) -> std::io::Result<usize> {
+        self.init_source_io_path(std::path::Path::new(file_name), buffer_size)
+    }
+    pub fn load_names(&mut self, file_name: &str) -> Result<usize, String> {
+        self.load_names_path(std::path::Path::new(file_name))
     }
 
-    pub fn load_names(&mut self, file_name: &str) -> Result<usize, String> {
+    pub fn init_path(&mut self, namesdmp: &std::path::Path) -> Result<usize, String> {
+        if namesdmp.as_os_str().is_empty() {
+            return Ok(0);
+        }
+        self.load_names_path(namesdmp)
+    }
+
+    pub fn init_source_path(
+        &mut self,
+        file_name: &std::path::Path,
+        buffer_size: usize,
+    ) -> Result<usize, String> {
+        self.init_source_io_path(file_name, buffer_size)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Source-owned names input with its actual typed I/O error retained.
+    pub fn init_source_io_path(
+        &mut self,
+        file_name: &std::path::Path,
+        buffer_size: usize,
+    ) -> std::io::Result<usize> {
+        if file_name.as_os_str().is_empty() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        crate::data::blastdb::taxdmp::read_names_dmp_with_source_buffer_path(
+            file_name,
+            buffer_size,
+            |id, name| {
+                if id >= 0 {
+                    let index = id as usize;
+                    self.name.resize(index + 1, String::new());
+                    self.name[index] = name.to_owned();
+                    count += 1;
+                }
+            },
+        )?;
+        Ok(count)
+    }
+
+    pub fn load_names_path(&mut self, file_name: &std::path::Path) -> Result<usize, String> {
         let mut n = 0usize;
-        read_names_dmp(file_name, |id, name| {
+        read_names_dmp_path(file_name, |id, name| {
             if id >= 0 {
                 let i = id as usize;
                 self.name.resize(i + 1, String::new());
@@ -33,19 +84,54 @@ impl Taxonomy {
     }
 }
 
+pub type ByteTaxonomy = Taxonomy<Vec<u8>>;
+impl ByteTaxonomy {
+    pub fn init_source_bytes_io(
+        &mut self,
+        file_name: &str,
+        buffer_size: usize,
+    ) -> std::io::Result<usize> {
+        self.init_source_bytes_io_path(std::path::Path::new(file_name), buffer_size)
+    }
+
+    pub fn init_source_bytes_io_path(
+        &mut self,
+        file_name: &std::path::Path,
+        buffer_size: usize,
+    ) -> std::io::Result<usize> {
+        if file_name.as_os_str().is_empty() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        crate::data::blastdb::taxdmp::read_names_dmp_bytes_with_source_buffer_path(
+            file_name,
+            buffer_size,
+            |id, name| {
+                if id >= 0 {
+                    let index = id as usize;
+                    self.name.resize(index + 1, Vec::new());
+                    self.name[index] = name.to_vec();
+                    count += 1;
+                }
+            },
+        )?;
+        Ok(count)
+    }
+}
+
 /// A taxonomy node in the NCBI taxonomy tree.
 #[derive(Debug, Clone)]
-pub struct TaxonomyNode {
+pub struct TaxonomyNode<N = String> {
     pub taxid: TaxId,
     pub parent: TaxId,
     pub rank: String,
-    pub name: String,
+    pub name: N,
 }
 
 /// Taxonomy tree for taxonomic classification.
 #[derive(Debug, Clone, Default)]
 pub struct TaxonomyTree {
-    nodes: Vec<TaxonomyNode>,
+    nodes: Vec<TaxonomyNode<Vec<u8>>>,
     parent_map: Vec<TaxId>, // index by taxid, value is parent taxid
 }
 
@@ -56,6 +142,14 @@ impl TaxonomyTree {
 
     /// Add a node to the tree.
     pub fn add_node(&mut self, node: TaxonomyNode) {
+        self.add_node_bytes(TaxonomyNode {
+            taxid: node.taxid,
+            parent: node.parent,
+            rank: node.rank,
+            name: node.name.into_bytes(),
+        });
+    }
+    pub fn add_node_bytes(&mut self, node: TaxonomyNode<Vec<u8>>) {
         let taxid = node.taxid as usize;
         if taxid >= self.parent_map.len() {
             self.parent_map.resize(taxid + 1, 0);
@@ -130,11 +224,21 @@ impl TaxonomyTree {
 
     /// Matches C++ `SequenceFile::taxon_scientific_name(taxid)`.
     pub fn taxon_scientific_name(&self, taxid: TaxId) -> String {
+        self.try_taxon_scientific_name(taxid)
+            .expect("Raw taxonomy name is not UTF-8; use taxon_scientific_name_bytes")
+    }
+    pub fn try_taxon_scientific_name(
+        &self,
+        taxid: TaxId,
+    ) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.taxon_scientific_name_bytes(taxid))
+    }
+    pub fn taxon_scientific_name_bytes(&self, taxid: TaxId) -> Vec<u8> {
         self.nodes
             .iter()
             .find(|node| node.taxid == taxid && !node.name.is_empty())
             .map(|node| node.name.clone())
-            .unwrap_or_else(|| taxid.to_string())
+            .unwrap_or_else(|| taxid.to_string().into_bytes())
     }
 
     pub fn rank(&self, taxid: TaxId) -> Option<&str> {

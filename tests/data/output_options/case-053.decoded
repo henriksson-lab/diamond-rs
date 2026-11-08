@@ -1,0 +1,23 @@
+# DIAMOND v2.1.24. http://github.com/bbuchfink/diamond
+# Invocation: /data/henriksson/github/claude/diamond-rs/diamond/build/diamond blastx -q /data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.fna -d /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/tax.dmnd --masking 0 --comp-based-stats 1 --max-hsps 0 -p1 -b 0.0000001 -f 6 qseqid staxids sscinames sfamily slineages --header verbose -o /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/source.out
+# Fields: Query Seq - id, Unique Subject Taxonomy ID(s), separated by a ';' (in numerical order), Unique Subject Scientific Name(s), separated by a ';', Unique subject family(s), separated by a ';', Unique Subject Lineage(s), separated by a '<>'
+translated_query	10	Zeta species	N/A	Bacteria; Test kingdom; Test phylum; Zeta species
+translated_query	11	Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Alpha species
+translated_query	11	Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Alpha species
+translated_query	11	Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Alpha species
+translated_query		N/A	N/A	N/A
+translated_query		N/A	N/A	N/A
+translated_query		N/A	N/A	N/A
+translated_query	10;11	Zeta species;Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Zeta species<>Bacteria; Test kingdom; Test phylum; Alpha species
+translated_query	10;11	Zeta species;Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Zeta species<>Bacteria; Test kingdom; Test phylum; Alpha species
+translated_query	10;11	Zeta species;Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Zeta species<>Bacteria; Test kingdom; Test phylum; Alpha species
+reverse_query	10	Zeta species	N/A	Bacteria; Test kingdom; Test phylum; Zeta species
+reverse_query	11	Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Alpha species
+reverse_query	11	Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Alpha species
+reverse_query	11	Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Alpha species
+reverse_query		N/A	N/A	N/A
+reverse_query		N/A	N/A	N/A
+reverse_query		N/A	N/A	N/A
+reverse_query	10;11	Zeta species;Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Zeta species<>Bacteria; Test kingdom; Test phylum; Alpha species
+reverse_query	10;11	Zeta species;Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Zeta species<>Bacteria; Test kingdom; Test phylum; Alpha species
+reverse_query	10;11	Zeta species;Alpha species	N/A	Bacteria; Test kingdom; Test phylum; Zeta species<>Bacteria; Test kingdom; Test phylum; Alpha species

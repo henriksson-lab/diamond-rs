@@ -9,6 +9,7 @@ use crate::basic::packed_transcript::EditOperation;
 use crate::basic::value::letter_mask;
 use crate::dp::ungapped::DiagonalSegment;
 use crate::util::hsp::{Anchor, ApproxHsp};
+use std::io::Write;
 
 use super::{Aligner, DEFAULT_CHAINING_STACKED_HSP_RATIO, END};
 
@@ -204,6 +205,17 @@ impl Aligner<'_> {
         }
 
         if let Some(hsp) = out.as_deref_mut() {
+            if self.log {
+                let _ = writeln!(
+                    std::io::stdout().lock(),
+                    "Backtrace node={} i={}-{} j={}-{}",
+                    node,
+                    diag + subject_pos,
+                    diag + subject_end,
+                    subject_pos,
+                    subject_end
+                );
+            }
             while subject_pos < subject_end {
                 let subject_letter = letter_mask(self.subject[subject_pos as usize]);
                 let query_letter = letter_mask(self.query[(diag + subject_pos) as usize]);
@@ -349,6 +361,17 @@ impl Aligner<'_> {
                     .filter(|_| !at_end)
                     .map(|idx| self.diags.edges[idx].j)
                     .unwrap_or(diagonal.j);
+                if self.log {
+                    let _ = writeln!(
+                        std::io::stdout().lock(),
+                        "Backtrace node={} i={}-{} j={}-{}",
+                        current.node,
+                        diag + subject_pos,
+                        diag + current.subject_end,
+                        subject_pos,
+                        current.subject_end
+                    );
+                }
                 while subject_pos < current.subject_end {
                     let subject_letter = letter_mask(self.subject[subject_pos as usize]);
                     let query_letter = letter_mask(self.query[(diag + subject_pos) as usize]);
@@ -522,12 +545,29 @@ impl Aligner<'_> {
         let mut max_score = 0;
         let mut traits_begin = traits.len();
         for node in top_nodes {
+            if self.log {
+                let _ = writeln!(
+                    std::io::stdout().lock(),
+                    "Backtrace candidate node={}",
+                    node
+                );
+            }
             if disjoint_diagonal_segment_with_ratio(
                 &traits[traits_begin..],
                 &self.diags.nodes[node].segment,
                 cutoff,
                 stacked_hsp_ratio,
             ) {
+                if self.log {
+                    let d = &self.diags.nodes[node];
+                    let _ = writeln!(
+                        std::io::stdout().lock(),
+                        "Backtrace node={} prefix_score={} rel_score={}",
+                        node,
+                        d.prefix_score,
+                        d.rel_score()
+                    );
+                }
                 max_score = max_score.max(self.backtrace_top_with_hsps(
                     node,
                     hsps,
@@ -537,6 +577,9 @@ impl Aligner<'_> {
                     max_shift,
                     stacked_hsp_ratio,
                 ));
+                if self.log {
+                    let _ = writeln!(std::io::stdout().lock());
+                }
             }
         }
         max_score

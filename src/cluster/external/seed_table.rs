@@ -1,20 +1,24 @@
 //! Seed-table construction from `diamond/src/cluster/external/seed_table.cpp`.
 
+use crate::util::io::source_c_path;
+use std::cell::RefCell;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::external::{ClusterStats, Job};
 use super::pair_table::{Bucket, RadixedTable, SeedEntry, RADIX_BITS, RADIX_COUNT};
+use super::storage::BucketWriter;
 use crate::basic::reduction::Reduction;
 use crate::basic::seed_iterator::SketchIterator;
 use crate::basic::shape::Shape;
-use crate::basic::value::{Letter, SequenceType, SEED_MASK};
-use crate::data::fasta::{FastaFile, FastaFileConfig};
+use crate::basic::value::{Letter, SEED_MASK};
 use crate::masking::motifs::mask_motifs;
 use crate::masking::{bit_to_hard_mask, mask_sequence, MaskingAlgo, MaskingStat};
 use crate::search::seed_complexity::seed_is_complex;
 use crate::util::io::CompressedBuffer;
-use crate::util::sequence::seqid;
+use crate::util::parallel::Atomic;
+use crate::util::sequence::seqid_bytes;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Volume {
@@ -39,34 +43,117 @@ impl Volume {
 pub struct VolumedFile(pub Vec<Volume>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SeedSequence {
-    pub id: String,
+pub struct SeedSequence<T = String> {
+    pub id: T,
     pub sequence: Vec<Letter>,
+}
+
+pub type ByteSeedSequence = SeedSequence<Vec<u8>>;
+impl From<SeedSequence> for ByteSeedSequence {
+    fn from(record: SeedSequence) -> Self {
+        Self {
+            id: record.id.into_bytes(),
+            sequence: record.sequence,
+        }
+    }
+}
+impl TryFrom<ByteSeedSequence> for SeedSequence {
+    type Error = std::string::FromUtf8Error;
+    fn try_from(record: ByteSeedSequence) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: String::from_utf8(record.id)?,
+            sequence: record.sequence,
+        })
+    }
 }
 
 pub trait SequenceVolumeReader {
     fn read_volume(&mut self, path: &Path) -> Result<Vec<SeedSequence>, String>;
+    fn visit_volume(
+        &mut self,
+        path: &Path,
+        visitor: &mut dyn FnMut(SeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for record in self.read_volume(path)? {
+            visitor(record)?;
+        }
+        Ok(())
+    }
+    /// File-backed implementations override this to construct and retain the
+    /// input owner before opening dependent output, including empty inputs.
+    fn visit_volume_with_open(
+        &mut self,
+        path: &Path,
+        on_open: &mut dyn FnMut() -> Result<(), String>,
+        visitor: &mut dyn FnMut(SeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        on_open()?;
+        self.visit_volume(path, visitor)
+    }
+    /// Canonical Source byte title path. Legacy String-only library readers
+    /// adapt losslessly; concrete file-backed readers override these methods.
+    fn visit_volume_bytes(
+        &mut self,
+        path: &Path,
+        visitor: &mut dyn FnMut(ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.visit_volume(path, &mut |record| visitor(record.into()))
+    }
+    fn visit_volume_bytes_with_open(
+        &mut self,
+        path: &Path,
+        on_open: &mut dyn FnMut() -> Result<(), String>,
+        visitor: &mut dyn FnMut(ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.visit_volume_with_open(path, on_open, &mut |record| visitor(record.into()))
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct FastaVolumeReader;
 
 impl SequenceVolumeReader for FastaVolumeReader {
+    fn visit_volume_bytes(
+        &mut self,
+        path: &Path,
+        visitor: &mut dyn FnMut(ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        super::reader::visit_volume_bytes_owned(path, visitor, &mut || Ok(()), &Default::default())
+    }
+    fn visit_volume_bytes_with_open(
+        &mut self,
+        path: &Path,
+        on_open: &mut dyn FnMut() -> Result<(), String>,
+        visitor: &mut dyn FnMut(ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        super::reader::visit_volume_bytes_owned(path, visitor, on_open, &Default::default())
+    }
+    fn visit_volume(
+        &mut self,
+        path: &Path,
+        visitor: &mut dyn FnMut(SeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        super::reader::visit_volume(path, visitor)
+    }
+    fn visit_volume_with_open(
+        &mut self,
+        path: &Path,
+        on_open: &mut dyn FnMut() -> Result<(), String>,
+        visitor: &mut dyn FnMut(SeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        super::reader::visit_volume_owned(
+            path,
+            visitor,
+            on_open,
+            &crate::util::io::IoErrorOwner::default(),
+        )
+    }
     fn read_volume(&mut self, path: &Path) -> Result<Vec<SeedSequence>, String> {
-        let mut file = FastaFile::open(
-            &[path.to_path_buf()],
-            FastaFileConfig {
-                sequence_type: SequenceType::AminoAcid,
-                ..FastaFileConfig::default()
-            },
-        )?;
         let mut sequences = Vec::new();
-        while let Some(entry) = file.read_seq()? {
-            sequences.push(SeedSequence {
-                id: entry.id,
-                sequence: entry.sequence,
-            });
-        }
+        self.visit_volume(path, &mut |record| {
+            sequences.push(record);
+            Ok(())
+        })?;
         Ok(sequences)
     }
 }
@@ -100,8 +187,8 @@ impl SeedMasker for DefaultSeedMasker {
 
 pub struct SeedTableConfig<'a> {
     pub threads: usize,
-    pub soft_masking: &'a str,
-    pub motif_masking: &'a str,
+    pub soft_masking: &'a [u8],
+    pub motif_masking: &'a [u8],
     pub sketch_size: i32,
     pub sensitivity_sketch_size: i32,
     pub seed_cut: f64,
@@ -125,25 +212,59 @@ pub struct SeedFileArray {
     base_dir: PathBuf,
     worker_id: i64,
     entries: Vec<Vec<SeedEntry>>,
+    bounded: Option<RefCell<BucketWriter>>,
 }
 
 impl SeedFileArray {
     pub fn new(base_dir: impl AsRef<Path>, worker_id: i64) -> Result<Self, String> {
         let base_dir = base_dir.as_ref().to_path_buf();
         for radix in 0..RADIX_COUNT {
-            fs::create_dir_all(base_dir.join(radix.to_string()))
+            fs::create_dir_all(source_c_path(&(base_dir.join(radix.to_string()))).as_ref())
                 .map_err(|error| error.to_string())?;
         }
         Ok(Self {
             base_dir,
             worker_id,
             entries: vec![Vec::new(); RADIX_COUNT],
+            bounded: None,
+        })
+    }
+
+    pub fn new_bounded(base_dir: impl AsRef<Path>, worker_id: i64) -> Result<Self, String> {
+        Self::new_bounded_owned(
+            base_dir,
+            worker_id,
+            crate::util::io::IoErrorOwner::default(),
+        )
+    }
+
+    pub fn new_bounded_owned(
+        base_dir: impl AsRef<Path>,
+        worker_id: i64,
+        errors: crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            base_dir: base_dir.as_ref().into(),
+            worker_id,
+            entries: vec![Vec::new(); RADIX_COUNT],
+            bounded: Some(RefCell::new(BucketWriter::new_owned(
+                base_dir.as_ref(),
+                worker_id,
+                RADIX_COUNT,
+                errors,
+            )?)),
         })
     }
 
     pub fn write_msb(&mut self, entry: SeedEntry) {
         let radix = (entry.key() >> (64 - RADIX_BITS)) as usize;
-        self.entries[radix].push(entry);
+        if let Some(writer) = &self.bounded {
+            let mut bytes = Vec::with_capacity(SeedEntry::ENCODED_SIZE);
+            entry.serialize(&mut bytes);
+            writer.borrow_mut().write_deferred(radix, &bytes);
+        } else {
+            self.entries[radix].push(entry);
+        }
     }
 
     pub fn entries(&self, radix: usize) -> &[SeedEntry] {
@@ -151,13 +272,17 @@ impl SeedFileArray {
     }
 
     pub fn finish(&self) -> Result<RadixedTable, String> {
+        if let Some(writer) = &self.bounded {
+            return writer.borrow_mut().finish();
+        }
         let mut buckets = Vec::with_capacity(RADIX_COUNT);
         for radix in 0..RADIX_COUNT {
             let directory = self.base_dir.join(radix.to_string());
             let manifest = directory.join("bucket.tsv");
             let entries = &self.entries[radix];
             if entries.is_empty() {
-                fs::write(&manifest, []).map_err(|error| error.to_string())?;
+                fs::write(source_c_path(&manifest).as_ref(), [])
+                    .map_err(|error| error.to_string())?;
             } else {
                 let volume = directory.join(format!("worker_{}_volume_0", self.worker_id));
                 let mut compressed = CompressedBuffer::new();
@@ -169,10 +294,12 @@ impl SeedFileArray {
                         .map_err(|error| error.to_string())?;
                 }
                 compressed.finish().map_err(|error| error.to_string())?;
-                fs::write(&volume, compressed.data()).map_err(|error| error.to_string())?;
+                fs::write(source_c_path(&volume).as_ref(), compressed.data())
+                    .map_err(|error| error.to_string())?;
                 fs::write(
-                    &manifest,
-                    format!("{}\t{}\n", volume.display(), entries.len()),
+                    source_c_path(&manifest).as_ref(),
+                    super::storage::manifest_line(&volume, &[entries.len() as u64])
+                        .map_err(|e| e.to_string())?,
                 )
                 .map_err(|error| error.to_string())?;
             }
@@ -204,8 +331,8 @@ where
         .shapes
         .first()
         .ok_or_else(|| "No seed shapes configured.".to_owned())?;
-    let use_tantan = config.soft_masking.is_empty() || config.soft_masking == "tantan";
-    let use_motif = config.motif_masking.is_empty() || config.motif_masking == "1";
+    let use_tantan = config.soft_masking.is_empty() || config.soft_masking == b"tantan";
+    let use_motif = config.motif_masking.is_empty() || config.motif_masking == b"1";
     let mut sketch_size = if config.sketch_size == 0 {
         config.sensitivity_sketch_size
     } else {
@@ -222,16 +349,22 @@ where
     }
 
     let base_dir = job.base_dir(None).join(format!("seed_table_{shape_index}"));
-    fs::create_dir_all(&base_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(source_c_path(&base_dir).as_ref()).map_err(|error| error.to_string())?;
     let accessions = job.root_dir().join("accessions");
     let write_accessions = job.round_index() == 0 && shape_index == 0;
     if write_accessions {
-        fs::create_dir_all(&accessions).map_err(|error| error.to_string())?;
+        fs::create_dir_all(source_c_path(&accessions).as_ref())
+            .map_err(|error| error.to_string())?;
     }
-    let mut output = SeedFileArray::new(&base_dir, job.worker_id())?;
+    let mut output = SeedFileArray::new_bounded_owned(&base_dir, job.worker_id(), job.io_errors())?;
     let mut stats = SeedTableStats::default();
-
-    for (volume_index, volume) in volumes.0.iter().enumerate() {
+    let queue = Atomic::new(base_dir.join("queue"));
+    loop {
+        let volume_index =
+            usize::try_from(queue.fetch_add_one()?).map_err(|error| error.to_string())?;
+        let Some(volume) = volumes.0.get(volume_index) else {
+            break;
+        };
         job.log(&format!(
             "Building seed table. Shape={}/{} Volume={}/{} Records={}",
             shape_index + 1,
@@ -240,16 +373,27 @@ where
             volumes.0.len(),
             volume.record_count
         ))?;
-        let sequences = reader.read_volume(&volume.path)?;
-        let mut accession_text = String::new();
+        let accession_out = RefCell::new(None);
+        let mut on_open = || {
+            if write_accessions {
+                let path = accessions.join(format!("{volume_index}.txt"));
+                *accession_out.borrow_mut() = Some(BufWriter::new(
+                    fs::File::create(source_c_path(&path).as_ref()).map_err(|_| {
+                        super::storage::path_error(&job.io_errors(), b"Error opening file ", &path)
+                    })?,
+                ));
+            }
+            Ok(())
+        };
         let mut oid = volume.oid_begin as i64;
-        for mut record in sequences {
+        reader.visit_volume_bytes_with_open(&volume.path, &mut on_open, &mut |mut record| {
             if job.round_index() > 0 {
                 oid = c_atoll(&record.id);
             }
-            if write_accessions {
-                accession_text.push_str(&seqid(&record.id));
-                accession_text.push('\n');
+            if let Some(out) = accession_out.borrow_mut().as_mut() {
+                out.write_all(&seqid_bytes(&record.id))
+                    .and_then(|()| out.write_all(b"\n"))
+                    .map_err(|error| error.to_string())?;
             }
             if use_tantan || use_motif {
                 stats.masking_stat += masker.mask(&mut record.sequence, use_tantan, use_motif);
@@ -261,7 +405,7 @@ where
                 .collect();
             if record.sequence.len() < shape.length as usize {
                 oid += 1;
-                continue;
+                return Ok(());
             }
             let mut iterator = SketchIterator::new(&reduced, shape, sketch_size, config.reduction);
             while iterator.good() {
@@ -283,15 +427,17 @@ where
                 iterator.increment();
             }
             oid += 1;
-        }
-        if write_accessions {
-            let path = accessions.join(format!("{volume_index}.txt"));
-            fs::write(&path, accession_text)
-                .map_err(|_| format!("Error opening file {}", path.display()))?;
+            Ok(())
+        })?;
+        if let Some(out) = accession_out.borrow_mut().as_mut() {
+            out.flush().map_err(|error| error.to_string())?;
         }
         stats.volumes_processed += 1;
     }
     let buckets = output.finish()?;
+    let finished = Atomic::new(base_dir.join("finished"));
+    finished.fetch_add(stats.volumes_processed as i64)?;
+    finished.await_value(volumes.0.len() as i64)?;
     job.log_stats(&ClusterStats {
         seeds_considered: stats.seeds_considered,
         seeds_indexed: stats.seeds_indexed,
@@ -301,8 +447,8 @@ where
     Ok((buckets, stats))
 }
 
-fn c_atoll(value: &str) -> i64 {
-    let bytes = value.as_bytes();
+fn c_atoll(value: impl AsRef<[u8]>) -> i64 {
+    let bytes = value.as_ref();
     let mut index = 0;
     while index < bytes.len() && bytes[index].is_ascii_whitespace() {
         index += 1;
@@ -413,8 +559,8 @@ mod tests {
         let shapes = [Shape::from_code("11", &reduction)];
         let config = SeedTableConfig {
             threads: 2,
-            soft_masking: "",
-            motif_masking: "",
+            soft_masking: b"",
+            motif_masking: b"",
             sketch_size: 0,
             sensitivity_sketch_size: 100,
             seed_cut: -1.0,
@@ -487,8 +633,8 @@ mod tests {
         let shapes = [Shape::from_code("1", &reduction)];
         let config = SeedTableConfig {
             threads: 1,
-            soft_masking: "none",
-            motif_masking: "0",
+            soft_masking: b"none",
+            motif_masking: b"0",
             sketch_size: 10,
             sensitivity_sketch_size: 0,
             seed_cut: -1.0,
@@ -520,8 +666,8 @@ mod tests {
         let job = Job::new(0, 0, 1, &root, 0).unwrap();
         let config = SeedTableConfig {
             threads: 1,
-            soft_masking: "none",
-            motif_masking: "0",
+            soft_masking: b"none",
+            motif_masking: b"0",
             sketch_size: 0,
             sensitivity_sketch_size: 0,
             seed_cut: 0.0,

@@ -130,6 +130,35 @@ pub fn total_blocks(letters: u64, config: SequenceFileConfig) -> Result<usize, S
 
 /// Detects the same file families as C++ `SequenceFile::auto_create`, without
 /// constructing a concrete reader or consulting process-wide configuration.
+fn append_path_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+fn source_dmnd_candidate(path: &std::path::Path) -> PathBuf {
+    let candidate = append_path_suffix(path, ".dmnd");
+    #[cfg(unix)]
+    let has_suffix = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().ends_with(b".dmnd")
+    };
+    #[cfg(windows)]
+    let has_suffix = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .collect::<Vec<_>>()
+            .ends_with(&[46, 100, 109, 110, 100])
+    };
+    #[cfg(not(any(unix, windows)))]
+    let has_suffix = path.as_os_str().as_encoded_bytes().ends_with(b".dmnd");
+    if !has_suffix && candidate.exists() {
+        candidate
+    } else {
+        path.to_path_buf()
+    }
+}
+
 pub fn detect_type(
     paths: &[PathBuf],
     flags: SequenceFileFlags,
@@ -137,9 +166,8 @@ pub fn detect_type(
 ) -> Result<(SequenceFileType, PathBuf), String> {
     if paths.len() == 1 {
         let path = &paths[0];
-        let path_text = path.to_string_lossy();
-        let pin = PathBuf::from(format!("{path_text}.pin"));
-        let pal = PathBuf::from(format!("{path_text}.pal"));
+        let pin = append_path_suffix(path, ".pin");
+        let pal = append_path_suffix(path, ".pal");
         if pin.exists() || pal.exists() || path.extension().is_some_and(|x| x == "pal") {
             if config.multiprocessing {
                 return Err("--multiprocessing is not compatible with BLAST databases.".into());
@@ -149,11 +177,7 @@ pub fn detect_type(
             }
             return Ok((SequenceFileType::Blast, path.clone()));
         }
-        let dmnd = if path.exists() {
-            path.clone()
-        } else {
-            PathBuf::from(format!("{path_text}.dmnd"))
-        };
+        let dmnd = source_dmnd_candidate(path);
         if crate::data::dmnd::is_diamond_db_file(&dmnd) {
             return Ok((SequenceFileType::Dmnd, dmnd));
         }
@@ -162,6 +186,65 @@ pub fn detect_type(
         return Ok((SequenceFileType::Fasta, paths[0].clone()));
     }
     Err("Sequence file does not have a supported format.".into())
+}
+
+/// Source auto_create's actual header probe. Unlike the convenience boolean
+/// detector, a missing/unreadable candidate is a typed FileOpenException;
+/// only EndOfStream while reading its magic is interpreted as a non-DMND file.
+pub fn detect_type_source(
+    paths: &[PathBuf],
+    flags: SequenceFileFlags,
+    config: SequenceFileConfig,
+) -> std::io::Result<(SequenceFileType, PathBuf)> {
+    detect_type_source_with_buffer(paths, flags, config, 67_108_864)
+}
+
+pub fn detect_type_source_with_buffer(
+    paths: &[PathBuf],
+    flags: SequenceFileFlags,
+    config: SequenceFileConfig,
+    buffer_size: usize,
+) -> std::io::Result<(SequenceFileType, PathBuf)> {
+    if paths.len() == 1 {
+        let path = &paths[0];
+        if append_path_suffix(path, ".pin").exists()
+            || append_path_suffix(path, ".pal").exists()
+            || path.extension().is_some_and(|x| x == "pal")
+        {
+            if config.multiprocessing {
+                return Err(std::io::Error::other(
+                    "--multiprocessing is not compatible with BLAST databases.",
+                ));
+            }
+            if config.target_indexed {
+                return Err(std::io::Error::other(
+                    "--target-indexed is not compatible with BLAST databases.",
+                ));
+            }
+            return Ok((SequenceFileType::Blast, path.clone()));
+        }
+        let candidate = source_dmnd_candidate(path);
+        if !candidate.as_os_str().is_empty() && candidate.as_os_str() != std::ffi::OsStr::new("-") {
+            let mut input =
+                crate::util::io::InputFile::with_source_profile_path(&candidate, 0, buffer_size)
+                    .map_err(std::io::Error::other)?;
+            let magic = match input.read_u64() {
+                Ok(magic) => Some(magic),
+                Err(crate::util::io::IoError::EndOfStream) => None,
+                Err(error) => return Err(std::io::Error::other(error)),
+            };
+            input.close().map_err(std::io::Error::other)?;
+            if magic == Some(crate::data::dmnd::MAGIC_NUMBER) {
+                return Ok((SequenceFileType::Dmnd, candidate));
+            }
+        }
+    }
+    if !flags.contains(SequenceFileFlags::NO_FASTA) && !paths.is_empty() {
+        return Ok((SequenceFileType::Fasta, paths[0].clone()));
+    }
+    Err(std::io::Error::other(
+        "Sequence file does not have a supported format.",
+    ))
 }
 
 pub fn single_oid(accession: &str, oids: &[OId]) -> Result<OId, String> {
@@ -174,39 +257,54 @@ pub fn single_oid(accession: &str, oids: &[OId]) -> Result<OId, String> {
 
 #[derive(Debug, Clone, Default)]
 pub struct AccessionIndex {
-    acc_to_oid: HashMap<String, OId>,
-    oid_to_acc: Vec<String>,
+    acc_to_oid: HashMap<Vec<u8>, OId>,
+    oid_to_acc: Vec<Vec<u8>>,
 }
 
 impl AccessionIndex {
     pub fn add_seqid_mapping(&mut self, title: &str, oid: OId) -> Result<(), String> {
-        let accession = crate::util::sequence::seqid(title);
+        self.add_seqid_mapping_bytes(title.as_bytes(), oid)
+            .map_err(|error| error.to_string())
+    }
+    pub fn add_seqid_mapping_bytes(&mut self, title: &[u8], oid: OId) -> std::io::Result<()> {
+        let accession = crate::util::sequence::seqid_bytes(title);
         if oid != self.oid_to_acc.len() as OId {
-            return Err("add_seqid_mapping: OIDs must be added consecutively".into());
+            return Err(std::io::Error::other(
+                "add_seqid_mapping: OIDs must be added consecutively",
+            ));
         }
         if self.acc_to_oid.contains_key(&accession) {
-            return Err(format!(
-                "Accession is not unique in database file: {accession}"
-            ));
+            let mut message = b"Accession is not unique in database file: ".to_vec();
+            message.extend_from_slice(&accession);
+            return Err(crate::util::io::RawDiagnosticError(message).into_io());
         }
         self.acc_to_oid.insert(accession.clone(), oid);
         self.oid_to_acc.push(accession);
         Ok(())
     }
-
     pub fn accession_to_oid(&self, accession: &str) -> Result<Vec<OId>, String> {
+        self.accession_to_oid_bytes(accession.as_bytes())
+            .map_err(|error| error.to_string())
+    }
+    pub fn accession_to_oid_bytes(&self, accession: &[u8]) -> std::io::Result<Vec<OId>> {
         self.acc_to_oid
             .get(accession)
             .copied()
-            .map(|x| vec![x])
-            .ok_or_else(|| format!("Accession not found in database: {accession}"))
+            .map(|oid| vec![oid])
+            .ok_or_else(|| {
+                let mut message = b"Accession not found in database: ".to_vec();
+                message.extend_from_slice(accession);
+                crate::util::io::RawDiagnosticError(message).into_io()
+            })
     }
-
-    pub fn seqid(&self, oid: OId) -> Result<&str, String> {
+    pub fn seqid_bytes(&self, oid: OId) -> Result<&[u8], String> {
         self.oid_to_acc
             .get(oid as usize)
-            .map(String::as_str)
+            .map(Vec::as_slice)
             .ok_or_else(|| "OId to accession mapping not available.".into())
+    }
+    pub fn seqid(&self, oid: OId) -> Result<&str, String> {
+        std::str::from_utf8(self.seqid_bytes(oid)?).map_err(|error| error.to_string())
     }
 }
 
@@ -395,10 +493,72 @@ pub fn contained_many<T: TaxonomyAccess>(
     Ok(all)
 }
 
+/// Source taxonomy-list parsing, shared by real database filters and
+/// provided-database workflows whose metadata access can fail afterward.
+pub fn parse_taxonomy_filter(list: &str, delimiter: char) -> Result<BTreeSet<TaxId>, String> {
+    parse_taxonomy_filter_bytes(list.as_bytes(), delimiter as u8)
+}
+pub fn parse_taxonomy_filter_bytes(list: &[u8], delimiter: u8) -> Result<BTreeSet<TaxId>, String> {
+    let mut taxa = BTreeSet::new();
+    if !list.is_empty() {
+        let mut tokens = list.split(|byte| *byte == delimiter).peekable();
+        while let Some(token) = tokens.next() {
+            if token.is_empty() && tokens.peek().is_none() && list.last() == Some(&delimiter) {
+                break;
+            }
+            let mut c = token.to_vec();
+            c.push(0);
+            let begin = c.as_ptr().cast();
+            let mut end = std::ptr::null_mut();
+            // std::stoi uses the active C locale and accepts a decimal prefix.
+            // Parsing into the wider CRT type and then checking int's bounds
+            // also detects overflow on LLP64 without relying on stale errno.
+            let value = unsafe { libc::strtoll(begin, &mut end, 10) };
+            if end == begin.cast_mut() || value < i32::MIN as i64 || value > i32::MAX as i64 {
+                return Err("stoi".into());
+            }
+            taxa.insert(value as TaxId);
+        }
+    }
+    if taxa.is_empty() {
+        return Err("Option --taxonlist/--taxon-exclude used with empty list.".into());
+    }
+    if taxa.contains(&0) || taxa.contains(&1) {
+        return Err(
+            "Option --taxonlist/--taxon-exclude used with invalid argument (0 or 1).".into(),
+        );
+    }
+    Ok(taxa)
+}
+
 pub fn filter_by_taxonomy<T, FT, FL>(
     db: &T,
     list: &str,
     delimiter: char,
+    exclude: bool,
+    sequence_count: OId,
+    taxids: FT,
+    seq_length: FL,
+) -> Result<DbFilter, String>
+where
+    T: TaxonomyAccess,
+    FT: FnMut(OId) -> Result<Vec<TaxId>, String>,
+    FL: FnMut(OId) -> Result<Loc, String>,
+{
+    filter_by_taxonomy_bytes(
+        db,
+        list.as_bytes(),
+        delimiter as u8,
+        exclude,
+        sequence_count,
+        taxids,
+        seq_length,
+    )
+}
+pub fn filter_by_taxonomy_bytes<T, FT, FL>(
+    db: &T,
+    list: &[u8],
+    delimiter: u8,
     exclude: bool,
     sequence_count: OId,
     mut taxids: FT,
@@ -409,19 +569,7 @@ where
     FT: FnMut(OId) -> Result<Vec<TaxId>, String>,
     FL: FnMut(OId) -> Result<Loc, String>,
 {
-    let taxa: BTreeSet<TaxId> = list
-        .split(delimiter)
-        .filter(|x| !x.trim().is_empty())
-        .map(|x| x.trim().parse::<TaxId>().map_err(|e| e.to_string()))
-        .collect::<Result<_, _>>()?;
-    if taxa.is_empty() {
-        return Err("Option --taxonlist/--taxon-exclude used with empty list.".into());
-    }
-    if taxa.contains(&0) || taxa.contains(&1) {
-        return Err(
-            "Option --taxonlist/--taxon-exclude used with invalid argument (0 or 1).".into(),
-        );
-    }
+    let taxa = parse_taxonomy_filter_bytes(list, delimiter)?;
     let mut out = DbFilter::new(sequence_count as usize);
     for oid in 0..sequence_count {
         let c = contained_many(db, &taxids(oid)?, &taxa, exclude, exclude)?;
@@ -434,21 +582,55 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub struct DictionaryEntry {
+pub struct DictionaryEntry<T = String> {
     pub oid: OId,
     pub len: Loc,
-    pub title: String,
+    pub title: T,
     pub seq: Vec<Letter>,
     pub self_aln_score: f64,
 }
 
-#[derive(Debug, Default)]
-pub struct SequenceDictionary {
-    entries: Vec<DictionaryEntry>,
+pub type ByteDictionaryEntry = DictionaryEntry<Vec<u8>>;
+impl From<DictionaryEntry> for ByteDictionaryEntry {
+    fn from(entry: DictionaryEntry) -> Self {
+        Self {
+            oid: entry.oid,
+            len: entry.len,
+            title: entry.title.into_bytes(),
+            seq: entry.seq,
+            self_aln_score: entry.self_aln_score,
+        }
+    }
+}
+impl TryFrom<ByteDictionaryEntry> for DictionaryEntry {
+    type Error = std::string::FromUtf8Error;
+    fn try_from(entry: ByteDictionaryEntry) -> Result<Self, Self::Error> {
+        Ok(Self {
+            oid: entry.oid,
+            len: entry.len,
+            title: String::from_utf8(entry.title)?,
+            seq: entry.seq,
+            self_aln_score: entry.self_aln_score,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct SequenceDictionary<T = String> {
+    entries: Vec<DictionaryEntry<T>>,
     block_to_dict_id: HashMap<usize, Vec<DictId>>,
 }
 
-impl SequenceDictionary {
+pub type ByteSequenceDictionary = SequenceDictionary<Vec<u8>>;
+impl<T> Default for SequenceDictionary<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            block_to_dict_id: HashMap::new(),
+        }
+    }
+}
+impl<T> SequenceDictionary<T> {
     pub fn init_block(&mut self, block: usize, seq_count: usize, persist: bool) {
         if !persist {
             self.block_to_dict_id.clear();
@@ -462,7 +644,7 @@ impl SequenceDictionary {
         &mut self,
         block: usize,
         block_id: usize,
-        entry: DictionaryEntry,
+        entry: DictionaryEntry<T>,
     ) -> Result<DictId, String> {
         let ids = self
             .block_to_dict_id
@@ -478,7 +660,7 @@ impl SequenceDictionary {
         Ok(id)
     }
 
-    pub fn entry(&self, dict_id: DictId) -> Result<&DictionaryEntry, String> {
+    pub fn entry(&self, dict_id: DictId) -> Result<&DictionaryEntry<T>, String> {
         usize::try_from(dict_id)
             .ok()
             .and_then(|i| self.entries.get(i))
@@ -552,6 +734,34 @@ mod tests {
     }
 
     #[test]
+    fn taxonomy_filter_bytes_keep_stoi_prefix_and_int_range() {
+        assert_eq!(
+            parse_taxonomy_filter_bytes(b" +7\xff,9\0ignored,", b',').unwrap(),
+            BTreeSet::from([7, 9])
+        );
+        assert_eq!(
+            parse_taxonomy_filter_bytes(b"\xc2\xa07", b',').unwrap_err(),
+            "stoi"
+        );
+        assert_eq!(
+            parse_taxonomy_filter_bytes(b"2147483648", b',').unwrap_err(),
+            "stoi"
+        );
+        assert_eq!(
+            parse_taxonomy_filter_bytes(b"999999999999999999999", b',').unwrap_err(),
+            "stoi"
+        );
+        assert_eq!(
+            parse_taxonomy_filter_bytes(b"7,,", b',').unwrap_err(),
+            "stoi"
+        );
+        assert_eq!(
+            parse_taxonomy_filter_bytes(b"", b',').unwrap_err(),
+            "Option --taxonlist/--taxon-exclude used with empty list."
+        );
+    }
+
+    #[test]
     fn cpp_partition_preserves_initial_size_semantics() {
         assert_eq!(partition(&[4, 7, 3], 10, 2), (vec![0, 1, 3], vec![4, 10]));
         assert_eq!(partition(&[4, 3], 10, 2), (vec![0, 2], vec![7]));
@@ -611,7 +821,7 @@ mod tests {
 
     #[test]
     fn dictionary_ids_are_stable_within_block() {
-        let mut dict = SequenceDictionary::default();
+        let mut dict = SequenceDictionary::<String>::default();
         dict.init_block(7, 2, false);
         let entry = || DictionaryEntry {
             oid: 9,
@@ -648,4 +858,70 @@ mod tests {
         assert_eq!(frame_mask(QueryStrands::Plus), 0b00_0111);
         assert_eq!(frame_mask(QueryStrands::Minus), 0b11_1000);
     }
+}
+
+/// Source SequenceFile::load_seqs first protein-block warning. Call only for
+/// the first logical block; later chunks do not repeat the ten-record probe.
+const PROTEIN_DNA_ERROR: &str = "The sequences are expected to be proteins but only contain DNA letters. Use the option --ignore-warnings to proceed.";
+
+/// Incremental first-block warning from Source's one-pass load loop. The
+/// tenth all-DNA record fails before the next input record is parsed; a
+/// shorter all-DNA block fails when that block finishes.
+pub struct ProteinInputProbe {
+    ignore: bool,
+    count: usize,
+    dna: usize,
+}
+impl ProteinInputProbe {
+    pub fn new(ignore_warnings: bool) -> Self {
+        Self {
+            ignore: ignore_warnings,
+            count: 0,
+            dna: 0,
+        }
+    }
+    pub fn observe(&mut self, sequence: &[crate::basic::value::Letter]) -> Result<(), String> {
+        if self.ignore || self.count >= 10 || sequence.is_empty() {
+            return Ok(());
+        }
+        self.count += 1;
+        let traits = crate::basic::value::ValueTraits::new(
+            crate::basic::value::AMINO_ACID_ALPHABET,
+            crate::basic::value::MASK_LETTER,
+            b" \t\r\n",
+            crate::basic::value::SequenceType::AminoAcid,
+        );
+        if sequence.iter().all(|letter| {
+            ((*letter & crate::basic::value::LETTER_MASK) as usize) < traits.alphabet.len()
+        }) && crate::util::sequence::looks_like_dna(sequence, &traits)?
+        {
+            self.dna += 1;
+            if self.dna == 10 {
+                return Err(PROTEIN_DNA_ERROR.to_owned());
+            }
+        }
+        Ok(())
+    }
+    pub fn finish_block(&self) -> Result<(), String> {
+        if self.count != 0 && self.count == self.dna {
+            Err(PROTEIN_DNA_ERROR.to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub fn check_protein_input<'a>(
+    sequences: impl IntoIterator<Item = &'a [crate::basic::value::Letter]>,
+    ignore_warnings: bool,
+) -> Result<(), String> {
+    let mut probe = ProteinInputProbe::new(ignore_warnings);
+    for sequence in sequences
+        .into_iter()
+        .filter(|sequence| !sequence.is_empty())
+        .take(10)
+    {
+        probe.observe(sequence)?;
+    }
+    probe.finish_block()
 }

@@ -1,0 +1,38 @@
+--- upstream/src/cluster/cascaded/recluster.cpp
++++ diagnostic/src/cluster/cascaded/recluster.cpp
+@@ -39,6 +39,18 @@
+ 
+ namespace Cluster {
+ 
++template<typename It, typename It2>
++int64_t checked_update_clustering(It clustering, It2 mapping, It2 query_begin, It2 query_end, It2 db_begin) {
++	const uint64_t n = query_end - query_begin;
++	int64_t k = 0;
++	for (OId i = 0; i < n; ++i)
++		if (mapping[i] != Mapback::NIL_VALUE && clustering[query_begin[i]] != db_begin[mapping[i]]) {
++			clustering[query_begin[i]] = (typename It::value_type)db_begin[mapping[i]];
++			++k;
++		}
++	return k;
++}
++
+ static vector<OId> recluster(shared_ptr<SequenceFile>& db, const vector<OId>& clustering, int iteration) {
+ 	TaskTimer timer(("*** Initializing recluster iteration " + to_string(iteration + 1)).c_str());
+ 
+@@ -69,6 +81,7 @@
+ 		return clustering;
+ 	shared_ptr<FastaFile> unaligned(db->sub_db(unal_members.cbegin(), unal_members.cend()));
+ 	unaligned->set_seqinfo_ptr(0);
++	unaligned->flags() |= SequenceFile::Flags::ALL;
+ 	timer.finish();
+ 	message_stream << "#Sequences that failed to align against assigned centroid: " << unal_members.size() << endl;
+ 
+@@ -102,7 +115,7 @@
+ 
+ 	timer.go("Updating clustering");
+ 	vector<OId> out = clustering;
+-	update_clustering(out.begin(), mapback->centroid_id.cbegin(), unal_members.cbegin(), unal_members.cend(), centroids.cbegin());
++	checked_update_clustering(out.begin(), mapback->centroid_id.cbegin(), unal_members.cbegin(), unal_members.cend(), centroids.cbegin());
+ 
+ 	timer.go("Deallocating memory");	
+ 	centroid_db.reset();

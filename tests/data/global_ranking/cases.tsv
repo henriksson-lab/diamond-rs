@@ -1,0 +1,48 @@
+case-000	blastp	1	1	0	6	1	
+case-001	blastp	1	1	1	6	1	
+case-002	blastp	1	0.0000001	0	6	1	
+case-003	blastp	1	0.0000001	1	6	1	
+case-004	blastp	2	1	0	6	1	
+case-005	blastp	2	1	1	6	1	
+case-006	blastp	2	0.0000001	0	6	1	
+case-007	blastp	2	0.0000001	1	6	1	
+case-008	blastp	7	1	0	6	1	
+case-009	blastp	7	1	1	6	1	
+case-010	blastp	7	0.0000001	0	6	1	
+case-011	blastp	7	0.0000001	1	6	1	
+case-012	blastx	1	1	0	6	1	
+case-013	blastx	1	1	1	6	1	
+case-014	blastx	1	0.0000001	0	6	1	
+case-015	blastx	1	0.0000001	1	6	1	
+case-016	blastx	2	1	0	6	1	
+case-017	blastx	2	1	1	6	1	
+case-018	blastx	2	0.0000001	0	6	1	
+case-019	blastx	2	0.0000001	1	6	1	
+case-020	blastx	7	1	0	6	1	
+case-021	blastx	7	1	1	6	1	
+case-022	blastx	7	0.0000001	0	6	1	
+case-023	blastx	7	0.0000001	1	6	1	
+case-024	blastp	2	0.0000001	0	6	1	-k 1
+case-025	blastp	2	0.0000001	0	6	1	--top 10
+case-026	blastp	2	0.0000001	0	6	1	--id 75 --query-cover 50
+case-027	blastp	2	0.0000001	0	6	1	--max-hsps 0
+case-028	blastp	2	0.0000001	0	6	1	--comp-based-stats 0
+case-029	blastp	2	0.0000001	0	6	1	--sensitive
+case-030	blastx	2	0.0000001	0	6	1	-k 1
+case-031	blastx	2	0.0000001	0	6	1	--top 10
+case-032	blastx	2	0.0000001	0	6	1	--id 75 --query-cover 50
+case-033	blastx	2	0.0000001	0	6	1	--max-hsps 0
+case-034	blastx	2	0.0000001	0	6	1	--comp-based-stats 0
+case-035	blastx	2	0.0000001	0	6	1	--sensitive
+case-036	blastp	2	0.0000001	0	104	1	
+case-037	blastp	2	0.0000001	0	101	1	
+case-038	blastp	2	0.0000001	0	5	1	
+case-039	blastp	2	0.0000001	0	103	1	
+case-040	blastp	2	0.0000001	0	edge	1	
+case-041	blastp	2	0.0000001	0	null	1	
+case-042	blastx	2	0.0000001	0	104	1	
+case-043	blastx	2	0.0000001	0	101	1	
+case-044	blastx	2	0.0000001	0	5	1	
+case-045	blastx	2	0.0000001	0	103	1	
+case-046	blastx	2	0.0000001	0	edge	1	
+case-047	blastx	2	0.0000001	0	null	1	

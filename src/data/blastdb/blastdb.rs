@@ -2,15 +2,102 @@
 //!
 //! Mirrors `diamond/src/data/blastdb/blastdb.cpp` and `blastdb.h`.
 
+use super::pal::{absolute_parts, path_bytes, raw_error};
 use crate::basic::value::{Letter, Loc, TaxId};
-use crate::data::blastdb::taxdmp::{read_names_dmp, read_nodes_dmp};
+use crate::data::blastdb::taxdmp::{
+    read_names_dmp_bytes_with_source_buffer_path, read_nodes_dmp_bytes_with_source_buffer_path,
+};
 use crate::data::blastdb::volume::{
-    build_title, BlastDefLine, BlastVolume, DbFilter, Pal, RawChunk, SequenceFileFlags,
+    build_title_bytes, BlastDefLine, BlastVolume, ByteBlastDefLine, DbFilter, Pal, RawChunk,
+    SequenceFileFlags,
 };
 use crate::data::taxonomy::Rank;
-use crate::util::system::{absolute_path, exists, PATH_SEPARATOR};
+use crate::util::io::source_c_path;
+#[cfg(test)]
+use crate::util::system::PATH_SEPARATOR;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+
+fn path_error(prefix: &[u8], path: &Path, suffix: &[u8]) -> std::io::Error {
+    let mut message = prefix.to_vec();
+    let bytes = match path_bytes(path) {
+        Ok(bytes) => bytes,
+        Err(error) => return error,
+    };
+    message.extend_from_slice(&bytes);
+    message.extend_from_slice(suffix);
+    raw_error(message)
+}
+
+/// TextInputFile's Source byte-line contract, including codec autodetection,
+/// one trailing CR removal, interior empty lines and an unterminated final line.
+fn read_accession_list_source(
+    file_name: &Path,
+    buffer_size: usize,
+) -> std::io::Result<HashMap<Vec<u8>, bool>> {
+    let mut input = crate::util::io::InputFile::with_source_profile_path(file_name, 0, buffer_size)
+        .map_err(std::io::Error::other)?
+        .into_deserializer();
+    let mut accessions = HashMap::new();
+    loop {
+        let mut line = Vec::new();
+        let terminated = input
+            .read_to(&mut line, b'\n')
+            .map_err(std::io::Error::other)?;
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.is_empty() && !terminated {
+            break;
+        }
+        accessions.insert(line, false);
+        if !terminated {
+            break;
+        }
+    }
+    input.close().map_err(std::io::Error::other)?;
+    Ok(accessions)
+}
+
+fn match_accession_bytes(
+    deflines: &[ByteBlastDefLine],
+    accessions: &mut HashMap<Vec<u8>, bool>,
+) -> bool {
+    for defline in deflines {
+        for seqid in &defline.seqids {
+            if let Some(found) = accessions.get_mut(&seqid.value) {
+                *found = true;
+                return true;
+            }
+            if seqid.version.is_some() || seqid.chain.is_some() {
+                let formatted = super::volume::format_seqid_bytes(seqid);
+                if let Some(found) = accessions.get_mut(&formatted) {
+                    *found = true;
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn check_missing_accessions(
+    accessions: &HashMap<Vec<u8>, bool>,
+    skip_missing: bool,
+) -> std::io::Result<()> {
+    if !skip_missing {
+        for (accession, found) in accessions {
+            if !found {
+                let mut message = b"Accession not found in database: ".to_vec();
+                message.extend_from_slice(accession);
+                message.extend_from_slice(b". Use --skip-missing-seqids to ignore.");
+                return Err(crate::util::io::RawDiagnosticError(message).into_io());
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlastDbConfig {
@@ -26,15 +113,15 @@ impl std::fmt::Debug for SqliteConnection {
 }
 
 impl SqliteConnection {
-    fn open_readonly(path: &str) -> Result<Self, String> {
-        Self::open(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    fn open_readonly(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::open(path.as_ref(), OpenFlags::SQLITE_OPEN_READ_ONLY)
     }
 
-    fn open(path: &str, flags: OpenFlags) -> Result<Self, String> {
-        if path.as_bytes().contains(&0) {
-            return Err("SQLite path contains a null byte".to_string());
+    fn open(path: &Path, flags: OpenFlags) -> Result<Self, String> {
+        if path.as_os_str().as_encoded_bytes().contains(&0) {
+            return Err("SQLite path contains a null byte".into());
         }
-        Connection::open_with_flags(path, flags)
+        Connection::open_with_flags(source_c_path(&(path)).as_ref(), flags)
             .map(Self)
             .map_err(|error| error.to_string())
     }
@@ -65,7 +152,7 @@ impl SqliteConnection {
     #[cfg(test)]
     fn create_test_database(path: &str) -> Result<(), String> {
         let connection = Self::open(
-            path,
+            Path::new(path),
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
         connection
@@ -110,18 +197,22 @@ impl SeqInfo {
 
 #[derive(Debug)]
 pub struct BlastDB {
-    file_name: String,
+    pub(crate) accession_spool:
+        Option<std::sync::Arc<crate::data::accession_spool::AccessionSpool>>,
+    file_name: PathBuf,
     pal: Pal,
     taxon_db: Option<SqliteConnection>,
     taxon_mapping: Vec<(u64, TaxId)>,
-    custom_ranks: BTreeMap<String, i32>,
+    taxon_mapping_sorted: bool,
+    custom_ranks: BTreeMap<Vec<u8>, i32>,
     rank_mapping: HashMap<TaxId, i32>,
     oid: u64,
     long_seqids: bool,
     flags: SequenceFileFlags,
     parent_cache: Vec<TaxId>,
-    extra_names: HashMap<TaxId, String>,
-    volumes: BTreeMap<u64, String>,
+    extra_names: HashMap<TaxId, Vec<u8>>,
+    volumes: BTreeMap<u64, PathBuf>,
+    io_errors: crate::util::io::IoErrorOwner,
     dict_oid: Vec<Vec<u64>>,
     volume: BlastVolume,
     raw_chunk_no: i32,
@@ -130,14 +221,40 @@ pub struct BlastDB {
 
 impl BlastDB {
     pub fn new(file_name: &str, flags: SequenceFileFlags) -> Result<Self, String> {
-        let pal = Pal::new(file_name)?;
-        let volume =
-            BlastVolume::new(&pal.volumes[0], 0, pal.oid_index[0], pal.oid_index[1], true)?;
+        Self::new_path(Path::new(file_name), flags).map_err(|e| e.to_string())
+    }
+    pub fn new_path(file_name: &Path, flags: SequenceFileFlags) -> std::io::Result<Self> {
+        Self::new_path_with_io_owner(file_name, flags, &crate::util::io::IoErrorOwner::default())
+    }
+    pub fn new_path_with_io_owner(
+        file_name: &Path,
+        flags: SequenceFileFlags,
+        errors: &crate::util::io::IoErrorOwner,
+    ) -> std::io::Result<Self> {
+        let result = Self::new_path_owned(file_name, flags, errors);
+        errors.finish(result)
+    }
+    fn new_path_owned(
+        file_name: &Path,
+        flags: SequenceFileFlags,
+        errors: &crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
+        let pal = errors.capture(Pal::new_path(file_name))?;
+        let volume = BlastVolume::new_path_owned(
+            &pal.volumes[0],
+            0,
+            pal.oid_index[0],
+            pal.oid_index[1],
+            true,
+            errors,
+        )?;
         let mut db = Self {
-            file_name: file_name.to_string(),
+            accession_spool: None,
+            file_name: file_name.to_path_buf(),
             pal,
             taxon_db: None,
             taxon_mapping: Vec::new(),
+            taxon_mapping_sorted: true,
             custom_ranks: BTreeMap::new(),
             rank_mapping: HashMap::new(),
             oid: 0,
@@ -146,6 +263,7 @@ impl BlastDB {
             parent_cache: Vec::new(),
             extra_names: HashMap::new(),
             volumes: BTreeMap::new(),
+            io_errors: errors.clone(),
             dict_oid: Vec::new(),
             volume,
             raw_chunk_no: 0,
@@ -165,12 +283,16 @@ impl BlastDB {
         if db.flags.contains(SequenceFileFlags::TAXON_MAPPING) {
             let flags_now = db.flags;
             for oid in 0..db.pal.sequence_count {
-                let deflines = db.deflines(oid, true, false, true)?;
-                for defline in deflines {
-                    if let Some(taxid) = defline.taxid {
-                        db.taxon_mapping.push((oid, taxid));
-                    }
-                }
+                let deflines = db.deflines_bytes(oid, true, false, true)?;
+                // Source's constructor obtains this mapping through
+                // RawChunk::decode (pin.cpp): one sorted set of taxids per
+                // OID, even when multiple deflines share the same taxid.
+                let taxids: BTreeSet<_> = deflines
+                    .into_iter()
+                    .filter_map(|defline| defline.taxid)
+                    .collect();
+                db.taxon_mapping
+                    .extend(taxids.into_iter().map(|taxid| (oid, taxid)));
             }
             db.flags = flags_now;
             db.flags &= !SequenceFileFlags::TAXON_MAPPING;
@@ -185,57 +307,64 @@ impl BlastDB {
             }
         }
 
-        let (dbdir, _dbfile) = absolute_path(file_name);
+        let (dbdir, _dbfile) = errors.capture(absolute_parts(file_name))?;
         if db.flags.contains(SequenceFileFlags::TAXON_RANKS) {
-            let file = format!("{dbdir}{PATH_SEPARATOR}nodes.dmp");
-            if !exists(&file) {
-                return Err(format!(
-                    "Taxonomy rank information (nodes.dmp) is missing in search path ({dbdir}). Download and extract this file in the database directory: https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/new_taxdump/new_taxdump.zip"
-                ));
+            let file = dbdir.join("nodes.dmp");
+            if !source_c_path(&file).exists() {
+                return errors.capture(Err(path_error(b"Taxonomy rank information (nodes.dmp) is missing in search path (",&dbdir,b"). Download and extract this file in the database directory: https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/new_taxdump/new_taxdump.zip")));
             }
             let mut next_rank = Rank::COUNT as i32;
-            read_nodes_dmp(&file, |taxid, _parent, rank| {
-                if let Some(p) = Rank::predefined(rank) {
-                    db.rank_mapping.insert(taxid, p as i32);
-                } else if let Some(&r) = db.custom_ranks.get(rank) {
-                    db.rank_mapping.insert(taxid, r);
-                } else {
-                    let r = next_rank;
-                    next_rank += 1;
-                    db.custom_ranks.insert(rank.to_string(), r);
-                    db.rank_mapping.insert(taxid, r);
-                }
-            })
-            .map_err(|e| e.to_string())?;
+            let result = read_nodes_dmp_bytes_with_source_buffer_path(
+                &file,
+                1 << 20,
+                |taxid, _parent, rank| {
+                    if let Some(p) = Rank::predefined_bytes(rank) {
+                        db.rank_mapping.insert(taxid, p as i32);
+                    } else if let Some(&r) = db.custom_ranks.get(rank) {
+                        db.rank_mapping.insert(taxid, r);
+                    } else {
+                        let r = next_rank;
+                        next_rank += 1;
+                        db.custom_ranks.insert(rank.to_vec(), r);
+                        db.rank_mapping.insert(taxid, r);
+                    }
+                },
+            );
+            errors.capture(result)?;
         }
 
         if db.flags.contains(SequenceFileFlags::TAXON_NODES) {
-            let dbpath = format!("{dbdir}{PATH_SEPARATOR}taxonomy4blast.sqlite3");
-            if !exists(&dbpath) {
-                return Err(format!(
-                    "Taxonomy database (taxonomy4blast.sqlite3) file not found in path: {dbpath}. Make sure that the database was downloaded correctly."
-                ));
+            let dbpath = dbdir.join("taxonomy4blast.sqlite3");
+            if !source_c_path(&dbpath).exists() {
+                return errors.capture(Err(path_error(
+                    b"Taxonomy database (taxonomy4blast.sqlite3) file not found in path: ",
+                    &dbpath,
+                    b". Make sure that the database was downloaded correctly.",
+                )));
             }
-            let connection = SqliteConnection::open_readonly(&dbpath)
-                .map_err(|error| format!("Failed to open database {dbpath}: {error}"))?;
+            let connection =
+                errors.capture(SqliteConnection::open_readonly(&dbpath).map_err(|error| {
+                    path_error(
+                        b"Failed to open database ",
+                        &dbpath,
+                        format!(": {error}").as_bytes(),
+                    )
+                }))?;
             let max_id = connection.max_taxid()?;
             db.parent_cache = vec![TaxId::MIN; max_id as usize + 1];
             db.taxon_db = Some(connection);
         }
 
         if db.flags.contains(SequenceFileFlags::TAXON_SCIENTIFIC_NAMES) {
-            let file = format!("{dbdir}{PATH_SEPARATOR}names.dmp");
-            if !exists(&file) {
-                return Err(format!(
-                    "Taxonomy names information (names.dmp) is missing in search path ({dbdir}). Download and extract this file in the database directory: https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/new_taxdump/new_taxdump.zip"
-                ));
+            let file = dbdir.join("names.dmp");
+            if !source_c_path(&file).exists() {
+                return errors.capture(Err(path_error(b"Taxonomy names information (names.dmp) is missing in search path (",&dbdir,b"). Download and extract this file in the database directory: https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/new_taxdump/new_taxdump.zip")));
             }
-            read_names_dmp(&file, |taxid, name| {
-                db.extra_names
-                    .entry(taxid)
-                    .or_insert_with(|| name.to_string());
-            })
-            .map_err(|e| e.to_string())?;
+            let result =
+                read_names_dmp_bytes_with_source_buffer_path(&file, 1 << 20, |taxid, name| {
+                    db.extra_names.entry(taxid).or_insert_with(|| name.to_vec());
+                });
+            errors.capture(result)?;
         }
 
         Ok(db)
@@ -253,6 +382,20 @@ impl BlastDB {
         Ok(db)
     }
 
+    pub fn new_path_with_config(
+        file_name: &Path,
+        flags: SequenceFileFlags,
+        config: BlastDbConfig,
+    ) -> std::io::Result<Self> {
+        let db = Self::new_path(file_name, flags)?;
+        if config.multiprocessing {
+            return Err(std::io::Error::other(
+                "Multiprocessing mode is not compatible with BLAST databases.",
+            ));
+        }
+        Ok(db)
+    }
+
     pub fn file_count(&self) -> i64 {
         1
     }
@@ -262,20 +405,27 @@ impl BlastDB {
             return Ok(());
         }
         let idx = self.pal.volume(oid) as usize;
-        self.volume = BlastVolume::new(
+        self.volume = BlastVolume::new_path_owned(
             &self.pal.volumes[idx],
             idx as i32,
             self.pal.oid_index[idx],
             self.pal.oid_index[idx + 1],
             true,
+            &self.io_errors,
         )?;
         Ok(())
     }
 
     pub fn print_info(&self) -> String {
+        String::from_utf8(
+            self.print_info_bytes()
+                .expect("Source name encoding failed; use print_info_bytes"),
+        )
+        .expect("BLAST database name is not UTF-8; use print_info_bytes")
+    }
+    pub fn print_info_bytes(&self) -> std::io::Result<Vec<u8>> {
         let mut out = format!(
-            "Database: {} (type: BLAST database, volumes: {}, sequences: {}, letters: {})\n",
-            self.file_name,
+            " (type: BLAST database, volumes: {}, sequences: {}, letters: {})\n",
             self.pal.volumes.len(),
             self.sequence_count(),
             self.letters()
@@ -307,7 +457,10 @@ impl BlastDB {
                 self.extra_names.len()
             ));
         }
-        out
+        let mut bytes = b"Database: ".to_vec();
+        bytes.extend_from_slice(&path_bytes(&self.file_name)?);
+        bytes.extend_from_slice(out.as_bytes());
+        Ok(bytes)
     }
 
     pub fn init_seqinfo_access(&mut self) {}
@@ -398,7 +551,17 @@ impl BlastDB {
         all: bool,
         full_titles: bool,
     ) -> Result<String, String> {
-        self.fetch_seqid(oid as u64, all, full_titles)
+        String::from_utf8(self.read_id_data_bytes(oid, all, full_titles)?)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn read_id_data_bytes(
+        &mut self,
+        oid: i64,
+        all: bool,
+        full_titles: bool,
+    ) -> Result<Vec<u8>, String> {
+        self.fetch_seqid_bytes(oid as u64, all, full_titles)
     }
 
     pub fn deflines(
@@ -408,9 +571,23 @@ impl BlastDB {
         full_titles: bool,
         taxids: bool,
     ) -> Result<Vec<BlastDefLine>, String> {
+        self.deflines_bytes(oid, all, full_titles, taxids)?
+            .into_iter()
+            .map(ByteBlastDefLine::try_into_string)
+            .collect()
+    }
+
+    pub fn deflines_bytes(
+        &mut self,
+        oid: u64,
+        all: bool,
+        full_titles: bool,
+        taxids: bool,
+    ) -> Result<Vec<ByteBlastDefLine>, String> {
         self.open_volume(oid)?;
         let volume_oid = (oid - self.volume.begin) as u32;
-        self.volume.deflines(volume_oid, all, full_titles, taxids)
+        self.volume
+            .deflines_bytes(volume_oid, all, full_titles, taxids)
     }
 
     pub fn skip_id_data(&mut self) {}
@@ -421,26 +598,74 @@ impl BlastDB {
         all: bool,
         full_titles: bool,
     ) -> Result<String, String> {
+        String::from_utf8(self.fetch_seqid_bytes(oid, all, full_titles)?)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn fetch_seqid_bytes(
+        &mut self,
+        oid: u64,
+        all: bool,
+        full_titles: bool,
+    ) -> Result<Vec<u8>, String> {
         self.open_volume(oid)?;
         let taxids = self.flags.contains(SequenceFileFlags::TAXON_MAPPING);
         let volume_oid = (oid - self.volume.begin) as u32;
-        let deflines = self.volume.deflines(volume_oid, all, full_titles, taxids)?;
+        let deflines = self
+            .volume
+            .deflines_bytes(volume_oid, all, full_titles, taxids)?;
         if taxids && !self.taxon_mapping.iter().any(|&(o, _)| o == oid) {
             for i in &deflines {
                 if let Some(taxid) = i.taxid {
-                    self.taxon_mapping.push((oid, taxid));
+                    self.add_taxid_mapping(&[(oid, taxid)]);
                 }
             }
         }
-        Ok(build_title(&deflines, "\x01", all))
+        Ok(build_title_bytes(&deflines, b"\x01", all))
     }
 
     pub fn add_taxid_mapping(&mut self, taxids: &[(u64, TaxId)]) {
+        if let (Some(last), Some(first)) = (self.taxon_mapping.last(), taxids.first()) {
+            self.taxon_mapping_sorted &= last.0 <= first.0;
+        }
+        self.taxon_mapping_sorted &= taxids.windows(2).all(|pair| pair[0].0 <= pair[1].0);
         self.taxon_mapping.extend_from_slice(taxids);
     }
 
+    /// Stream defline text without populating the optional taxonomy cache.
+    /// Accession-list finalization needs titles only, even when the search
+    /// owner also has TAXON_MAPPING enabled for actual matched subjects.
+    pub fn title_only(&mut self, oid: u64, all: bool, full_titles: bool) -> Result<String, String> {
+        String::from_utf8(self.title_only_bytes(oid, all, full_titles)?)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn title_only_bytes(
+        &mut self,
+        oid: u64,
+        all: bool,
+        full_titles: bool,
+    ) -> Result<Vec<u8>, String> {
+        self.open_volume(oid)?;
+        let volume_oid = (oid - self.volume.begin) as u32;
+        let deflines = self
+            .volume
+            .deflines_bytes(volume_oid, all, full_titles, false)?;
+        Ok(build_title_bytes(&deflines, b"\x01", all))
+    }
+
     pub fn seqid(&mut self, oid: u64, all: bool, full_titles: bool) -> Result<String, String> {
-        self.fetch_seqid(oid, all, full_titles)
+        String::from_utf8(self.seqid_bytes(oid, all, full_titles)?)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn seqid_bytes(
+        &mut self,
+        oid: u64,
+        all: bool,
+        full_titles: bool,
+    ) -> Result<Vec<u8>, String> {
+        self.fetch_seqid_bytes(oid, all, full_titles)
     }
 
     pub fn dict_seq(&mut self, dict_id: i64, _ref_block: usize) -> Result<Vec<Letter>, String> {
@@ -472,11 +697,20 @@ impl BlastDB {
     }
 
     pub fn read_seq(&mut self) -> Result<(Vec<Letter>, String), String> {
+        let (sequence, title) = self.read_seq_bytes()?;
+        Ok((
+            sequence,
+            String::from_utf8(title).map_err(|error| error.to_string())?,
+        ))
+    }
+
+    /// Source deflines are byte strings; this is the canonical sequential reader.
+    pub fn read_seq_bytes(&mut self) -> Result<(Vec<Letter>, Vec<u8>), String> {
         self.open_volume(self.oid)?;
         let volume_oid = (self.oid - self.volume.begin) as u32;
         let seq = self.volume.sequence(volume_oid)?;
-        let deflines = self.volume.deflines(volume_oid, true, true, false)?;
-        let id = build_title(&deflines, " >", true);
+        let deflines = self.volume.deflines_bytes(volume_oid, true, true, false)?;
+        let id = build_title_bytes(&deflines, b" >", true);
         self.oid += 1;
         Ok((seq, id))
     }
@@ -526,10 +760,16 @@ impl BlastDB {
         file_name: &str,
         skip_missing_seqids: bool,
     ) -> Result<DbFilter, String> {
+        self.filter_by_accession_path(Path::new(file_name), skip_missing_seqids)
+    }
+    pub fn filter_by_accession_path(
+        &mut self,
+        file_name: &Path,
+        skip_missing_seqids: bool,
+    ) -> Result<DbFilter, String> {
         let mut v = DbFilter::new(self.sequence_count() as usize);
-        let text = std::fs::read_to_string(file_name).map_err(|e| e.to_string())?;
-        let mut accs: HashMap<String, bool> =
-            text.lines().map(|line| (line.to_string(), false)).collect();
+        let mut source_accessions =
+            read_accession_list_source(file_name, 64 << 20).map_err(|error| error.to_string())?;
         self.set_seqinfo_ptr(0)?;
         loop {
             let chunk = self.raw_chunk(
@@ -538,10 +778,10 @@ impl BlastDB {
                     | SequenceFileFlags::TITLES
                     | SequenceFileFlags::FULL_TITLES,
             )?;
-            let pkg = chunk.decode(
+            let pkg = chunk.decode_bytes(
                 SequenceFileFlags::SEQS | SequenceFileFlags::FULL_TITLES,
                 None,
-                Some(&mut accs),
+                Some(&mut source_accessions),
             )?;
             for oid in pkg.oids {
                 if let Some(slot) = v.oid_filter.get_mut(oid as usize) {
@@ -554,27 +794,302 @@ impl BlastDB {
             }
         }
 
-        if !skip_missing_seqids {
-            for (acc, found) in &accs {
-                if !found {
-                    return Err(format!(
-                        "Accession not found in database: {acc}. Use --skip-missing-seqids to ignore."
-                    ));
-                }
-            }
-        }
+        check_missing_accessions(&source_accessions, skip_missing_seqids)
+            .map_err(|error| error.to_string())?;
         Ok(v)
     }
 
+    /// Decode one global OID without changing the sequential logical cursor.
+    /// The per-volume decoder seeks independently when random ranking reads
+    /// revisit an earlier volume, retaining bounded sequence ownership.
+    pub fn record_at(&mut self, oid: u64) -> Result<(Vec<Letter>, String), String> {
+        let (sequence, title) = self.record_at_bytes(oid)?;
+        Ok((
+            sequence,
+            String::from_utf8(title).map_err(|error| error.to_string())?,
+        ))
+    }
+
+    pub fn record_at_bytes(&mut self, oid: u64) -> Result<(Vec<Letter>, Vec<u8>), String> {
+        if oid >= self.sequence_count() {
+            return Err("OID exceeds number of sequences in database".to_owned());
+        }
+        let mut sequence = Vec::new();
+        self.seq_data(oid as usize, &mut sequence)?;
+        let title = self.seqid_bytes(oid, true, true)?;
+        Ok((sequence, title))
+    }
+
+    /// Accession filtering only needs deflines and indexed lengths. Avoid the
+    /// old whole raw-sequence chunk allocation while constructing a PAL mask.
+    pub fn filter_by_accession_metadata(
+        &mut self,
+        file_name: &str,
+        skip_missing_seqids: bool,
+    ) -> Result<DbFilter, String> {
+        self.filter_by_accession_metadata_io(file_name, skip_missing_seqids, 64 << 20)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn filter_by_accession_metadata_io(
+        &mut self,
+        file_name: &str,
+        skip_missing_seqids: bool,
+        buffer_size: usize,
+    ) -> std::io::Result<DbFilter> {
+        self.filter_by_accession_metadata_path_io(
+            Path::new(file_name),
+            skip_missing_seqids,
+            buffer_size,
+        )
+    }
+    pub fn filter_by_accession_metadata_path_io(
+        &mut self,
+        file_name: &Path,
+        skip_missing_seqids: bool,
+        buffer_size: usize,
+    ) -> std::io::Result<DbFilter> {
+        let mut accessions = read_accession_list_source(file_name, buffer_size)?;
+        let mut filter = DbFilter::new(self.sequence_count() as usize);
+        for oid in 0..self.sequence_count() {
+            let deflines = self
+                .deflines_bytes(
+                    oid,
+                    self.flags.contains(SequenceFileFlags::ALL_SEQIDS),
+                    self.flags.contains(SequenceFileFlags::FULL_TITLES),
+                    false,
+                )
+                .map_err(std::io::Error::other)?;
+            if match_accession_bytes(&deflines, &mut accessions) {
+                filter.oid_filter[oid as usize] = true;
+                filter.letter_count += self
+                    .seq_length(oid as usize)
+                    .map_err(std::io::Error::other)?
+                    .max(0) as u64;
+            }
+        }
+        check_missing_accessions(&accessions, skip_missing_seqids)?;
+        Ok(filter)
+    }
+
+    /// Apply the alias filters in the same order as Search::run. SEQIDLIST
+    /// replaces TAXIDLIST when both occur in the alias, as in the source.
+    pub fn alias_filter(&mut self) -> Result<Option<DbFilter>, String> {
+        self.search_filter("", "", "", false)
+    }
+
+    /// Search::run filter precedence, with bounded metadata-only access.
+    pub fn search_filter(
+        &mut self,
+        include: &str,
+        exclude: &str,
+        seqidlist: &str,
+        skip_missing: bool,
+    ) -> Result<Option<DbFilter>, String> {
+        self.search_filter_io(include, exclude, seqidlist, skip_missing, 64 << 20)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Actual search invocation's file buffer and fatal I/O metadata owner.
+    pub fn search_filter_io(
+        &mut self,
+        include: &str,
+        exclude: &str,
+        seqidlist: &str,
+        skip_missing: bool,
+        buffer_size: usize,
+    ) -> std::io::Result<Option<DbFilter>> {
+        self.search_filter_path_io(
+            include,
+            exclude,
+            Path::new(seqidlist),
+            skip_missing,
+            buffer_size,
+        )
+    }
+    pub fn search_filter_path_io(
+        &mut self,
+        include: &str,
+        exclude: &str,
+        seqidlist: &Path,
+        skip_missing: bool,
+        buffer_size: usize,
+    ) -> std::io::Result<Option<DbFilter>> {
+        self.search_filter_bytes_path_io(
+            include.as_bytes(),
+            exclude.as_bytes(),
+            seqidlist,
+            skip_missing,
+            buffer_size,
+        )
+    }
+    pub fn search_filter_bytes_path_io(
+        &mut self,
+        include: &[u8],
+        exclude: &[u8],
+        seqidlist: &Path,
+        skip_missing: bool,
+        buffer_size: usize,
+    ) -> std::io::Result<Option<DbFilter>> {
+        let errors = self.io_errors.clone();
+        let result = self.search_filter_owned(
+            include,
+            exclude,
+            seqidlist,
+            skip_missing,
+            buffer_size,
+            &errors,
+        );
+        errors.finish(result)
+    }
+
+    fn search_filter_owned(
+        &mut self,
+        include: &[u8],
+        exclude: &[u8],
+        seqidlist: &Path,
+        skip_missing: bool,
+        buffer_size: usize,
+        errors: &crate::util::io::IoErrorOwner,
+    ) -> Result<Option<DbFilter>, String> {
+        if !include.is_empty() && !exclude.is_empty() {
+            return Err("Options --taxonlist and --taxon-exclude are mutually exclusive.".into());
+        }
+        let explicit_taxa = !include.is_empty() || !exclude.is_empty();
+        let alias_accessions = self
+            .pal
+            .metadata
+            .get("SEQIDLIST")
+            .map(|value| crate::util::io::source_bytes_os(value).map(PathBuf::from))
+            .transpose();
+        let alias_accessions = errors.capture(alias_accessions.map_err(std::io::Error::other))?;
+        let accessions = if seqidlist.as_os_str().is_empty() {
+            alias_accessions
+        } else {
+            Some(seqidlist.to_owned())
+        };
+        let taxonomy = if explicit_taxa {
+            Some((
+                if include.is_empty() { exclude } else { include }.to_owned(),
+                b',',
+                !exclude.is_empty(),
+            ))
+        } else if let Some(path) = self.pal.metadata.get("TAXIDLIST") {
+            Some((
+                {
+                    let path = errors.capture(
+                        crate::util::io::source_bytes_os(path)
+                            .map(PathBuf::from)
+                            .map_err(std::io::Error::other),
+                    )?;
+                    let mut input = errors
+                        .capture(std::fs::File::open(source_c_path(&path).as_ref()).map_err(
+                            |_| path_error(b"Cannot open TAXIDLIST file: ", &path, b""),
+                        ))?;
+                    let mut bytes = Vec::new();
+                    // Source checks the ifstream constructor, then streams its
+                    // rdbuf without checking later read failures.
+                    let _ = std::io::Read::read_to_end(&mut input, &mut bytes);
+                    bytes
+                },
+                b'\n',
+                false,
+            ))
+        } else {
+            None
+        };
+        let mut filter = None;
+        if let Some((values, delimiter, exclude)) = taxonomy {
+            // The generic taxonomy predicate uses immutable access; the source
+            // parent lookup fills a cache, so keep that mutation scoped here.
+            struct Access<'a>(std::cell::RefCell<&'a mut BlastDB>);
+            impl crate::data::sequence_file::TaxonomyAccess for Access<'_> {
+                fn parent(&self, taxid: TaxId) -> TaxId {
+                    self.0.borrow_mut().get_parent(taxid)
+                }
+                fn rank(&self, taxid: TaxId) -> i32 {
+                    self.0.borrow().rank(taxid)
+                }
+                fn max_taxid(&self) -> TaxId {
+                    self.0.borrow().max_taxid()
+                }
+            }
+            let count = self.sequence_count();
+            let access = Access(std::cell::RefCell::new(&mut *self));
+            filter = Some(crate::data::sequence_file::filter_by_taxonomy_bytes(
+                &access,
+                &values,
+                delimiter,
+                exclude,
+                count,
+                |oid| Ok(access.0.borrow().taxids(oid as usize)),
+                |oid| access.0.borrow_mut().seq_length(oid as usize),
+            )?);
+        }
+        if !seqidlist.as_os_str().is_empty() && self.pal.metadata.contains_key("SEQIDLIST") {
+            return Err("Using --seqidlist on already filtered BLAST alias database.".into());
+        }
+        if let Some(path) = accessions {
+            if explicit_taxa {
+                return Err("--seqidlist is not compatible with taxonomy filtering.".into());
+            }
+            filter = Some(errors.capture(self.filter_by_accession_metadata_path_io(
+                &path,
+                skip_missing,
+                buffer_size,
+            ))?);
+        }
+        Ok(filter)
+    }
+
+    pub fn file_path(&self) -> &Path {
+        &self.file_name
+    }
+    pub fn try_file_name(&self) -> std::io::Result<String> {
+        self.file_name
+            .to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| std::io::Error::other("BLAST database name is not UTF-8; use file_path"))
+    }
     pub fn file_name(&self) -> String {
-        self.file_name.clone()
+        self.try_file_name()
+            .expect("BLAST database name is not UTF-8; use file_path or try_file_name")
+    }
+    pub fn source_io<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> std::io::Result<T> {
+        let errors = self.io_errors.clone();
+        let result = f(self);
+        errors.finish(result)
+    }
+    pub fn record_at_bytes_io(&mut self, oid: u64) -> std::io::Result<(Vec<Letter>, Vec<u8>)> {
+        self.source_io(|db| db.record_at_bytes(oid))
     }
 
     pub fn taxids(&self, oid: usize) -> Vec<TaxId> {
-        self.taxon_mapping
-            .iter()
-            .filter_map(|&(o, t)| if o == oid as u64 { Some(t) } else { None })
-            .collect()
+        let mut taxids: Vec<_> = if self.taxon_mapping_sorted {
+            let begin = self
+                .taxon_mapping
+                .partition_point(|&(entry, _)| entry < oid as u64);
+            self.taxon_mapping[begin..]
+                .iter()
+                .take_while(|&&(entry, _)| entry == oid as u64)
+                .map(|&(_, taxid)| taxid)
+                .collect()
+        } else {
+            // Explicit external mappings may arrive in arbitrary OID order.
+            self.taxon_mapping
+                .iter()
+                .filter_map(|&(entry, taxid)| (entry == oid as u64).then_some(taxid))
+                .collect()
+        };
+        // The immutable reference oracle uses GNU libstdc++ 11.4:
+        // unordered_multimap::emplace without a hint prepends equivalent keys,
+        // and rehash preserves their relative order. The vector above stores
+        // insertion order; expose the same per-OID iteration order as Source.
+        taxids.reverse();
+        taxids
     }
 
     pub fn max_taxid(&self) -> TaxId {
@@ -606,10 +1121,20 @@ impl BlastDB {
     }
 
     pub fn taxon_scientific_name(&self, taxid: TaxId) -> String {
+        self.try_taxon_scientific_name(taxid)
+            .expect("Raw taxonomy name is not UTF-8; use taxon_scientific_name_bytes")
+    }
+    pub fn try_taxon_scientific_name(
+        &self,
+        taxid: TaxId,
+    ) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.taxon_scientific_name_bytes(taxid))
+    }
+    pub fn taxon_scientific_name_bytes(&self, taxid: TaxId) -> Vec<u8> {
         self.extra_names
             .get(&taxid)
             .cloned()
-            .unwrap_or_else(|| taxid.to_string())
+            .unwrap_or_else(|| taxid.to_string().into_bytes())
     }
 
     pub fn seq_data(&mut self, oid: usize, dst: &mut Vec<Letter>) -> Result<(), String> {
@@ -636,6 +1161,12 @@ impl BlastDB {
         }
     }
 
+    pub fn accession_to_oid_bytes(&self, acc: &[u8]) -> std::io::Result<Vec<u64>> {
+        let mut message = b"Accession not found in database: ".to_vec();
+        message.extend_from_slice(acc);
+        Err(crate::util::io::RawDiagnosticError(message).into_io())
+    }
+
     pub fn accession_to_oid(&self, acc: &str) -> Result<Vec<u64>, String> {
         Err(format!("Accession not found in database: {acc}"))
     }
@@ -660,7 +1191,7 @@ impl BlastDB {
         self.long_seqids
     }
 
-    pub fn volumes(&self) -> &BTreeMap<u64, String> {
+    pub fn volumes(&self) -> &BTreeMap<u64, PathBuf> {
         &self.volumes
     }
 
@@ -703,9 +1234,13 @@ mod tests {
     }
 
     fn sample_header(title: &str, acc: &str, version: u16, taxid: u16) -> Vec<u8> {
+        sample_header_bytes(title.as_bytes(), acc.as_bytes(), version, taxid)
+    }
+
+    fn sample_header_bytes(title: &[u8], acc: &[u8], version: u16, taxid: u16) -> Vec<u8> {
         let mut seqid_inner = Vec::new();
         seqid_inner.extend_from_slice(&[0xa1, (2 + acc.len()) as u8, 0x1a, acc.len() as u8]);
-        seqid_inner.extend_from_slice(acc.as_bytes());
+        seqid_inner.extend_from_slice(acc);
         seqid_inner.extend_from_slice(&[0xa3, 0x04, 0x02, 0x02]);
         seqid_inner.extend_from_slice(&version.to_be_bytes());
 
@@ -719,7 +1254,7 @@ mod tests {
 
         let mut defline = Vec::new();
         defline.extend_from_slice(&[0xa0, (2 + title.len()) as u8, 0x1a, title.len() as u8]);
-        defline.extend_from_slice(title.as_bytes());
+        defline.extend_from_slice(title);
         defline.extend_from_slice(&[0xa1, seqid_wrap.len() as u8]);
         defline.extend_from_slice(&seqid_wrap);
         defline.extend_from_slice(&[0xa2, 0x04, 0x02, 0x02]);
@@ -774,6 +1309,53 @@ mod tests {
         ));
         std::fs::create_dir(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_paths_survive_pal_volume_suffixes_accession_filter_and_diagnostics() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = temp_dir("raw-path");
+        let prefix = dir.join(std::ffi::OsString::from_vec(b"vol\xff".to_vec()));
+        let header = sample_header("title", "ACC", 1, 7);
+        write_volume_files(
+            &prefix,
+            1,
+            &[0, header.len() as u32],
+            &[0, 4],
+            &header,
+            &[0, 1, 2, 0],
+        );
+        let alias = dir.join(std::ffi::OsString::from_vec(b"alias\xfe.pal".to_vec()));
+        let ids = dir.join(std::ffi::OsString::from_vec(b"ids\xfd".to_vec()));
+        std::fs::write(&ids, b"ACC.1\n").unwrap();
+        std::fs::write(
+            &alias,
+            b"TITLE raw\xfc\nDBLIST vol\xff\nSEQIDLIST ids\xfd\n",
+        )
+        .unwrap();
+        let mut db = BlastDB::new_path(&alias, SequenceFileFlags::ALL).unwrap();
+        assert_eq!(db.file_path(), alias);
+        assert_eq!(db.pal.volumes, vec![prefix]);
+        assert_eq!(db.pal.metadata["TITLE"], b"raw\xfc");
+        assert_eq!(db.record_at_bytes_io(0).unwrap().0, vec![0, 20]);
+        let filter = db
+            .search_filter_bytes_path_io(b"", b"", Path::new(""), false, 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filter.oid_filter, vec![true]);
+        drop(db);
+        let missing = dir.join(std::ffi::OsString::from_vec(b"missing\xfb".to_vec()));
+        let error = BlastDB::new_path(&missing, SequenceFileFlags::NONE).unwrap_err();
+        let diagnostic = crate::util::io::RawDiagnosticError::find(&error).unwrap();
+        let mut expected = b"Error opening file ".to_vec();
+        expected.extend_from_slice(
+            &path_bytes(&super::super::pal::append_suffix(&missing, ".phr")).unwrap(),
+        );
+        expected.extend_from_slice(b". ");
+        assert!(diagnostic.starts_with(&expected));
+        assert!(crate::util::io::file_open_error::find(&error).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1024,6 +1606,53 @@ mod tests {
     }
 
     #[test]
+    fn opaque_deflines_survive_indexed_sequential_and_chunk_readers() {
+        // Source phr.cpp assigns BER bytes directly to std::string. In
+        // particular, stored strings preserve NUL; only const-char delimiters
+        // in build_title use C-string termination.
+        let dir = temp_dir("raw-deflines");
+        let prefix = dir.join("db");
+        let first = sample_header_bytes(b"description\xff\0tail", b"ACC\x80", 1, 7);
+        let second = sample_header_bytes(b"second\xfe", b"ALT\xff", 2, 9);
+        let mut header = vec![0x30, (first.len() + second.len() - 4) as u8];
+        header.extend_from_slice(&first[2..]);
+        header.extend_from_slice(&second[2..]);
+        write_volume_files(
+            &prefix,
+            1,
+            &[0, header.len() as u32],
+            &[0, 4],
+            &header,
+            &[0, 1, 2, 0],
+        );
+        let mut db = BlastDB::new(prefix.to_str().unwrap(), SequenceFileFlags::NONE).unwrap();
+        let expected = b"ACC\x80.1 description\xff\0tail\x01ALT\xff.2 second\xfe";
+        assert_eq!(db.seqid_bytes(0, true, true).unwrap(), expected);
+        assert_eq!(db.title_only_bytes(0, true, true).unwrap(), expected);
+        assert_eq!(db.record_at_bytes(0).unwrap().1, expected);
+        assert!(db.seqid(0, true, true).is_err());
+        assert_eq!(
+            db.read_seq_bytes().unwrap().1,
+            b"ACC\x80.1 description\xff\0tail >ALT\xff.2 second\xfe"
+        );
+        db.set_seqinfo_ptr(0).unwrap();
+        let flags = SequenceFileFlags::SEQS
+            | SequenceFileFlags::TITLES
+            | SequenceFileFlags::FULL_TITLES
+            | SequenceFileFlags::ALL_SEQIDS
+            | SequenceFileFlags::TAXON_MAPPING;
+        let chunk = db.raw_chunk(100, flags).unwrap();
+        let mut wanted = HashMap::from([(b"ALT\xff.2".to_vec(), false)]);
+        let decoded = chunk.decode_bytes(flags, None, Some(&mut wanted)).unwrap();
+        assert!(wanted[b"ALT\xff.2".as_slice()]);
+        assert_eq!(decoded.oids, vec![0]);
+        assert_eq!(decoded.ids.get(0), expected);
+        assert_eq!(decoded.taxids, vec![(0, 7), (0, 9)]);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn test_blastdb_read_seq_seqinfo_raw_chunk_and_filter() {
         let dir = temp_dir("basic");
         let prefix = dir.join("db");
@@ -1263,6 +1892,118 @@ mod tests {
         }
         std::fs::remove_file(pal).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn source_accession_list_reader_decodes_gzip_and_preserves_byte_lines() {
+        let dir = temp_dir("accession-byte-lines");
+        let path = dir.join("ids.gz");
+        let mut output = flate2::write::GzEncoder::new(
+            std::fs::File::create(&path).unwrap(),
+            flate2::Compression::default(),
+        );
+        output.write_all(b"ONE.1\r\n\xff\r\n\nTWO.1").unwrap();
+        output.finish().unwrap();
+        let entries = read_accession_list_source(&path, 64).unwrap();
+        assert_eq!(entries.len(), 4);
+        for key in [b"ONE.1".as_slice(), b"\xff", b"", b"TWO.1"] {
+            assert_eq!(entries.get(key), Some(&false));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_accession_filters_use_source_codecs_and_retain_typed_errors() {
+        let dir = temp_dir("accession-source-io");
+        let prefix = dir.join("db");
+        let first = sample_header("", "ONE", 1, 7);
+        let mut headers = first.clone();
+        headers.extend_from_slice(&sample_header("", "TWO", 1, 9));
+        write_volume_files(
+            &prefix,
+            2,
+            &[0, first.len() as u32, headers.len() as u32],
+            &[0, 4, 8],
+            &headers,
+            &[0, 1, 2, 0, 0, 3, 4, 0],
+        );
+        let mut database = BlastDB::new(prefix.to_str().unwrap(), SequenceFileFlags::NONE).unwrap();
+        let ids = dir.join("ids.gz");
+        let mut output = flate2::write::GzEncoder::new(
+            std::fs::File::create(&ids).unwrap(),
+            flate2::Compression::default(),
+        );
+        output.write_all(b"ONE.1\r\nTWO.1").unwrap();
+        output.finish().unwrap();
+        let filter = database
+            .search_filter_io("", "", ids.to_str().unwrap(), false, 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filter.oid_filter, [true, true]);
+        assert_eq!(filter.letter_count, 6);
+
+        let missing = dir.join("missing.txt");
+        let error = database
+            .search_filter_io("", "", missing.to_str().unwrap(), false, 64)
+            .unwrap_err();
+        assert_eq!(
+            crate::util::io::file_open_error::find(&error).unwrap().path,
+            missing.to_string_lossy()
+        );
+
+        let bytes = dir.join("byte-ids");
+        std::fs::write(&bytes, b"\xff\r\n").unwrap();
+        let error = database
+            .search_filter_io("", "", bytes.to_str().unwrap(), false, 64)
+            .unwrap_err();
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error).unwrap(),
+            b"Accession not found in database: \xff. Use --skip-missing-seqids to ignore."
+        );
+        let filter = database
+            .search_filter_io("", "", bytes.to_str().unwrap(), true, 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(filter.oid_filter, [false, false]);
+        drop(database);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn early_taxonomy_mapping_deduplicates_deflines_before_gnu_group_order() {
+        let dir = temp_dir("early-taxonomy-deflines");
+        let prefix = dir.join("db");
+        let mut first = vec![0x30, 0];
+        for (accession, taxid) in [("A", 9), ("B", 7), ("C", 9)] {
+            let header = sample_header("", accession, 1, taxid);
+            first.extend_from_slice(&header[2..]);
+        }
+        assert!(first.len() - 2 < 128);
+        first[1] = (first.len() - 2) as u8;
+        let mut headers = first.clone();
+        headers.extend_from_slice(&sample_header("", "D", 1, 9));
+        write_volume_files(
+            &prefix,
+            2,
+            &[0, first.len() as u32, headers.len() as u32],
+            &[0, 4, 8],
+            &headers,
+            &[0, 1, 2, 0, 0, 3, 4, 0],
+        );
+        let mut database =
+            BlastDB::new(prefix.to_str().unwrap(), SequenceFileFlags::TAXON_MAPPING).unwrap();
+        // RawChunk's sorted set inserts 7 then 9; GNU unordered_multimap's
+        // equal-key iteration returns the most recently inserted taxid first.
+        assert_eq!(database.taxids(0), [9, 7]);
+        assert_eq!(database.taxids(1), [9]);
+        assert!(!database.flags().contains(SequenceFileFlags::TAXON_MAPPING));
+        // Explicit additions use the same insertion policy, including actual
+        // duplicate pairs: Source only deduplicates within decoded packages.
+        database.add_taxid_mapping(&[(0, 5), (1, 4), (0, 9)]);
+        assert_eq!(database.taxids(0), [9, 5, 9, 7]);
+        assert_eq!(database.taxids(1), [4, 9]);
+        drop(database);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

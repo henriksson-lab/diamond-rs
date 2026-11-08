@@ -20,3 +20,7 @@ pub mod sequence_set;
 pub mod taxon_list;
 pub mod taxonomy;
 pub mod taxonomy_nodes;
+
+pub mod persistent_dictionary;
+
+pub(crate) mod accession_spool;

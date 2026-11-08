@@ -66,8 +66,39 @@ pub trait HeartbeatConfig {
     fn queue_len(&self, queue: usize) -> usize;
 }
 
+/// Byte-preserving Source title interface. The existing String interface
+/// remains a convenience adapter into this same worker implementation.
+pub trait HeartbeatByteConfig {
+    fn query_title_bytes(&self, query: usize) -> &[u8];
+    fn queue_len(&self, queue: usize) -> usize;
+}
+impl<T: HeartbeatConfig> HeartbeatByteConfig for T {
+    fn query_title_bytes(&self, query: usize) -> &[u8] {
+        self.query_title(query).as_bytes()
+    }
+    fn queue_len(&self, queue: usize) -> usize {
+        HeartbeatConfig::queue_len(self, queue)
+    }
+}
+
 /// Matches C++ `heartbeat_worker(qend, output_sink, cfg, verbose_stream)`.
 pub fn heartbeat_worker<S, C, W, F>(
+    qend: usize,
+    output_sink: &mut S,
+    cfg: &C,
+    verbose_stream: &mut W,
+    sleep_for: F,
+) -> io::Result<()>
+where
+    S: HeartbeatOutputSink,
+    C: HeartbeatConfig,
+    W: Write,
+    F: FnMut(Duration),
+{
+    heartbeat_worker_bytes(qend, output_sink, cfg, verbose_stream, sleep_for)
+}
+
+pub fn heartbeat_worker_bytes<S, C, W, F>(
     qend: usize,
     output_sink: &mut S,
     cfg: &C,
@@ -76,7 +107,7 @@ pub fn heartbeat_worker<S, C, W, F>(
 ) -> io::Result<()>
 where
     S: HeartbeatOutputSink,
-    C: HeartbeatConfig,
+    C: HeartbeatByteConfig,
     W: Write,
     F: FnMut(Duration),
 {
@@ -88,15 +119,22 @@ where
             break;
         }
         if n == INTERVAL {
-            let title = cfg.query_title(next);
-            let title = title.split(' ').next().unwrap_or(title);
-            writeln!(
+            let title = crate::util::sequence::c_string_bytes(cfg.query_title_bytes(next));
+            let title = &title[..title
+                .iter()
+                .position(|&byte| byte == b' ')
+                .unwrap_or(title.len())];
+            write!(
                 verbose_stream,
-                "Queries={} size={} max_size={} next={} queue={}/{}",
+                "Queries={} size={} max_size={} next=",
                 next,
                 megabytes(output_sink.size()),
-                megabytes(output_sink.max_size()),
-                title,
+                megabytes(output_sink.max_size())
+            )?;
+            verbose_stream.write_all(title)?;
+            writeln!(
+                verbose_stream,
+                " queue={}/{}",
                 cfg.queue_len(0),
                 cfg.queue_len(1)
             )?;
@@ -149,6 +187,32 @@ mod tests {
         fn queue_len(&self, queue: usize) -> usize {
             self.queues[queue]
         }
+    }
+
+    #[test]
+    fn byte_heartbeat_writes_source_title_bytes_without_utf8_conversion() {
+        struct Config;
+        impl HeartbeatByteConfig for Config {
+            fn query_title_bytes(&self, _: usize) -> &[u8] {
+                b"q\xff\0ignored"
+            }
+            fn queue_len(&self, _: usize) -> usize {
+                0
+            }
+        }
+        let mut next_values = vec![0; 102];
+        next_values.push(1);
+        let mut sink = TestSink {
+            next_values,
+            size: 0,
+            max_size: 0,
+        };
+        let mut output = Vec::new();
+        heartbeat_worker_bytes(1, &mut sink, &Config, &mut output, |_| {}).unwrap();
+        assert_eq!(
+            output,
+            b"Queries=0 size=0 max_size=0 next=q\xff queue=0/0\n"
+        );
     }
 
     #[test]

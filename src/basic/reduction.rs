@@ -188,9 +188,12 @@ impl Reduction {
         self.freq[bucket as usize]
     }
 
-    /// Reduce an entire sequence.
+    /// Source Reduction::reduce_seq reads through Sequence::operator[], which
+    /// strips SEQ_MASK annotations before looking up the biological residue.
     pub fn reduce_seq(&self, seq: &[Letter]) -> Vec<Letter> {
-        seq.iter().map(|&l| self.reduce(l) as Letter).collect()
+        seq.iter()
+            .map(|&l| self.reduce(l & super::value::LETTER_MASK) as Letter)
+            .collect()
     }
 
     pub fn decode_seed(&self, seed: u64, len: usize) -> String {
@@ -222,6 +225,17 @@ impl std::fmt::Display for Reduction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequence_reduction_ignores_seed_annotations() {
+        let reduction = Reduction::default_reduction();
+        let residues = [1, 5, 11, MASK_LETTER, STOP_LETTER];
+        let annotated = residues.map(|letter| letter | super::super::value::SEED_MASK);
+        assert_eq!(
+            reduction.reduce_seq(&annotated),
+            reduction.reduce_seq(&residues)
+        );
+    }
 
     #[test]
     fn test_default_reduction() {

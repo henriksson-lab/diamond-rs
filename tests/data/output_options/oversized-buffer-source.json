@@ -1,0 +1,84 @@
+{
+  "oracle_sha256": "d8d08608b96706db62e44036fc979f9a658e72f59fc19d8727546daa616c42d8",
+  "oracle_path": "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+  "cwd": "/tmp/diamond-oversized-buffer-oracle-txpvcu92",
+  "host_pointer_width": 64,
+  "cases": [
+    {
+      "value": "9223372036854775807",
+      "args": [
+        "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+        "-p1",
+        "--file-buffer-size",
+        "9223372036854775807",
+        "-o",
+        "/tmp/diamond-oversized-buffer-oracle-txpvcu92/output-9223372036854775807"
+      ],
+      "status": 1,
+      "stdout": "\u001b[0;39m",
+      "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 1\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: Failed to allocate sufficient memory. Please refer to the online wiki for instructions on memory usage.\n",
+      "output_created": false,
+      "address_space_limit_bytes": 536870912,
+      "core_limit_bytes": 0,
+      "cpu_limit_seconds": 20
+    },
+    {
+      "value": "4294967296",
+      "args": [
+        "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+        "-p1",
+        "--file-buffer-size",
+        "4294967296",
+        "-o",
+        "/tmp/diamond-oversized-buffer-oracle-txpvcu92/output-4294967296"
+      ],
+      "status": 1,
+      "stdout": "\u001b[0;39m",
+      "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 1\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: Failed to allocate sufficient memory. Please refer to the online wiki for instructions on memory usage.\n",
+      "output_created": false,
+      "address_space_limit_bytes": 536870912,
+      "core_limit_bytes": 0,
+      "cpu_limit_seconds": 20
+    },
+    {
+      "value": "9223372036854775808",
+      "args": [
+        "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/plain.dmnd",
+        "-p1",
+        "--file-buffer-size",
+        "9223372036854775808",
+        "-o",
+        "/tmp/diamond-oversized-buffer-oracle-txpvcu92/output-9223372036854775808"
+      ],
+      "status": 1,
+      "stdout": "\u001b[0;39m",
+      "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 1\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: Failed to allocate sufficient memory. Please refer to the online wiki for instructions on memory usage.\n",
+      "output_created": false,
+      "address_space_limit_bytes": 536870912,
+      "core_limit_bytes": 0,
+      "cpu_limit_seconds": 20
+    }
+  ],
+  "provenance": {
+    "oracle": "Existing unchanged DIAMOND 2.1.24 build 178 executable; neither source tree nor binary was edited or rebuilt.",
+    "source_commit": "1d162b4fefb5e6b4d868c24e6ad551cad2dcf246",
+    "execution": "Linux x86-64 source process launched from isolated /tmp directory with RLIMIT_AS=536870912 bytes, RLIMIT_CORE=0 and RLIMIT_CPU=20 seconds; subprocess timeout 25 seconds.",
+    "scope": "Freezes allocation-error status, terminal diagnostic, and absence of output creation. The 4294967296 case is above 32-bit usize::MAX; this 64-bit source probe rejects it under the recorded address-space limit and does not establish 32-bit runtime evidence.",
+    "native_preflight_limit": "Fallible capacity preflight rejects target conversion overflow or a currently impossible reservation. It does not guarantee later simultaneous allocations or page commitment will succeed."
+  }
+}

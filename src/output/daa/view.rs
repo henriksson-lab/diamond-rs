@@ -5,7 +5,7 @@ use std::io::{self, Seek, Write};
 use crate::data::daa::{
     finish_daa_from_file, init_daa, view_query_daa, view_query_edge, view_query_null,
     view_query_paf, view_query_pairwise, view_query_sam, view_query_tabular, view_query_xml,
-    DaaFile, DaaQueryRecord, DaaViewConfig,
+    DaaFile, DaaName, DaaQueryRecord, DaaViewConfig,
 };
 use crate::output::format::{print_tabular_footer, print_tabular_header, Header, TabularFormat};
 use crate::output::{pairwise, sam, xml};
@@ -91,7 +91,10 @@ impl ViewFetcher {
 
     /// C++ `ViewFetcher::operator()`, returning the records and their stable
     /// query numbers directly rather than exposing mutable member buffers.
-    pub fn fetch_batch(&mut self, daa: &mut DaaFile) -> io::Result<Vec<(Vec<u8>, usize)>> {
+    pub fn fetch_batch<N: DaaName>(
+        &mut self,
+        daa: &mut DaaFile<N>,
+    ) -> io::Result<Vec<(Vec<u8>, usize)>> {
         if self.finished {
             return Ok(Vec::new());
         }
@@ -111,9 +114,9 @@ impl ViewFetcher {
 
 /// C++ `view_query` with its cloned output format and global configuration
 /// represented explicitly.
-pub fn view_query(
-    record: &DaaQueryRecord,
-    daa: &DaaFile,
+pub fn view_query<N: DaaName>(
+    record: &DaaQueryRecord<N>,
+    daa: &DaaFile<N>,
     out: &mut Vec<u8>,
     format: &DaaViewFormat<'_>,
     score_matrix: &ScoreMatrix,
@@ -140,8 +143,8 @@ pub fn view_query(
 
 /// C++ `view_worker`. Rust keeps fetching and output ordering deterministic;
 /// callers can schedule workers externally without exposing DAA reader state.
-pub fn view_worker<W: Write>(
-    daa: &mut DaaFile,
+pub fn view_worker<W: Write, N: DaaName>(
+    daa: &mut DaaFile<N>,
     writer: &mut ViewWriter<W>,
     fetcher: &mut ViewFetcher,
     format: &DaaViewFormat<'_>,
@@ -154,7 +157,7 @@ pub fn view_worker<W: Write>(
             return Ok(());
         }
         for (buf, query_num) in batch {
-            let record = DaaQueryRecord::from_buffer(daa, &buf, query_num)
+            let record = DaaQueryRecord::<N>::from_buffer_storage(daa, &buf, query_num)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             let mut output = Vec::new();
             view_query(&record, daa, &mut output, format, score_matrix, config)
@@ -170,15 +173,15 @@ pub fn view_worker<W: Write>(
 
 /// C++ `view_daa`, parameterized over its input file, output stream, format,
 /// and formerly global settings.
-pub fn view_daa<W: Write + Seek>(
-    daa: &mut DaaFile,
+pub fn view_daa<W: Write + Seek, N: DaaName>(
+    daa: &mut DaaFile<N>,
     output: &mut W,
     format: &DaaViewFormat<'_>,
     config: &DaaViewConfig,
     runtime: &DaaViewRuntimeConfig<'_>,
 ) -> io::Result<()> {
     let score_matrix = ScoreMatrix::new(
-        &daa.score_matrix(),
+        &daa.score_matrix_for_alignment()?,
         daa.gap_open_penalty(),
         daa.gap_extension_penalty(),
         0,
@@ -195,19 +198,29 @@ pub fn view_daa<W: Write + Seek>(
     let first_record = first
         .as_ref()
         .map(|(buf, query_num)| {
-            DaaQueryRecord::from_buffer(daa, buf, *query_num)
+            DaaQueryRecord::<N>::from_buffer_storage(daa, buf, *query_num)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
         })
         .transpose()?;
 
+    // Source renders the first query before emitting any format header.
+    let mut first_output = Vec::new();
+    if let Some(record) = &first_record {
+        view_query(
+            record,
+            daa,
+            &mut first_output,
+            format,
+            &score_matrix,
+            config,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    }
     write_header(output, daa, format, runtime, first_record.as_ref())?;
 
     let mut writer = ViewWriter::new(output);
-    if let Some(record) = first_record {
-        let mut buf = Vec::new();
-        view_query(&record, daa, &mut buf, format, &score_matrix, config)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        writer.consume(&mut buf)?;
+    if first_record.is_some() {
+        writer.consume(&mut first_output)?;
     }
     let mut fetcher = ViewFetcher::new();
     view_worker(
@@ -234,12 +247,12 @@ pub fn view_daa<W: Write + Seek>(
     writer.writer_mut().flush()
 }
 
-fn write_header<W: Write>(
+fn write_header<W: Write, N: DaaName>(
     writer: &mut W,
-    daa: &DaaFile,
+    daa: &DaaFile<N>,
     format: &DaaViewFormat<'_>,
     runtime: &DaaViewRuntimeConfig<'_>,
-    first: Option<&DaaQueryRecord>,
+    first: Option<&DaaQueryRecord<N>>,
 ) -> io::Result<()> {
     match format {
         DaaViewFormat::Daa | DaaViewFormat::Paf | DaaViewFormat::Null | DaaViewFormat::Edge => {
@@ -258,16 +271,16 @@ fn write_header<W: Write>(
         }
         DaaViewFormat::Sam { .. } => sam::print_header(writer, daa.mode(), runtime.invocation),
         DaaViewFormat::Pairwise => pairwise::print_header(writer),
-        DaaViewFormat::Xml => xml::print_header(
+        DaaViewFormat::Xml => xml::print_header_bytes(
             writer,
             daa.mode(),
-            &daa.score_matrix(),
+            &daa.score_matrix_for_alignment()?,
             daa.gap_open_penalty(),
             daa.gap_extension_penalty(),
             daa.evalue(),
-            first.map_or("", |record| record.query_name.as_str()),
+            first.map_or(&[][..], |record| record.query_name.daa_bytes()),
             first.map_or(0, |record| record.query_len() as u32),
-            "",
+            b"",
         ),
     }
 }

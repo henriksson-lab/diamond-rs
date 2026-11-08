@@ -1,0 +1,10 @@
+{
+  "Source_commit": "1d162b4fefb5e6b4d868c24e6ad551cad2dcf246",
+  "Source_EXTRA_binary_sha256": "a380398577a3149ccf060297ac3fc9a3c6dd34ac5be469a1a4409d983923c5a1",
+  "Source_argv": "diamond view -a blastx.cbs1.score100.daa --quiet -p 1 -f 6 qseqid full_qseq_mate qseq_translated -o out",
+  "archive_sha256": "db2ad08da7b830e5e5f58ff3b55874ca74e01e5816c7bc8c5cc7ce9e478991a3",
+  "expected_sha256": "31b4e6f0e0af88bb7a5d0f054b8ec3f5c10d55ad5705a186bf70655e405fad12",
+  "rows": 8,
+  "scope": "Unchanged Source EXTRA executable; same default view field behavior in baseline (no query files supplied). Output::Info has no mate and the actual callback prints *, while generic HSP-only unavailable-field marker N/A was incorrect. No Source rebuild or runtime dependency on Source.",
+  "raw_capture": ".tmp/native-post-translation-20261107/view-extra-compression/source-translated-active.json"
+}

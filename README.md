@@ -6,6 +6,7 @@ DIAMOND is a high-performance sequence aligner for protein and translated DNA se
 
 **This crate is under translation. Do not use it. Do not trust any text below**
 
+* 2026-11-08: Missing translated parts being hooked up
 * 2026-10-13: More fixes
 * 2026-10-05: More fixes
 * 2026-09-30: More optimization. portability work
@@ -41,12 +42,21 @@ But:
 
 This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 
-- **CLI**: Native Rust routes cover `blastp`, `blastx`, `makedb`, `dbinfo`, `getseq`, `makeidx`, `cluster`, `linclust`, `deepclust`, `merge-daa`, `view`, `test`, `version`, and help
+- **CLI**: Native Rust routes cover `blastp`, `blastx`, `makedb`, `dbinfo`, `getseq`, `makeidx`, `cluster`, `linclust`, `deepclust`, `greedy-vertex-cover`, `realign`, `reassign`, `recluster`, `merge-daa`, `view`, `version`, and help. `prepdb` and `roc` have native no-op/deprecation handling. Standard `benchmark` executes native kernels and reproduces the pinned source's missing-adjusted-matrix failure after the diagonal phase. The built-in `test` command runs all 20 upstream hash cases natively. Command coverage does not imply every option is native; see `TRANSLATION_COMPLETION.md`.
 - **Validated parity**: The final 2026-10-06 matrix passed 164/164 tested search-sensitivity, scoring, clustering, and DAA producer/viewer cases against upstream DIAMOND 2.1.24. This is bounded evidence, not a claim that every DIAMOND option is translated or bug-free.
+- **Native search algorithms**: Explicit `--algo 0` (double-indexed), `--algo 1` (query-indexed), `-c/--index-chunks`, and all registered search sensitivity switches run in Rust. `makeidx` also honors those sensitivity switches. The source default budgets and explicit `-b/--block-size` use native query/reference blocks and intermediate merging for protein/translated FASTA and DMND searches; supplied translated-query blocks and blocked taxonomy fields are connected too. `--min-score` now applies native bit-score reporting thresholds and overrides the E-value cutoff. The in-process regression backend passes all 20 upstream hashes; remaining integration and scale requirements are tracked in `TRANSLATION_COMPLETION.md`.
+- **Native search output**: Tabular and flat JSON output connect all 52 standard fields and 48 dynamic taxonomy rank fields to actual search contexts, including translated sequence, FASTQ quality, original reference sequence, and phase-specific self-alignment scores. The self-contained context suite covers 216 byte comparisons against frozen source outputs; see `tests/data/tabular_context/`.
+- **Native SAM search**: `blastp`/`blastx -f 101` or `-f sam`, `--unal`, `--sam-query-len`, and SAM `--salltitles` use native HSP/transcript callbacks, including blocked search and the supplied translated-query API. Frozen source fixtures cover 168 CLI comparisons plus library and diagnostic checks.
+- **Native edge/null search**: `blastp`/`blastx -f edge` serializes native binary HSP records; `-f null` executes the source transcript pipeline with no output. Block merging retains original IDs, coordinate DP requirements, and corrected-score precision. Bounded source evidence is in `tests/data/edge_null/`.
+- **Native taxonomy search**: `blastp`/`blastx -f 102` and `--include-lineage` use actual database mappings/nodes/names and the source classifier defaults. Tests cover 284 exact source-output comparisons and eight separately documented source-UB compatibility checks; see `tests/data/taxon_search/`.
+- **Native search output controls**: `--header`, `--compress 0/1`, `--file-buffer-size` and `--no-auto-append` connect to the native blocked search and I/O lifecycle. Frozen source fixtures cover 348 CLI comparisons, fixed-invocation library gzip bytes, large streams and error side effects; see `tests/data/output_options/`.
+- **Native search controls**: `--approx-id` and `--soft-masking 0/none/seg/tantan` now reach ordinary, blocked, query-indexed and supplied-query search, retaining automatic motif masking and restoring residues before extension. Fixtures cover 152 direct source comparisons plus 12 separately documented source-UB compatibility checks; see `tests/data/search_controls/`.
+- **Native archive titles**: `--salltitles` and `--sallseqid` preserve DAA full titles/all IDs through one shared dictionary policy; other-format effects and DAA `--unal 0/1` match the source. Frozen evidence covers 156 CLI, 48 archive/view and 24 supplied-query comparisons; see `tests/data/archive_titles/`.
+- **Current code integration**: Native global ranking, iteration, SWIPE, legacy frameshift, extension modes, contiguous seeds, context-aware minimum lengths and streamed BLAST references are connected and compile/link. The arithmetic-corrected package passes 1,876 default tests and all 20 release regression hashes; a real 1.1-billion-residue database matches pinned Source byte-for-byte. Remaining interaction, taxonomy-spill and platform gates are tracked in `TRANSLATION_COMPLETION.md`.
 - **Parallel**: Seed search uses rayon for multi-threaded processing
 - **SIMD**: SSE4.1/AVX2 dynamic-programming and search kernels, plus translated and tested AVX-512 primitives; production stage-1 dispatch follows upstream's whole-worker ISA choice
 - **Portability target**: Native Linux, macOS, and Windows support; platform-specific low-level code must use each target's ABI and remain covered by CI
-- **Library API**: Core types, scoring matrices, DP kernels, FASTA parsing, and seed search
+- **Library API**: Core types, scoring matrices, DP kernels, FASTA parsing, seed search, and native `diamond::run` for connected commands. Command statuses return to the caller; untranslated commands/options remain explicit errors.
 - **Tests**: More than 1,600 self-contained Rust library tests plus CLI and integration suites; source-text audits and tests requiring an adjacent upstream checkout have been removed
 - **Deterministic statistics**: ALP and TANTAN use a specified Rust implementation of the established GNU 31-word additive RNG sequence, with the same output and `RAND_MAX` on every platform
 - **Taxonomy infrastructure**: Native `makedb` writes upstream-exact accession mappings, nodes/ranks, and scientific names for `--taxonmap`/`--taxonnodes`/`--taxonnames`, using bounded external sorting. Native DMND `blastp` and `blastx` load that metadata and emit byte-exact `staxids`, `sscinames`, `slineages`, `sskingdoms`, `skingdoms`, and `sphylums` fields. NCBI BLAST-database search remains deliberately separate because pinned upstream crosses a documented undefined-behavior boundary there.
@@ -61,7 +71,7 @@ This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
   the explicitly listed advanced modes remain open.
 - Multi-query `json-flat` output intentionally reproduces upstream DIAMOND 2.1.24's missing separators. The resulting byte stream is not valid JSON. This inherited behavior is retained for exact parity and covered by regression evidence.
 - Native macOS and Windows CI/runtime evidence remains a release gate, particularly for RSS units and memory-limit spill decisions.
-- The optional C++ `ffi`/`--legacy` adapter is only a diagnostic for a source checkout containing the adjacent upstream `diamond/` tree. It is disabled by default and is not used by routine CI or benchmarks. In the packaged crate that large tree is intentionally excluded, so `--all-features` remains buildable but the adapter stays unavailable and `--legacy` reports that limitation.
+- The C++ `ffi` adapter is disabled by default and requires a non-Windows source checkout containing the adjacent upstream `diamond/` tree. The CLI invokes this comparison oracle only with an explicit `--legacy` request. Unconnected production commands/options return a native error; they never switch to C++. Remaining native integration and parity work are still required for translation completion. Packaged `--all-features` builds remain buildable with the adapter unavailable.
 
 ## Building
 
@@ -69,7 +79,8 @@ This project is an ongoing port of the DIAMOND C++ codebase to Rust. Currently:
 
 - Rust 1.85+
 - Default native Rust build: no CMake or C++ toolchain required
-- Default native build: SQLite is bundled through `rusqlite`; no system SQLite package is required
+- Default native build: a C compiler is required for bundled SQLite and the zlib fallback. SQLite is bundled through `rusqlite`; no system SQLite package is required
+- Gzip uses stock zlib through `flate2`/`libz-sys` for source-compatible compressed bytes. A system zlib may be used; otherwise libz-sys builds its bundled C source. No DIAMOND C++ source is needed
 - Zstandard compression/decompression uses the pure-Rust `zstd-pure-rs` backend; no native zstd library is required
 - Optional source-checkout-only, non-Windows FFI diagnostic: CMake 2.6+, a C++ compiler, zlib, SQLite3, and pthreads. The system SQLite dependency belongs to the adjacent upstream C++ compatibility build.
 
@@ -90,7 +101,16 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 # C++ diagnostic backend. In a packaged crate the feature compiles as an
 # explicitly unavailable adapter because the upstream source tree is omitted.
 cargo build --features ffi
+
+# Use an isolated oracle checkout. The CMake EXTRA/DNA/MCL/ZSTD switches
+# follow the corresponding Cargo features; optional C++ dependencies must
+# be present in that checkout for the selected profile.
+DIAMOND_FFI_SOURCE_DIR=/path/to/oracle cargo build --features ffi
 ```
+
+The optional `ffi,zstd` oracle also needs the C++ zstd development library.
+Neither this environment variable nor any C++ dependency is used by the
+default Rust build. A missing source tree leaves the adapter unavailable.
 
 ### Test
 
@@ -102,7 +122,7 @@ cargo test --release
 # adapter. Routine parity comparisons use the external validation harness.
 cargo test --release --features ffi -- --test-threads=1
 
-# Run the native regression command
+# Run the native built-in upstream regression suite
 cargo run --release -- test
 ```
 
@@ -376,11 +396,17 @@ other words, the 16 GB default still spills; it is not a requirement to have
 and one active disk bin also consume memory, so this is a spill trigger rather
 than an OS-enforced hard cap and peak RSS can overshoot it.
 
-This default deliberately differs from upstream DIAMOND `blastp`, whose hit
-buffer is always disk-backed. The value follows upstream's 16 GB clustering
+This default deliberately differs from upstream DIAMOND `blastp`, whose default
+hit buffer is disk-backed. The value follows upstream's 16 GB clustering
 memory default. Use `--memory-limit 0G` to start directly in disk mode for the
 closest memory-policy comparison with upstream, or set another nonzero limit
 to spill earlier or later.
+
+Automatic mode grows storage with actual hits; the ceiling does not reserve
+that amount of address space. Explicit `--hit-membuf` selects Source's persistent
+memory mode, including its initial 1 GiB reservation per hit bin, and disables
+positive adaptive spill limits. `--memory-limit 0G` still forces disk mode when
+both options are supplied.
 
 The following table uses the same upstream baseline and pinned CPUs as the
 forced-disk table below. Rust was invoked without `--memory-limit`, exercising

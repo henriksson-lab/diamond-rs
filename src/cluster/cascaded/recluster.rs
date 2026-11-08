@@ -6,7 +6,7 @@
 
 use crate::align::hsp::HspContext;
 use crate::basic::value::{OId, SuperBlockId};
-use crate::cluster::cascaded::helpers::cluster_steps;
+use crate::cluster::cascaded::helpers::cluster_steps_bytes;
 use crate::cluster::realign::DatabaseMetadata;
 use crate::cluster::reassign::{update_clustering, Mapback, DEFAULT_MEMBER_COVER};
 use crate::config::Sensitivity;
@@ -16,24 +16,24 @@ use crate::util::data_structures::{make_flat_array, FlatArray};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReclusterConfig {
-    pub database: String,
-    pub clustering: String,
+    pub database: std::path::PathBuf,
+    pub clustering: std::path::PathBuf,
     pub member_cover: Option<f64>,
     pub mutual_cover: Option<f64>,
     pub approx_min_id: Option<f64>,
-    pub soft_masking: Option<String>,
-    pub masking: Option<String>,
+    pub soft_masking: Option<Vec<u8>>,
+    pub masking: Option<Vec<u8>>,
     pub diag_filter_id: Option<f64>,
     pub diag_filter_cov: Option<f64>,
-    pub cluster_steps: Vec<String>,
+    pub cluster_steps: Vec<Vec<u8>>,
     pub db_size: Option<u64>,
 }
 
 impl Default for ReclusterConfig {
     fn default() -> Self {
         Self {
-            database: String::new(),
-            clustering: String::new(),
+            database: std::path::PathBuf::new(),
+            clustering: std::path::PathBuf::new(),
             member_cover: None,
             mutual_cover: None,
             approx_min_id: None,
@@ -51,7 +51,7 @@ impl Default for ReclusterConfig {
 pub struct ReclusterSearchConfig {
     pub command: &'static str,
     pub max_target_seqs: usize,
-    pub iterate: Vec<String>,
+    pub iterate: Vec<Vec<u8>>,
     pub output_format: &'static str,
     pub self_search: bool,
     pub query_cover: f64,
@@ -62,6 +62,11 @@ pub struct ReclusterSearchConfig {
     pub chunk_size: f64,
     pub lin_stage1_query: bool,
     pub lin_stage1_target: bool,
+    pub approx_min_id: f64,
+    pub masking: Vec<u8>,
+    pub soft_masking: Vec<u8>,
+    pub diag_filter_id: Option<f64>,
+    pub diag_filter_cov: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,7 +76,11 @@ pub struct ReclusterSummary {
     pub clustering: Vec<OId>,
 }
 
-pub trait ReclusterBackend {
+pub trait ReclusterBackend<T = String> {
+    fn io_errors(&self) -> crate::util::io::IoErrorOwner {
+        Default::default()
+    }
+
     type Database;
 
     fn open_database(
@@ -79,6 +88,28 @@ pub trait ReclusterBackend {
         path: &str,
         flags: SequenceFileFlags,
     ) -> Result<(Self::Database, DatabaseMetadata), String>;
+    fn open_database_path(
+        &mut self,
+        path: &std::path::Path,
+        flags: SequenceFileFlags,
+    ) -> Result<(Self::Database, DatabaseMetadata), String> {
+        self.open_database(
+            path.to_str()
+                .ok_or("Legacy backend requires UTF-8 paths; override open_database_path")?,
+            flags,
+        )
+    }
+    fn read_clustering_path(
+        &mut self,
+        path: &std::path::Path,
+        database: &Self::Database,
+    ) -> Result<Vec<OId>, String> {
+        self.read_clustering(
+            path.to_str()
+                .ok_or("Legacy backend requires UTF-8 paths; override read_clustering_path")?,
+            database,
+        )
+    }
     fn close_database(&mut self, database: Self::Database) -> Result<(), String>;
     fn open_output(&mut self) -> Result<(), String>;
     fn read_clustering(
@@ -98,7 +129,8 @@ pub trait ReclusterBackend {
         clusters: &FlatArray<OId>,
         centroids: &[OId],
         hsp_values: HspValues,
-        callback: &mut dyn FnMut(&HspContext),
+        config: &ReclusterConfig,
+        callback: &mut dyn FnMut(&HspContext<T>),
     ) -> Result<(), String>;
     fn reset_statistics(&mut self);
     fn run_search(
@@ -112,6 +144,7 @@ pub trait ReclusterBackend {
         &mut self,
         database: &Self::Database,
         linear: bool,
+        config: &mut ReclusterConfig,
     ) -> Result<Vec<SuperBlockId>, String>;
     fn init_random_access(&mut self, database: &mut Self::Database) -> Result<(), String>;
     fn write_clustering(
@@ -140,8 +173,8 @@ fn initialize_thresholds(config: &mut ReclusterConfig) -> Result<(), String> {
     let approx_min_id = *config.approx_min_id.get_or_insert(50.0);
     config
         .soft_masking
-        .get_or_insert_with(|| "tantan".to_owned());
-    config.masking.get_or_insert_with(|| "0".to_owned());
+        .get_or_insert_with(|| b"tantan".to_vec());
+    config.masking.get_or_insert_with(|| b"0".to_vec());
     if approx_min_id >= 90.0 && config.mutual_cover.is_none() {
         config.diag_filter_id.get_or_insert(approx_min_id - 10.0);
         let member_cover = config.member_cover.unwrap_or(DEFAULT_MEMBER_COVER);
@@ -156,28 +189,17 @@ fn initialize_thresholds(config: &mut ReclusterConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_sensitivity(name: &str) -> Result<Sensitivity, String> {
-    match name {
-        "faster" => Ok(Sensitivity::Faster),
-        "fast" => Ok(Sensitivity::Fast),
-        "default" => Ok(Sensitivity::Default),
-        "linclust-40" => Ok(Sensitivity::Linclust40),
-        "linclust-20" => Ok(Sensitivity::Linclust20),
-        "shapes-6x10" => Ok(Sensitivity::Shapes6x10),
-        "shapes-30x10" => Ok(Sensitivity::Shapes30x10),
-        "mid-sensitive" => Ok(Sensitivity::MidSensitive),
-        "sensitive" => Ok(Sensitivity::Sensitive),
-        "more-sensitive" => Ok(Sensitivity::MoreSensitive),
-        "very-sensitive" => Ok(Sensitivity::VerySensitive),
-        "ultra-sensitive" => Ok(Sensitivity::UltraSensitive),
-        _ => Err(format!("Invalid sensitivity level: {name}")),
-    }
+fn parse_sensitivity(name: &[u8]) -> Result<Sensitivity, String> {
+    crate::basic::config::sensitivity_from_bytes(name).map_err(|error| error.to_string())
 }
 
-fn search_config(config: &ReclusterConfig) -> Result<ReclusterSearchConfig, String> {
+fn search_config(
+    config: &ReclusterConfig,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<ReclusterSearchConfig, String> {
     let coverage = config.mutual_cover.or(config.member_cover).unwrap();
     let steps = if config.cluster_steps.is_empty() {
-        cluster_steps(config.approx_min_id.unwrap(), false)
+        cluster_steps_bytes(config.approx_min_id.unwrap(), false)
     } else {
         config.cluster_steps.clone()
     };
@@ -190,15 +212,20 @@ fn search_config(config: &ReclusterConfig) -> Result<ReclusterSearchConfig, Stri
         query_cover: coverage,
         subject_cover: config.mutual_cover.map_or(0.0, |_| coverage),
         query_or_target_cover: 0.0,
-        sensitivity: parse_sensitivity(
+        sensitivity: errors.capture(crate::basic::config::sensitivity_from_bytes(
             steps
                 .last()
                 .ok_or_else(|| "No clustering sensitivity step configured.".to_owned())?,
-        )?,
+        ))?,
         lowmem: 1,
         chunk_size: 4.0,
         lin_stage1_query: false,
         lin_stage1_target: false,
+        approx_min_id: config.approx_min_id.unwrap(),
+        masking: config.masking.clone().unwrap(),
+        soft_masking: config.soft_masking.clone().unwrap(),
+        diag_filter_id: config.diag_filter_id,
+        diag_filter_cov: config.diag_filter_cov,
     })
 }
 
@@ -207,11 +234,11 @@ fn search_config(config: &ReclusterConfig) -> Result<ReclusterSearchConfig, Stri
 struct RecursiveRecluster;
 
 impl RecursiveRecluster {
-    fn recluster<B: ReclusterBackend>(
+    fn recluster<T, B: ReclusterBackend<T>>(
         backend: &mut B,
         database: &B::Database,
         clustering: &[OId],
-        config: &ReclusterConfig,
+        config: &mut ReclusterConfig,
         iteration: usize,
     ) -> Result<Vec<OId>, String> {
         let sequence_count = backend.sequence_count(database);
@@ -242,7 +269,7 @@ impl RecursiveRecluster {
         let member_cover = config.member_cover.unwrap_or(DEFAULT_MEMBER_COVER);
         let approx_min_id = config.approx_min_id.unwrap();
         let mut callback_error = None;
-        let mut callback = |hsp: &HspContext| {
+        let mut callback = |hsp: &HspContext<T>| {
             let coverage = mutual_cover
                 .is_some_and(|cutoff| hsp.qcovhsp() >= cutoff && hsp.scovhsp() >= cutoff)
                 || (mutual_cover.is_none() && hsp.scovhsp() >= member_cover);
@@ -258,7 +285,14 @@ impl RecursiveRecluster {
                 }
             }
         };
-        backend.realign(database, &clusters, &centroids, hsp_values, &mut callback)?;
+        backend.realign(
+            database,
+            &clusters,
+            &centroids,
+            hsp_values,
+            config,
+            &mut callback,
+        )?;
         if let Some(error) = callback_error {
             return Err(error);
         }
@@ -274,7 +308,7 @@ impl RecursiveRecluster {
         let unaligned = backend.create_subdatabase(database, &unaligned_members)?;
         let centroid_database = backend.create_subdatabase(database, &centroids)?;
         backend.reset_statistics();
-        let search = search_config(config)?;
+        let search = search_config(config, &backend.io_errors())?;
         let mut mapback = Mapback::new(unaligned_members.len());
         backend.run_search(&centroid_database, &unaligned, &search, &mut |bytes| {
             mapback.consume(bytes, config.mutual_cover, member_cover)
@@ -286,18 +320,24 @@ impl RecursiveRecluster {
             &unaligned_members,
             &centroids,
         )?;
+        drop(centroid_database);
         let unmapped_members = mapback.unmapped();
         if unmapped_members.is_empty() {
             return Ok(output);
         }
 
         let unmapped = backend.create_subdatabase(&unaligned, &unmapped_members)?;
+        drop(mapback);
+        drop(unaligned);
+        drop(clusters);
+        drop(centroids);
         let initial: Vec<OId> = backend
-            .cascaded(&unmapped, false)?
+            .cascaded(&unmapped, false, config)?
             .into_iter()
             .map(OId::from)
             .collect();
-        let recursive = Self::recluster(backend, &unmapped, &initial, config, iteration + 1)?;
+        let recursive =
+            Self::recluster::<T, B>(backend, &unmapped, &initial, config, iteration + 1)?;
         if recursive.len() != unmapped_members.len() {
             return Err("Recursive reclustering mapping size mismatch.".to_owned());
         }
@@ -323,10 +363,22 @@ pub fn recluster<B: ReclusterBackend>(
     config: &mut ReclusterConfig,
     backend: &mut B,
 ) -> Result<ReclusterSummary, String> {
-    if config.database.is_empty() {
+    recluster_typed::<String, B>(config, backend)
+}
+pub fn recluster_bytes<B: ReclusterBackend<Vec<u8>>>(
+    config: &mut ReclusterConfig,
+    backend: &mut B,
+) -> Result<ReclusterSummary, String> {
+    recluster_typed::<Vec<u8>, B>(config, backend)
+}
+fn recluster_typed<T, B: ReclusterBackend<T>>(
+    config: &mut ReclusterConfig,
+    backend: &mut B,
+) -> Result<ReclusterSummary, String> {
+    if config.database.as_os_str().is_empty() {
         return Err("Database file is required for reclustering.".to_owned());
     }
-    if config.clustering.is_empty() {
+    if config.clustering.as_os_str().is_empty() {
         return Err("Clustering file is required for reclustering.".to_owned());
     }
     initialize_thresholds(config)?;
@@ -334,12 +386,13 @@ pub fn recluster<B: ReclusterBackend>(
     let flags = SequenceFileFlags::NEED_LETTER_COUNT
         | SequenceFileFlags::ACC_TO_OID_MAPPING
         | SequenceFileFlags::OID_TO_ACC_MAPPING;
-    let (mut database, metadata) = backend.open_database(&config.database, flags)?;
+    let (mut database, metadata) = backend.open_database_path(&config.database, flags)?;
     config.db_size = Some(metadata.letters);
     let execution = (|| {
         backend.open_output()?;
-        let clustering = backend.read_clustering(&config.clustering, &database)?;
-        let clustering = RecursiveRecluster::recluster(backend, &database, &clustering, config, 0)?;
+        let clustering = backend.read_clustering_path(&config.clustering, &database)?;
+        let clustering =
+            RecursiveRecluster::recluster::<T, B>(backend, &database, &clustering, config, 0)?;
         if metadata.titles_lazy {
             backend.init_random_access(&mut database)?;
         }
@@ -477,6 +530,7 @@ mod tests {
             _: &FlatArray<OId>,
             _: &[OId],
             hsp_values: HspValues,
+            _config: &ReclusterConfig,
             callback: &mut dyn FnMut(&HspContext),
         ) -> Result<(), String> {
             self.calls.push(format!("realign:{}", database.id));
@@ -513,6 +567,7 @@ mod tests {
             &mut self,
             database: &Self::Database,
             linear: bool,
+            _config: &mut ReclusterConfig,
         ) -> Result<Vec<SuperBlockId>, String> {
             self.calls
                 .push(format!("cascaded:{}:{linear}", database.id));
@@ -537,8 +592,8 @@ mod tests {
 
     fn config() -> ReclusterConfig {
         ReclusterConfig {
-            database: "db.dmnd".to_owned(),
-            clustering: "clusters.tsv".to_owned(),
+            database: "db.dmnd".into(),
+            clustering: "clusters.tsv".into(),
             ..ReclusterConfig::default()
         }
     }

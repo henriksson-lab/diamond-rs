@@ -6,9 +6,15 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+/// Match Source's compile-time `__FMA__ || _MSC_VER` choice. AVX2 alone
+/// does not enable FMA in the default GNU/Clang CMake dispatch object.
+pub const fn uses_fma() -> bool {
+    cfg!(any(target_feature = "fma", target_env = "msvc"))
+}
+
 #[cfg(target_arch = "x86_64")]
 pub fn has_avx2() -> bool {
-    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    is_x86_feature_detected!("avx2") && (!uses_fma() || is_x86_feature_detected!("fma"))
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -210,10 +216,10 @@ unsafe fn hsum_avx2(a: __m256) -> f32 {
 ///
 /// Processes f[0..48] with AVX2 (6 chunks of 8), then f[48..50] scalar.
 ///
-/// Upstream calls `SIMD::fmadd` here. Its AVX2 dispatch object is compiled with
-/// `-march=native`, which selects `_mm256_fmadd_ps` on an FMA-capable host.
+/// Source's `SIMD::fmadd` uses separate multiply/add unless its build enables
+/// FMA; the arithmetic contract follows the build, not the running CPU.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2")]
 pub unsafe fn forward_step_avx2(
     f: &mut [f32; 50],
     d: &[f32; 50],
@@ -234,7 +240,11 @@ pub unsafe fn forward_step_avx2(
         let vf = _mm256_loadu_ps(f.as_ptr().add(off));
         let vd = _mm256_loadu_ps(d.as_ptr().add(off));
         let ve = _mm256_loadu_ps(e_seg.as_ptr().add(off));
-        let tmp = _mm256_fmadd_ps(vf, vf2f, _mm256_mul_ps(vb_old, vd));
+        let tmp = if uses_fma() {
+            _mm256_fmadd_ps(vf, vf2f, _mm256_mul_ps(vb_old, vd))
+        } else {
+            _mm256_add_ps(_mm256_mul_ps(vf, vf2f), _mm256_mul_ps(vb_old, vd))
+        };
         let vf_new = _mm256_mul_ps(tmp, ve);
         _mm256_storeu_ps(f.as_mut_ptr().add(off), vf_new);
         f_sum_new += hsum_avx2(vf_new);
@@ -242,19 +252,27 @@ pub unsafe fn forward_step_avx2(
 
     // Scalar tail for elements 48, 49
     for off in 48..50 {
-        let vf = f[off].mul_add(f2f, b_old * d[off]) * e_seg[off];
+        let vf = if uses_fma() {
+            f[off].mul_add(f2f, b_old * d[off])
+        } else {
+            f[off] * f2f + b_old * d[off]
+        } * e_seg[off];
         f[off] = vf;
         f_sum_new += vf;
     }
 
-    *b = b_old.mul_add(b2b, f_sum_prev * p_repeat_end);
+    *b = if uses_fma() {
+        b_old.mul_add(b2b, f_sum_prev * p_repeat_end)
+    } else {
+        b_old * b2b + f_sum_prev * p_repeat_end
+    };
     f_sum_new
 }
 
 /// AVX2 backward step: matches C++ backward_step() exactly.
 /// See [`forward_step_avx2`] for the upstream FMA dispatch contract.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2")]
 pub unsafe fn backward_step_avx2(
     f: &mut [f32; 50],
     d: &[f32; 50],
@@ -275,17 +293,29 @@ pub unsafe fn backward_step_avx2(
         let vf_e = _mm256_mul_ps(vf, ve);
         let vt = _mm256_mul_ps(vf_e, vd);
         tsum += hsum_avx2(vt);
-        let vf_new = _mm256_fmadd_ps(vf_e, vf2f, vc);
+        let vf_new = if uses_fma() {
+            _mm256_fmadd_ps(vf_e, vf2f, vc)
+        } else {
+            _mm256_add_ps(_mm256_mul_ps(vf_e, vf2f), vc)
+        };
         _mm256_storeu_ps(f.as_mut_ptr().add(off), vf_new);
     }
 
     for off in 48..50 {
         let vf = f[off] * e_seg[off];
         tsum += vf * d[off];
-        f[off] = vf.mul_add(f2f, p_repeat_end * *b);
+        f[off] = if uses_fma() {
+            vf.mul_add(f2f, p_repeat_end * *b)
+        } else {
+            vf * f2f + p_repeat_end * *b
+        };
     }
 
-    *b = b2b.mul_add(*b, tsum);
+    *b = if uses_fma() {
+        b2b.mul_add(*b, tsum)
+    } else {
+        b2b * *b + tsum
+    };
 }
 
 /// AVX2 scale: multiply all 50 elements by s (matches C++ SIMD::scale)

@@ -2,6 +2,7 @@
 
 use std::fs::File as StdFile;
 use std::io::{Read, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use super::{
     zlib_decompress, zstd_decompress, FilePrimitive, FileSink, IoError, IoResult,
@@ -23,11 +24,25 @@ enum OutputFileStream {
 }
 
 fn make_compressor(sink: FileSink, compressor: Compressor) -> OutputFileStream {
-    let buffer = OutputStreamBuffer::new(sink);
+    make_compressor_with_buffer_size(sink, compressor, super::DEFAULT_FILE_BUFFER_SIZE)
+}
+
+fn make_compressor_with_buffer_size(
+    sink: FileSink,
+    compressor: Compressor,
+    buffer_size: usize,
+) -> OutputFileStream {
+    let buffer = OutputStreamBuffer::with_source_buffer_size(sink, buffer_size);
     match compressor {
         Compressor::None => OutputFileStream::Plain(buffer),
-        Compressor::Zlib => OutputFileStream::Zlib(OutputStreamBuffer::new(ZlibSink::new(buffer))),
-        Compressor::Zstd => OutputFileStream::Zstd(OutputStreamBuffer::new(ZstdSink::new(buffer))),
+        Compressor::Zlib => OutputFileStream::Zlib(OutputStreamBuffer::with_source_buffer_size(
+            ZlibSink::new(buffer),
+            buffer_size,
+        )),
+        Compressor::Zstd => OutputFileStream::Zstd(OutputStreamBuffer::with_source_buffer_size(
+            ZstdSink::new(buffer),
+            buffer_size,
+        )),
     }
 }
 
@@ -58,16 +73,30 @@ impl StreamEntity for OutputFileStream {
         dispatch_stream!(self, stream => stream.close())
     }
 
+    fn file_path(&self) -> &Path {
+        dispatch_stream!(self, stream => stream.file_path())
+    }
     fn file_name(&self) -> &str {
-        dispatch_stream!(self, stream => stream.file_name())
+        self.file_path()
+            .to_str()
+            .expect("Non-UTF8 OS path; use file_path")
     }
 
     fn file(&mut self) -> IoResult<&mut StdFile> {
         dispatch_stream!(self, stream => stream.file())
     }
 
+    #[cfg(any(unix, windows))]
+    fn shared_stdio(&mut self) -> IoResult<Option<super::cstdio_file::SharedCstdio>> {
+        dispatch_stream!(self, stream => stream.shared_stdio())
+    }
+
+    fn clone_file(&mut self) -> IoResult<StdFile> {
+        dispatch_stream!(self, stream => stream.clone_file())
+    }
+
     fn write(&mut self, ptr: &[u8]) -> IoResult<()> {
-        dispatch_stream!(self, stream => stream.write(ptr))
+        dispatch_stream!(self, stream => stream.forward_write(ptr))
     }
 
     fn flush(&mut self) -> IoResult<()> {
@@ -86,16 +115,99 @@ impl StreamEntity for OutputFileStream {
 #[derive(Debug)]
 pub struct OutputFile {
     serializer: Serializer<OutputFileStream>,
-    file_name: String,
+    file_name: PathBuf,
 }
 
 impl OutputFile {
     /// C++ `OutputFile(const string&, Compressor, const char*)`.
     pub fn new(file_name: &str, compressor: Compressor, mode: &str) -> IoResult<Self> {
-        let sink = FileSink::new(file_name, mode, false, 0)?;
+        Self::new_path(Path::new(file_name), compressor, mode)
+    }
+    pub fn new_path(file_name: &Path, compressor: Compressor, mode: &str) -> IoResult<Self> {
+        let sink = FileSink::new_path(file_name, mode, false, 0)?;
         Ok(Self {
             serializer: Serializer::new(make_compressor(sink, compressor)),
-            file_name: file_name.to_string(),
+            file_name: file_name.to_path_buf(),
+        })
+    }
+
+    /// Source construction with explicit `config.file_buffer_size`.
+    pub fn with_buffer_size(
+        file_name: &str,
+        compressor: Compressor,
+        mode: &str,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        Self::with_buffer_size_path(Path::new(file_name), compressor, mode, buffer_size)
+    }
+    pub fn with_buffer_size_path(
+        file_name: &Path,
+        compressor: Compressor,
+        mode: &str,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        Self::with_codec_profile(file_name, compressor, mode, buffer_size, true, false)
+    }
+    /// Source command build profile; low-level typed constructors stay capable.
+    pub fn with_source_profile(
+        file_name: &str,
+        compressor: Compressor,
+        mode: &str,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        Self::with_source_profile_path(Path::new(file_name), compressor, mode, buffer_size)
+    }
+    pub fn with_source_profile_path(
+        file_name: &Path,
+        compressor: Compressor,
+        mode: &str,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        Self::with_codec_profile(
+            file_name,
+            compressor,
+            mode,
+            buffer_size,
+            cfg!(feature = "zstd"),
+            true,
+        )
+    }
+    pub fn source_new(file_name: &str, compressor: Compressor, mode: &str) -> IoResult<Self> {
+        Self::source_new_path(Path::new(file_name), compressor, mode)
+    }
+    pub fn source_new_path(file_name: &Path, compressor: Compressor, mode: &str) -> IoResult<Self> {
+        Self::with_source_profile_path(file_name, compressor, mode, super::DEFAULT_FILE_BUFFER_SIZE)
+    }
+    fn with_codec_profile(
+        file_name: &Path,
+        compressor: Compressor,
+        mode: &str,
+        buffer_size: usize,
+        allow_zstd: bool,
+        source_profile: bool,
+    ) -> IoResult<Self> {
+        if buffer_size == 0 && !source_profile {
+            return Err(IoError::Other("File buffer size must be positive.".into()));
+        }
+        let sink = FileSink::new_path(file_name, mode, false, 0)?;
+        // Source creates/truncates the sink before make_compressor rejects
+        // an unavailable build feature. Keep that observable ordering.
+        if compressor == Compressor::Zstd && !allow_zstd {
+            return Err(IoError::Other(
+                "Executable was not compiled with ZStd support.".into(),
+            ));
+        }
+        let serializer_size = if file_name.as_os_str().is_empty() {
+            OutputStreamBuffer::<FileSink>::STDOUT_BUF_SIZE
+        } else {
+            buffer_size
+        };
+        Ok(Self {
+            serializer: Serializer::with_source_buffer_size(
+                make_compressor_with_buffer_size(sink, compressor, buffer_size),
+                serializer_size,
+            ),
+            file_name: file_name.to_path_buf(),
         })
     }
 
@@ -105,25 +217,48 @@ impl OutputFile {
         compressor: Compressor,
         mode: &str,
     ) -> IoResult<Self> {
+        Self::from_temp_file_data_with_buffer_size(
+            data,
+            compressor,
+            mode,
+            super::DEFAULT_FILE_BUFFER_SIZE,
+        )
+    }
+    pub fn from_temp_file_data_with_buffer_size(
+        data: &TempFileData,
+        compressor: Compressor,
+        mode: &str,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
         #[cfg(unix)]
         {
             let file = data.try_clone_file()?;
-            let sink = FileSink::from_file(&data.name, file, mode, false, 0)?;
+            let sink = FileSink::from_file_path(&data.name, file, mode, false, 0)?;
             Ok(Self {
-                serializer: Serializer::new(make_compressor(sink, compressor)),
+                serializer: Serializer::with_source_buffer_size(
+                    make_compressor_with_buffer_size(sink, compressor, buffer_size),
+                    buffer_size,
+                ),
                 file_name: data.name.clone(),
             })
         }
         #[cfg(not(unix))]
         {
-            Self::new(&data.name, compressor, mode)
+            Self::with_buffer_size_path(&data.name, compressor, mode, buffer_size)
         }
     }
 
     pub fn remove(&mut self) {
-        if std::fs::remove_file(&self.file_name).is_err() {
-            eprintln!("Warning: Failed to delete file {}", self.file_name);
+        let _ = self.try_remove();
+    }
+    pub fn try_remove(&mut self) -> IoResult<()> {
+        if std::fs::remove_file(super::source_c_path(&self.file_name).as_ref()).is_err() {
+            let mut bytes = b"Warning: Failed to delete file ".to_vec();
+            bytes.extend_from_slice(&super::path_diagnostic_bytes(&self.file_name)?);
+            bytes.push(b'\n');
+            let _ = std::io::Write::write_all(&mut super::console::stderr(), &bytes);
         }
+        Ok(())
     }
 
     pub fn advise_need(&mut self) -> IoResult<()> {
@@ -132,19 +267,38 @@ impl OutputFile {
             use std::num::NonZeroU64;
 
             let size = u64::try_from(self.serializer.file_size()?).unwrap_or(0);
-            let file = self.serializer.file()?;
+            let file = self.serializer.clone_file()?;
             // Upstream passes SEQUENTIAL | WILLNEED. POSIX advice values are
             // an enum rather than bitflags, and on the supported Unix targets
             // that expression resolves to WILLNEED. Preserve that one-call
             // behavior while using a typed descriptor API.
-            let _ =
-                rustix::fs::fadvise(file, 0, NonZeroU64::new(size), rustix::fs::Advice::WillNeed);
+            let _ = rustix::fs::fadvise(
+                &file,
+                0,
+                NonZeroU64::new(size),
+                rustix::fs::Advice::WillNeed,
+            );
         }
         Ok(())
     }
 
+    pub fn file_path(&self) -> &Path {
+        &self.file_name
+    }
+    #[cfg(unix)]
+    pub fn file_name_bytes(&self) -> &[u8] {
+        use std::os::unix::ffi::OsStrExt;
+        self.file_name.as_os_str().as_bytes()
+    }
+    pub fn try_file_name(&self) -> IoResult<&str> {
+        self.file_name
+            .to_str()
+            .ok_or_else(|| IoError::Other("OS path is not UTF-8; use file_path".into()))
+    }
     pub fn file_name(&self) -> String {
-        self.file_name.clone()
+        self.try_file_name()
+            .expect("Non-UTF8 OS path; use file_path")
+            .to_owned()
     }
 
     pub fn write_raw(&mut self, ptr: &[u8]) -> IoResult<()> {
@@ -227,6 +381,17 @@ impl OutputFile {
 
     pub fn file(&mut self) -> IoResult<&mut StdFile> {
         self.serializer.file()
+    }
+
+    /// Owned descriptor view, without reopening the pathname. Rewind first
+    /// when transferring a completed output to an input reader.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn shared_stdio(&mut self) -> IoResult<Option<super::cstdio_file::SharedCstdio>> {
+        self.serializer.shared_stdio()
+    }
+
+    pub fn clone_file(&mut self) -> IoResult<StdFile> {
+        self.serializer.clone_file()
     }
 }
 

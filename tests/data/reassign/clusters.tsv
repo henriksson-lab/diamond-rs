@@ -1,0 +1,7 @@
+centroid	member
+a	a
+b	b
+a	member_base
+b	member_a
+b	fragment
+a	duplicate_member

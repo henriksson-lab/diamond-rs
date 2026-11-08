@@ -34,29 +34,29 @@ pub const DEFAULT_REALIGN_FORMAT: [&str; 10] = [
 /// `Cluster::realign()`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealignConfig {
-    pub database: String,
-    pub clustering: String,
-    pub output_format: Vec<String>,
-    pub output_header: Option<Vec<String>>,
+    pub database: std::path::PathBuf,
+    pub clustering: std::path::PathBuf,
+    pub output_format: Vec<Vec<u8>>,
+    pub output_header: Option<Vec<Vec<u8>>>,
     pub db_size: Option<u64>,
     pub max_evalue: f64,
     pub frame_shift: i32,
     pub query_translated: bool,
-    pub score_matrix_name: String,
+    pub score_matrix_name: Vec<u8>,
 }
 
 impl Default for RealignConfig {
     fn default() -> Self {
         Self {
-            database: String::new(),
-            clustering: String::new(),
+            database: std::path::PathBuf::new(),
+            clustering: std::path::PathBuf::new(),
             output_format: Vec::new(),
             output_header: None,
             db_size: None,
             max_evalue: 0.0,
             frame_shift: 0,
             query_translated: false,
-            score_matrix_name: "BLOSUM62".to_owned(),
+            score_matrix_name: b"BLOSUM62".to_vec(),
         }
     }
 }
@@ -79,13 +79,37 @@ pub struct RealignSummary {
 /// Adapter for facilities whose upstream implementations live outside
 /// `cluster/realign.cpp` (sequence-file construction, TSV cluster loading,
 /// and the block-pair alignment overload in `cluster/output.cpp`).
-pub trait RealignBackend {
+pub trait RealignBackend<T = String> {
+    fn io_errors(&self) -> crate::util::io::IoErrorOwner {
+        Default::default()
+    }
+
     fn open_database(
         &mut self,
         path: &str,
         flags: SequenceFileFlags,
     ) -> Result<DatabaseMetadata, String>;
 
+    fn open_database_path(
+        &mut self,
+        path: &std::path::Path,
+        flags: SequenceFileFlags,
+    ) -> Result<DatabaseMetadata, String> {
+        self.open_database(
+            path.to_str()
+                .ok_or("Legacy backend requires UTF-8 paths; override open_database_path")?,
+            flags,
+        )
+    }
+    fn read_centroid_sorted_path(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(FlatArray<OId>, Vec<OId>), String> {
+        self.read_centroid_sorted(
+            path.to_str()
+                .ok_or("Legacy backend requires UTF-8 paths; override read_centroid_sorted_path")?,
+        )
+    }
     fn set_score_matrix_db_letters(&mut self, letters: u64) -> Result<(), String>;
 
     fn init_random_access(&mut self) -> Result<(), String>;
@@ -97,49 +121,36 @@ pub trait RealignBackend {
         clusters: &FlatArray<OId>,
         centroids: &[OId],
         hsp_values: HspValues,
-        emit: &mut dyn FnMut(&HspContext) -> Result<(), String>,
+        emit: &mut dyn FnMut(&HspContext<T>) -> Result<(), String>,
     ) -> Result<(), String>;
 
     fn close_database(&mut self) -> Result<(), String>;
 }
 
-/// Execute C++ `Cluster::realign()` with explicit ownership adapters.
-///
-/// `format_match` corresponds to `OutputFormat::print_match`; it receives the
-/// reused C++ `TextBuffer` equivalent and must append exactly one formatted
-/// match. The buffer is written and cleared after every callback invocation.
-pub fn realign<B, W, F>(
-    config: &mut RealignConfig,
-    backend: &mut B,
-    output: &mut W,
-    mut format_match: F,
-) -> Result<RealignSummary, String>
-where
-    B: RealignBackend,
-    W: Write,
-    F: FnMut(&HspContext, &mut Vec<u8>) -> Result<(), String>,
-{
-    if config.database.is_empty() {
-        return Err("Database file is required for the realign workflow.".to_owned());
-    }
-    if config.clustering.is_empty() {
-        return Err("Clustering file is required for the realign workflow.".to_owned());
-    }
-
+/// Validate the output policy before a concrete command opens its destination.
+pub fn tabular_format(config: &mut RealignConfig) -> Result<TabularFormat, String> {
+    tabular_format_io(config).map_err(|error| error.to_string())
+}
+pub fn tabular_format_io(config: &mut RealignConfig) -> std::io::Result<TabularFormat> {
     if config.output_format.is_empty() {
         config.output_format = DEFAULT_REALIGN_FORMAT
             .iter()
-            .map(|value| (*value).to_owned())
+            .map(|value| value.as_bytes().to_vec())
             .collect();
     }
-    let format_code = FormatCode::parse(&config.output_format[0])
-        .ok_or_else(|| format!("Invalid output format: {}", config.output_format[0]))?;
+    let format_code = FormatCode::parse_bytes(&config.output_format[0]).ok_or_else(|| {
+        let mut message = b"Invalid output format: ".to_vec();
+        message.extend_from_slice(&config.output_format[0]);
+        crate::util::io::RawDiagnosticError(message).into_io()
+    })?;
     if format_code != FormatCode::Tabular {
-        return Err("The realign workflow only supports tabular output format.".to_owned());
+        return Err(std::io::Error::other(
+            "The realign workflow only supports tabular output format.",
+        ));
     }
 
-    let format_args: Vec<&str> = config.output_format.iter().map(String::as_str).collect();
-    let tabular = TabularFormat::new(
+    let format_args: Vec<&[u8]> = config.output_format.iter().map(Vec::as_slice).collect();
+    let tabular = TabularFormat::new_bytes(
         &format_args,
         false,
         config.frame_shift,
@@ -152,17 +163,76 @@ where
                 .output_field()
                 .map(|definition| definition.key)
                 .unwrap_or("unknown");
-            return Err(format!(
+            return Err(std::io::Error::other(format!(
                 "Unsupported output field for the realign workflow: {key}"
-            ));
+            )));
         }
     }
+
+    Ok(tabular)
+}
+
+/// Execute C++ `Cluster::realign()` with explicit ownership adapters.
+///
+/// `format_match` corresponds to `OutputFormat::print_match`; it receives the
+/// reused C++ `TextBuffer` equivalent and must append exactly one formatted
+/// match. The buffer is written and cleared after every callback invocation.
+pub fn realign<B, W, F>(
+    config: &mut RealignConfig,
+    backend: &mut B,
+    output: &mut W,
+    format_match: F,
+) -> Result<RealignSummary, String>
+where
+    B: RealignBackend,
+    W: Write,
+    F: FnMut(&HspContext, &mut Vec<u8>) -> Result<(), String>,
+{
+    realign_typed(config, backend, output, format_match)
+}
+pub fn realign_bytes<B, W, F>(
+    config: &mut RealignConfig,
+    backend: &mut B,
+    output: &mut W,
+    format_match: F,
+) -> Result<RealignSummary, String>
+where
+    B: RealignBackend<Vec<u8>>,
+    W: Write,
+    F: FnMut(&HspContext<Vec<u8>>, &mut Vec<u8>) -> Result<(), String>,
+{
+    realign_typed(config, backend, output, format_match)
+}
+fn realign_typed<T, B, W, F>(
+    config: &mut RealignConfig,
+    backend: &mut B,
+    output: &mut W,
+    mut format_match: F,
+) -> Result<RealignSummary, String>
+where
+    B: RealignBackend<T>,
+    W: Write,
+    F: FnMut(&HspContext<T>, &mut Vec<u8>) -> Result<(), String>,
+{
+    if config.database.as_os_str().is_empty() {
+        return Err("Database file is required for the realign workflow.".to_owned());
+    }
+    if config.clustering.as_os_str().is_empty() {
+        return Err("Clustering file is required for the realign workflow.".to_owned());
+    }
+
+    let tabular = backend.io_errors().capture(tabular_format_io(config))?;
 
     let header_args = config
         .output_header
         .as_ref()
-        .map(|values| values.iter().map(String::as_str).collect::<Vec<&str>>());
-    let header = TabularFormat::header_format(Workflow::Cluster, header_args.as_deref())?;
+        .map(|values| values.iter().map(Vec::as_slice).collect::<Vec<&[u8]>>());
+    let header = backend
+        .io_errors()
+        .capture(TabularFormat::header_format_bytes(
+            Workflow::Cluster,
+            header_args.as_deref(),
+        ))?;
     if header == Header::Simple {
         output
             .write_all(output_header(&tabular.fields, true)?.as_bytes())
@@ -170,7 +240,7 @@ where
     }
 
     let flags = SequenceFileFlags::NEED_LETTER_COUNT | SequenceFileFlags::ACC_TO_OID_MAPPING;
-    let database = backend.open_database(&config.database, flags)?;
+    let database = backend.open_database_path(&config.database, flags)?;
     let execution = (|| {
         let score_matrix_db_letters = config.db_size.unwrap_or(database.letters);
         backend.set_score_matrix_db_letters(score_matrix_db_letters)?;
@@ -178,11 +248,11 @@ where
         if database.titles_lazy {
             backend.init_random_access()?;
         }
-        let (clusters, centroids) = backend.read_centroid_sorted(&config.clustering)?;
+        let (clusters, centroids) = backend.read_centroid_sorted_path(&config.clustering)?;
         let mapping_count = usize::try_from(clusters.data_size())
             .map_err(|_| "Cluster mapping count does not fit usize.".to_owned())?;
         let mut buffer = Vec::new();
-        let mut emit = |hsp: &HspContext| {
+        let mut emit = |hsp: &HspContext<T>| {
             format_match(hsp, &mut buffer)?;
             output
                 .write_all(&buffer)
@@ -288,8 +358,8 @@ mod tests {
 
     fn configured() -> RealignConfig {
         RealignConfig {
-            database: "db.dmnd".to_owned(),
-            clustering: "clusters.tsv".to_owned(),
+            database: "db.dmnd".into(),
+            clustering: "clusters.tsv".into(),
             ..RealignConfig::default()
         }
     }
@@ -307,7 +377,13 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(config.output_format, DEFAULT_REALIGN_FORMAT);
+        assert_eq!(
+            config.output_format,
+            DEFAULT_REALIGN_FORMAT
+                .iter()
+                .map(|field| field.as_bytes().to_vec())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(config.max_evalue, f64::MAX);
         assert_eq!(summary.score_matrix_db_letters, 123);
         assert_eq!((summary.centroid_count, summary.mapping_count), (2, 3));
@@ -360,13 +436,13 @@ mod tests {
     fn rejects_non_tabular_and_no_realign_fields_verbatim() {
         let mut backend = FakeBackend::default();
         let mut config = configured();
-        config.output_format = vec!["101".to_owned()];
+        config.output_format = vec![b"101".to_vec()];
         assert_eq!(
             realign(&mut config, &mut backend, &mut Vec::new(), |_, _| Ok(())).unwrap_err(),
             "The realign workflow only supports tabular output format."
         );
 
-        config.output_format = vec!["6".to_owned(), "qseq".to_owned()];
+        config.output_format = vec![b"6".to_vec(), b"qseq".to_vec()];
         assert_eq!(
             realign(&mut config, &mut backend, &mut Vec::new(), |_, _| Ok(())).unwrap_err(),
             "Unsupported output field for the realign workflow: qseq"
@@ -394,7 +470,7 @@ mod tests {
             realign(&mut config, &mut backend, &mut Vec::new(), |_, _| Ok(())).unwrap_err(),
             "Database file is required for the realign workflow."
         );
-        config.database = "db.dmnd".to_owned();
+        config.database = "db.dmnd".into();
         assert_eq!(
             realign(&mut config, &mut backend, &mut Vec::new(), |_, _| Ok(())).unwrap_err(),
             "Clustering file is required for the realign workflow."

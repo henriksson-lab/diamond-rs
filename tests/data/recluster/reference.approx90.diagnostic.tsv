@@ -1,0 +1,10 @@
+centroid	member
+a	a
+a	member_base
+a	duplicate_member
+b	b
+b	member_a
+b	fragment
+new_family_1	new_family_1
+new_family_2	new_family_2
+orphan	orphan

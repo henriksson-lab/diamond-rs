@@ -29,13 +29,13 @@ pub fn write_unaligned<W: Write>(
             } else {
                 query.seqs().get(i)
             };
-            let id = std::str::from_utf8(query.ids()?.get(i)).map_err(|e| e.to_string())?;
+            let id = query.ids()?.get(i);
             let qual = if query.qual().empty() {
                 None
             } else {
                 Some(query.qual().get(i))
             };
-            sequence::format(seq, id, qual, &mut buf, format, value_traits, 160)?;
+            sequence::format_bytes(seq, id, qual, &mut buf, format, value_traits, 160)?;
             file.write_all(buf.data()).map_err(|e| e.to_string())?;
             buf.clear();
         }
@@ -60,13 +60,13 @@ pub fn write_aligned<W: Write>(
             } else {
                 query.seqs().get(i)
             };
-            let id = std::str::from_utf8(query.ids()?.get(i)).map_err(|e| e.to_string())?;
+            let id = query.ids()?.get(i);
             let qual = if query.qual().empty() {
                 None
             } else {
                 Some(query.qual().get(i))
             };
-            sequence::format(seq, id, qual, &mut buf, format, value_traits, 160)?;
+            sequence::format_bytes(seq, id, qual, &mut buf, format, value_traits, 160)?;
             file.write_all(buf.data()).map_err(|e| e.to_string())?;
             buf.clear();
         }
@@ -210,5 +210,29 @@ mod tests {
         assert_eq!(lines[1].len(), 160);
         assert!(lines[1].iter().all(|&b| b == b'A'));
         assert_eq!(lines[2], b"A");
+
+        // Source auxiliary output retains arbitrary title and quality bytes.
+        let mut raw = Block::new();
+        raw.push_back_bytes(
+            &[0, 1],
+            Some(b"raw\xff"),
+            Some(b"\xfe!"),
+            0,
+            SequenceType::AminoAcid,
+            0,
+            false,
+        )
+        .unwrap();
+        *QUERY_ALIGNED.lock().unwrap() = vec![false];
+        let mut output = Vec::new();
+        write_unaligned(
+            &raw,
+            &mut output,
+            "fastq",
+            &traits,
+            AlignModeBlock::blastp(),
+        )
+        .unwrap();
+        assert_eq!(output, b"@raw\xff\nAR\n+\n\xfe!\n");
     }
 }

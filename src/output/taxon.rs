@@ -33,7 +33,12 @@ impl TaxonFormat {
         OutputFormatSpec::taxon_format(self.include_lineage)
     }
 
-    pub fn print_match(&mut self, r: &HspContext, subject_taxids: &[TaxId], tree: &TaxonomyTree) {
+    pub fn print_match<T>(
+        &mut self,
+        r: &HspContext<T>,
+        subject_taxids: &[TaxId],
+        tree: &TaxonomyTree,
+    ) {
         if subject_taxids.is_empty() {
             return;
         }
@@ -49,22 +54,29 @@ impl TaxonFormat {
         query_title: &str,
         tree: &TaxonomyTree,
     ) -> io::Result<()> {
-        write!(writer, "{}\t{}\t", query_id(query_title), self.taxid)?;
+        self.print_query_epilog_bytes(writer, query_title.as_bytes(), tree)
+    }
+
+    pub fn print_query_epilog_bytes<W: Write>(
+        &self,
+        writer: &mut W,
+        query_title: &[u8],
+        tree: &TaxonomyTree,
+    ) -> io::Result<()> {
+        writer.write_all(&crate::util::sequence::seqid_bytes(query_title))?;
+        write!(writer, "\t{}\t", self.taxid)?;
         if self.taxid > 0 {
             write!(writer, "{}", format_evalue(self.evalue))?;
         } else {
             write!(writer, "0")?;
         }
         if self.include_lineage {
-            write!(
-                writer,
-                "\t{}",
-                if self.taxid > 0 {
-                    taxon_lineage(self.taxid, tree)
-                } else {
-                    "N/A".to_string()
-                }
-            )?;
+            writer.write_all(b"\t")?;
+            if self.taxid > 0 {
+                writer.write_all(&taxon_lineage_bytes(self.taxid, tree))?;
+            } else {
+                writer.write_all(b"N/A")?;
+            }
         }
         writeln!(writer)
     }
@@ -123,14 +135,18 @@ fn sequence_file_lca(tree: &TaxonomyTree, t1: TaxId, t2: TaxId) -> TaxId {
 }
 
 pub fn taxon_lineage(taxid: TaxId, tree: &TaxonomyTree) -> String {
+    String::from_utf8(taxon_lineage_bytes(taxid, tree))
+        .expect("Raw taxonomy name is not UTF-8; use taxon_lineage_bytes")
+}
+pub fn taxon_lineage_bytes(taxid: TaxId, tree: &TaxonomyTree) -> Vec<u8> {
     let lin = tree.lineage_root_to_taxid(taxid);
     if lin.is_empty() {
-        return "N/A".to_string();
+        return b"N/A".to_vec();
     }
-    let mut out = tree.taxon_scientific_name(lin[0]);
+    let mut out = tree.taxon_scientific_name_bytes(lin[0]);
     for &taxid in &lin[1..] {
-        out.push_str("; ");
-        out.push_str(&tree.taxon_scientific_name(taxid));
+        out.extend_from_slice(b"; ");
+        out.extend_from_slice(&tree.taxon_scientific_name_bytes(taxid));
     }
     out
 }
@@ -142,9 +158,9 @@ pub fn query_id(title: &str) -> &str {
         .unwrap_or("")
 }
 
-pub fn print_match(
+pub fn print_match<T>(
     format: &mut TaxonFormat,
-    r: &HspContext,
+    r: &HspContext<T>,
     subject_taxids: &[TaxId],
     tree: &TaxonomyTree,
 ) {
@@ -158,6 +174,15 @@ pub fn print_query_epilog<W: Write>(
     tree: &TaxonomyTree,
 ) -> io::Result<()> {
     format.print_query_epilog(writer, query_title, tree)
+}
+
+pub fn print_query_epilog_bytes<W: Write>(
+    format: &TaxonFormat,
+    writer: &mut W,
+    query_title: &[u8],
+    tree: &TaxonomyTree,
+) -> io::Result<()> {
+    format.print_query_epilog_bytes(writer, query_title, tree)
 }
 
 pub fn subject_taxids<'a>(subject_oid: OId, taxids_by_oid: &'a [Vec<TaxId>]) -> &'a [TaxId] {
@@ -254,7 +279,7 @@ mod tests {
     #[test]
     fn test_taxon_format_empty_and_subject_lookup() {
         let tree = test_tree();
-        let r = HspContext::default();
+        let r: HspContext = HspContext::default();
         let mut format = TaxonFormat::new(false);
         format.print_match(&r, &[], &tree);
         let mut out = Vec::new();

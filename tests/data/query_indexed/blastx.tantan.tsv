@@ -1,0 +1,4 @@
+translated_query	single_domain	100	78	0	0	1	234	1	78	1.08e-59	176
+translated_query	reordered	100	78	0	0	1	234	302	379	6.89e-56	176
+reverse_query	single_domain	100	78	0	0	1137	904	1	78	1.08e-59	176
+reverse_query	reordered	100	78	0	0	1137	904	302	379	6.89e-56	176

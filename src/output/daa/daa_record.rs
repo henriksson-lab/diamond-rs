@@ -5,7 +5,8 @@
 //! making the original source-file mapping explicit.
 
 pub use crate::data::daa::{
-    copy_match_record_raw, translate_query, DaaMatch, DaaMatchIterator, DaaQueryRecord, DaaRawMatch,
+    copy_match_record_raw, translate_query, ByteDaaFile, ByteDaaMatch, ByteDaaQueryRecord,
+    DaaMatch, DaaMatchIterator, DaaQueryRecord, DaaRawMatch,
 };
 
 use crate::output::format::OutputFormatSpec;

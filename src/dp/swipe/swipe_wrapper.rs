@@ -345,7 +345,7 @@ pub fn recompute_reversed(hsps: &mut [Hsp], params: &mut Params<'_>) -> Vec<Hsp>
     let mut dp_targets = targets();
     let query_len = params.query.len() as i32;
     for hsp in hsps.iter() {
-        let query_cover = hsp.query_cover(params.query_source_len);
+        let query_cover = hsp.query_cover_percent(params.query_source_len as u32);
         let subject_cover = hsp.subject_cover(hsp.target_seq.len() as i32);
         let query_cutoff = if params.query_or_target_cover > 0.0 {
             params.query_or_target_cover

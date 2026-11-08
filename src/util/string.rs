@@ -184,21 +184,22 @@ where
 
     pub fn read_i64(&mut self) -> Result<i64, TokenizerException> {
         let (token, end) = self.read_integer_prefix()?;
-        let value = token
-            .parse::<i64>()
-            .map_err(|_| TokenizerException::new())?;
+        // Source uses strtoll without inspecting errno, so range overflow
+        // retains the signed saturation value before any narrower cast.
+        let value = match token.parse::<i64>() {
+            Ok(value) => value,
+            Err(error) => match error.kind() {
+                std::num::IntErrorKind::PosOverflow => i64::MAX,
+                std::num::IntErrorKind::NegOverflow => i64::MIN,
+                _ => return Err(TokenizerException::new()),
+            },
+        };
         self.p = self.delimiters.next(self.s, end)?;
         Ok(value)
     }
 
     pub fn read_u64(&mut self) -> Result<u64, TokenizerException> {
-        let (token, end) = self.read_integer_prefix()?;
-        let value = token
-            .parse::<i64>()
-            .map(|x| x as u64)
-            .map_err(|_| TokenizerException::new())?;
-        self.p = self.delimiters.next(self.s, end)?;
-        Ok(value)
+        self.read_i64().map(|value| value as u64)
     }
 
     pub fn read_i32(&mut self) -> Result<i32, TokenizerException> {
@@ -363,7 +364,13 @@ pub fn replace(s: &str, a: char, b: char) -> String {
 }
 
 pub fn ratio_percentage_f64(x: f64, y: f64) -> String {
-    format!("{:.0}/{:.0} ({:.2}%)", x, y, x / y * 100.0)
+    use crate::output::format::format_fixed_precision;
+    format!(
+        "{}/{} ({}%)",
+        format_fixed_precision(x, 0),
+        format_fixed_precision(y, 0),
+        format_fixed_precision(x / y * 100.0, 2)
+    )
 }
 
 pub fn ratio_percentage_usize(x: usize, y: usize) -> String {
@@ -394,34 +401,195 @@ where
 }
 
 pub fn interpret_number(s: &str) -> Result<i64, String> {
-    let (number_start, number_end) =
-        scan_decimal_float_prefix(s, 0).ok_or_else(|| format!("Invalid number format: {}", s))?;
-    let n: f64 = s[number_start..number_end]
-        .parse()
-        .map_err(|_| format!("Invalid number format: {}", s))?;
-    let suffix_text = s[number_end..].trim_start_matches(|c: char| c.is_ascii_whitespace());
-    let suffix = suffix_text.chars().next().ok_or_else(|| {
-        format!(
-            "Missing size specifier in number: {}. Permitted values: T, G, M, K",
-            s
-        )
-    })?;
+    interpret_number_bytes(s.as_bytes()).map_err(|error| error.to_string())
+}
+
+/// Source stringstream double/char extraction in the classic locale. Only
+/// the extracted ASCII numeric token is converted to Rust text; diagnostics
+/// and the remaining stream retain the original byte extent.
+pub fn interpret_number_bytes(s: &[u8]) -> std::io::Result<i64> {
+    fn diagnostic(prefix: &[u8], value: &[u8], suffix: &[u8]) -> std::io::Error {
+        let mut message = prefix.to_vec();
+        message.extend_from_slice(value);
+        message.extend_from_slice(suffix);
+        crate::util::io::RawDiagnosticError(message).into_io()
+    }
+    fn skip_space(s: &[u8], at: &mut usize) {
+        while s.get(*at).is_some_and(u8::is_ascii_whitespace) {
+            *at += 1;
+        }
+    }
+    let mut at = 0;
+    skip_space(s, &mut at);
+    let start = at;
+    if matches!(s.get(at), Some(b'+' | b'-')) {
+        at += 1;
+    }
+    let mut digits = false;
+    while s.get(at).is_some_and(u8::is_ascii_digit) {
+        digits = true;
+        at += 1;
+    }
+    if s.get(at) == Some(&b'.') {
+        at += 1;
+        while s.get(at).is_some_and(u8::is_ascii_digit) {
+            digits = true;
+            at += 1;
+        }
+    }
+    let mut exponent_valid = true;
+    if digits && matches!(s.get(at), Some(b'e' | b'E')) {
+        at += 1;
+        if matches!(s.get(at), Some(b'+' | b'-')) {
+            at += 1;
+        }
+        let exponent_start = at;
+        while s.get(at).is_some_and(u8::is_ascii_digit) {
+            at += 1;
+        }
+        exponent_valid = at != exponent_start;
+    }
+    let n = std::str::from_utf8(&s[start..at])
+        .ok()
+        .and_then(|token| token.parse::<f64>().ok());
+    let failed = !digits || !exponent_valid || n.is_none_or(|value| !value.is_finite());
+    let mut eof = at == s.len();
+    // Failed extraction inhibits both later formatted char extractions. The
+    // Source initializes that char to NUL before attempting the first one.
+    let mut suffix = 0;
+    if !failed && !eof {
+        skip_space(s, &mut at);
+        if at == s.len() {
+            eof = true;
+        } else {
+            suffix = s[at];
+            at += 1;
+        }
+    }
+    if eof {
+        return Err(diagnostic(
+            b"Missing size specifier in number: ",
+            s,
+            b". Permitted values: T, G, M, K",
+        ));
+    }
     let mult = match suffix {
-        'T' | 't' => 1e12,
-        'G' | 'g' => 1e9,
-        'M' | 'm' => 1e6,
-        'K' | 'k' => 1e3,
+        b'T' | b't' => 1e12,
+        b'G' | b'g' => 1e9,
+        b'M' | b'm' => 1e6,
+        b'K' | b'k' => 1e3,
         _ => {
-            return Err(format!(
-                "Invalid size specifier ({}) in number: {}. Permitted suffixes: T, G, M, K",
-                suffix, s
-            ))
+            let mut prefix = b"Invalid size specifier (".to_vec();
+            prefix.push(suffix);
+            prefix.extend_from_slice(b") in number: ");
+            return Err(diagnostic(&prefix, s, b". Permitted suffixes: T, G, M, K"));
         }
     };
-    if !suffix_text[suffix.len_utf8()..].trim().is_empty() {
-        return Err(format!("Invalid number format: {}", s));
+    skip_space(s, &mut at);
+    if at != s.len() {
+        return Err(diagnostic(b"Invalid number format: ", s, b""));
     }
-    Ok((n * mult) as i64)
+    Ok((n.unwrap_or(0.0) * mult) as i64)
+}
+
+/// Canonical byte overload of Source Util::String::tokenize(const char*,...).
+/// Both arguments have C-string extent; empty delimiter runs are skipped.
+pub fn tokenize_bytes(input: &[u8], delimiters: &[u8]) -> Vec<Vec<u8>> {
+    let input = &input[..input
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(input.len())];
+    let delimiters = &delimiters[..delimiters
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(delimiters.len())];
+    let mut tokens = input
+        .split(|byte| delimiters.contains(byte))
+        .filter(|token| !token.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        tokens.push(Vec::new());
+    }
+    tokens
+}
+
+/// Source CharDelimiter tokenizer over raw bytes. Numeric conversion uses
+/// the selected C runtime's strtoll, including its whitespace, saturation and
+/// ignored errno behavior; a suffix must be exactly the delimiter or NUL.
+pub struct ByteTokenizer<'a> {
+    input: &'a [u8],
+    position: Option<usize>,
+    delimiter: u8,
+}
+impl<'a> ByteTokenizer<'a> {
+    pub fn new(input: &'a [u8], delimiter: u8) -> Self {
+        let end = input
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(input.len());
+        Self {
+            input: &input[..end],
+            position: Some(0),
+            delimiter,
+        }
+    }
+    pub fn good(&self) -> bool {
+        self.position
+            .is_some_and(|position| position < self.input.len())
+    }
+    pub fn read_bytes(&mut self) -> Result<Vec<u8>, TokenizerException> {
+        let start = self.position.ok_or_else(TokenizerException::new)?;
+        let end = self.input[start..]
+            .iter()
+            .position(|&byte| byte == self.delimiter)
+            .map(|offset| start + offset);
+        match end {
+            Some(end) => {
+                self.position = Some(end + 1);
+                Ok(self.input[start..end].to_vec())
+            }
+            None => {
+                self.position = None;
+                Ok(self.input[start..].to_vec())
+            }
+        }
+    }
+    pub fn read_i64(&mut self) -> Result<i64, TokenizerException> {
+        if !self.good() {
+            return Err(TokenizerException::new());
+        }
+        let position = self.position.unwrap();
+        // Raw Rust slices need a temporary terminator for the actual CRT
+        // parser. This workspace is discarded immediately, never an ID cache.
+        let mut terminated = self.input[position..].to_vec();
+        terminated.push(0);
+        let begin = terminated.as_ptr().cast::<libc::c_char>();
+        let mut end = std::ptr::null_mut();
+        let value = unsafe { libc::strtoll(begin, &mut end, 10) };
+        let consumed = unsafe { end.offset_from(begin) } as usize;
+        if consumed == 0 {
+            return Err(TokenizerException::new());
+        }
+        let next = position + consumed;
+        self.position = if next == self.input.len() {
+            None
+        } else if self.input[next] == self.delimiter {
+            Some(next + 1)
+        } else {
+            return Err(TokenizerException::new());
+        };
+        Ok(value as i64)
+    }
+    pub fn read_u64(&mut self) -> Result<u64, TokenizerException> {
+        self.read_i64().map(|value| value as u64)
+    }
+    pub fn read_i32(&mut self) -> Result<i32, TokenizerException> {
+        self.read_i64().map(|value| value as i32)
+    }
+    pub fn read_u32(&mut self) -> Result<u32, TokenizerException> {
+        self.read_i64().map(|value| value as u32)
+    }
 }
 
 pub fn tokenize(str_: &str, delimiters: &str) -> Vec<String> {
@@ -1101,6 +1269,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn byte_size_numbers_keep_source_stream_state_and_raw_diagnostics() {
+        assert_eq!(interpret_number_bytes(b" 1.5e2 K\t").unwrap(), 150_000);
+        let error = interpret_number_bytes(b"2K\xff").unwrap_err();
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error).unwrap(),
+            b"Invalid number format: 2K\xff"
+        );
+        // Numeric extraction failed before EOF: c remains its initialized NUL,
+        // and the Source main's what() C string stops at that byte.
+        let error = interpret_number_bytes(b"1e K").unwrap_err();
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error).unwrap(),
+            b"Invalid size specifier ("
+        );
+        assert!(interpret_number_bytes(b"10")
+            .unwrap_err()
+            .to_string()
+            .starts_with("Missing size specifier"));
+    }
+
+    #[test]
+    fn byte_tokenizer_preserves_raw_fields_c_extent_and_source_integer_suffix_rules() {
+        assert_eq!(
+            tokenize_bytes(b"\tkey\xff\t\tvalue\xfe\0ignored", b"\t"),
+            vec![b"key\xff".to_vec(), b"value\xfe".to_vec()]
+        );
+        assert_eq!(tokenize_bytes(b"\t\t", b"\t"), vec![Vec::<u8>::new()]);
+        let mut tokens = ByteTokenizer::new(b"999999999999999999999999\t\xff\t-1", b'\t');
+        assert_eq!(tokens.read_i64().unwrap(), i64::MAX);
+        assert_eq!(tokens.read_bytes().unwrap(), b"\xff");
+        assert_eq!(tokens.read_u64().unwrap(), u64::MAX);
+        assert!(!tokens.good());
+        assert!(ByteTokenizer::new(b"12\xff", b'\t').read_u64().is_err());
+        assert_eq!(
+            ByteTokenizer::new(b"12\0\xff", b'\t').read_u64().unwrap(),
+            12
+        );
+    }
+
+    #[test]
     fn test_suffix_helpers() {
         assert!(ends_with("abc.dmnd", ".dmnd"));
         assert!(!ends_with("abc", ".dmnd"));
@@ -1248,6 +1456,25 @@ mod tests {
         assert_eq!(t.getline(), "abc");
         t.skip_to('\n');
         assert_eq!(t.getline(), "def");
+    }
+
+    #[test]
+    fn tokenizer_integer_overflow_preserves_source_strtoll_saturation() {
+        let mut tokens = Tokenizer::new(
+            "9223372036854775808,-9223372036854775809,+999999999999999999999999999999,9223372036854775808,-9223372036854775809",
+            CharDelimiter::new(','),
+        );
+        assert_eq!(tokens.read_i64().unwrap(), i64::MAX);
+        assert_eq!(tokens.read_i64().unwrap(), i64::MIN);
+        assert_eq!(tokens.read_u64().unwrap(), i64::MAX as u64);
+        assert_eq!(tokens.read_i32().unwrap(), -1);
+        assert_eq!(tokens.read_i32().unwrap(), 0);
+        assert!(!tokens.good());
+        assert!(
+            Tokenizer::new("9223372036854775808junk", CharDelimiter::new(','))
+                .read_i64()
+                .is_err()
+        );
     }
 
     #[test]

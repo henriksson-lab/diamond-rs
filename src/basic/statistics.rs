@@ -163,9 +163,11 @@ impl Statistics {
     pub fn report(&self) -> StatisticsReport {
         let d = |v| self.get(v);
         let pct = |numerator: StatType, denominator: StatType| {
-            numerator as f64 * 100.0 / denominator as f64
+            crate::output::format::format_default_float(
+                numerator as f64 * 100.0 / denominator as f64,
+            )
         };
-        let seconds = |v| d(v) as f64 / 1e6;
+        let seconds = |v| crate::output::format::format_default_float(d(v) as f64 / 1e6);
         let mut diagnostics = String::new();
         writeln!(
             diagnostics,
@@ -491,7 +493,9 @@ impl Statistics {
 
         let verbose = format!(
             "Temporary disk space used (search): {} GB\n",
-            d(StatValue::SearchTempSpace) as f64 / (1u64 << 30) as f64
+            crate::output::format::format_default_float(
+                d(StatValue::SearchTempSpace) as f64 / (1u64 << 30) as f64
+            )
         );
         let message = format!(
             "Reported {} pairwise alignments, {} HSPs.\n{} queries aligned.\n",
@@ -534,6 +538,80 @@ impl std::ops::AddAssign<&Statistics> for Statistics {
 
 pub static STATISTICS: LazyLock<Mutex<Statistics>> =
     LazyLock::new(|| Mutex::new(Statistics::new()));
+
+/// Merge one completed Source worker accumulator into its search-wide owner.
+pub fn merge_statistics(statistics: &Statistics) {
+    STATISTICS.lock().unwrap().add_assign_statistics(statistics);
+}
+
+pub fn inc_statistics(value: StatValue, count: StatType) {
+    STATISTICS.lock().unwrap().inc(value, count);
+}
+
+pub fn max_statistics(value: StatValue, count: StatType) {
+    STATISTICS.lock().unwrap().max(value, count);
+}
+
+/// Print Source's accumulated statistics without resetting them or adding a
+/// search timer. Cluster realignment uses this boundary independently of run.
+pub fn report_statistics() -> io::Result<()> {
+    let summary = STATISTICS.lock().unwrap().report();
+    // Release statistics before entering any independently routed stream.
+    crate::util::log_stream::log_stream()
+        .lock()
+        .unwrap()
+        .write(summary.diagnostics)?;
+    crate::util::log_stream::verbose_stream()
+        .lock()
+        .unwrap()
+        .write(summary.verbose)?;
+    crate::util::log_stream::message_stream()
+        .lock()
+        .unwrap()
+        .write(summary.message)?;
+    Ok(())
+}
+
+/// Actual Search::run boundary: reset once, execute real work, then report
+/// only after successful output finalization. MPP initialization/recovery reset
+/// statistics too, but Source returns before its end-of-search report.
+/// The native command execution guard serializes Source's global lifecycle.
+pub fn with_search_statistics<T>(
+    report: bool,
+    work: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    with_search_statistics_prepared(report, || Ok(()), work)
+}
+
+/// Search::run starts its total timer before resolving the actual temporary
+/// owner, but resets the statistics only after that preparation succeeds.
+pub fn with_search_statistics_prepared<T>(
+    report: bool,
+    prepare: impl FnOnce() -> io::Result<()>,
+    work: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let total = std::time::Instant::now();
+    prepare()?;
+    STATISTICS.lock().unwrap().reset();
+    let result = work();
+    if report && result.is_ok() {
+        // master_thread logs after its real buffers/owners are released.
+        let _ = crate::util::system::log_rss();
+        let elapsed = crate::output::format::format_default_float(
+            total.elapsed().as_millis() as f64 / 1000.0,
+        );
+        if let Ok(mut stream) = crate::util::log_stream::message_stream().lock() {
+            let _ = stream.write(format!("Total time = {elapsed}s\n"));
+        }
+        let _ = report_statistics();
+    }
+    if result.is_ok() {
+        // Search::run logs once more after master_thread returns, including
+        // its successful initialization/recovery early-return paths.
+        let _ = crate::util::system::log_rss();
+    }
+    result
+}
 
 #[cfg(test)]
 mod tests {

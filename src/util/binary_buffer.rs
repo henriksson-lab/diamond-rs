@@ -144,14 +144,20 @@ impl<'a> BinaryBufferIterator<'a> {
     }
 
     pub fn read_string(&mut self) -> Result<String, String> {
+        String::from_utf8(self.read_cstring_bytes()?.to_vec()).map_err(|e| e.to_string())
+    }
+
+    /// Borrow the stored C string bytes, consuming its NUL terminator.
+    pub fn read_cstring_bytes(&mut self) -> Result<&'a [u8], String> {
         let start = self.ptr;
-        while {
+        loop {
             self.check(1)?;
-            let c = self.data[self.ptr];
+            let byte = self.data[self.ptr];
             self.ptr += 1;
-            c != 0
-        } {}
-        String::from_utf8(self.data[start..self.ptr - 1].to_vec()).map_err(|e| e.to_string())
+            if byte == 0 {
+                return Ok(&self.data[start..self.ptr - 1]);
+            }
+        }
     }
 
     pub fn read_bytes(&mut self, size: usize) -> Result<&'a [u8], String> {
@@ -222,6 +228,16 @@ impl_binary_readable!(u8, i8, u16, i16, u32, i32, u64, i64, f32, f64);
 mod tests {
     use super::*;
     use crate::util::algo::write_varuint32;
+
+    #[test]
+    fn c_string_bytes_preserve_non_utf8_and_consume_only_the_terminator() {
+        let mut input = BinaryBufferIterator::new(b"name\xff\0next\0");
+        assert_eq!(input.read_cstring_bytes().unwrap(), b"name\xff");
+        assert_eq!(input.read_string().unwrap(), "next");
+        assert!(!input.good());
+        let mut checked = BinaryBufferIterator::new(b"\xff\0");
+        assert!(checked.read_string().is_err());
+    }
 
     #[test]
     fn test_binary_buffer_read_scalars_vec_and_string() {

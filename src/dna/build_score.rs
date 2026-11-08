@@ -40,9 +40,7 @@ impl Blastn_Score {
             Some(&mut errors),
         );
         if status != 0 || parameters.lambda <= 0.0 {
-            return Err(errors
-                .map(|message| message.message)
-                .unwrap_or_else(|| "Failed to initialize Karlin blocks".to_owned()));
+            return Err("Failed to initialize Karlin Blocks".to_owned());
         }
         Ok(Self::new_with_parameters(
             reward,
@@ -109,6 +107,23 @@ impl Blastn_Score {
     #[allow(non_snake_case)]
     pub fn blast_eValue(&self, raw_score: i32, query_length: i32) -> f64 {
         self.blast_e_value(raw_score, query_length)
+    }
+
+    /// Validated nucleotide Karlin statistics used by alignment and reporting.
+    pub fn lambda(&self) -> f64 {
+        self.lambda
+    }
+    pub fn k(&self) -> f64 {
+        self.k
+    }
+    pub fn h(&self) -> f64 {
+        self.h
+    }
+    pub fn database_letters(&self) -> u64 {
+        self.target_length_
+    }
+    pub fn sequence_count(&self) -> i64 {
+        self.db_size_
     }
 
     pub fn reward(&self) -> i32 {

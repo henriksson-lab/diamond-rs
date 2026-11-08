@@ -1,7 +1,8 @@
 //! Markov clustering translated from `diamond/src/contrib/mcl/mcl.cpp` and
 //! its inline `dense.h` and `sparse.h` implementations.
 
-use nalgebra::{linalg::Schur, Complex, ComplexField, DMatrix, DVector, Normed};
+use super::{eigen_complex, source_eigen};
+use nalgebra::DMatrix;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MASK_INVERSE: u64 = 0xc000_0000_0000_0000;
@@ -53,25 +54,18 @@ impl DenseMatrix {
     }
 
     pub fn norm(&self) -> f32 {
-        self.values
-            .iter()
-            .map(|value| value * value)
-            .sum::<f32>()
-            .sqrt()
+        super::eigen_hessenberg::squared_norm(&self.values).sqrt()
     }
 
     fn multiply(&self, rhs: &Self) -> Self {
         assert_eq!(self.n, rhs.n);
-        let mut result = Self::zeros(self.n);
-        for col in 0..self.n {
-            for k in 0..self.n {
-                let y = rhs[(k, col)];
-                for row in 0..self.n {
-                    result[(row, col)] += self[(row, k)] * y;
-                }
-            }
+        let lhs = DMatrix::from_column_slice(self.n, self.n, &self.values);
+        let rhs = DMatrix::from_column_slice(rhs.n, rhs.n, &rhs.values);
+        let product = eigen_complex::source_real_product(&lhs, &rhs);
+        Self {
+            n: self.n,
+            values: product.as_slice().to_vec(),
         }
-        result
     }
 }
 
@@ -98,11 +92,16 @@ pub struct SparseMatrix {
 impl SparseMatrix {
     pub fn from_triplets(n: usize, triplets: &[Triplet], symmetric: bool) -> Self {
         let mut values = BTreeMap::new();
+        // Source appends all mirrored entries after the original triplets,
+        // then Eigen setFromTriplets sums duplicates in that insertion order.
+        // Interleaving each mirror changes cancellation in f32 arithmetic.
         for triplet in triplets {
-            if triplet.value.abs() > f32::EPSILON {
-                values.insert((triplet.row, triplet.col), triplet.value);
-                if symmetric && triplet.row != triplet.col {
-                    values.insert((triplet.col, triplet.row), triplet.value);
+            *values.entry((triplet.row, triplet.col)).or_insert(0.0) += triplet.value;
+        }
+        if symmetric {
+            for triplet in triplets {
+                if triplet.row != triplet.col {
+                    *values.entry((triplet.col, triplet.row)).or_insert(0.0) += triplet.value;
                 }
             }
         }
@@ -114,9 +113,13 @@ impl SparseMatrix {
     }
 
     pub fn triplets(&self) -> impl Iterator<Item = Triplet> + '_ {
-        self.values
+        let mut entries = self
+            .values
             .iter()
             .map(|(&(row, col), &value)| Triplet::new(row, col, value))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| (entry.col, entry.row));
+        entries.into_iter()
     }
 }
 
@@ -191,11 +194,11 @@ pub struct MclResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct GraphHandle {
+pub struct GraphHandle<S = String> {
     pub sequence_count: usize,
     pub symmetric: bool,
     pub edges: Vec<Triplet>,
-    pub similarity: String,
+    pub similarity: S,
     pub threshold: Option<f64>,
 }
 
@@ -207,8 +210,11 @@ pub fn get_graph_handle(
     similarity: Option<&str>,
     threshold: Option<f64>,
 ) -> GraphHandle {
-    let similarity = similarity.unwrap_or("normalized_bitscore_global");
-    let threshold = if similarity == "normalized_bitscore_global" {
+    let default_similarity = similarity.is_none_or(str::is_empty);
+    let similarity = similarity
+        .filter(|value| !value.is_empty())
+        .unwrap_or("normalized_bitscore_global");
+    let threshold = if default_similarity {
         threshold
             .or(Some(DEFAULT_CLUSTERING_THRESHOLD))
             .filter(|value| *value != 0.0)
@@ -361,65 +367,58 @@ impl Mcl {
             }
             output.values = values;
         }
-        output.values.retain(|_, value| value.abs() > f32::EPSILON);
+        // Source's final pruned() has reference zero; unlike the explicit
+        // pruned(1, epsilon) inside each multiplication it removes only zero.
+        output.values.retain(|_, value| *value != 0.0);
         Ok(output)
     }
 
-    pub fn sparse_matrix_get_norm(input: &SparseMatrix, _threads: usize) -> f32 {
-        input
-            .values
-            .values()
-            .map(|value| value.powi(2))
-            .sum::<f32>()
-            .sqrt()
+    pub fn sparse_matrix_get_norm(input: &SparseMatrix, threads: usize) -> f32 {
+        let threads = threads.max(1);
+        let mut sums = vec![0.0f32; threads];
+        for entry in input.triplets() {
+            sums[entry.col % threads] += entry.value * entry.value;
+        }
+        sums.into_iter().sum::<f32>().sqrt()
     }
 
     pub fn get_exp_dense(input: &DenseMatrix, r: f32) -> DenseMatrix {
-        if r.fract() == 0.0 {
-            let mut output = input.clone();
-            for _ in 1..r as u32 {
-                output = output.multiply(input);
-            }
-            return output;
-        }
-
-        let matrix = DMatrix::from_fn(input.n, input.n, |row, col| {
-            Complex::new(input[(row, col)], 0.0)
-        });
-        let (q, t) = Schur::new(matrix).unpack();
-        let mut triangular_vectors = DMatrix::<Complex<f32>>::zeros(input.n, input.n);
-        for col in 0..input.n {
-            let lambda = t[(col, col)];
-            triangular_vectors[(col, col)] = Complex::new(1.0, 0.0);
-            for row in (0..col).rev() {
-                let sum = ((row + 1)..=col)
-                    .map(|k| t[(row, k)] * triangular_vectors[(k, col)])
-                    .sum::<Complex<f32>>();
-                let denominator = t[(row, row)] - lambda;
-                if denominator.norm() > f32::EPSILON {
-                    triangular_vectors[(row, col)] = -sum / denominator;
-                }
-            }
-        }
-        let vectors = q * triangular_vectors;
-        let Some(inverse) = vectors.clone().try_inverse() else {
-            // This is the source's singular-eigenvector path: `out` remains
-            // unchanged. The caller allocates it as zero.
-            return DenseMatrix::zeros(input.n);
-        };
-        if vectors.determinant().norm() * 0.5 <= f32::EPSILON {
-            return DenseMatrix::zeros(input.n);
-        }
-        let diagonal =
-            DMatrix::from_diagonal(&DVector::from_fn(input.n, |row, _| t[(row, row)].powf(r)));
-        let powered = vectors * diagonal * inverse;
         let mut output = DenseMatrix::zeros(input.n);
-        for col in 0..input.n {
-            for row in 0..input.n {
-                output[(row, col)] = powered[(row, col)].re;
+        Self::get_exp_dense_into(input, &mut output, r);
+        output
+    }
+
+    /// Source keeps the caller's existing output when the eigenvector
+    /// determinant gate fails. The allocating convenience API starts at zero;
+    /// native Markov iterations retain the actual previous expansion buffer.
+    pub fn get_exp_dense_into(input: &DenseMatrix, output: &mut DenseMatrix, r: f32) {
+        assert_eq!(input.n, output.n);
+        if r.fract() == 0.0 {
+            *output = input.clone();
+            for _ in 1..r as u32 {
+                *output = output.multiply(input);
+            }
+            return;
+        }
+        if input.n == 0 {
+            return;
+        }
+        let matrix = DMatrix::from_column_slice(input.n, input.n, &input.values);
+        let (values, vectors) = source_eigen::eigen(&matrix);
+        let mut diagonal = DMatrix::zeros(input.n, input.n);
+        for i in 0..input.n {
+            diagonal[(i, i)] = eigen_complex::source_complex_pow(values[i], r).re;
+        }
+        let determinant = eigen_complex::source_complex_determinant(&vectors);
+        let threshold = 0.5f64 * determinant.re.hypot(determinant.im) as f64;
+        if threshold > f32::EPSILON as f64 {
+            let inverse = eigen_complex::source_complex_inverse(&vectors);
+            let left = eigen_complex::source_complex_real_product(&vectors, &diagonal);
+            let powered = eigen_complex::source_complex_product(&left, &inverse);
+            for i in 0..input.n * input.n {
+                output.values[i] = powered.as_slice()[i].re;
             }
         }
-        output
     }
 
     pub fn markov_process_dense(
@@ -432,16 +431,17 @@ impl Mcl {
         *matrix = Self::get_gamma_dense(matrix, 1.0);
         let mut iteration = 0;
         let mut diff_norm = f32::MAX;
+        let mut expanded = DenseMatrix::zeros(matrix.n);
         while iteration < max_iter && diff_norm > f32::EPSILON {
-            let expanded = Self::get_exp_dense(matrix, expansion);
+            Self::get_exp_dense_into(matrix, &mut expanded, expansion);
             let update = Self::get_gamma_dense(&expanded, inflation);
-            diff_norm = matrix
+            let difference = matrix
                 .values
                 .iter()
                 .zip(&update.values)
-                .map(|(left, right)| (left - right).powi(2))
-                .sum::<f32>()
-                .sqrt();
+                .map(|(left, right)| left - right)
+                .collect::<Vec<_>>();
+            diff_norm = super::eigen_hessenberg::squared_norm(&difference).sqrt();
             *matrix = update;
             iteration += 1;
         }
@@ -458,20 +458,28 @@ impl Mcl {
         max_iter: u32,
         threads: usize,
     ) -> Result<(), String> {
-        *matrix = Self::get_gamma_sparse(matrix, 1.0, threads);
+        self.markov_process_sparse_with_threads(matrix, inflation, expansion, max_iter, || threads)
+    }
+
+    fn markov_process_sparse_with_threads(
+        &mut self,
+        matrix: &mut SparseMatrix,
+        inflation: f32,
+        expansion: f32,
+        max_iter: u32,
+        get_threads: impl Fn() -> usize,
+    ) -> Result<(), String> {
+        *matrix = Self::get_gamma_sparse(matrix, 1.0, get_threads());
         let mut iteration = 0;
         let mut diff_norm = f32::MAX;
         while iteration < max_iter && diff_norm > f32::EPSILON {
-            let expanded = Self::get_exp_sparse(matrix, expansion, threads)?;
-            let update = Self::get_gamma_sparse(&expanded, inflation, threads);
+            let expanded = Self::get_exp_sparse(matrix, expansion, get_threads())?;
+            let update = Self::get_gamma_sparse(&expanded, inflation, get_threads());
             let mut difference = matrix.clone();
             for (&key, &value) in &update.values {
                 *difference.values.entry(key).or_insert(0.0) -= value;
             }
-            difference
-                .values
-                .retain(|_, value| value.abs() > f32::EPSILON);
-            diff_norm = Self::sparse_matrix_get_norm(&difference, threads);
+            diff_norm = Self::sparse_matrix_get_norm(&difference, get_threads());
             *matrix = update;
             iteration += 1;
         }
@@ -543,8 +551,41 @@ impl Mcl {
     pub fn run(
         &mut self,
         sequence_ids: &[String],
-        graph: &GraphHandle,
+        graph: &GraphHandle<impl AsRef<[u8]>>,
         config: MclConfig,
+    ) -> Result<MclResult, String> {
+        self.run_with_threads(sequence_ids, graph, config, || 1)
+    }
+
+    pub fn run_with_threads(
+        &mut self,
+        sequence_ids: &[String],
+        graph: &GraphHandle<impl AsRef<[u8]>>,
+        config: MclConfig,
+        get_threads: impl Fn() -> usize,
+    ) -> Result<MclResult, String> {
+        self.run_impl(sequence_ids, graph, config, get_threads, false)
+    }
+
+    /// Process a single component already remapped by Source get_indices().
+    /// Applying unordered-set member ordering again would change its matrix.
+    pub(crate) fn run_component_with_threads(
+        &mut self,
+        sequence_ids: &[String],
+        graph: &GraphHandle<impl AsRef<[u8]>>,
+        config: MclConfig,
+        get_threads: impl Fn() -> usize,
+    ) -> Result<MclResult, String> {
+        self.run_impl(sequence_ids, graph, config, get_threads, true)
+    }
+
+    fn run_impl(
+        &mut self,
+        sequence_ids: &[String],
+        graph: &GraphHandle<impl AsRef<[u8]>>,
+        config: MclConfig,
+        get_threads: impl Fn() -> usize,
+        already_component: bool,
     ) -> Result<MclResult, String> {
         if graph.sequence_count != sequence_ids.len() {
             return Err("Graph and sequence counts differ".into());
@@ -556,7 +597,15 @@ impl Mcl {
         }
 
         let mut statistics = Self::print_stats(graph.sequence_count, &graph.edges, config, 1);
-        let components = graph_components(graph.sequence_count, &graph.edges);
+        let components = if already_component {
+            if graph.sequence_count == 0 {
+                Vec::new()
+            } else {
+                vec![(0..graph.sequence_count).collect()]
+            }
+        } else {
+            graph_components(graph.sequence_count, &graph.edges)
+        };
         let mut encoded = vec![0u64; graph.sequence_count];
         let mut next_cluster = 0u64;
 
@@ -590,12 +639,12 @@ impl Mcl {
                     statistics.sparse_calculations += 1;
                     let mut matrix =
                         Self::get_sparse_matrix_and_clear(&order, &mut triplets, config.symmetric);
-                    self.markov_process_sparse(
+                    self.markov_process_sparse_with_threads(
                         &mut matrix,
                         config.inflation,
                         config.expansion,
                         config.max_iter,
-                        1,
+                        &get_threads,
                     )?;
                     sets_from_entries(order.len(), matrix.triplets())
                 } else {
@@ -669,10 +718,7 @@ fn graph_components(sequence_count: usize, edges: &[Triplet]) -> Vec<Vec<usize>>
             union.merge(edge.row, edge.col);
         }
     }
-    let mut sets = union.sets();
-    // `MCL::run` processes the largest disconnected components first.
-    sets.sort_unstable_by(|left, right| right.len().cmp(&left.len()));
-    sets
+    super::source_order::components(union.sets())
 }
 
 fn sets_from_entries(
@@ -730,7 +776,10 @@ impl UnionFind {
         for value in 0..self.parent.len() {
             sets.entry(self.root(value)).or_default().push(value);
         }
-        sets.into_values().collect()
+        let mut sets: Vec<_> = sets.into_values().collect();
+        // Source assigns set IDs on the first member, not representative ID.
+        sets.sort_by_key(|set| set[0]);
+        sets
     }
 }
 

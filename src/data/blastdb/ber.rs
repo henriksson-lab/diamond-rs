@@ -34,11 +34,15 @@ pub fn decode_integer(data: &[u8]) -> i64 {
     value
 }
 
+pub fn read_pascal_bytes(file: &mut File) -> IoResult<Vec<u8>> {
+    let length = read_be32(file)? as usize;
+    let mut value = vec![0; length];
+    file.read_exact(&mut value)?;
+    Ok(value)
+}
 pub fn read_pascal_string(file: &mut File) -> IoResult<String> {
-    let l = read_be32(file)? as usize;
-    let mut s = vec![0u8; l];
-    file.read_exact(&mut s)?;
-    Ok(String::from_utf8_lossy(&s).into_owned())
+    String::from_utf8(read_pascal_bytes(file)?)
+        .map_err(|e| crate::util::io::IoError::Other(e.to_string()))
 }
 
 #[cfg(test)]

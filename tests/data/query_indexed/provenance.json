@@ -1,0 +1,121 @@
+{
+  "upstream_commit": "1d162b4fefb5e6b4d868c24e6ad551cad2dcf246",
+  "upstream_binary_sha256": "d8d08608b96706db62e44036fc979f9a658e72f59fc19d8727546daa616c42d8",
+  "qualification": "Unmodified Linux x86_64 AVX2 binary; tabular bytes independent of filesystem path; same source bytes at c1/default, c2 and c4. Fixture inputs are ../search_output/{query.faa,query.fna,reference.faa}.",
+  "fixtures": [
+    {
+      "fixture": "blastp.0.tsv",
+      "sha256": "dfce01e8ef2798b7816f0e082a93a62220b8fe4e7319bf04b2296d73d97788f1",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--algo",
+        "1",
+        "--masking",
+        "0"
+      ]
+    },
+    {
+      "fixture": "blastp.tantan.tsv",
+      "sha256": "dfce01e8ef2798b7816f0e082a93a62220b8fe4e7319bf04b2296d73d97788f1",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--algo",
+        "1",
+        "--masking",
+        "tantan"
+      ]
+    },
+    {
+      "fixture": "blastp.seg.tsv",
+      "sha256": "dfce01e8ef2798b7816f0e082a93a62220b8fe4e7319bf04b2296d73d97788f1",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--algo",
+        "1",
+        "--masking",
+        "seg"
+      ]
+    },
+    {
+      "fixture": "blastx.0.tsv",
+      "sha256": "89eeb7991b4abe8b85a7091516c7a492bceb521ea150c5aa4b42f1f6d768fb05",
+      "args": [
+        "blastx",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.fna",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--algo",
+        "1",
+        "--masking",
+        "0"
+      ]
+    },
+    {
+      "fixture": "blastx.tantan.tsv",
+      "sha256": "89eeb7991b4abe8b85a7091516c7a492bceb521ea150c5aa4b42f1f6d768fb05",
+      "args": [
+        "blastx",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.fna",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--algo",
+        "1",
+        "--masking",
+        "tantan"
+      ]
+    },
+    {
+      "fixture": "blastx.seg.tsv",
+      "sha256": "89eeb7991b4abe8b85a7091516c7a492bceb521ea150c5aa4b42f1f6d768fb05",
+      "args": [
+        "blastx",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.fna",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--algo",
+        "1",
+        "--masking",
+        "seg"
+      ]
+    }
+  ],
+  "index_fixtures": {
+    "source_database": "../search_output/reference.faa via source makedb defaults",
+    "source_options": "makeidx -p1 --linclust-20/--shapes-6x10/--shapes-30x10; same pinned oracle",
+    "files": [
+      {
+        "mode": "lin20",
+        "sha256": "dd9441dfc96a6ee61e6edfbe512ccc6ad6659f0eb3e111d8eff288c86a282910"
+      },
+      {
+        "mode": "shapes6",
+        "sha256": "b2084e9df6fc3b4a67cd8d3d7735f32a223edc9dc21a814f09f0771933ab286b"
+      },
+      {
+        "mode": "shapes30",
+        "sha256": "85a35a8050fb00514376d8d9722604f5e1ea7d07c8618afcc09e1beacc0a9182"
+      }
+    ]
+  }
+}

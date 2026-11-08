@@ -1,0 +1,68 @@
+[
+  {
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-sam-20261107/source.dmnd",
+      "-f",
+      "101",
+      "--sam-query-len",
+      "1"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid parameter count for option '--sam-query-len'\n"
+  },
+  {
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-sam-20261107/source.dmnd",
+      "-f",
+      "101",
+      "--sam-query-len=1"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid option: sam-query-len=1\n"
+  },
+  {
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-sam-20261107/source.dmnd",
+      "-f",
+      "101",
+      "--salltitles",
+      "1"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid parameter count for option '--salltitles'\n"
+  },
+  {
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-sam-20261107/source.dmnd",
+      "-f",
+      "101",
+      "--salltitles=1"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid option: salltitles=1\n"
+  }
+]

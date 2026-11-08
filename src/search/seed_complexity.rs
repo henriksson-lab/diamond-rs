@@ -347,3 +347,22 @@ mod tests {
         assert_ne!(seqs.data_at(pos)[0] & SEED_MASK, 0);
     }
 }
+
+/// Source mask_seeds reports local counts to verbose_stream; these are not
+/// Statistics::LOW_COMPLEXITY_SEEDS or QUERY_SEEDS (unused in this workflow).
+pub(crate) fn report_masking(
+    stats: &MaskSeedsStats,
+    query_letters: usize,
+    reference_letters: usize,
+) {
+    let message = format!(
+        "Masked seeds: {}\nMasked positions (query): {}\nMasked positions (target): {}\n",
+        crate::util::string::ratio_percentage_usize(stats.masked_seed_count, stats.seed_count),
+        crate::util::string::ratio_percentage_usize(stats.query_count, query_letters),
+        crate::util::string::ratio_percentage_usize(stats.target_count, reference_letters)
+    );
+    let _ = crate::util::log_stream::verbose_stream()
+        .lock()
+        .unwrap()
+        .write(message);
+}

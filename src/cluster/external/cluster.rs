@@ -1,21 +1,27 @@
 //! External-memory clustering from `diamond/src/cluster/external/cluster.cpp`.
 //!
-//! Cross-process queues in C++ only distribute ownership of buckets and
-//! volumes. This port performs those same storage-backed passes
-//! deterministically in one process while preserving the native record and
-//! manifest formats used by the surrounding external-clustering modules.
+//! File-backed queues distribute bucket and volume ownership across workers.
+//! Closure ownership and completion barriers retain Source's shared job
+//! protocol, native record layouts, and representative manifests.
 
+use crate::util::io::source_c_path;
+use crate::util::parallel::{Atomic, FileStack};
+use std::cell::RefCell;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::external::{Assignment, Edge, Job};
 use super::pair_table::{Bucket, RadixedTable};
-use super::seed_table::{FastaVolumeReader, SequenceVolumeReader, Volume, VolumedFile};
+use super::seed_table::{Volume, VolumedFile};
+use super::storage::BucketWriter;
 use crate::basic::sequence_utils;
 use crate::basic::value::{OId, AMINO_ACID_ALPHABET};
-use crate::util::io::{CompressedBuffer, InputFile};
+#[cfg(test)]
+use crate::util::io::CompressedBuffer;
 
 const EDGE_ENCODED_SIZE: usize = 24;
+#[cfg(test)]
 const ASSIGNMENT_ENCODED_SIZE: usize = 16;
 
 fn representative_count(volumes: &VolumedFile) -> Result<usize, String> {
@@ -60,7 +66,7 @@ pub fn compute_closure(job: &Job, volumes: &VolumedFile, rep: &mut [OId]) -> Res
     }
 
     let output_dir = job.base_dir(None).join("clustering");
-    fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(source_c_path(&output_dir).as_ref()).map_err(|error| error.to_string())?;
     for (index, volume) in volumes.0.iter().enumerate() {
         let begin = usize::try_from(volume.oid_begin)
             .map_err(|_| "Volume OID range does not fit memory.".to_owned())?;
@@ -73,8 +79,9 @@ pub fn compute_closure(job: &Job, volumes: &VolumedFile, rep: &mut [OId]) -> Res
         for &oid in slice {
             bytes.extend_from_slice(&oid.to_ne_bytes());
         }
-        fs::write(output_dir.join(format!("volume{index}")), bytes)
-            .map_err(|error| error.to_string())?;
+        let mut output = job.create_output(&output_dir.join(format!("volume{index}")))?;
+        job.io(output.write_raw(&bytes))?;
+        job.io(output.close())?;
     }
     Ok(())
 }
@@ -87,13 +94,14 @@ pub fn compute_closure_from_assignment_file(
 ) -> Result<(), String> {
     job.log("Computing transitive closure")?;
     let mut rep = (0..representative_count(volumes)? as OId).collect::<Vec<_>>();
-    let assignment_volumes = read_manifest(assignment_file)?;
+    let assignment_volumes =
+        super::external::read_manifest_owned(assignment_file, &job.io_errors())?;
     for (path, count) in &assignment_volumes {
-        let mut input = open_input(path)?;
+        let mut input = job.open_input(path, 0)?;
         for _ in 0..*count {
             let assignment = Assignment {
-                member_oid: input.read_u64().map_err(|error| error.to_string())?,
-                rep_oid: input.read_u64().map_err(|error| error.to_string())?,
+                member_oid: job.io(input.read_u64())?,
+                rep_oid: job.io(input.read_u64())?,
             };
             if assignment.rep_oid as usize >= rep.len() {
                 return Err(format!(
@@ -110,6 +118,7 @@ pub fn compute_closure_from_assignment_file(
             }
             rep[member] = assignment.rep_oid;
         }
+        job.io(input.close())?;
     }
     compute_closure(job, volumes, &mut rep)?;
     remove_manifest_storage(assignment_file, &assignment_volumes)?;
@@ -118,123 +127,179 @@ pub fn compute_closure_from_assignment_file(
 
 /// C++ file-local `get_reps` using the normal FASTA volume adapter.
 pub fn get_reps(job: &Job, volumes: &VolumedFile) -> Result<PathBuf, String> {
-    let mut reader = FastaVolumeReader;
     if job.last_round() {
         return Ok(PathBuf::new());
     }
     let base_dir = job.base_dir(None).join("reps");
-    fs::create_dir_all(&base_dir).map_err(|error| error.to_string())?;
-    let mut manifest = String::new();
-    let mut cluster_count = 0_u64;
-    for (volume_index, volume) in volumes.0.iter().enumerate() {
-        job.log(&format!(
-            "Writing representatives. Volume={}/{} Records={}",
-            volume_index + 1,
-            volumes.0.len(),
-            volume.record_count
-        ))?;
-        let representatives = read_clustering_volume(job, volume_index, volume)?;
-        let records = reader.read_volume(&volume.path)?;
+    fs::create_dir_all(source_c_path(&base_dir).as_ref()).map_err(|error| error.to_string())?;
+    let manifest_path = base_dir.join("reps.tsv");
+    let manifest = FileStack::try_new_owned(&manifest_path, job.io_errors())?;
+    let queue = Atomic::new(base_dir.join("queue"));
+    let mut processed = 0;
+    let mut cluster_count = 0;
+    loop {
+        let index = usize::try_from(queue.fetch_add_one()?)
+            .map_err(|_| "Negative representative volume index")?;
+        let Some(volume) = volumes.0.get(index) else {
+            break;
+        };
+        let representatives = read_clustering_volume(job, index, volume)?;
+        let path = base_dir.join(format!("{index}.faa"));
+        // Source constructs the sequence input before its unchecked ofstream.
+        // A failed output keeps failbit semantics while counters and the
+        // representative manifest still describe the selected input records.
+        let output = RefCell::new((None::<BufWriter<fs::File>>, false));
         let mut table_oid = volume.oid_begin;
         let mut table_index = 0usize;
-        let mut next_file_oid = volume.oid_begin;
-        let output_path = base_dir.join(format!("{volume_index}.faa"));
-        let mut output = Vec::new();
-        let mut count = 0_u64;
-        for record in records {
-            let file_oid = if job.round_index() > 0 {
-                parse_oid_like_atoll(&record.id)?
-            } else {
-                next_file_oid
-            };
-            while table_oid < file_oid {
+        let mut next_oid = volume.oid_begin;
+        let mut count = 0u64;
+        super::reader::visit_volume_bytes_owned(
+            &volume.path,
+            &mut |record| {
+                let oid = if job.round_index() > 0 {
+                    job.capture_io(parse_oid_like_atoll_bytes(&record.id))?
+                } else {
+                    next_oid
+                };
+                while table_oid < oid {
+                    table_oid += 1;
+                    table_index += 1;
+                }
+                if table_oid != oid || table_index >= representatives.len() {
+                    return Err(format!("Representative table does not contain OID {oid}."));
+                }
+                if representatives[table_index] == oid {
+                    let mut state = output.borrow_mut();
+                    let (stream, failed) = &mut *state;
+                    if !*failed {
+                        if let Some(stream) = stream {
+                            if writeln!(
+                                stream,
+                                ">{oid}\n{}",
+                                sequence_utils::to_string(&record.sequence, AMINO_ACID_ALPHABET,)
+                            )
+                            .is_err()
+                            {
+                                *failed = true;
+                            }
+                        }
+                    }
+                    count += 1;
+                }
+                next_oid = oid
+                    .checked_add(1)
+                    .ok_or_else(|| "Sequence OID overflow.".to_owned())?;
                 table_oid += 1;
                 table_index += 1;
-            }
-            if table_oid != file_oid || table_index >= representatives.len() {
-                return Err(format!(
-                    "Representative table does not contain OID {file_oid}."
-                ));
-            }
-            if representatives[table_index] == file_oid {
-                output.extend_from_slice(format!(">{file_oid}\n").as_bytes());
-                output.extend_from_slice(
-                    sequence_utils::to_string(&record.sequence, AMINO_ACID_ALPHABET).as_bytes(),
-                );
-                output.push(b'\n');
-                count += 1;
-            }
-            next_file_oid = file_oid
-                .checked_add(1)
-                .ok_or_else(|| "Sequence OID overflow.".to_owned())?;
-            table_oid += 1;
-            table_index += 1;
+                Ok(())
+            },
+            &mut || {
+                let stream = fs::File::create(source_c_path(&path).as_ref())
+                    .ok()
+                    .map(BufWriter::new);
+                let failed = stream.is_none();
+                *output.borrow_mut() = (stream, failed);
+                Ok(())
+            },
+            &job.io_errors(),
+        )?;
+        if let (Some(mut output), _) = output.into_inner() {
+            let _ = output.flush();
         }
-        fs::write(&output_path, output).map_err(|error| error.to_string())?;
-        manifest.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
-            output_path.display(),
-            count,
-            volume.oid_begin,
-            volume.oid_end
-        ));
+        manifest.push_bytes(&job.io(super::storage::manifest_line(
+            &path,
+            &[count as u64, volume.oid_begin, volume.oid_end],
+        ))?)?;
         cluster_count += count;
+        processed += 1;
     }
     job.log(&format!("Representatives written: {cluster_count}"))?;
-    let manifest_path = base_dir.join("reps.tsv");
-    fs::write(&manifest_path, manifest).map_err(|error| error.to_string())?;
+    let finished = Atomic::new(base_dir.join("finished"));
+    finished.fetch_add(processed)?;
+    finished.await_value(volumes.0.len() as i64)?;
     Ok(manifest_path)
 }
 
 /// C++ unidirectional `cluster` pass.
 pub fn cluster(job: &Job, edges: &RadixedTable, volumes: &VolumedFile) -> Result<PathBuf, String> {
-    let mut assignments = Vec::new();
-    for (bucket_index, bucket) in edges.iter().enumerate() {
-        let (mut bucket_edges, storage) = read_edge_bucket(bucket)?;
+    let directory = job.base_dir(None).join("clustering");
+    let bucket_dir = directory.join("0");
+    let mut output = BucketWriter::new_owned(&directory, job.worker_id(), 1, job.io_errors())?;
+    let queue = Atomic::new(job.base_dir(None).join("alignments/queue"));
+    let mut processed = 0;
+    loop {
+        let index = usize::try_from(queue.fetch_add_one()?)
+            .map_err(|_| "Negative clustering bucket index")?;
+        let Some(bucket) = edges.get(index) else {
+            break;
+        };
+        let (mut records, storage) = read_edge_bucket(job, bucket)?;
         job.log(&format!(
             "Clustering. Bucket={}/{} Records={} Size={}",
-            bucket_index + 1,
+            index + 1,
             edges.len(),
-            bucket_edges.len(),
-            bucket_edges.len() * EDGE_ENCODED_SIZE
+            crate::util::string::format(records.len() as u64),
+            crate::util::string::format((records.len() * EDGE_ENCODED_SIZE) as u64)
         ))?;
-        bucket_edges.sort_unstable();
-        let mut begin = 0usize;
-        while begin < bucket_edges.len() {
-            let member_oid = bucket_edges[begin].member_oid;
-            let edge = bucket_edges[begin];
+        records.sort_unstable();
+        let mut begin = 0;
+        while begin < records.len() {
+            let edge = records[begin];
             if edge.member_len < edge.rep_len
                 || (edge.member_len == edge.rep_len && edge.member_oid > edge.rep_oid)
             {
-                assignments.push(Assignment {
-                    member_oid: edge.member_oid,
-                    rep_oid: edge.rep_oid,
-                });
+                let mut bytes = [0; 16];
+                bytes[..8].copy_from_slice(&edge.member_oid.to_ne_bytes());
+                bytes[8..].copy_from_slice(&edge.rep_oid.to_ne_bytes());
+                output.write(0, &bytes)?;
             }
             begin += 1;
-            while begin < bucket_edges.len() && bucket_edges[begin].member_oid == member_oid {
+            while begin < records.len() && records[begin].member_oid == edge.member_oid {
                 begin += 1;
             }
         }
+        // Source's per-bucket BufferArray workers finish before file.remove,
+        // retaining the enclosing FileArray across every claimed bucket.
+        output.flush_unpublished()?;
         remove_manifest_storage(&bucket.path, &storage)?;
+        processed += 1;
     }
-    let assignment_file = write_assignments(job, &assignments)?;
-    compute_closure_from_assignment_file(job, &assignment_file, volumes)?;
+    output.finish()?;
+    drop(output);
+    let manifest = bucket_dir.join("bucket.tsv");
+    let finished = Atomic::new(directory.join("finished"));
+    let previous = finished.fetch_add(processed)?;
+    let closure_finished = Atomic::new(directory.join("closure_finished"));
+    // Source elects through this completion counter alone. A late worker
+    // with no claimed buckets can enter again after assignments were consumed;
+    // its empty manifest then writes an identity closure. Preserve that
+    // scheduling-dependent file protocol, without an additional owner lock.
+    if previous + processed < edges.len() as i64 {
+        closure_finished.await_value(1)?;
+    } else {
+        compute_closure_from_assignment_file(job, &manifest, volumes)?;
+        closure_finished.fetch_add_one()?;
+    }
     get_reps(job, volumes)
 }
 
-/// C++ `cluster_bidirectional` pass.
 pub fn cluster_bidirectional(
     job: &Job,
     edges: &RadixedTable,
     volumes: &VolumedFile,
 ) -> Result<PathBuf, String> {
+    let lock = Atomic::new(job.base_dir(None).join("cluster_bidirectional_lock"));
+    let finished = Atomic::new(job.base_dir(None).join("cluster_bidirectional_finished"));
+    if lock.fetch_add_one()? != 0 {
+        finished.await_value(1)?;
+        return get_reps(job, volumes);
+    }
     job.log("Computing clustering (bi-directional coverage)")?;
     let count = representative_count(volumes)?;
     let mut storage = Vec::new();
     let mut degree = vec![0_u32; count];
     for (bucket_index, bucket) in edges.iter().enumerate() {
-        let (bucket_edges, bucket_storage) = read_edge_bucket(bucket)?;
+        let (bucket_edges, bucket_storage) = read_edge_bucket(job, bucket)?;
         job.log(&format!(
             "Getting node degrees. Bucket={}/{} Records={} Size={}",
             bucket_index + 1,
@@ -254,7 +319,7 @@ pub fn cluster_bidirectional(
     }
     let mut rep = (0..count as OId).collect::<Vec<_>>();
     for (bucket_index, bucket) in edges.iter().enumerate() {
-        let (bucket_edges, _) = read_edge_bucket(bucket)?;
+        let (bucket_edges, _) = read_edge_bucket(job, bucket)?;
         job.log(&format!(
             "Assigning reps. Bucket={}/{} Records={} Size={}",
             bucket_index + 1,
@@ -271,6 +336,7 @@ pub fn cluster_bidirectional(
     for (manifest, bucket_storage) in storage {
         remove_manifest_storage(&manifest, &bucket_storage)?;
     }
+    finished.fetch_add_one()?;
     get_reps(job, volumes)
 }
 
@@ -298,12 +364,11 @@ fn assign_higher_degree(
 }
 
 fn read_clustering_volume(job: &Job, index: usize, volume: &Volume) -> Result<Vec<OId>, String> {
-    let bytes = fs::read(
-        job.base_dir(None)
+    let bytes = job.read_plain_file(
+        &job.base_dir(None)
             .join("clustering")
             .join(format!("volume{index}")),
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
     let expected = usize::try_from(volume.oid_end.saturating_sub(volume.oid_begin))
         .map_err(|_| "Volume OID range does not fit memory.".to_owned())?;
     if bytes.len() != expected * std::mem::size_of::<OId>() {
@@ -319,13 +384,14 @@ fn read_clustering_volume(job: &Job, index: usize, volume: &Volume) -> Result<Ve
         .collect())
 }
 
+#[cfg(test)]
 fn write_assignments(job: &Job, assignments: &[Assignment]) -> Result<PathBuf, String> {
     let directory = job.base_dir(None).join("clustering").join("0");
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    fs::create_dir_all(source_c_path(&directory).as_ref()).map_err(|error| error.to_string())?;
     let volume = directory.join(format!("worker_{}_volume_0", job.worker_id()));
     let manifest = directory.join("bucket.tsv");
     if assignments.is_empty() {
-        fs::write(&manifest, []).map_err(|error| error.to_string())?;
+        fs::write(source_c_path(&manifest).as_ref(), []).map_err(|error| error.to_string())?;
     } else {
         let mut compressed = CompressedBuffer::new();
         for assignment in assignments {
@@ -337,73 +403,60 @@ fn write_assignments(job: &Job, assignments: &[Assignment]) -> Result<PathBuf, S
                 .map_err(|error| error.to_string())?;
         }
         compressed.finish().map_err(|error| error.to_string())?;
-        fs::write(&volume, compressed.data()).map_err(|error| error.to_string())?;
+        fs::write(source_c_path(&volume).as_ref(), compressed.data())
+            .map_err(|error| error.to_string())?;
         fs::write(
-            &manifest,
-            format!("{}\t{}\n", volume.display(), assignments.len()),
+            source_c_path(&manifest).as_ref(),
+            super::storage::manifest_line(&volume, &[assignments.len() as u64])
+                .map_err(|e| e.to_string())?,
         )
         .map_err(|error| error.to_string())?;
     }
     Ok(manifest)
 }
 
-fn read_edge_bucket(bucket: &Bucket) -> Result<(Vec<Edge>, Vec<(PathBuf, usize)>), String> {
-    let storage = read_manifest(&bucket.path)?;
+fn read_edge_bucket(
+    job: &Job,
+    bucket: &Bucket,
+) -> Result<(Vec<Edge>, Vec<(PathBuf, usize)>), String> {
+    let storage = super::external::read_manifest_owned(&bucket.path, &job.io_errors())?;
     let mut edges = Vec::new();
     for (path, count) in &storage {
-        let mut input = open_input(path)?;
+        let mut input = job.open_input(path, 0)?;
         for _ in 0..*count {
             edges.push(Edge {
-                rep_oid: input.read_u64().map_err(|error| error.to_string())?,
-                member_oid: input.read_u64().map_err(|error| error.to_string())?,
-                rep_len: input.read_u32().map_err(|error| error.to_string())?,
-                member_len: input.read_u32().map_err(|error| error.to_string())?,
+                rep_oid: job.io(input.read_u64())?,
+                member_oid: job.io(input.read_u64())?,
+                rep_len: job.io(input.read_u32())?,
+                member_len: job.io(input.read_u32())?,
             });
         }
+        job.io(input.close())?;
     }
     Ok((edges, storage))
 }
 
-fn read_manifest(path: &Path) -> Result<Vec<(PathBuf, usize)>, String> {
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    let mut volumes = Vec::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let mut fields = line.split_whitespace();
-        let volume = fields
-            .next()
-            .ok_or_else(|| "Format error in VolumedFile".to_owned())?;
-        let count = fields
-            .next()
-            .ok_or_else(|| "Format error in VolumedFile".to_owned())?
-            .parse::<usize>()
-            .map_err(|_| "Format error in VolumedFile".to_owned())?;
-        volumes.push((PathBuf::from(volume), count));
-    }
-    Ok(volumes)
-}
-
-fn open_input(path: &Path) -> Result<InputFile, String> {
-    InputFile::new(
-        path.to_str()
-            .ok_or_else(|| "Non-UTF-8 external-clustering volume path.".to_owned())?,
-        0,
-    )
-    .map_err(|error| error.to_string())
-}
-
 fn remove_manifest_storage(path: &Path, volumes: &[(PathBuf, usize)]) -> Result<(), String> {
     for (volume, _) in volumes {
-        let _ = fs::remove_file(volume);
+        let _ = fs::remove_file(source_c_path(&(volume)).as_ref());
     }
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(source_c_path(&(path)).as_ref());
     if let Some(directory) = path.parent() {
-        let _ = fs::remove_dir(directory);
+        let _ = fs::remove_dir(source_c_path(&(directory)).as_ref());
     }
     Ok(())
 }
 
 fn parse_oid_like_atoll(id: &str) -> Result<OId, String> {
-    let bytes = id.as_bytes();
+    parse_oid_like_atoll_bytes(id.as_bytes()).map_err(|error| error.to_string())
+}
+fn raw_oid_error(prefix: &[u8], id: &[u8]) -> std::io::Error {
+    let mut message = prefix.to_vec();
+    message.extend_from_slice(id);
+    crate::util::io::RawDiagnosticError(message).into_io()
+}
+fn parse_oid_like_atoll_bytes(id: &[u8]) -> std::io::Result<OId> {
+    let bytes = crate::util::sequence::c_string_bytes(id);
     let mut index = 0;
     while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
         index += 1;
@@ -420,11 +473,11 @@ fn parse_oid_like_atoll(id: &str) -> Result<OId, String> {
         value = value
             .checked_mul(10)
             .and_then(|value| value.checked_add(u64::from(digit)))
-            .ok_or_else(|| format!("Sequence OID overflow: {id}"))?;
+            .ok_or_else(|| raw_oid_error(b"Sequence OID overflow: ", id))?;
         index += 1;
     }
     if index == begin {
-        return Err(format!("Invalid sequence OID: {id}"));
+        return Err(raw_oid_error(b"Invalid sequence OID: ", id));
     }
     Ok(value)
 }
@@ -549,7 +602,7 @@ mod tests {
         );
         // Exercise representative selection and the storage-backed closure,
         // then use the same automatic FASTA adapter as the public workflow.
-        let mut bucket_edges = read_edge_bucket(&edges[0]).unwrap().0;
+        let mut bucket_edges = read_edge_bucket(&job, &edges[0]).unwrap().0;
         bucket_edges.sort_unstable();
         assert_eq!(bucket_edges[0].member_oid, 0);
         let assignment_file = write_assignments(
@@ -578,11 +631,57 @@ mod tests {
     }
 
     #[test]
+    fn late_zero_bucket_worker_recomputes_source_identity_closure() {
+        let root = temp_dir("late_closure");
+        let mut first = Job::new(3, 1, 1024, &root, 0).unwrap();
+        first.set_round_count(1);
+        let volumes = volumes(&root, 4);
+        fs::create_dir_all(first.base_dir(None).join("alignments")).unwrap();
+        let edges = edge_table(
+            &root,
+            &[
+                Edge {
+                    rep_oid: 0,
+                    member_oid: 2,
+                    rep_len: 12,
+                    member_len: 4,
+                },
+                Edge {
+                    rep_oid: 1,
+                    member_oid: 3,
+                    rep_len: 11,
+                    member_len: 4,
+                },
+            ],
+        );
+        cluster(&first, &edges, &volumes).unwrap();
+        assert_eq!(read_mapping(&first, 4), [0, 1, 0, 1]);
+
+        // Enter after the first worker completed, with the real shared queue
+        // already exhausted and the assignment storage already consumed.
+        // This is Source's reachable zero-work path, not a timing simulation.
+        let mut late = Job::new(3, 1, 1024, &root, 1).unwrap();
+        late.set_round_count(1);
+        cluster(&late, &edges, &volumes).unwrap();
+        assert_eq!(read_mapping(&late, 4), [0, 1, 2, 3]);
+        assert_eq!(
+            Atomic::new(late.base_dir(None).join("clustering/closure_finished"))
+                .fetch_add(0)
+                .unwrap(),
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cluster_end_to_end_consumes_native_edge_storage_on_last_round() {
         let root = temp_dir("cluster_e2e");
         let mut job = Job::new(3, 1, 1024, &root, 0).unwrap();
         job.set_round_count(1);
         let volumes = volumes(&root, 4);
+        // Source align creates its owner directory before cluster opens the
+        // shared alignments/queue. This fixture supplies edge files directly.
+        fs::create_dir_all(job.base_dir(None).join("alignments")).unwrap();
         let edges = edge_table(
             &root,
             &[

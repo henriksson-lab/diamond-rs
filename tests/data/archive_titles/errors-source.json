@@ -1,0 +1,78 @@
+[
+  {
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/archive_titles/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-archive-titles-20261107/reference.dmnd",
+      "--salltitles",
+      "1",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-archive-titles-20261107/error"
+    ],
+    "flags": [
+      "--salltitles",
+      "1"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid parameter count for option '--salltitles'\n"
+  },
+  {
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/archive_titles/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-archive-titles-20261107/reference.dmnd",
+      "--salltitles=1",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-archive-titles-20261107/error"
+    ],
+    "flags": [
+      "--salltitles=1"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid option: salltitles=1\n"
+  },
+  {
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/archive_titles/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-archive-titles-20261107/reference.dmnd",
+      "--sallseqid",
+      "1",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-archive-titles-20261107/error"
+    ],
+    "flags": [
+      "--sallseqid",
+      "1"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid parameter count for option '--sallseqid'\n"
+  },
+  {
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/archive_titles/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-archive-titles-20261107/reference.dmnd",
+      "--sallseqid=1",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-archive-titles-20261107/error"
+    ],
+    "flags": [
+      "--sallseqid=1"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid option: sallseqid=1\n"
+  }
+]

@@ -2,6 +2,126 @@
 
 use std::sync::Mutex;
 
+/// Default C++ stream insertion for the primitive numeric values used by
+/// ALP's Matrix/Vector templates. Custom value types retain their Display
+/// implementation, corresponding to their own stream insertion operator.
+pub(crate) fn format_value<T: std::fmt::Display + std::any::Any>(value: &T) -> String {
+    // Inspect the primitive itself before Display can discard a NaN sign.
+    // Any proves the concrete type safely; custom owned values keep their
+    // own Display insertion, rather than being guessed from rendered text.
+    let primitive = value as &dyn std::any::Any;
+    let number = if let Some(value) = primitive.downcast_ref::<f32>() {
+        Some((
+            f64::from(*value),
+            value.is_nan() && value.is_sign_negative(),
+        ))
+    } else {
+        primitive
+            .downcast_ref::<f64>()
+            .map(|value| (*value, value.is_nan() && value.is_sign_negative()))
+    };
+    match number {
+        Some((_, true)) => "-nan".to_owned(),
+        Some((value, false)) => crate::output::format::format_default_float(value),
+        None => value.to_string(),
+    }
+}
+
+/// Formatted extraction for ALP's primitive values. Numeric extraction consumes
+/// a prefix and leaves the next character in the stream, unlike token.parse().
+pub(crate) fn read_value<T: std::str::FromStr>(input: &str, offset: &mut usize) -> Option<T> {
+    let bytes = input.as_bytes();
+    while *offset < bytes.len() && bytes[*offset].is_ascii_whitespace() {
+        *offset += 1;
+    }
+    let start = *offset;
+    if start == bytes.len() {
+        return None;
+    }
+    let kind = std::any::type_name::<T>();
+    let float = matches!(kind, "f32" | "f64");
+    let integer = matches!(
+        kind,
+        "i16" | "i32" | "i64" | "i128" | "isize" | "u16" | "u32" | "u64" | "u128" | "usize"
+    );
+    if float || integer {
+        if matches!(bytes.get(*offset), Some(b'+' | b'-')) {
+            *offset += 1;
+        }
+        let digits = *offset;
+        while bytes.get(*offset).is_some_and(u8::is_ascii_digit) {
+            *offset += 1;
+        }
+        let mut has_digits = *offset > digits;
+        if float && bytes.get(*offset) == Some(&b'.') {
+            *offset += 1;
+            let fraction = *offset;
+            while bytes.get(*offset).is_some_and(u8::is_ascii_digit) {
+                *offset += 1;
+            }
+            has_digits |= *offset > fraction;
+        }
+        if !has_digits {
+            return None;
+        }
+        if float && matches!(bytes.get(*offset), Some(b'e' | b'E')) {
+            *offset += 1;
+            if matches!(bytes.get(*offset), Some(b'+' | b'-')) {
+                *offset += 1;
+            }
+            let exponent = *offset;
+            while bytes.get(*offset).is_some_and(u8::is_ascii_digit) {
+                *offset += 1;
+            }
+            if *offset == exponent {
+                return None;
+            }
+        }
+        let token = &input[start..*offset];
+        if float {
+            let finite = if kind == "f32" {
+                token.parse::<f32>().ok()?.is_finite()
+            } else {
+                token.parse::<f64>().ok()?.is_finite()
+            };
+            return finite.then(|| token.parse().ok()).flatten();
+        }
+        if kind.starts_with('u') && token.starts_with('-') {
+            let bits = match kind {
+                "u16" => 16,
+                "u32" => 32,
+                "u64" => 64,
+                "usize" => usize::BITS,
+                _ => 128,
+            };
+            let magnitude = token[1..].parse::<u128>().ok()?;
+            let max = u128::MAX >> (128 - bits);
+            if magnitude > max {
+                return None;
+            }
+            return (0u128.wrapping_sub(magnitude) & max)
+                .to_string()
+                .parse()
+                .ok();
+        }
+        token.parse().ok()
+    } else {
+        while *offset < bytes.len() && !bytes[*offset].is_ascii_whitespace() {
+            *offset += 1;
+        }
+        input[start..*offset].parse().ok()
+    }
+}
+
+pub(crate) fn read_values<T: std::str::FromStr>(input: &str) -> (Vec<T>, bool) {
+    let mut offset = 0;
+    let mut values = Vec::new();
+    while let Some(value) = read_value(input, &mut offset) {
+        values.push(value);
+    }
+    (values, offset == input.len())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     HUMAN,

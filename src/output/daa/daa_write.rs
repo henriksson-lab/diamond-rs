@@ -13,13 +13,13 @@ use crate::output::intermediate::IntermediateRecord;
 
 /// Database access used by the `SequenceFile` overload of C++ `finish_daa`.
 ///
-/// Titles are returned as owned strings because Rust database backends may
-/// decode them lazily.  As in C++, the title is written verbatim followed by a
-/// NUL byte.
-pub trait DaaSequenceFile {
+/// Name storage defaults to String for existing typed backends. Native byte
+/// dictionaries implement DaaSequenceFile<Vec<u8>> without a Unicode roundtrip.
+/// As in C++, each stored title is written verbatim followed by NUL.
+pub trait DaaSequenceFile<N = String> {
     fn sequence_count(&self) -> u64;
     fn dict_size(&self) -> usize;
-    fn dict_title(&self, index: usize) -> String;
+    fn dict_title(&self, index: usize) -> N;
     fn dict_len(&self, index: usize) -> u32;
 }
 
@@ -35,7 +35,7 @@ pub struct DaaRunMetadata {
     pub k: f64,
     pub lambda: f64,
     pub max_evalue: f64,
-    pub matrix: String,
+    pub matrix: Vec<u8>,
     pub mode: u32,
     pub aligned_queries: u64,
 }
@@ -58,6 +58,15 @@ pub fn write_daa_query_record(
     daa::write_daa_query_record(buf, query_name, query, input_sequence_type)
 }
 
+pub fn write_daa_query_record_bytes(
+    buf: &mut Vec<u8>,
+    query_name: &[u8],
+    query: &[Letter],
+    input_sequence_type: SequenceType,
+) -> usize {
+    daa::write_daa_query_record_bytes(buf, query_name, query, input_sequence_type)
+}
+
 /// C++ `finish_daa_query_record(TextBuffer&, size_t)`.
 pub fn finish_daa_query_record(buf: &mut [u8], seek_pos: usize) {
     daa::finish_daa_query_record(buf, seek_pos)
@@ -78,16 +87,33 @@ pub fn write_daa_record_hsp(buf: &mut Vec<u8>, hsp: &Hsp, subject_id: u32) {
 }
 
 /// C++ `finish_daa(OutputFile&, SequenceFile&)`.
-pub fn finish_daa_from_sequence_file<W, D>(
+pub fn finish_daa_from_sequence_file<W: Write + Seek, D: DaaSequenceFile>(
+    writer: &mut W,
+    db: &D,
+    metadata: &DaaRunMetadata,
+) -> io::Result<()> {
+    finish_daa_from_sequence_file_impl(writer, db, metadata)
+}
+/// Canonical byte-title path used by native search dictionaries.
+pub fn finish_daa_from_sequence_file_bytes<W: Write + Seek, D: DaaSequenceFile<Vec<u8>>>(
+    writer: &mut W,
+    db: &D,
+    metadata: &DaaRunMetadata,
+) -> io::Result<()> {
+    finish_daa_from_sequence_file_impl(writer, db, metadata)
+}
+
+fn finish_daa_from_sequence_file_impl<W, D, N>(
     writer: &mut W,
     db: &D,
     metadata: &DaaRunMetadata,
 ) -> io::Result<()>
 where
     W: Write + Seek,
-    D: DaaSequenceFile,
+    D: DaaSequenceFile<N>,
+    N: AsRef<[u8]>,
 {
-    let mut header = DaaHeader2::with_params(
+    let mut header = DaaHeader2::with_params_bytes(
         db.sequence_count(),
         metadata.db_letters,
         metadata.gap_open,
@@ -112,9 +138,9 @@ where
     let mut names_size = 0u64;
     for index in 0..count {
         let title = db.dict_title(index);
-        writer.write_all(title.as_bytes())?;
+        writer.write_all(title.as_ref())?;
         writer.write_all(&[0])?;
-        names_size += title.len() as u64 + 1;
+        names_size += title.as_ref().len() as u64 + 1;
     }
     header.block_size[1] = names_size;
 
@@ -127,7 +153,10 @@ where
 }
 
 /// C++ `finish_daa(OutputFile&, DAAFile&)`.
-pub fn finish_daa_from_file<W: Write + Seek>(writer: &mut W, daa_in: &DaaFile) -> io::Result<()> {
+pub fn finish_daa_from_file<W: Write + Seek, N: daa::DaaName>(
+    writer: &mut W,
+    daa_in: &DaaFile<N>,
+) -> io::Result<()> {
     daa::finish_daa_from_file(writer, daa_in)
 }
 
@@ -140,6 +169,16 @@ pub fn finish_daa_from_refs<W: Write + Seek>(
     query_count: i64,
 ) -> io::Result<()> {
     daa::finish_daa_from_refs(writer, daa_in, seq_ids, seq_lens, query_count)
+}
+
+pub fn finish_daa_from_refs_bytes<W: Write + Seek>(
+    writer: &mut W,
+    daa_in: &daa::ByteDaaFile,
+    seq_ids: &[Vec<u8>],
+    seq_lens: &[u32],
+    query_count: i64,
+) -> io::Result<()> {
+    daa::finish_daa_from_refs_bytes(writer, daa_in, seq_ids, seq_lens, query_count)
 }
 
 /// C++ file-local `terminate_aln_block`.

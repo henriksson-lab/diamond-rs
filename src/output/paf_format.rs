@@ -28,7 +28,16 @@ impl PafFormat {
         query_title: &str,
         unaligned: bool,
     ) -> io::Result<()> {
-        super::paf::print_query_intro(writer, query_title, unaligned)
+        self.print_query_intro_bytes(writer, query_title.as_bytes(), unaligned)
+    }
+
+    pub fn print_query_intro_bytes<W: Write>(
+        &self,
+        writer: &mut W,
+        query_title: &[u8],
+        unaligned: bool,
+    ) -> io::Result<()> {
+        super::paf::print_query_intro_bytes(writer, query_title, unaligned)
     }
 
     pub fn print_match<W: Write>(
@@ -37,7 +46,16 @@ impl PafFormat {
         record: &HspContext,
         score_matrix: &ScoreMatrix,
     ) -> io::Result<()> {
-        super::paf::print_match_context(writer, record, score_matrix)
+        self.print_match_bytes(writer, record, score_matrix)
+    }
+
+    pub fn print_match_bytes<W: Write, T: AsRef<[u8]>>(
+        &self,
+        writer: &mut W,
+        record: &HspContext<T>,
+        score_matrix: &ScoreMatrix,
+    ) -> io::Result<()> {
+        super::paf::print_match_context_bytes(writer, record, score_matrix)
     }
 
     /// Full C++ mapping with the global blastn command state made explicit.
@@ -48,7 +66,22 @@ impl PafFormat {
         score_matrix: &ScoreMatrix,
         blastn_command: bool,
     ) -> io::Result<()> {
-        super::paf::print_match_context_with_command(writer, record, score_matrix, blastn_command)
+        self.print_match_with_command_bytes(writer, record, score_matrix, blastn_command)
+    }
+
+    pub fn print_match_with_command_bytes<W: Write, T: AsRef<[u8]>>(
+        &self,
+        writer: &mut W,
+        record: &HspContext<T>,
+        score_matrix: &ScoreMatrix,
+        blastn_command: bool,
+    ) -> io::Result<()> {
+        super::paf::print_match_context_with_command_bytes(
+            writer,
+            record,
+            score_matrix,
+            blastn_command,
+        )
     }
 }
 

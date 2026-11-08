@@ -340,6 +340,9 @@ unsafe fn finish(best: V, overflow: V, len: usize, delta: i8) -> BatchScores8 {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
+// The final unrolled cell advances the row pointers past the column;
+// older rustc (e.g. 1.85) flags that last increment as an unused assignment.
+#[allow(unused_assignments)]
 unsafe fn score_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool>(
     query: &[Letter],
     targets: &[ScoreTarget<'_>],

@@ -1,8 +1,14 @@
 //! Cluster-member realignment from `diamond/src/cluster/output.cpp`.
 
+use std::io::Write;
 use std::sync::{Arc, Mutex};
+#[path = "context_stream.rs"]
+mod context_stream;
+pub use context_stream::ClusterOutputIo;
 
-use crate::align::hsp::HspContext;
+use rayon::prelude::*;
+
+use crate::align::hsp::{ByteHspContext, HspContext};
 use crate::basic::statistics::Statistics;
 use crate::basic::value::{CentroidId, Letter, OId};
 use crate::data::block::Block;
@@ -10,11 +16,11 @@ use crate::dp::swipe::{
     bin as swipe_bin, swipe, targets as make_dp_targets, CarryOver, DpTarget, Flags, HspValues,
     Params, Targets,
 };
-use crate::stats::cbs::hauser_correction;
+use crate::stats::cbs::hauser_correction_window;
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::data_structures::{make_flat_array, FlatArray};
 
-pub trait ClusterRealignDatabase {
+pub trait ClusterRealignDatabase: Send {
     fn sequence_count(&self) -> OId;
     fn letters(&self) -> u64;
     fn titles_lazy(&self) -> bool;
@@ -23,6 +29,9 @@ pub trait ClusterRealignDatabase {
     fn tell_seq(&self) -> OId;
     fn load_seqs(&mut self, block_size: u64) -> Result<Arc<Block>, String>;
     fn seqid(&mut self, oid: OId) -> Result<String, String>;
+    fn seqid_bytes(&mut self, oid: OId) -> Result<Vec<u8>, String> {
+        self.seqid(oid).map(String::into_bytes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -30,8 +39,15 @@ pub struct ClusterOutputConfig {
     pub block_size: u64,
     pub db_size: Option<u64>,
     pub comp_based_stats_hauser: bool,
+    pub cbs_window: i32,
     pub cutoff_score_8bit: i32,
     pub max_swipe_dp: i64,
+    pub band_bin: i32,
+    pub col_bin: i32,
+    pub swipe_task_size: i64,
+    pub transcript_len_estimate: f64,
+    pub threads_align: u32,
+    pub target_parallel_verbosity: u32,
     pub approx_backtrace: bool,
     pub max_evalue: f64,
     pub query_cover: f64,
@@ -47,8 +63,15 @@ impl Default for ClusterOutputConfig {
             block_size: 1 << 29,
             db_size: None,
             comp_based_stats_hauser: false,
+            cbs_window: 40,
             cutoff_score_8bit: 240,
             max_swipe_dp: 1_000_000,
+            band_bin: 24,
+            col_bin: 400,
+            swipe_task_size: 100_000_000,
+            transcript_len_estimate: 1.0,
+            threads_align: 0,
+            target_parallel_verbosity: u32::MAX,
             approx_backtrace: false,
             max_evalue: f64::MAX,
             query_cover: 0.0,
@@ -65,7 +88,7 @@ struct Cfg<'a, D> {
     lazy_titles: bool,
     clusters: &'a FlatArray<OId>,
     centroids: &'a [OId],
-    database: &'a mut D,
+    database: Mutex<&'a mut D>,
     centroid_block: Arc<Block>,
     member_block: Arc<Block>,
 }
@@ -85,7 +108,7 @@ impl<'a, D> Cfg<'a, D> {
             lazy_titles,
             clusters,
             centroids,
-            database,
+            database: Mutex::new(database),
             centroid_block,
             member_block,
         }
@@ -98,8 +121,8 @@ fn align_centroid<D: ClusterRealignDatabase>(
     statistics: &mut Statistics,
     config: &ClusterOutputConfig,
     score_matrix: &ScoreMatrix,
-    cfg: &mut Cfg<'_, D>,
-) -> Result<Vec<HspContext>, String> {
+    cfg: &Cfg<'_, D>,
+) -> Result<Vec<ByteHspContext>, String> {
     let centroid_oid = cfg.centroids[centroid as usize];
     let centroid_id = cfg.centroid_block.oid2block_id(centroid_oid)?;
     let centroid_seq = cfg.centroid_block.seqs().get(centroid_id as usize);
@@ -131,17 +154,21 @@ fn align_centroid<D: ClusterRealignDatabase>(
     }
 
     let centroid_title = if cfg.lazy_titles {
-        cfg.database.seqid(centroid_oid)?
+        cfg.database.lock().unwrap().seqid_bytes(centroid_oid)?
     } else {
-        String::from_utf8_lossy(cfg.centroid_block.ids()?.get(centroid_id as usize)).into_owned()
+        cfg.centroid_block.ids()?.get(centroid_id as usize).to_vec()
     };
     let correction = if config.comp_based_stats_hauser {
-        Some(hauser_correction(centroid_seq, score_matrix))
+        Some(hauser_correction_window(
+            centroid_seq,
+            score_matrix,
+            config.cbs_window as u32 as usize,
+        ))
     } else {
         None
     };
     let mut params = Params::new(centroid_seq, score_matrix);
-    params.query_id = Some(&centroid_title);
+    params.query_id_bytes = Some(&centroid_title);
     params.frame = 0;
     params.query_source_len = centroid_seq.len() as i32;
     params.composition_bias = correction.as_deref();
@@ -149,6 +176,14 @@ fn align_centroid<D: ClusterRealignDatabase>(
     params.v = cfg.hsp_values;
     params.cutoff_score_8bit = config.cutoff_score_8bit;
     params.max_swipe_dp = config.max_swipe_dp;
+    params.band_bin = config.band_bin;
+    params.col_bin = config.col_bin;
+    params.swipe_task_size = config.swipe_task_size;
+    params.transcript_len_estimate = config.transcript_len_estimate;
+    params.threads_align = config.threads_align;
+    params.target_parallel_verbosity = config.target_parallel_verbosity;
+    let swipe_error = crate::dp::swipe::SwipeError::default();
+    params.error_sink = Some(swipe_error.clone());
     params.approx_backtrace = config.approx_backtrace;
     params.max_evalue = config.max_evalue;
     params.query_cover = config.query_cover;
@@ -161,21 +196,29 @@ fn align_centroid<D: ClusterRealignDatabase>(
 
     let mut output = Vec::new();
     let hsps = swipe(&dp_targets, &mut params);
+    if let Some(error) = swipe_error.take() {
+        return Err(error);
+    }
     *statistics += &swipe_statistics.lock().unwrap();
-    for hsp in hsps {
+    for mut hsp in hsps {
         let subject_block_id = hsp.swipe_target as usize;
         let subject_oid = cfg.member_block.block_id2oid(subject_block_id as u32);
         let subject_title = if cfg.lazy_titles {
-            cfg.database.seqid(subject_oid)?
+            cfg.database.lock().unwrap().seqid_bytes(subject_oid)?
         } else {
-            String::from_utf8_lossy(cfg.member_block.ids()?.get(subject_block_id)).into_owned()
+            cfg.member_block.ids()?.get(subject_block_id).to_vec()
         };
-        output.push(HspContext::new(
+        // C++ serializes each context to its intermediate stream and invokes
+        // the callback on a fresh deserialized context. Query sequences and
+        // corrected scores are absent from that record. In particular the
+        // normalized-identity callback observes an empty query sequence.
+        hsp.corrected_bit_score = 0.0;
+        let mut context = ByteHspContext::new_bytes(
             hsp,
             centroid_id,
             centroid_oid,
-            vec![centroid_seq.to_vec()],
-            centroid_seq.len() as i32,
+            vec![Vec::new()],
+            0,
             centroid_title.clone(),
             subject_oid,
             cfg.member_block.seqs().length(subject_block_id),
@@ -185,7 +228,9 @@ fn align_centroid<D: ClusterRealignDatabase>(
             Vec::<Letter>::new(),
             0.0,
             0.0,
-        ));
+        );
+        context.query_len = centroid_seq.len() as i32;
+        output.push(context);
     }
     Ok(output)
 }
@@ -197,22 +242,41 @@ fn run_block_pair<D: ClusterRealignDatabase>(
     end: CentroidId,
     config: &ClusterOutputConfig,
     score_matrix: &ScoreMatrix,
-    cfg: &mut Cfg<'_, D>,
-) -> Result<(Vec<HspContext>, Statistics), String> {
-    let mut output = Vec::new();
-    let mut total_statistics = Statistics::new();
-    for centroid in begin..end {
-        let mut statistics = Statistics::new();
-        output.extend(align_centroid(
-            centroid,
-            &mut statistics,
-            config,
-            score_matrix,
-            cfg,
-        )?);
-        total_statistics += &statistics;
-    }
-    Ok((output, total_statistics))
+    cfg: &Cfg<'_, D>,
+    io_config: &ClusterOutputIo,
+    errors: Option<&crate::util::io::IoErrorOwner>,
+) -> Result<(context_stream::ContextFile, Statistics), String> {
+    let (file, mut writer) =
+        context_stream::capture_io(context_stream::ContextFile::create(io_config), errors)?;
+    let statistics = Mutex::new(Statistics::new());
+    let sink = crate::output::live_sink::LiveSink::new(
+        begin as usize,
+        false,
+        |contexts: Vec<ByteHspContext>| {
+            for context in contexts {
+                context_stream::write_context(&mut writer, &context)?;
+            }
+            Ok(())
+        },
+    );
+    let titles = vec![""; (end - begin) as usize];
+    context_stream::capture_io(
+        sink.execute(begin as usize, &titles, || {
+            (begin..end).into_par_iter().try_for_each(|centroid| {
+                let mut stats = Statistics::new();
+                let contexts = align_centroid(centroid, &mut stats, config, score_matrix, cfg)
+                    .map_err(std::io::Error::other)?;
+                *statistics.lock().unwrap() += &stats;
+                let bytes = contexts.len() * std::mem::size_of::<ByteHspContext>();
+                sink.push(centroid as usize, contexts, bytes)
+            })
+        }),
+        errors,
+    )?;
+    context_stream::capture_io(sink.finish(end as usize), errors)?;
+    context_stream::capture_io(writer.flush(), errors)?;
+    drop(writer);
+    Ok((file, statistics.into_inner().unwrap()))
 }
 
 /// C++ structured-cluster `realign` overload.
@@ -220,7 +284,7 @@ pub fn realign_clusters<D, F>(
     clusters: &FlatArray<OId>,
     centroids: &[OId],
     database: &mut D,
-    mut callback: F,
+    callback: F,
     hsp_values: HspValues,
     config: &ClusterOutputConfig,
     score_matrix: &mut ScoreMatrix,
@@ -228,6 +292,130 @@ pub fn realign_clusters<D, F>(
 where
     D: ClusterRealignDatabase,
     F: FnMut(&HspContext) -> Result<(), String>,
+{
+    realign_clusters_with_io(
+        clusters,
+        centroids,
+        database,
+        callback,
+        hsp_values,
+        config,
+        score_matrix,
+        &ClusterOutputIo::default(),
+    )
+}
+
+/// Native command adapter preserving Source's bounded temporary stream lifecycle.
+pub fn realign_clusters_with_io<D, F>(
+    clusters: &FlatArray<OId>,
+    centroids: &[OId],
+    database: &mut D,
+    mut callback: F,
+    hsp_values: HspValues,
+    config: &ClusterOutputConfig,
+    score_matrix: &mut ScoreMatrix,
+    io_config: &ClusterOutputIo,
+) -> Result<Statistics, String>
+where
+    D: ClusterRealignDatabase,
+    F: FnMut(&HspContext) -> Result<(), String>,
+{
+    realign_clusters_with_io_owner(
+        clusters,
+        centroids,
+        database,
+        |context| {
+            callback(
+                &context
+                    .try_to_string_context()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+        hsp_values,
+        config,
+        score_matrix,
+        io_config,
+        None,
+    )
+}
+
+pub fn realign_clusters_with_io_errors<D, F>(
+    clusters: &FlatArray<OId>,
+    centroids: &[OId],
+    database: &mut D,
+    mut callback: F,
+    hsp_values: HspValues,
+    config: &ClusterOutputConfig,
+    score_matrix: &mut ScoreMatrix,
+    io_config: &ClusterOutputIo,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<Statistics, String>
+where
+    D: ClusterRealignDatabase,
+    F: FnMut(&HspContext) -> Result<(), String>,
+{
+    realign_clusters_with_io_owner(
+        clusters,
+        centroids,
+        database,
+        |context| {
+            callback(
+                &context
+                    .try_to_string_context()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+        hsp_values,
+        config,
+        score_matrix,
+        io_config,
+        Some(errors),
+    )
+}
+
+/// Byte-canonical command entry into the same Source realignment engine.
+pub fn realign_clusters_with_io_errors_bytes<D, F>(
+    clusters: &FlatArray<OId>,
+    centroids: &[OId],
+    database: &mut D,
+    callback: F,
+    hsp_values: HspValues,
+    config: &ClusterOutputConfig,
+    score_matrix: &mut ScoreMatrix,
+    io_config: &ClusterOutputIo,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<Statistics, String>
+where
+    D: ClusterRealignDatabase,
+    F: FnMut(&ByteHspContext) -> Result<(), String>,
+{
+    realign_clusters_with_io_owner(
+        clusters,
+        centroids,
+        database,
+        callback,
+        hsp_values,
+        config,
+        score_matrix,
+        io_config,
+        Some(errors),
+    )
+}
+
+fn realign_clusters_with_io_owner<D, F>(
+    clusters: &FlatArray<OId>,
+    centroids: &[OId],
+    database: &mut D,
+    mut callback: F,
+    hsp_values: HspValues,
+    config: &ClusterOutputConfig,
+    score_matrix: &mut ScoreMatrix,
+    io_config: &ClusterOutputIo,
+    errors: Option<&crate::util::io::IoErrorOwner>,
+) -> Result<Statistics, String>
+where
+    D: ClusterRealignDatabase,
+    F: FnMut(&ByteHspContext) -> Result<(), String>,
 {
     let mut statistics = Statistics::new();
     database.set_seqinfo_ptr(0)?;
@@ -252,7 +440,7 @@ where
             if member_block.empty() {
                 break;
             }
-            let mut cfg = Cfg::new(
+            let cfg = Cfg::new(
                 hsp_values,
                 lazy_titles,
                 clusters,
@@ -262,18 +450,14 @@ where
                 member_block,
             );
             let (block_output, block_statistics) =
-                run_block_pair(begin, end, config, score_matrix, &mut cfg)?;
+                run_block_pair(begin, end, config, score_matrix, &cfg, io_config, errors)?;
             temporary_outputs.push(block_output);
             statistics += &block_statistics;
-            if centroid_block.seqs().len() as OId == cfg.database.sequence_count() {
+            if centroid_block.seqs().len() as OId == cfg.database.lock().unwrap().sequence_count() {
                 break;
             }
         }
-        let mut merged: Vec<HspContext> = temporary_outputs.into_iter().flatten().collect();
-        merged.sort_by_key(|context| context.query_oid);
-        for context in &merged {
-            callback(context)?;
-        }
+        context_stream::merge_files(temporary_outputs, &mut callback, errors)?;
     }
     Ok(statistics)
 }

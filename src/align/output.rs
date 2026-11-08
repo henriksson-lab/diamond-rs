@@ -1,5 +1,5 @@
-use crate::align::hsp::HspContext;
 use crate::align::hsp::Match;
+use crate::align::hsp::{ByteHspContext, HspContext};
 use crate::basic::statistics::{StatValue, Statistics};
 use crate::basic::value::{BlockId, DictId, Letter, OId, SequenceType};
 use crate::data::daa::{finish_daa_query_record, write_daa_query_record, write_daa_record_hsp};
@@ -13,6 +13,11 @@ pub trait GenerateOutputTarget {
     fn subject_len(&self, subject_id: BlockId) -> usize;
     fn subject_seq(&self, subject_id: BlockId) -> Vec<Letter>;
     fn target_title(&self, subject_id: BlockId, all_seqids: bool) -> io::Result<String>;
+    fn target_title_bytes(&self, subject_id: BlockId, all_seqids: bool) -> io::Result<Vec<u8>> {
+        self.target_title(subject_id, all_seqids)
+            .map(String::into_bytes)
+    }
+
     fn target_self_aln_score(&self, subject_id: BlockId) -> f64;
     fn dict_id(
         &mut self,
@@ -32,6 +37,28 @@ pub trait GenerateOutputFormat {
     ) -> io::Result<()>;
 
     fn print_match(&mut self, out: &mut Vec<u8>, context: &HspContext) -> io::Result<()>;
+
+    /// Checked legacy callback bridge. Native command printers override this
+    /// with the raw renderer; this fallback cannot silently replace byte data.
+    fn print_match_bytes(&mut self, out: &mut Vec<u8>, context: &ByteHspContext) -> io::Result<()> {
+        self.print_match(out, &context.try_to_string_context()?)
+    }
+    fn print_query_intro_bytes(
+        &mut self,
+        out: &mut Vec<u8>,
+        query_block_id: BlockId,
+        unaligned: bool,
+    ) -> io::Result<()> {
+        self.print_query_intro(out, query_block_id, unaligned)
+    }
+    fn print_query_epilog_bytes(
+        &mut self,
+        out: &mut Vec<u8>,
+        query_block_id: BlockId,
+        unaligned: bool,
+    ) -> io::Result<()> {
+        self.print_query_epilog(out, query_block_id, unaligned)
+    }
 
     fn print_query_epilog(
         &mut self,
@@ -66,6 +93,50 @@ where
     T: GenerateOutputTarget,
     F: GenerateOutputFormat,
 {
+    generate_output_bytes(
+        targets,
+        query_block_id,
+        stat,
+        iterated,
+        format_report_unaligned,
+        report_unaligned,
+        current_ref_block,
+        output_format,
+        target,
+        printer,
+        query,
+        query_source,
+        query_title.as_bytes(),
+        query_oid,
+        query_self_aln_score,
+        input_sequence_type,
+        all_seqids,
+    )
+}
+
+pub fn generate_output_bytes<T, F>(
+    targets: &[Match],
+    query_block_id: BlockId,
+    stat: &mut Statistics,
+    iterated: bool,
+    format_report_unaligned: bool,
+    report_unaligned: bool,
+    current_ref_block: usize,
+    output_format: &OutputFormat,
+    target: &mut T,
+    printer: Option<&mut F>,
+    query: Vec<Vec<Letter>>,
+    query_source: &[Letter],
+    query_title: &[u8],
+    query_oid: OId,
+    query_self_aln_score: f64,
+    input_sequence_type: SequenceType,
+    all_seqids: bool,
+) -> io::Result<Option<Vec<u8>>>
+where
+    T: GenerateOutputTarget,
+    F: GenerateOutputFormat,
+{
     let aligned = !targets.is_empty();
     if !aligned && !format_report_unaligned {
         return Ok(None);
@@ -82,8 +153,12 @@ where
         }
     } else if output_format.code == FormatCode::Daa {
         if aligned {
-            seek_pos =
-                write_daa_query_record(&mut out, query_title, query_source, input_sequence_type);
+            seek_pos = crate::data::daa::write_daa_query_record_bytes(
+                &mut out,
+                query_title,
+                query_source,
+                input_sequence_type,
+            );
         }
     } else if aligned || report_unaligned {
         let printer = printer.as_deref_mut().ok_or_else(|| {
@@ -92,7 +167,7 @@ where
                 "generate_output: missing text output format",
             )
         })?;
-        printer.print_query_intro(&mut out, query_block_id, !aligned)?;
+        printer.print_query_intro_bytes(&mut out, query_block_id, !aligned)?;
     }
 
     for (i, target_match) in targets.iter().enumerate() {
@@ -123,8 +198,8 @@ where
                     output_format,
                 )?;
             } else {
-                let target_title = target.target_title(subject_id, all_seqids)?;
-                let context = HspContext::new(
+                let target_title = target.target_title_bytes(subject_id, all_seqids)?;
+                let mut context = ByteHspContext::new_bytes(
                     hsp.clone(),
                     query_block_id,
                     query_oid,
@@ -140,13 +215,14 @@ where
                     query_self_aln_score,
                     target_self_aln_score,
                 );
+                context.query_source = Some(query_source.to_vec());
                 let printer = printer.as_deref_mut().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "generate_output: missing text output format",
                     )
                 })?;
-                printer.print_match(&mut out, &context)?;
+                printer.print_match_bytes(&mut out, &context)?;
             }
 
             n_hsp += 1;
@@ -174,7 +250,7 @@ where
                     "generate_output: missing text output format",
                 )
             })?;
-            printer.print_query_epilog(&mut out, query_block_id, !aligned)?;
+            printer.print_query_epilog_bytes(&mut out, query_block_id, !aligned)?;
         }
     }
 

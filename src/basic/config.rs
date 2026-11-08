@@ -2,6 +2,37 @@
 
 use crate::config::Sensitivity;
 use crate::util::io::Compressor;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+/// Source `EnumTraits<Sensitivity>::from_string`, including the sorted map's
+/// permitted-value diagnostic. Keep workflow parsers on this shared registry.
+pub fn sensitivity_from_string(value: &str) -> Result<Sensitivity, String> {
+    sensitivity_from_bytes(value.as_bytes()).map_err(|error| error.to_string())
+}
+
+pub fn sensitivity_from_bytes(value: &[u8]) -> std::io::Result<Sensitivity> {
+    match value {
+        b"default" => Ok(Sensitivity::Default),
+        b"fast" => Ok(Sensitivity::Fast),
+        b"faster" => Ok(Sensitivity::Faster),
+        b"linclust-20" => Ok(Sensitivity::Linclust20),
+        b"linclust-40" => Ok(Sensitivity::Linclust40),
+        b"mid-sensitive" => Ok(Sensitivity::MidSensitive),
+        b"more-sensitive" => Ok(Sensitivity::MoreSensitive),
+        b"sensitive" => Ok(Sensitivity::Sensitive),
+        b"shapes-30x10" => Ok(Sensitivity::Shapes30x10),
+        b"shapes-6x10" => Ok(Sensitivity::Shapes6x10),
+        b"ultra-sensitive" => Ok(Sensitivity::UltraSensitive),
+        b"very-sensitive" => Ok(Sensitivity::VerySensitive),
+        _ => {
+            let mut message = b"Invalid value for string field: ".to_vec();
+            message.extend_from_slice(value);
+            message.extend_from_slice(b". Permitted values: default, fast, faster, linclust-20, linclust-40, mid-sensitive, more-sensitive, sensitive, shapes-30x10, shapes-6x10, ultra-sensitive, very-sensitive");
+            Err(crate::util::io::RawDiagnosticError(message).into_io())
+        }
+    }
+}
 
 pub const REGISTERED_COMMANDS: &str = "makedb prepdb blastp blastx cluster linclust realign recluster reassign view merge-daa help version getseq dbinfo test makeidx greedy-vertex-cover roc benchmark deepclust random-seqs sort dbstat mask fastq2fasta info seed-stat smith-waterman simulate-seqs split upgma upgmamc reverse compute-medoids mutate roc-id find-shapes hashseqs listseeds blastn wc cut model-seqs make-seed-table";
 
@@ -64,6 +95,10 @@ pub enum Command {
     ClusterRealign,
     Benchmark,
     Mask,
+    ListSeeds,
+    ComputeMedoids,
+    ModelSeqs,
+    MakeSeedTable,
     Other,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,17 +112,17 @@ pub enum Algo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigInput {
     pub argc: usize,
-    pub argv: Vec<String>,
+    pub argv: Vec<OsString>,
     pub check_io: bool,
     pub command: Command,
     pub debug_log: bool,
     pub quiet: bool,
     pub verbose: bool,
-    pub database: String,
-    pub output_file: String,
-    pub daa_file: String,
-    pub output_format: Vec<String>,
-    pub compression: String,
+    pub database: PathBuf,
+    pub output_file: PathBuf,
+    pub daa_file: PathBuf,
+    pub output_format: Vec<Vec<u8>>,
+    pub compression: Vec<u8>,
     pub no_auto_append: bool,
     pub chunk_size: f64,
     pub top_present: bool,
@@ -104,23 +139,24 @@ pub struct ConfigInput {
     pub mp_recover: bool,
     pub comp_based_stats: u32,
     pub translated_cbs_supported: bool,
-    pub matrix_file: String,
+    pub matrix_file: PathBuf,
     pub gap_open: i32,
     pub gap_extend: i32,
     pub sensitivities: Vec<Sensitivity>,
     pub algo: Algo,
     pub query_gencode: u32,
-    pub strand: String,
-    pub unfmt: String,
-    pub alfmt: String,
-    pub query_file: Vec<String>,
+    pub strand: Vec<u8>,
+    pub unfmt: Vec<u8>,
+    pub alfmt: Vec<u8>,
+    pub aligned_file: PathBuf,
+    pub query_file: Vec<PathBuf>,
     pub store_query_quality: bool,
     pub target_indexed: bool,
     pub lowmem: u32,
     pub swipe_all: bool,
-    pub parallel_tmpdir: String,
+    pub parallel_tmpdir: PathBuf,
     pub hit_membuf: bool,
-    pub tmpdir: String,
+    pub tmpdir: PathBuf,
     pub threads: Option<i32>,
     pub hardware_threads: i32,
     pub now: i64,
@@ -135,11 +171,11 @@ impl Default for ConfigInput {
             debug_log: false,
             quiet: false,
             verbose: false,
-            database: String::new(),
-            output_file: String::new(),
-            daa_file: String::new(),
+            database: PathBuf::new(),
+            output_file: PathBuf::new(),
+            daa_file: PathBuf::new(),
             output_format: vec![],
-            compression: String::new(),
+            compression: Vec::new(),
             no_auto_append: false,
             chunk_size: 0.0,
             top_present: false,
@@ -156,23 +192,24 @@ impl Default for ConfigInput {
             mp_recover: false,
             comp_based_stats: 1,
             translated_cbs_supported: true,
-            matrix_file: String::new(),
+            matrix_file: PathBuf::new(),
             gap_open: -1,
             gap_extend: -1,
             sensitivities: vec![],
             algo: Algo::Auto,
             query_gencode: 1,
-            strand: "both".into(),
-            unfmt: "fasta".into(),
-            alfmt: "fasta".into(),
+            strand: b"both".to_vec(),
+            unfmt: b"fasta".to_vec(),
+            alfmt: b"fasta".to_vec(),
+            aligned_file: PathBuf::new(),
             query_file: vec![],
             store_query_quality: false,
             target_indexed: false,
             lowmem: 4,
             swipe_all: false,
-            parallel_tmpdir: String::new(),
+            parallel_tmpdir: PathBuf::new(),
             hit_membuf: false,
-            tmpdir: String::new(),
+            tmpdir: PathBuf::new(),
             threads: None,
             hardware_threads: 1,
             now: 0,
@@ -181,31 +218,62 @@ impl Default for ConfigInput {
 }
 
 pub trait ConfigBackend {
+    fn invocation(&mut self, args: &[OsString]) -> Result<Vec<u8>, String> {
+        invocation_bytes(args)
+    }
+    fn auxiliary_formats(&mut self, _: &ConfigInput) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn presentation(&mut self, _: &ConfigInput, _: u8) -> Result<(), String> {
+        Ok(())
+    }
+    fn streams(&mut self, _: &ConfigInput, _: u8) -> Result<(), String> {
+        Ok(())
+    }
+    fn completed(&mut self, _: &Config, _: &ConfigInput) -> Result<(), String> {
+        Ok(())
+    }
     fn cbs(&mut self, _: u32) -> Result<(), String>;
     fn scoring(&mut self, _: &ConfigInput) -> Result<(), String>;
     fn masking(&mut self) -> Result<(), String>;
+    fn enums(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     fn translator(&mut self, _: u32) -> Result<(), String>;
     fn temp(&mut self, _: &str) -> Result<(), String>;
     fn mkdir(&mut self, _: &str) -> Result<(), String>;
+    fn temp_path(&mut self, path: &Path) -> Result<(), String> {
+        self.temp(
+            path.to_str()
+                .ok_or("Non-UTF-8 path requires a path-aware ConfigBackend")?,
+        )
+    }
+    fn mkdir_path(&mut self, path: &Path) -> Result<(), String> {
+        self.mkdir(
+            path.to_str()
+                .ok_or("Non-UTF-8 path requires a path-aware ConfigBackend")?,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub command: Command,
     pub verbosity: u8,
-    pub database: String,
-    pub output_file: String,
-    pub daa_file: String,
+    pub database: PathBuf,
+    pub output_file: PathBuf,
+    pub daa_file: PathBuf,
     pub range_culling: bool,
     pub top: Option<f64>,
     pub frame_shift: i32,
     pub sensitivity: Sensitivity,
     pub algo: Algo,
     pub store_query_quality: bool,
-    pub tmpdir: String,
+    pub tmpdir: PathBuf,
     pub threads: i32,
     pub trace_pt_membuf: bool,
-    pub invocation: String,
+    pub invocation: Vec<u8>,
     pub old_warning: bool,
 }
 
@@ -218,12 +286,35 @@ impl Config {
         Ok(())
     }
     pub fn single_query_file<'a>(&self, i: &'a ConfigInput) -> &'a str {
-        i.query_file.first().map(String::as_str).unwrap_or("")
+        self.single_query_path(i)
+            .to_str()
+            .expect("Non-UTF-8 query path; use single_query_path")
+    }
+    pub fn single_query_path<'a>(&self, i: &'a ConfigInput) -> &'a Path {
+        i.query_file
+            .first()
+            .map(PathBuf::as_path)
+            .unwrap_or_else(|| Path::new(""))
     }
     pub fn compressor(&self, i: &ConfigInput) -> Result<Compressor, String> {
-        compressor(&i.compression)
+        self.compressor_io(i).map_err(|error| error.to_string())
+    }
+    pub fn compressor_io(&self, i: &ConfigInput) -> std::io::Result<Compressor> {
+        compressor_bytes(&i.compression)
     }
     pub fn new<B: ConfigBackend>(i: &ConfigInput, b: &mut B) -> Result<Self, String> {
+        Self::new_with_extra(i, b, false)
+    }
+    /// Source EXTRA constructor. Its CBS::COUNT is still 6: the last
+    /// explicitly assigned enum entry is 5, after the experimental entry 6.
+    pub fn new_extra<B: ConfigBackend>(i: &ConfigInput, b: &mut B) -> Result<Self, String> {
+        Self::new_with_extra(i, b, true)
+    }
+    fn new_with_extra<B: ConfigBackend>(
+        i: &ConfigInput,
+        b: &mut B,
+        _extra: bool,
+    ) -> Result<Self, String> {
         let verbosity = if i.debug_log {
             3
         } else if i.quiet {
@@ -233,7 +324,7 @@ impl Config {
         } else if (matches!(
             i.command,
             Command::View | Command::BlastP | Command::BlastX | Command::BlastN
-        ) && i.output_file.is_empty()
+        ) && i.output_file.as_os_str().is_empty()
             && i.argc != 2)
             || matches!(
                 i.command,
@@ -244,6 +335,7 @@ impl Config {
         } else {
             1
         };
+        b.presentation(i, verbosity)?;
         if i.top_present && i.max_target_present {
             return Err("--top and -k/--max-target-seqs are mutually exclusive.".into());
         }
@@ -290,7 +382,7 @@ impl Config {
         );
         if i.check_io {
             if i.command == Command::MakeDb {
-                if db.is_empty() {
+                if db.as_os_str().is_empty() {
                     return Err("Missing parameter: database file (--db/-d)".into());
                 }
                 if i.chunk_size != 0.0 {
@@ -301,22 +393,22 @@ impl Config {
                 i.command,
                 Command::BlastP | Command::BlastX | Command::BlastN
             ) {
-                if db.is_empty() {
+                if db.as_os_str().is_empty() {
                     return Err("Missing parameter: database file (--db/-d)".into());
                 }
-                if !daa.is_empty() {
-                    if !out.is_empty() {
+                if !daa.as_os_str().is_empty() {
+                    if !out.as_os_str().is_empty() {
                         return Err("Options --daa and --out cannot be used together.".into());
                     }
-                    if i.output_format.first().is_some_and(|x| x != "daa") {
+                    if i.output_format.first().is_some_and(|x| x != b"daa") {
                         return Err("Invalid parameter: --daa/-a. Output file is specified with the --out/-o parameter.".into());
                     }
                     out = daa.clone()
                 }
-                if !daa.is_empty()
+                if !daa.as_os_str().is_empty()
                     || matches!(
-                        i.output_format.first().map(String::as_str),
-                        Some("daa" | "100")
+                        i.output_format.first().map(Vec::as_slice),
+                        Some(b"daa" | b"100")
                     )
                 {
                     if !i.compression.is_empty() {
@@ -327,10 +419,11 @@ impl Config {
                     }
                 }
             }
-            if i.command == Command::DbInfo && db.is_empty() {
+            if i.command == Command::DbInfo && db.as_os_str().is_empty() {
                 return Err("Missing parameter: database file (--db/-d)".into());
             }
         }
+        b.streams(i, verbosity)?;
         if !i.no_auto_append {
             if i.command == Command::MakeDb {
                 append(&mut db, ".dmnd")
@@ -338,10 +431,10 @@ impl Config {
             if i.command == Command::View {
                 append(&mut daa, ".daa")
             }
-            if i.compression == "1" {
+            if i.compression == b"1" {
                 append(&mut out, ".gz")
             }
-            if i.compression == "zstd" {
+            if i.compression == b"zstd" {
                 append(&mut out, ".zst")
             }
         }
@@ -358,9 +451,12 @@ impl Config {
             algo: i.algo,
             store_query_quality: i.store_query_quality,
             tmpdir: i.tmpdir.clone(),
-            threads: i.threads.unwrap_or(i.hardware_threads),
+            threads: i
+                .threads
+                .filter(|threads| *threads != 0)
+                .unwrap_or(i.hardware_threads),
             trace_pt_membuf: i.hit_membuf,
-            invocation: i.argv.join(" "),
+            invocation: b.invocation(&i.argv)?,
             old_warning: i.command != Command::Version && i.now - 1_772_912_406 > 15_552_000,
         };
         if scoring(i.command) {
@@ -372,13 +468,13 @@ impl Config {
             if range && frame == 0 {
                 return Err("Query range culling is only supported in frameshift alignment mode (option -F).".into());
             }
-            if !i.matrix_file.is_empty() {
+            if !i.matrix_file.as_os_str().is_empty() {
                 if i.gap_open == -1 || i.gap_extend == -1 {
                     return Err("Custom scoring matrices require setting the --gapopen and --gapextend options.".into());
                 }
                 if matches!(
-                    i.output_format.first().map(String::as_str),
-                    Some("daa" | "100")
+                    i.output_format.first().map(Vec::as_slice),
+                    Some(b"daa" | b"100")
                 ) {
                     return Err(
                         "Custom scoring matrices are not supported for the DAA format.".into(),
@@ -388,29 +484,28 @@ impl Config {
                     return Err("This value for --comp-based-stats is not supported when using a custom scoring matrix.".into());
                 }
             }
-            b.scoring(i)?;
+            let mut scoring_input = i.clone();
+            scoring_input.frame_shift = frame;
+            b.scoring(&scoring_input)?;
             b.masking()?
         }
         if temp(i.command) {
-            if c.tmpdir.is_empty() {
-                c.tmpdir = c
-                    .output_file
-                    .rsplit_once('/')
-                    .map(|x| x.0.into())
-                    .unwrap_or_default()
-            }
-            b.temp(&c.tmpdir)?
+            c.tmpdir =
+                crate::util::io::temp_file::source_temp_directory_path(&c.tmpdir, &c.output_file);
+            b.temp_path(&c.tmpdir)?
         }
         for &s in &i.sensitivities {
             c.set_sens(s)?
         }
+        b.enums()?;
         b.translator(i.query_gencode)?;
-        if !matches!(i.strand.as_str(), "both" | "minus" | "plus") {
+        if !matches!(i.strand.as_slice(), b"both" | b"minus" | b"plus") {
             return Err("Invalid value for parameter --strand".into());
         }
-        if i.unfmt == "fastq" || i.alfmt == "fastq" {
+        if i.unfmt == b"fastq" || i.alfmt == b"fastq" {
             c.store_query_quality = true
         }
+        b.auxiliary_formats(i)?;
         if i.command == Command::BlastX {
             if i.query_file.len() > 2 {
                 return Err("A maximum of 2 query files is supported in blastx mode.".into());
@@ -427,12 +522,13 @@ impl Config {
         if range && i.taxon_k != 0 {
             return Err("--taxon-k is not supported for --range-culling mode.".into());
         }
-        if i.multiprocessing && i.parallel_tmpdir.is_empty() {
+        if i.multiprocessing && i.parallel_tmpdir.as_os_str().is_empty() {
             return Err("--multiprocessing requires setting --parallel-tmpdir".into());
         }
         if i.multiprocessing {
-            b.mkdir(&i.parallel_tmpdir)?
+            b.mkdir_path(&i.parallel_tmpdir)?
         }
+        b.completed(&c, i)?;
         Ok(c)
     }
 }
@@ -450,7 +546,11 @@ fn scoring(c: Command) -> bool {
             | Command::RegressionTest
             | Command::ClusterReassign
             | Command::ClusterRealign
+            | Command::ListSeeds
+            | Command::ModelSeqs
+            | Command::MakeSeedTable
             | Command::Recluster
+            | Command::ComputeMedoids
     )
 }
 fn temp(c: Command) -> bool {
@@ -465,21 +565,51 @@ fn temp(c: Command) -> bool {
             | Command::RegressionTest
             | Command::ClusterReassign
             | Command::Recluster
+            | Command::ComputeMedoids
             | Command::DeepClust
             | Command::LinClust
     )
 }
-fn append(s: &mut String, e: &str) {
-    if !s.is_empty() && !s.ends_with(e) {
-        s.push_str(e)
+fn append(path: &mut PathBuf, suffix: &str) {
+    if !path.as_os_str().is_empty()
+        && !path
+            .as_os_str()
+            .as_encoded_bytes()
+            .ends_with(suffix.as_bytes())
+    {
+        path.as_mut_os_string().push(suffix);
     }
 }
+
+pub(crate) fn invocation_bytes(args: &[OsString]) -> Result<Vec<u8>, String> {
+    invocation_bytes_io(args).map_err(|e| e.to_string())
+}
+pub(crate) fn invocation_bytes_io(args: &[OsString]) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        if index != 0 {
+            out.push(b' ');
+        }
+        out.extend_from_slice(
+            &crate::util::io::source_os_bytes(arg.as_os_str()).map_err(std::io::Error::other)?,
+        );
+    }
+    Ok(out)
+}
+
 pub fn compressor(s: &str) -> Result<Compressor, String> {
+    compressor_bytes(s.as_bytes()).map_err(|error| error.to_string())
+}
+pub fn compressor_bytes(s: &[u8]) -> std::io::Result<Compressor> {
     match s {
-        "" | "0" => Ok(Compressor::None),
-        "1" => Ok(Compressor::Zlib),
-        "zstd" => Ok(Compressor::Zstd),
-        x => Err(format!("Invalid compression algorithm: {x}")),
+        b"" | b"0" => Ok(Compressor::None),
+        b"1" => Ok(Compressor::Zlib),
+        b"zstd" => Ok(Compressor::Zstd),
+        value => {
+            let mut message = b"Invalid compression algorithm: ".to_vec();
+            message.extend_from_slice(value);
+            Err(crate::util::io::RawDiagnosticError(message).into_io())
+        }
     }
 }
 pub fn set_string_option<T: Copy + Default>(
@@ -487,16 +617,28 @@ pub fn set_string_option<T: Copy + Default>(
     n: &str,
     v: &[(&str, T)],
 ) -> Result<T, String> {
+    set_bytes_option(s.as_bytes(), n, v).map_err(|e| e.to_string())
+}
+pub fn set_bytes_option<T: Copy + Default>(
+    s: &[u8],
+    n: &str,
+    v: &[(&str, T)],
+) -> std::io::Result<T> {
     if s.is_empty() {
         return Ok(T::default());
     }
-    v.iter().find(|x| x.0 == s).map(|x| x.1).ok_or_else(|| {
-        format!(
-            "Invalid argument for option {n}. Allowed values are:{}",
-            v.iter().map(|x| format!(" {}", x.0)).collect::<String>()
-        )
-    })
+    v.iter()
+        .find(|x| x.0.as_bytes() == s)
+        .map(|x| x.1)
+        .ok_or_else(|| {
+            let message = format!(
+                "Invalid argument for option {n}. Allowed values are:{}",
+                v.iter().map(|x| format!(" {}", x.0)).collect::<String>()
+            );
+            crate::util::io::RawDiagnosticError(message.into_bytes()).into_io()
+        })
 }
+
 pub fn block_size(m: i64, d: i64, s: Sensitivity, l: bool, t: i32, no_limit: bool) -> (f64, i32) {
     let (x, c) = crate::config::block_size(m, d, s, l, t);
     if !no_limit {

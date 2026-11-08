@@ -37,7 +37,28 @@ impl XmlFormat {
         no_parse_seqids: bool,
         accession_stats: &mut AccessionParsing,
     ) -> io::Result<()> {
-        super::xml::print_match_context_with_accession_stats(
+        self.print_match_bytes(
+            writer,
+            record,
+            score_matrix,
+            query_translated,
+            xml_blord_format,
+            no_parse_seqids,
+            accession_stats,
+        )
+    }
+
+    pub fn print_match_bytes<W: Write, T: AsRef<[u8]>>(
+        &self,
+        writer: &mut W,
+        record: &HspContext<T>,
+        score_matrix: &ScoreMatrix,
+        query_translated: bool,
+        xml_blord_format: bool,
+        no_parse_seqids: bool,
+        accession_stats: &mut AccessionParsing,
+    ) -> io::Result<()> {
+        super::xml::print_match_context_with_accession_stats_bytes(
             writer,
             record,
             score_matrix,
@@ -61,7 +82,57 @@ impl XmlFormat {
         first_query_len: u32,
         database: &str,
     ) -> io::Result<()> {
-        super::xml::print_header(
+        self.print_header_bytes(
+            writer,
+            mode,
+            matrix,
+            gap_open,
+            gap_extend,
+            evalue,
+            first_query_name.as_bytes(),
+            first_query_len,
+            database.as_bytes(),
+        )
+    }
+
+    pub fn print_header_bytes<W: Write>(
+        &self,
+        writer: &mut W,
+        mode: u32,
+        matrix: &str,
+        gap_open: i32,
+        gap_extend: i32,
+        evalue: f64,
+        first_query_name: &[u8],
+        first_query_len: u32,
+        database: &[u8],
+    ) -> io::Result<()> {
+        super::xml::print_header_bytes(
+            writer,
+            mode,
+            matrix,
+            gap_open,
+            gap_extend,
+            evalue,
+            first_query_name,
+            first_query_len,
+            database,
+        )
+    }
+
+    pub fn print_header_raw<W: Write>(
+        &self,
+        writer: &mut W,
+        mode: u32,
+        matrix: &[u8],
+        gap_open: i32,
+        gap_extend: i32,
+        evalue: f64,
+        first_query_name: &[u8],
+        first_query_len: u32,
+        database: &[u8],
+    ) -> io::Result<()> {
+        super::xml::print_header_raw(
             writer,
             mode,
             matrix,
@@ -81,7 +152,17 @@ impl XmlFormat {
         query_title: &str,
         query_len: i32,
     ) -> io::Result<()> {
-        super::xml::print_query_intro(writer, query_oid, query_title, query_len)
+        self.print_query_intro_bytes(writer, query_oid, query_title.as_bytes(), query_len)
+    }
+
+    pub fn print_query_intro_bytes<W: Write>(
+        &self,
+        writer: &mut W,
+        query_oid: u64,
+        query_title: &[u8],
+        query_len: i32,
+    ) -> io::Result<()> {
+        super::xml::print_query_intro_bytes(writer, query_oid, query_title, query_len)
     }
 
     #[allow(clippy::too_many_arguments)]

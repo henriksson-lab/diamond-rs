@@ -8,26 +8,68 @@ use crate::dp::swipe::HspValues;
 use crate::util::escape_sequences::{EscapeSequences, XML};
 use crate::util::sequence::FASTA_HEADER_SEP;
 
-/// Matches C++ `format_double(x)`.
-///
-/// For values >= 100: floor to integer.
-/// For values < 100: round to 1 decimal place, format as "X.Y".
-pub fn format_double(x: f64) -> String {
-    if x >= 100.0 {
-        format!("{}", x.floor() as i64)
-    } else if x <= -100.0 {
-        format!("{}", x.ceil() as i64)
-    } else {
-        let rounded = (x * 10.0).round() as i64;
-        let int_part = rounded / 10;
-        let frac_part = (rounded % 10).abs();
-        // Preserve sign for values like -0.5 where int_part rounds to 0
-        if x < 0.0 && int_part == 0 {
-            format!("-0.{}", frac_part)
+/// C++ iostream `defaultfloat` at its default six significant digits.
+/// Select fixed/scientific notation after rounding, including exponent carry.
+pub fn format_default_float(value: f64) -> String {
+    if let Some(text) = format_non_finite(value) {
+        return text.to_owned();
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0".to_owned()
         } else {
-            format!("{}.{}", int_part, frac_part)
+            "0".to_owned()
+        };
+    }
+    let scientific = format!("{value:.5e}");
+    let (mantissa, exponent) = scientific.split_once('e').unwrap();
+    let exponent: i32 = exponent.parse().unwrap();
+    if !(-4..6).contains(&exponent) {
+        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+        format!("{mantissa}e{exponent:+03}")
+    } else {
+        let decimals = (5 - exponent) as usize;
+        let fixed = format!("{value:.decimals$}");
+        if decimals == 0 {
+            fixed
+        } else {
+            fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
         }
     }
+}
+
+/// C printf/defaultfloat spellings, including the sign of a NaN.
+pub(crate) fn format_non_finite(value: f64) -> Option<&'static str> {
+    if value.is_nan() {
+        Some(if value.is_sign_negative() {
+            "-nan"
+        } else {
+            "nan"
+        })
+    } else if value.is_infinite() {
+        Some(if value.is_sign_negative() {
+            "-inf"
+        } else {
+            "inf"
+        })
+    } else {
+        None
+    }
+}
+
+/// C `snprintf("%lf", value)`: six fractional digits for finite values.
+pub fn format_fixed_float(value: f64) -> String {
+    format_fixed_precision(value, 6)
+}
+
+pub(crate) fn format_fixed_precision(value: f64, precision: usize) -> String {
+    format_non_finite(value).map_or_else(|| format!("{value:.precision$}"), str::to_owned)
+}
+
+/// Matches Source's format_double, including its signed remainder for
+/// negative values (for example -0.5 prints as "0.-5").
+pub fn format_double(x: f64) -> String {
+    crate::util::string::format_double(x)
 }
 
 /// Matches C++ `print_e(x)`.
@@ -37,6 +79,9 @@ pub fn format_double(x: f64) -> String {
 /// Rust's `{:.2e}` omits the sign for positive exponents and the leading zero
 /// for single-digit exponents (`8.35e-9` instead of `8.35e-09`).
 pub fn format_evalue(x: f64) -> String {
+    if let Some(text) = format_non_finite(x) {
+        return text.to_owned();
+    }
     if x == 0.0 {
         return "0.0".to_string();
     }
@@ -65,6 +110,10 @@ pub enum FormatCode {
     Pairwise = 0,
     Xml = 5,
     Tabular = 6,
+    /// Source internal binary-clustering tag; CLI spellings require WITH_MCL.
+    Bin1 = 8,
+    /// Source OutputFormat::EDGE internal tag; CLI spelling is `edge`.
+    Edge = 9,
     Daa = 100,
     Sam = 101,
     Taxon = 102,
@@ -74,15 +123,20 @@ pub enum FormatCode {
 
 impl FormatCode {
     pub fn parse(s: &str) -> Option<Self> {
+        Self::parse_bytes(s.as_bytes())
+    }
+    pub fn parse_bytes(s: &[u8]) -> Option<Self> {
         match s {
-            "0" => Some(Self::Pairwise),
-            "5" | "xml" => Some(Self::Xml),
-            "6" | "tab" => Some(Self::Tabular),
-            "100" | "daa" => Some(Self::Daa),
-            "101" | "sam" => Some(Self::Sam),
-            "102" => Some(Self::Taxon),
-            "103" | "paf" => Some(Self::Paf),
-            "104" | "json-flat" => Some(Self::JsonFlat),
+            b"0" => Some(Self::Pairwise),
+            b"5" | b"xml" => Some(Self::Xml),
+            b"6" | b"tab" => Some(Self::Tabular),
+            b"edge" => Some(Self::Edge),
+            b"bin1" | b"clus" if cfg!(feature = "mcl") => Some(Self::Bin1),
+            b"100" | b"daa" => Some(Self::Daa),
+            b"101" | b"sam" => Some(Self::Sam),
+            b"102" => Some(Self::Taxon),
+            b"103" | b"paf" => Some(Self::Paf),
+            b"104" | b"json-flat" => Some(Self::JsonFlat),
             _ => None,
         }
     }
@@ -294,6 +348,24 @@ pub struct OutputInitConfig<'a> {
     pub query_range_culling: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutputInitConfigBytes<'a> {
+    pub output_format: &'a [&'a [u8]],
+    pub daa_file: &'a std::path::Path,
+    pub command: OutputCommand,
+    pub include_lineage: bool,
+    pub frame_shift: i32,
+    pub query_translated: bool,
+    pub score_matrix_name: &'a [u8],
+    pub ext: &'a [u8],
+    pub multiprocessing: bool,
+    pub global_ranking_targets: u32,
+    pub toppercent: Option<f64>,
+    pub max_target_seqs: Option<i64>,
+    pub min_bit_score: f64,
+    pub query_range_culling: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutputInit {
     pub output_format: ResolvedOutputFormat,
@@ -301,6 +373,13 @@ pub struct OutputInit {
     pub toppercent: Option<f64>,
     pub message: String,
     pub dp_fields: HspValues,
+}
+
+fn raw_output_error(prefix: &[u8], value: &[u8], suffix: &[u8]) -> std::io::Error {
+    let mut message = prefix.to_vec();
+    message.extend_from_slice(value);
+    message.extend_from_slice(suffix);
+    std::io::Error::other(crate::util::io::RawDiagnosticError(message))
 }
 
 /// Matches C++ `get_output_format(output_format, daa_file, command)`.
@@ -313,9 +392,34 @@ pub fn get_output_format(
     query_translated: bool,
     score_matrix_name: &str,
 ) -> Result<ResolvedOutputFormat, String> {
+    let fields = output_format
+        .iter()
+        .map(|value| value.as_bytes())
+        .collect::<Vec<_>>();
+    get_output_format_bytes(
+        &fields,
+        std::path::Path::new(daa_file),
+        command,
+        include_lineage,
+        frame_shift,
+        query_translated,
+        score_matrix_name.as_bytes(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+pub fn get_output_format_bytes(
+    output_format: &[&[u8]],
+    daa_file: &std::path::Path,
+    command: OutputCommand,
+    include_lineage: bool,
+    frame_shift: i32,
+    query_translated: bool,
+    score_matrix_name: &[u8],
+) -> std::io::Result<ResolvedOutputFormat> {
     if output_format.is_empty() {
-        if daa_file.is_empty() || command == OutputCommand::View {
-            return Ok(ResolvedOutputFormat::Tabular(TabularFormat::new(
+        if daa_file.as_os_str().is_empty() || command == OutputCommand::View {
+            return Ok(ResolvedOutputFormat::Tabular(TabularFormat::new_bytes(
                 output_format,
                 false,
                 frame_shift,
@@ -323,7 +427,7 @@ pub fn get_output_format(
                 score_matrix_name,
             )?));
         } else if matches!(command, OutputCommand::BlastP | OutputCommand::BlastX)
-            && !daa_file.is_empty()
+            && !daa_file.as_os_str().is_empty()
         {
             return Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::daa_format(
                 false, false,
@@ -332,47 +436,73 @@ pub fn get_output_format(
     }
 
     let Some(&format) = output_format.first() else {
-        return Err("Invalid output format".to_string());
+        return Err(std::io::Error::other("Invalid output format"));
     };
     match format {
-        "tab" | "6" => Ok(ResolvedOutputFormat::Tabular(TabularFormat::new(
+        b"tab" | b"6" => Ok(ResolvedOutputFormat::Tabular(TabularFormat::new_bytes(
             output_format,
             false,
             frame_shift,
             query_translated,
             score_matrix_name,
         )?)),
-        "sam" | "101" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::sam_format())),
-        "xml" | "5" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::xml_format())),
-        "daa" | "100" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::daa_format(
+        b"sam" | b"101" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::sam_format())),
+        b"xml" | b"5" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::xml_format())),
+        b"daa" | b"100" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::daa_format(
             false, false,
         ))),
-        "0" => Ok(ResolvedOutputFormat::Spec(
+        b"0" => Ok(ResolvedOutputFormat::Spec(
             OutputFormatSpec::pairwise_format(),
         )),
-        "null" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::null_format())),
-        "102" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::taxon_format(
+        b"null" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::null_format())),
+        b"102" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::taxon_format(
             include_lineage,
         ))),
-        "paf" | "103" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::paf_format())),
-        "edge" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::edge_format())),
-        "json-flat" | "104" => Ok(ResolvedOutputFormat::Tabular(TabularFormat::new(
+        b"paf" | b"103" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::paf_format())),
+        b"edge" => Ok(ResolvedOutputFormat::Spec(OutputFormatSpec::edge_format())),
+        b"json-flat" | b"104" => Ok(ResolvedOutputFormat::Tabular(TabularFormat::new_bytes(
             output_format,
             true,
             frame_shift,
             query_translated,
             score_matrix_name,
         )?)),
-        _ => Err(format!(
-            "Invalid output format: {}\nAllowed values: 0,5,xml,6,tab,100,daa,101,sam,102,103,104,paf",
-            format
+        _ => Err(raw_output_error(
+            b"Invalid output format: ",
+            format,
+            b"\nAllowed values: 0,5,xml,6,tab,100,daa,101,sam,102,103,104,paf",
         )),
     }
 }
 
 /// Matches C++ `init_output(int64_t& max_target_seqs)`.
 pub fn init_output(cfg: &OutputInitConfig<'_>) -> Result<OutputInit, String> {
-    let mut output_format = get_output_format(
+    let fields = cfg
+        .output_format
+        .iter()
+        .map(|value| value.as_bytes())
+        .collect::<Vec<_>>();
+    init_output_bytes(&OutputInitConfigBytes {
+        output_format: &fields,
+        daa_file: std::path::Path::new(cfg.daa_file),
+        score_matrix_name: cfg.score_matrix_name.as_bytes(),
+        ext: cfg.ext.as_bytes(),
+        command: cfg.command,
+        include_lineage: cfg.include_lineage,
+        frame_shift: cfg.frame_shift,
+        query_translated: cfg.query_translated,
+        multiprocessing: cfg.multiprocessing,
+        global_ranking_targets: cfg.global_ranking_targets,
+        toppercent: cfg.toppercent,
+        max_target_seqs: cfg.max_target_seqs,
+        min_bit_score: cfg.min_bit_score,
+        query_range_culling: cfg.query_range_culling,
+    })
+    .map_err(|error| error.to_string())
+}
+
+pub fn init_output_bytes(cfg: &OutputInitConfigBytes<'_>) -> std::io::Result<OutputInit> {
+    let mut output_format = get_output_format_bytes(
         cfg.output_format,
         cfg.daa_file,
         cfg.command,
@@ -382,10 +512,12 @@ pub fn init_output(cfg: &OutputInitConfig<'_>) -> Result<OutputInit, String> {
         cfg.score_matrix_name,
     )?;
 
-    if cfg.ext == "none" && cfg.frame_shift != 0 {
-        return Err("Frameshift alignment does not support --ext none.".to_string());
+    if cfg.ext == b"none" && cfg.frame_shift != 0 {
+        return Err(std::io::Error::other(
+            "Frameshift alignment does not support --ext none.",
+        ));
     }
-    if cfg.ext == "none"
+    if cfg.ext == b"none"
         && matches!(
             output_format,
             ResolvedOutputFormat::Spec(OutputFormatSpec {
@@ -394,7 +526,9 @@ pub fn init_output(cfg: &OutputInitConfig<'_>) -> Result<OutputInit, String> {
             })
         )
     {
-        return Err("--ext none is not supported for DAA output.".to_string());
+        return Err(std::io::Error::other(
+            "--ext none is not supported for DAA output.",
+        ));
     }
 
     let needs_taxonomy = match &output_format {
@@ -410,7 +544,9 @@ pub fn init_output(cfg: &OutputInitConfig<'_>) -> Result<OutputInit, String> {
         }
     };
     if cfg.command == OutputCommand::View && needs_taxonomy {
-        return Err("Taxonomy features are not supported for the DAA format.".to_string());
+        return Err(std::io::Error::other(
+            "Taxonomy features are not supported for the DAA format.",
+        ));
     }
 
     if matches!(
@@ -421,7 +557,9 @@ pub fn init_output(cfg: &OutputInitConfig<'_>) -> Result<OutputInit, String> {
         })
     ) && cfg.multiprocessing
     {
-        return Err("The DAA format is not supported in multiprocessing mode.".to_string());
+        return Err(std::io::Error::other(
+            "The DAA format is not supported in multiprocessing mode.",
+        ));
     }
     if matches!(
         output_format,
@@ -431,7 +569,9 @@ pub fn init_output(cfg: &OutputInitConfig<'_>) -> Result<OutputInit, String> {
         })
     ) && cfg.global_ranking_targets != 0
     {
-        return Err("The DAA format is not supported in global ranking mode.".to_string());
+        return Err(std::io::Error::other(
+            "The DAA format is not supported in global ranking mode.",
+        ));
     }
 
     let mut toppercent = cfg.toppercent;
@@ -453,7 +593,9 @@ pub fn init_output(cfg: &OutputInitConfig<'_>) -> Result<OutputInit, String> {
         // Preserve C++ comparison semantics: NaN is neither below zero nor
         // above 100 and therefore is not rejected by this validation.
         if top < 0.0 || top > 100.0 {
-            return Err("Allowed value range for --top is between 0.0 and 100.0".to_string());
+            return Err(std::io::Error::other(
+                "Allowed value range for --top is between 0.0 and 100.0",
+            ));
         }
         if top == 100.0 {
             toppercent = None;
@@ -579,67 +721,175 @@ pub enum FieldId {
     Reserved1 = 74,
     Reserved2 = 75,
     SLineages = 76,
+    // COUNT is also the source registry's first dynamically allocated ID.
     Count = 77,
+    SCellularRoot = 78,
+    SAcellularRoot = 79,
+    SDomain = 80,
+    SRealm = 81,
+    SKingdom = 82,
+    SSubkingdom = 83,
+    SSuperphylum = 84,
+    SPhylum = 85,
+    SSubphylum = 86,
+    SSuperclass = 87,
+    SClassRank = 88,
+    SSubclass = 89,
+    SInfraclass = 90,
+    SCohort = 91,
+    SSubcohort = 92,
+    SSuperorder = 93,
+    SOrder = 94,
+    SSuborder = 95,
+    SInfraorder = 96,
+    SParvorder = 97,
+    SSuperfamily = 98,
+    SFamily = 99,
+    SSubfamily = 100,
+    STribe = 101,
+    SSubtribe = 102,
+    SGenus = 103,
+    SSubgenus = 104,
+    SSection = 105,
+    SSubsection = 106,
+    SSeries = 107,
+    SSpeciesGroup = 108,
+    SSpeciesSubgroup = 109,
+    SSpecies = 110,
+    SSubspecies = 111,
+    SVarietas = 112,
+    SForma = 113,
+    SStrain = 114,
+    SBiotype = 115,
+    SClade = 116,
+    SFormaSpecialis = 117,
+    SGenotype = 118,
+    SIsolate = 119,
+    SMorph = 120,
+    SPathogroup = 121,
+    SSerogroup = 122,
+    SSerotype = 123,
+    SSubvariety = 124,
 }
 
 impl FieldId {
+    pub fn taxonomy_rank(self) -> Option<crate::data::taxonomy_nodes::Rank> {
+        let id = self as u32;
+        if (77..=124).contains(&id) {
+            crate::data::taxonomy_nodes::Rank::from_index((id - 76) as usize)
+        } else {
+            None
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
+        Self::from_name_bytes(name.as_bytes())
+    }
+    pub fn from_name_bytes(name: &[u8]) -> Option<Self> {
         match name {
-            "qseqid" => Some(Self::QSeqId),
-            "qlen" => Some(Self::QLen),
-            "sseqid" => Some(Self::SSeqId),
-            "sallseqid" => Some(Self::SAllSeqId),
-            "slen" => Some(Self::SLen),
-            "qstart" => Some(Self::QStart),
-            "qend" => Some(Self::QEnd),
-            "sstart" => Some(Self::SStart),
-            "send" => Some(Self::SEnd),
-            "qseq" => Some(Self::QSeq),
-            "sseq" => Some(Self::SSeq),
-            "evalue" => Some(Self::EValue),
-            "bitscore" => Some(Self::BitScore),
-            "score" => Some(Self::Score),
-            "length" => Some(Self::Length),
-            "pident" => Some(Self::PIdent),
-            "nident" => Some(Self::NIdent),
-            "mismatch" => Some(Self::Mismatch),
-            "positive" => Some(Self::Positive),
-            "gapopen" => Some(Self::GapOpen),
-            "gaps" => Some(Self::Gaps),
-            "ppos" => Some(Self::PPos),
-            "qframe" => Some(Self::QFrame),
-            "btop" => Some(Self::BTop),
-            "staxids" => Some(Self::STaxIds),
-            "sscinames" => Some(Self::SSciNames),
-            "sskingdoms" => Some(Self::SSKingdoms),
-            "stitle" => Some(Self::STitle),
-            "salltitles" => Some(Self::SAllTitles),
-            "qcovhsp" => Some(Self::QCovHsp),
-            "qtitle" => Some(Self::QTitle),
-            "full_sseq" => Some(Self::FullSSeq),
-            "qqual" => Some(Self::QQual),
-            "qnum" => Some(Self::QNum),
-            "snum" => Some(Self::SNum),
-            "scovhsp" => Some(Self::SCovHsp),
-            "full_qqual" => Some(Self::FullQQual),
-            "full_qseq" => Some(Self::FullQSeq),
-            "qseq_gapped" => Some(Self::QSeqGapped),
-            "sseq_gapped" => Some(Self::SSeqGapped),
-            "qstrand" => Some(Self::QStrand),
-            "cigar" => Some(Self::Cigar),
-            "skingdoms" => Some(Self::SKingdoms),
-            "sphylums" => Some(Self::SPhylums),
-            "full_qseq_mate" => Some(Self::FullQSeqMate),
-            "qseq_translated" => Some(Self::QSeqTranslated),
-            "hspnum" => Some(Self::HspNum),
+            b"qseqid" => Some(Self::QSeqId),
+            b"qlen" => Some(Self::QLen),
+            b"sseqid" => Some(Self::SSeqId),
+            b"sallseqid" => Some(Self::SAllSeqId),
+            b"slen" => Some(Self::SLen),
+            b"qstart" => Some(Self::QStart),
+            b"qend" => Some(Self::QEnd),
+            b"sstart" => Some(Self::SStart),
+            b"send" => Some(Self::SEnd),
+            b"qseq" => Some(Self::QSeq),
+            b"sseq" => Some(Self::SSeq),
+            b"evalue" => Some(Self::EValue),
+            b"bitscore" => Some(Self::BitScore),
+            b"score" => Some(Self::Score),
+            b"length" => Some(Self::Length),
+            b"pident" => Some(Self::PIdent),
+            b"nident" => Some(Self::NIdent),
+            b"mismatch" => Some(Self::Mismatch),
+            b"positive" => Some(Self::Positive),
+            b"gapopen" => Some(Self::GapOpen),
+            b"gaps" => Some(Self::Gaps),
+            b"ppos" => Some(Self::PPos),
+            b"qframe" => Some(Self::QFrame),
+            b"btop" => Some(Self::BTop),
+            b"staxids" => Some(Self::STaxIds),
+            b"sscinames" => Some(Self::SSciNames),
+            b"sskingdoms" => Some(Self::SSKingdoms),
+            b"stitle" => Some(Self::STitle),
+            b"salltitles" => Some(Self::SAllTitles),
+            b"qcovhsp" => Some(Self::QCovHsp),
+            b"qtitle" => Some(Self::QTitle),
+            b"full_sseq" => Some(Self::FullSSeq),
+            b"qqual" => Some(Self::QQual),
+            b"qnum" => Some(Self::QNum),
+            b"snum" => Some(Self::SNum),
+            b"scovhsp" => Some(Self::SCovHsp),
+            b"full_qqual" => Some(Self::FullQQual),
+            b"full_qseq" => Some(Self::FullQSeq),
+            b"qseq_gapped" => Some(Self::QSeqGapped),
+            b"sseq_gapped" => Some(Self::SSeqGapped),
+            b"qstrand" => Some(Self::QStrand),
+            b"cigar" => Some(Self::Cigar),
+            b"skingdoms" => Some(Self::SKingdoms),
+            b"sphylums" => Some(Self::SPhylums),
+            b"full_qseq_mate" => Some(Self::FullQSeqMate),
+            b"qseq_translated" => Some(Self::QSeqTranslated),
+            b"hspnum" => Some(Self::HspNum),
             // C++ `blast_tab_format.cpp` registers exactly these spellings.
             // Do not accept BLAST aliases absent from upstream DIAMOND: its
             // CLI reports them as invalid output fields.
-            "normalized_nident" => Some(Self::NormalizedNident),
-            "normalized_bitscore" => Some(Self::NormalizedBitscore),
-            "approx_pident" => Some(Self::ApproxPIdent),
-            "corrected_bitscore" => Some(Self::CorrectedBitScore),
-            "slineages" => Some(Self::SLineages),
+            b"normalized_nident" => Some(Self::NormalizedNident),
+            b"normalized_bitscore" => Some(Self::NormalizedBitscore),
+            b"approx_pident" => Some(Self::ApproxPIdent),
+            b"corrected_bitscore" => Some(Self::CorrectedBitScore),
+            b"slineages" => Some(Self::SLineages),
+            b"ssuperkingdom" => Some(Self::Count),
+            b"scellular_root" => Some(Self::SCellularRoot),
+            b"sacellular_root" => Some(Self::SAcellularRoot),
+            b"sdomain" => Some(Self::SDomain),
+            b"srealm" => Some(Self::SRealm),
+            b"skingdom" => Some(Self::SKingdom),
+            b"ssubkingdom" => Some(Self::SSubkingdom),
+            b"ssuperphylum" => Some(Self::SSuperphylum),
+            b"sphylum" => Some(Self::SPhylum),
+            b"ssubphylum" => Some(Self::SSubphylum),
+            b"ssuperclass" => Some(Self::SSuperclass),
+            b"sclass" => Some(Self::SClassRank),
+            b"ssubclass" => Some(Self::SSubclass),
+            b"sinfraclass" => Some(Self::SInfraclass),
+            b"scohort" => Some(Self::SCohort),
+            b"ssubcohort" => Some(Self::SSubcohort),
+            b"ssuperorder" => Some(Self::SSuperorder),
+            b"sorder" => Some(Self::SOrder),
+            b"ssuborder" => Some(Self::SSuborder),
+            b"sinfraorder" => Some(Self::SInfraorder),
+            b"sparvorder" => Some(Self::SParvorder),
+            b"ssuperfamily" => Some(Self::SSuperfamily),
+            b"sfamily" => Some(Self::SFamily),
+            b"ssubfamily" => Some(Self::SSubfamily),
+            b"stribe" => Some(Self::STribe),
+            b"ssubtribe" => Some(Self::SSubtribe),
+            b"sgenus" => Some(Self::SGenus),
+            b"ssubgenus" => Some(Self::SSubgenus),
+            b"ssection" => Some(Self::SSection),
+            b"ssubsection" => Some(Self::SSubsection),
+            b"sseries" => Some(Self::SSeries),
+            b"sspecies_group" => Some(Self::SSpeciesGroup),
+            b"sspecies_subgroup" => Some(Self::SSpeciesSubgroup),
+            b"sspecies" => Some(Self::SSpecies),
+            b"ssubspecies" => Some(Self::SSubspecies),
+            b"svarietas" => Some(Self::SVarietas),
+            b"sforma" => Some(Self::SForma),
+            b"sstrain" => Some(Self::SStrain),
+            b"sbiotype" => Some(Self::SBiotype),
+            b"sclade" => Some(Self::SClade),
+            b"sforma_specialis" => Some(Self::SFormaSpecialis),
+            b"sgenotype" => Some(Self::SGenotype),
+            b"sisolate" => Some(Self::SIsolate),
+            b"smorph" => Some(Self::SMorph),
+            b"spathogroup" => Some(Self::SPathogroup),
+            b"sserogroup" => Some(Self::SSerogroup),
+            b"sserotype" => Some(Self::SSerotype),
+            b"ssubvariety" => Some(Self::SSubvariety),
             _ => None,
         }
     }
@@ -657,6 +907,117 @@ pub struct OutputField {
 
 impl FieldId {
     pub fn output_field(self) -> Option<OutputField> {
+        if let Some(rank) = self.taxonomy_rank() {
+            const KEYS: [&str; 48] = [
+                "ssuperkingdom",
+                "scellular_root",
+                "sacellular_root",
+                "sdomain",
+                "srealm",
+                "skingdom",
+                "ssubkingdom",
+                "ssuperphylum",
+                "sphylum",
+                "ssubphylum",
+                "ssuperclass",
+                "sclass",
+                "ssubclass",
+                "sinfraclass",
+                "scohort",
+                "ssubcohort",
+                "ssuperorder",
+                "sorder",
+                "ssuborder",
+                "sinfraorder",
+                "sparvorder",
+                "ssuperfamily",
+                "sfamily",
+                "ssubfamily",
+                "stribe",
+                "ssubtribe",
+                "sgenus",
+                "ssubgenus",
+                "ssection",
+                "ssubsection",
+                "sseries",
+                "sspecies_group",
+                "sspecies_subgroup",
+                "sspecies",
+                "ssubspecies",
+                "svarietas",
+                "sforma",
+                "sstrain",
+                "sbiotype",
+                "sclade",
+                "sforma_specialis",
+                "sgenotype",
+                "sisolate",
+                "smorph",
+                "spathogroup",
+                "sserogroup",
+                "sserotype",
+                "ssubvariety",
+            ];
+            const DESCRIPTIONS: [&str; 48] = [
+                "Unique subject superkingdom(s), separated by a ';'",
+                "Unique subject cellular root(s), separated by a ';'",
+                "Unique subject acellular root(s), separated by a ';'",
+                "Unique subject domain(s), separated by a ';'",
+                "Unique subject realm(s), separated by a ';'",
+                "Unique subject kingdom(s), separated by a ';'",
+                "Unique subject subkingdom(s), separated by a ';'",
+                "Unique subject superphylum(s), separated by a ';'",
+                "Unique subject phylum(s), separated by a ';'",
+                "Unique subject subphylum(s), separated by a ';'",
+                "Unique subject superclass(s), separated by a ';'",
+                "Unique subject class(s), separated by a ';'",
+                "Unique subject subclass(s), separated by a ';'",
+                "Unique subject infraclass(s), separated by a ';'",
+                "Unique subject cohort(s), separated by a ';'",
+                "Unique subject subcohort(s), separated by a ';'",
+                "Unique subject superorder(s), separated by a ';'",
+                "Unique subject order(s), separated by a ';'",
+                "Unique subject suborder(s), separated by a ';'",
+                "Unique subject infraorder(s), separated by a ';'",
+                "Unique subject parvorder(s), separated by a ';'",
+                "Unique subject superfamily(s), separated by a ';'",
+                "Unique subject family(s), separated by a ';'",
+                "Unique subject subfamily(s), separated by a ';'",
+                "Unique subject tribe(s), separated by a ';'",
+                "Unique subject subtribe(s), separated by a ';'",
+                "Unique subject genus(s), separated by a ';'",
+                "Unique subject subgenus(s), separated by a ';'",
+                "Unique subject section(s), separated by a ';'",
+                "Unique subject subsection(s), separated by a ';'",
+                "Unique subject series(s), separated by a ';'",
+                "Unique subject species group(s), separated by a ';'",
+                "Unique subject species subgroup(s), separated by a ';'",
+                "Unique subject species(s), separated by a ';'",
+                "Unique subject subspecies(s), separated by a ';'",
+                "Unique subject varietas(s), separated by a ';'",
+                "Unique subject forma(s), separated by a ';'",
+                "Unique subject strain(s), separated by a ';'",
+                "Unique subject biotype(s), separated by a ';'",
+                "Unique subject clade(s), separated by a ';'",
+                "Unique subject forma specialis(s), separated by a ';'",
+                "Unique subject genotype(s), separated by a ';'",
+                "Unique subject isolate(s), separated by a ';'",
+                "Unique subject morph(s), separated by a ';'",
+                "Unique subject pathogroup(s), separated by a ';'",
+                "Unique subject serogroup(s), separated by a ';'",
+                "Unique subject serotype(s), separated by a ';'",
+                "Unique subject subvariety(s), separated by a ';'",
+            ];
+            let index = rank as usize - 1;
+            return Some(OutputField {
+                id: self,
+                key: KEYS[index],
+                clust_key: "",
+                description: DESCRIPTIONS[index],
+                is_string: false,
+                is_array: true,
+            });
+        }
         Some(match self {
             FieldId::QSeqId => OutputField {
                 id: self,
@@ -1107,6 +1468,9 @@ impl FieldId {
     }
 
     pub fn output_flags(self) -> OutputFlags {
+        if self.taxonomy_rank().is_some() {
+            return OutputFlags::IS_ARRAY | OutputFlags::NO_REALIGN;
+        }
         match self {
             FieldId::QSeqId | FieldId::QTitle => OutputFlags::IS_STRING,
             FieldId::QSeq
@@ -1157,10 +1521,13 @@ pub enum Header {
 
 impl Header {
     pub fn parse(s: &str) -> Option<Self> {
+        Self::parse_bytes(s.as_bytes())
+    }
+    pub fn parse_bytes(s: &[u8]) -> Option<Self> {
         match s {
-            "0" => Some(Self::None),
-            "simple" => Some(Self::Simple),
-            "verbose" => Some(Self::Verbose),
+            b"0" => Some(Self::None),
+            b"simple" => Some(Self::Simple),
+            b"verbose" => Some(Self::Verbose),
             _ => None,
         }
     }
@@ -1213,6 +1580,27 @@ impl TabularFormat {
         query_translated: bool,
         score_matrix_name: &str,
     ) -> Result<Self, String> {
+        let fields = output_format
+            .iter()
+            .map(|value| value.as_bytes())
+            .collect::<Vec<_>>();
+        Self::new_bytes(
+            &fields,
+            json,
+            frame_shift,
+            query_translated,
+            score_matrix_name.as_bytes(),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn new_bytes(
+        output_format: &[&[u8]],
+        json: bool,
+        frame_shift: i32,
+        query_translated: bool,
+        score_matrix_name: &[u8],
+    ) -> std::io::Result<Self> {
         let mut format = Self {
             code: if json {
                 FormatCode::JsonFlat
@@ -1247,8 +1635,14 @@ impl TabularFormat {
             return Ok(format);
         }
         for field in &output_format[1..] {
-            let id = FieldId::from_name(field)
-                .ok_or_else(|| format!("Invalid output field: {}", field))?;
+            let id = FieldId::from_name_bytes(field)
+                .ok_or_else(|| raw_output_error(b"Invalid output field: ", field, b""))?;
+            if id.taxonomy_rank().is_some() {
+                format.needs_taxon_id_lists = true;
+                format.needs_taxon_nodes = true;
+                format.needs_taxon_ranks = true;
+                format.needs_taxon_scientific_names = true;
+            }
             if id == FieldId::STaxIds {
                 format.needs_taxon_id_lists = true;
             }
@@ -1282,14 +1676,15 @@ impl TabularFormat {
             if id == FieldId::FullQSeqMate {
                 format.needs_paired_end_info = true;
             }
-            if id == FieldId::ApproxPIdent && score_matrix_name != "BLOSUM62" {
-                return Err(
-                    "Approximate identity is only supported for the BLOSUM62 scoring matrix."
-                        .to_string(),
-                );
+            if id == FieldId::ApproxPIdent && score_matrix_name != b"BLOSUM62" {
+                return Err(std::io::Error::other(
+                    "Approximate identity is only supported for the BLOSUM62 scoring matrix.",
+                ));
             }
             if matches!(id, FieldId::FullQSeqMate | FieldId::QSeqTranslated) && !query_translated {
-                return Err("Output field only supported for translated search.".to_string());
+                return Err(std::io::Error::other(
+                    "Output field only supported for translated search.",
+                ));
             }
             format.hsp_values = format.hsp_values | id.hsp_values();
             format.flags |= id.output_flags();
@@ -1302,9 +1697,21 @@ impl TabularFormat {
         workflow: Workflow,
         output_header: Option<&[&str]>,
     ) -> Result<Header, String> {
+        let bytes = output_header.map(|values| {
+            values
+                .iter()
+                .map(|value| value.as_bytes())
+                .collect::<Vec<_>>()
+        });
+        Self::header_format_bytes(workflow, bytes.as_deref()).map_err(|error| error.to_string())
+    }
+    pub fn header_format_bytes(
+        workflow: Workflow,
+        output_header: Option<&[&[u8]]>,
+    ) -> std::io::Result<Header> {
         let cluster = matches!(workflow, Workflow::Cluster | Workflow::DeepClust);
         if workflow != Workflow::BlastP && !cluster {
-            return Err("header_format".to_string());
+            return Err(std::io::Error::other("header_format"));
         }
         let Some(output_header) = output_header else {
             return Ok(Header::None);
@@ -1317,15 +1724,25 @@ impl TabularFormat {
             });
         }
         if output_header.len() > 1 {
-            return Err(format!(
-                "Invalid header format: {}",
-                output_header.join(" ")
-            ));
+            let mut message = b"Invalid header format: ".to_vec();
+            for (i, field) in output_header.iter().enumerate() {
+                if i != 0 {
+                    message.push(b' ');
+                }
+                message.extend_from_slice(field);
+            }
+            return Err(crate::util::io::RawDiagnosticError(message).into_io());
         }
-        let h = Header::parse(output_header[0])
-            .ok_or_else(|| format!("Invalid header format: {}", output_header[0]))?;
+        let h = Header::parse_bytes(output_header[0]).ok_or_else(|| {
+            let mut message = b"Invalid value for string field: ".to_vec();
+            message.extend_from_slice(output_header[0]);
+            message.extend_from_slice(b". Permitted values: 0, simple, verbose");
+            crate::util::io::RawDiagnosticError(message).into_io()
+        })?;
         if h == Header::Verbose && cluster {
-            return Err("Verbose header format is not supported for cluster workflow.".to_string());
+            return Err(std::io::Error::other(
+                "Verbose header format is not supported for cluster workflow.",
+            ));
         }
         Ok(h)
     }
@@ -1381,32 +1798,49 @@ pub fn print_tabular_header(
     version: &str,
     invocation: &str,
 ) -> Result<String, String> {
-    let mut out = String::new();
+    String::from_utf8(print_tabular_header_bytes(
+        fields,
+        header,
+        is_json,
+        version,
+        invocation.as_bytes(),
+    )?)
+    .map_err(|error| error.to_string())
+}
+
+pub fn print_tabular_header_bytes(
+    fields: &[FieldId],
+    header: Header,
+    is_json: bool,
+    version: &str,
+    invocation: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
     match header {
         Header::Verbose => {
-            out.push_str("# DIAMOND v");
-            out.push_str(version);
-            out.push_str(". http://github.com/bbuchfink/diamond\n");
-            out.push_str("# Invocation: ");
-            out.push_str(invocation);
-            out.push('\n');
-            out.push_str("# Fields: ");
+            out.extend_from_slice(b"# DIAMOND v");
+            out.extend_from_slice(version.as_bytes());
+            out.extend_from_slice(b". http://github.com/bbuchfink/diamond\n");
+            out.extend_from_slice(b"# Invocation: ");
+            out.extend_from_slice(invocation);
+            out.push(b'\n');
+            out.extend_from_slice(b"# Fields: ");
             for (i, field) in fields.iter().enumerate() {
                 let def = field
                     .output_field()
                     .ok_or_else(|| format!("Invalid output field: {:?}", field))?;
                 if i > 0 {
-                    out.push_str(", ");
+                    out.extend_from_slice(b", ");
                 }
-                out.push_str(def.description);
+                out.extend_from_slice(def.description.as_bytes());
             }
-            out.push('\n');
+            out.push(b'\n');
         }
-        Header::Simple => out.push_str(&output_header(fields, false)?),
+        Header::Simple => out.extend_from_slice(output_header(fields, false)?.as_bytes()),
         Header::None => {}
     }
     if is_json {
-        out.push('[');
+        out.push(b'[');
     }
     Ok(out)
 }
@@ -1441,70 +1875,116 @@ pub fn print_title_escaped(
     escape_sequences: Option<&EscapeSequences>,
     json_array: bool,
 ) -> String {
-    let mut out = String::new();
-    let mut n = 0usize;
-    let mut rest = id;
+    try_print_title_escaped(id,full_titles,all_titles,separator,escape_sequences,json_array)
+        .expect("String title escape output is not UTF-8; use print_title_escaped_bytes or try_print_title_escaped")
+}
+
+pub fn try_print_title_escaped(
+    id: &str,
+    full_titles: bool,
+    all_titles: bool,
+    separator: &str,
+    escape_sequences: Option<&EscapeSequences>,
+    json_array: bool,
+) -> Result<String, std::string::FromUtf8Error> {
+    String::from_utf8(print_title_escaped_bytes(
+        id.as_bytes(),
+        full_titles,
+        all_titles,
+        separator.as_bytes(),
+        escape_sequences,
+        json_array,
+    ))
+}
+
+pub fn c_string_bytes(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len())]
+}
+
+pub fn print_title_bytes(
+    id: &[u8],
+    full_titles: bool,
+    all_titles: bool,
+    separator: &[u8],
+    json_array: bool,
+) -> Vec<u8> {
+    print_title_escaped_bytes(id, full_titles, all_titles, separator, None, json_array)
+}
+
+pub fn print_title_escaped_bytes(
+    id: &[u8],
+    full_titles: bool,
+    all_titles: bool,
+    separator: &[u8],
+    escape_sequences: Option<&EscapeSequences>,
+    json_array: bool,
+) -> Vec<u8> {
+    // Source accepts const char* here. Stop NUL at this consumer, never in
+    // canonical title storage.
+    let mut rest = c_string_bytes(id);
+    let mut output = Vec::new();
+    let mut n = 0;
     loop {
-        // C++ `StringDelimiters::scan` (`util/string/tokenizer.h:89-96`) probes
-        // the delimiter array in order and returns the FIRST delimiter that
-        // occurs anywhere — i.e. `\x01` always wins over ` >` if both are
-        // present, regardless of position. Picking the earliest-position
-        // delimiter (the obvious thing) would tokenize a multi-seqid header
-        // like `"sp|A >sp|B\x01sp|C"` into 3 pieces instead of C++'s 2.
-        let bytes = rest.as_bytes();
-        let (split_at, sep_len) = if let Some(i) = bytes.iter().position(|&byte| byte == 1) {
-            // Delimiter priority, rather than earliest position, is upstream
-            // `StringDelimiters::scan` behavior.
-            (i, FASTA_HEADER_SEP[0].len())
-        } else if let Some(i) = bytes.windows(2).position(|pair| pair == b" >") {
-            (i, FASTA_HEADER_SEP[1].len())
+        let (split, delimiter) = if let Some(i) = rest.iter().position(|&byte| byte == 1) {
+            (i, 1)
+        } else if let Some(i) = rest.windows(2).position(|bytes| bytes == b" >") {
+            (i, 2)
         } else {
             (rest.len(), 0)
         };
-        let s = &rest[..split_at];
         if n > 0 {
-            out.push_str(separator);
+            output.extend_from_slice(c_string_bytes(separator));
         }
         if json_array {
-            out.push('"');
+            output.push(b'"');
         }
+        let title = &rest[..split];
         let value = if full_titles {
-            s
+            title
         } else {
-            // Every ID delimiter is ASCII. Scanning bytes avoids constructing
-            // a `StrSearcher` for every output row while retaining a valid
-            // UTF-8 boundary for any non-ASCII title text.
-            let end = s
-                .as_bytes()
+            &title[..title
                 .iter()
                 .position(|byte| matches!(*byte, b' ' | 1 | 7 | 8 | 9 | 10 | 11 | 12 | 13))
-                .unwrap_or(s.len());
-            &s[..end]
+                .unwrap_or(title.len())]
         };
-        if let Some(esc) = escape_sequences {
-            out.push_str(&esc.escape_string(value));
+        if let Some(escape) = escape_sequences {
+            escape.escape_bytes_into(value, &mut output);
         } else {
-            out.push_str(value);
+            output.extend_from_slice(value);
         }
         if json_array {
-            out.push('"');
+            output.push(b'"');
         }
         n += 1;
-        if !all_titles {
+        if !all_titles || split == rest.len() {
             break;
         }
-        if split_at == rest.len() {
-            break;
-        }
-        rest = &rest[split_at + sep_len..];
-        // C++ Tokenizer::good() is false when a delimiter points directly at
-        // the terminating NUL, so a trailing separator does not add an empty
-        // title. Consecutive non-trailing separators still produce empties.
+        rest = &rest[split + delimiter..];
         if rest.is_empty() {
             break;
         }
     }
-    out
+    output
+}
+
+pub fn print_title_xml_bytes(
+    id: &[u8],
+    full_titles: bool,
+    all_titles: bool,
+    separator: &[u8],
+    json_array: bool,
+) -> Vec<u8> {
+    print_title_escaped_bytes(
+        id,
+        full_titles,
+        all_titles,
+        separator,
+        Some(&XML),
+        json_array,
+    )
 }
 
 /// Matches C++ `OutputFormat::print_title(id, full_titles, all_titles, separator)`.
@@ -1544,21 +2024,29 @@ pub fn print_taxon_names<I>(taxids: I, tree: &TaxonomyTree, json: bool) -> Strin
 where
     I: IntoIterator<Item = TaxId>,
 {
+    String::from_utf8(print_taxon_names_bytes(taxids, tree, json))
+        .expect("Raw taxonomy name is not UTF-8; use print_taxon_names_bytes")
+}
+pub fn print_taxon_names_bytes<I>(taxids: I, tree: &TaxonomyTree, json: bool) -> Vec<u8>
+where
+    I: IntoIterator<Item = TaxId>,
+{
     let taxids = taxids.into_iter().collect::<Vec<_>>();
     if taxids.is_empty() {
-        return "N/A".to_string();
+        return b"N/A".to_vec();
     }
-    let mut out = String::new();
+    let mut out = Vec::new();
     for (i, taxid) in taxids.iter().enumerate() {
+        // Source opens each quote before its separator, even in flat JSON.
+        if json {
+            out.push(b'"');
+        }
         if i > 0 {
-            out.push(if json { ',' } else { ';' });
+            out.push(if json { b',' } else { b';' });
         }
+        out.extend_from_slice(&tree.taxon_scientific_name_bytes(*taxid));
         if json {
-            out.push('"');
-        }
-        out.push_str(&tree.taxon_scientific_name(*taxid));
-        if json {
-            out.push('"');
+            out.push(b'"');
         }
     }
     out
@@ -1584,11 +2072,16 @@ pub fn lineage(taxid: TaxId, tree: &TaxonomyTree) -> Vec<TaxId> {
 }
 
 pub fn print_lineage(taxids: &[TaxId], tree: &TaxonomyTree, json: bool) -> String {
+    String::from_utf8(print_lineage_bytes(taxids, tree, json))
+        .expect("Raw taxonomy name is not UTF-8; use print_lineage_bytes")
+}
+
+pub fn print_lineage_bytes(taxids: &[TaxId], tree: &TaxonomyTree, json: bool) -> Vec<u8> {
     if taxids.is_empty() {
         return if json {
-            " []".to_string()
+            b" []".to_vec()
         } else {
-            "N/A".to_string()
+            b"N/A".to_vec()
         };
     }
     let mut lineages = std::collections::BTreeSet::new();
@@ -1600,44 +2093,48 @@ pub fn print_lineage(taxids: &[TaxId], tree: &TaxonomyTree, json: bool) -> Strin
     }
     if lineages.is_empty() {
         return if json {
-            " []".to_string()
+            b" []".to_vec()
         } else {
-            "N/A".to_string()
+            b"N/A".to_vec()
         };
     }
-    let mut out = String::new();
+    let mut out = Vec::new();
     if json {
-        out.push_str(" [\n");
+        out.extend_from_slice(b" [\n");
     }
     for (lineage_idx, lin) in lineages.iter().enumerate() {
         if lineage_idx > 0 {
             if json {
-                out.push_str(",\n");
+                out.extend_from_slice(b",\n");
             } else {
-                out.push_str("<>");
+                out.extend_from_slice(b"<>");
             }
         }
         if json {
-            out.push_str("\t\t[");
+            out.extend_from_slice(b"\t\t[");
         }
         for (i, taxid) in lin.iter().rev().enumerate() {
             if i > 0 {
-                out.push_str(if json { ", " } else { "; " });
+                out.extend_from_slice(if json {
+                    b", ".as_slice()
+                } else {
+                    b"; ".as_slice()
+                });
             }
             if json {
-                out.push('"');
+                out.push(b'"');
             }
-            out.push_str(&tree.taxon_scientific_name(*taxid));
+            out.extend_from_slice(&tree.taxon_scientific_name_bytes(*taxid));
             if json {
-                out.push('"');
+                out.push(b'"');
             }
         }
         if json {
-            out.push(']');
+            out.push(b']');
         }
     }
     if json {
-        out.push_str("\n\t]");
+        out.extend_from_slice(b"\n\t]");
     }
     out
 }
@@ -1648,14 +2145,44 @@ pub fn print_rank_taxon_names(
     rank: &str,
     json: bool,
 ) -> String {
-    print_taxon_names(tree.rank_taxids(taxids, rank), tree, json)
+    String::from_utf8(print_rank_taxon_names_bytes(taxids, tree, rank, json))
+        .expect("Raw taxonomy name is not UTF-8; use print_rank_taxon_names_bytes")
+}
+pub fn print_rank_taxon_names_bytes(
+    taxids: &[TaxId],
+    tree: &TaxonomyTree,
+    rank: &str,
+    json: bool,
+) -> Vec<u8> {
+    print_taxon_names_bytes(tree.rank_taxids(taxids, rank), tree, json)
+}
+pub fn print_dynamic_rank_names(
+    taxids: &[TaxId],
+    tree: &TaxonomyTree,
+    rank: crate::data::taxonomy_nodes::Rank,
+) -> String {
+    String::from_utf8(print_dynamic_rank_names_bytes(taxids, tree, rank))
+        .expect("Raw taxonomy name is not UTF-8; use print_dynamic_rank_names_bytes")
+}
+pub fn print_dynamic_rank_names_bytes(
+    taxids: &[TaxId],
+    tree: &TaxonomyTree,
+    rank: crate::data::taxonomy_nodes::Rank,
+) -> Vec<u8> {
+    let ids = tree
+        .rank_taxids(taxids, rank.name())
+        .into_iter()
+        .filter(|&id| id > 1);
+    print_taxon_names_bytes(ids, tree, false)
 }
 
 pub fn print_qqual(qual: &str, range: crate::util::interval::Interval) -> String {
     if qual.is_empty() {
         return "*".to_string();
     }
-    let begin = range.begin.max(0) as usize;
+    // Source forms unchecked pointers into the quality string. Clamp both
+    // bounds for incomplete FASTQ quality instead of reading outside it.
+    let begin = (range.begin.max(0) as usize).min(qual.len());
     let end = range.end.max(range.begin).min(qual.len() as i32) as usize;
     qual[begin..end].to_string()
 }
@@ -1663,6 +2190,23 @@ pub fn print_qqual(qual: &str, range: crate::util::interval::Interval) -> String
 pub fn print_full_qqual(qual: &str) -> &str {
     if qual.is_empty() {
         "*"
+    } else {
+        qual
+    }
+}
+
+pub fn print_qqual_bytes(qual: &[u8], range: crate::util::interval::Interval) -> Vec<u8> {
+    if c_string_bytes(qual).is_empty() {
+        return b"*".to_vec();
+    }
+    let begin = (range.begin.max(0) as usize).min(qual.len());
+    let end = (range.end.max(range.begin).max(0) as usize).min(qual.len());
+    c_string_bytes(&qual[begin..end]).to_vec()
+}
+pub fn print_full_qqual_bytes(qual: &[u8]) -> &[u8] {
+    let qual = c_string_bytes(qual);
+    if qual.is_empty() {
+        b"*"
     } else {
         qual
     }
@@ -1679,9 +2223,9 @@ pub fn print_full_qseq_mate(mate_seq: Option<&[crate::basic::value::Letter]>) ->
     out
 }
 
-pub fn write_tabular_context_row<W: Write>(
+pub fn write_tabular_context_row_bytes<W: Write, T: AsRef<[u8]>>(
     writer: &mut W,
-    r: &HspContext,
+    r: &HspContext<T>,
     fields: &[FieldId],
     query_translated: bool,
     frame_shift: bool,
@@ -1726,22 +2270,20 @@ pub fn write_tabular_context_row<W: Write>(
             }
         }
         match field {
-            FieldId::QSeqId | FieldId::QAcc | FieldId::QAccVer => write!(
-                writer,
-                "{}",
-                print_title(&r.query_title, false, false, "", false)
+            FieldId::QSeqId | FieldId::QAcc | FieldId::QAccVer => writer.write_all(
+                &print_title_bytes(r.query_title.as_ref(), false, false, b"", false),
             )?,
             FieldId::QLen => write!(writer, "{}", r.query_len)?,
-            FieldId::SSeqId | FieldId::SAcc | FieldId::SAccVer => write!(
-                writer,
-                "{}",
-                print_title(&r.target_title, false, false, "", false)
+            FieldId::SSeqId | FieldId::SAcc | FieldId::SAccVer => writer.write_all(
+                &print_title_bytes(r.target_title.as_ref(), false, false, b"", false),
             )?,
-            FieldId::SAllSeqId | FieldId::SAllacc => write!(
-                writer,
-                "{}",
-                print_title(&r.target_title, false, true, ";", false)
-            )?,
+            FieldId::SAllSeqId | FieldId::SAllacc => writer.write_all(&print_title_bytes(
+                r.target_title.as_ref(),
+                false,
+                true,
+                b";",
+                false,
+            ))?,
             FieldId::SLen => write!(writer, "{}", r.subject_len)?,
             FieldId::QStart => write!(writer, "{}", r.oriented_query_range().begin + 1)?,
             FieldId::QEnd => write!(writer, "{}", r.oriented_query_range().end + 1)?,
@@ -1749,14 +2291,29 @@ pub fn write_tabular_context_row<W: Write>(
             FieldId::SEnd => write!(writer, "{}", r.subject_source_range().end)?,
             FieldId::QSeq => {
                 let range = r.query_source_range();
-                let q = r.query_index(r.hsp.frame);
+                let q = if query_translated {
+                    r.query_source.as_deref().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Original query source is required for translated sequence output",
+                        )
+                    })?
+                } else {
+                    r.query_source
+                        .as_deref()
+                        .unwrap_or_else(|| r.query_index(r.hsp.frame))
+                };
                 let begin = range.begin.max(0) as usize;
                 let end = range.end.max(range.begin).min(q.len() as i32) as usize;
                 for &letter in &q[begin..end] {
                     write!(
                         writer,
                         "{}",
-                        AMINO_ACID_ALPHABET[(letter & LETTER_MASK) as usize] as char
+                        (if query_translated {
+                            &crate::basic::value::NUCLEOTIDE_ALPHABET[..]
+                        } else {
+                            r.alphabet()
+                        })[(letter & LETTER_MASK) as usize] as char
                     )?;
                 }
             }
@@ -1767,7 +2324,7 @@ pub fn write_tabular_context_row<W: Write>(
                         write!(
                             writer,
                             "{}",
-                            AMINO_ACID_ALPHABET[(it.subject() & LETTER_MASK) as usize] as char
+                            r.alphabet()[(it.subject() & LETTER_MASK) as usize] as char
                         )?;
                     }
                     it.advance();
@@ -1804,21 +2361,21 @@ pub fn write_tabular_context_row<W: Write>(
                                 write!(writer, "{}", n_matches)?;
                                 n_matches = 0;
                             }
-                            write!(writer, "{}{}", it.query_char(), it.subject_char())?;
+                            write!(writer, "{}{}", it.try_query_char()?, it.try_subject_char()?)?;
                         }
                         EditOperation::Insertion => {
                             if n_matches > 0 {
                                 write!(writer, "{}", n_matches)?;
                                 n_matches = 0;
                             }
-                            write!(writer, "{}-", it.query_char())?;
+                            write!(writer, "{}-", it.try_query_char()?)?;
                         }
                         EditOperation::Deletion => {
                             if n_matches > 0 {
                                 write!(writer, "{}", n_matches)?;
                                 n_matches = 0;
                             }
-                            write!(writer, "-{}", it.subject_char())?;
+                            write!(writer, "-{}", it.try_subject_char()?)?;
                         }
                     }
                     it.advance();
@@ -1827,24 +2384,28 @@ pub fn write_tabular_context_row<W: Write>(
                     write!(writer, "{}", n_matches)?;
                 }
             }
-            FieldId::STitle | FieldId::Stitle0 => write!(
-                writer,
-                "{}",
-                print_title(&r.target_title, true, false, "<>", false)
-            )?,
-            FieldId::SAllTitles => write!(
-                writer,
-                "{}",
-                print_title(&r.target_title, true, true, "<>", false)
-            )?,
+            FieldId::STitle | FieldId::Stitle0 => writer.write_all(&print_title_bytes(
+                r.target_title.as_ref(),
+                true,
+                false,
+                b"<>",
+                false,
+            ))?,
+            FieldId::SAllTitles => writer.write_all(&print_title_bytes(
+                r.target_title.as_ref(),
+                true,
+                true,
+                b"<>",
+                false,
+            ))?,
             FieldId::QCovHsp | FieldId::QCovS => write!(writer, "{}", format_double(r.qcovhsp()))?,
-            FieldId::QTitle => write!(writer, "{}", r.query_title)?,
+            FieldId::QTitle => writer.write_all(c_string_bytes(r.query_title.as_ref()))?,
             FieldId::FullSSeq => {
                 for &letter in &r.subject_seq {
                     write!(
                         writer,
                         "{}",
-                        AMINO_ACID_ALPHABET[(letter & LETTER_MASK) as usize] as char
+                        r.alphabet()[(letter & LETTER_MASK) as usize] as char
                     )?;
                 }
             }
@@ -1855,25 +2416,41 @@ pub fn write_tabular_context_row<W: Write>(
             FieldId::SNum => write!(writer, "{}", r.subject_oid.wrapping_add(snum_offset))?,
             FieldId::SCovHsp => write!(writer, "{}", format_double(r.scovhsp()))?,
             FieldId::FullQSeq => {
-                for &letter in r.query_index(r.hsp.frame) {
+                let source = if query_translated {
+                    r.query_source.as_deref().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Original query source is required for translated sequence output",
+                        )
+                    })?
+                } else {
+                    r.query_source
+                        .as_deref()
+                        .unwrap_or_else(|| r.query_index(r.hsp.frame))
+                };
+                for &letter in source {
                     write!(
                         writer,
                         "{}",
-                        AMINO_ACID_ALPHABET[(letter & LETTER_MASK) as usize] as char
+                        (if query_translated {
+                            &crate::basic::value::NUCLEOTIDE_ALPHABET[..]
+                        } else {
+                            r.alphabet()
+                        })[(letter & LETTER_MASK) as usize] as char
                     )?;
                 }
             }
             FieldId::QSeqGapped => {
                 let mut it = r.begin();
                 while it.good() {
-                    write!(writer, "{}", it.query_char())?;
+                    write!(writer, "{}", it.try_query_char()?)?;
                     it.advance();
                 }
             }
             FieldId::SSeqGapped => {
                 let mut it = r.begin();
                 while it.good() {
-                    write!(writer, "{}", it.subject_char())?;
+                    write!(writer, "{}", it.try_subject_char()?)?;
                     it.advance();
                 }
             }
@@ -1904,7 +2481,7 @@ pub fn write_tabular_context_row<W: Write>(
                             write!(
                                 writer,
                                 "{}",
-                                AMINO_ACID_ALPHABET[(it.query() & LETTER_MASK) as usize] as char
+                                r.alphabet()[(it.try_query()? & LETTER_MASK) as usize] as char
                             )?;
                         }
                         it.advance();
@@ -1912,13 +2489,15 @@ pub fn write_tabular_context_row<W: Write>(
                 } else {
                     let range = r.query_range();
                     let q = r.query_index(r.hsp.frame);
-                    let begin = range.begin.max(0) as usize;
-                    let end = range.end.max(range.begin).min(q.len() as i32) as usize;
-                    for &letter in &q[begin..end] {
+                    let valid = usize::try_from(range.begin).ok()
+                        .zip(usize::try_from(range.end).ok())
+                        .and_then(|(begin,end)| q.get(begin..end))
+                        .ok_or_else(|| io::Error::other("Source query-character output dereferences an empty or out-of-range translated sequence context."))?;
+                    for &letter in valid {
                         write!(
                             writer,
                             "{}",
-                            AMINO_ACID_ALPHABET[(letter & LETTER_MASK) as usize] as char
+                            r.alphabet()[(letter & LETTER_MASK) as usize] as char
                         )?;
                     }
                 }
@@ -1934,16 +2513,23 @@ pub fn write_tabular_context_row<W: Write>(
             // C++ `info.out.print_d(...)` (`blast_tab_format.cpp:614,618`) uses
             // `snprintf("%lf", x)` — 6-decimal fixed. Rust's default `{}`
             // produces shortest-round-trip and diverges.
-            FieldId::NormalizedBitscore => write!(
-                writer,
-                "{:.6}",
-                r.bit_score() / r.query_self_aln_score.max(r.target_self_aln_score)
-            )?,
+            FieldId::NormalizedBitscore => {
+                // std::max keeps its first operand when the comparison is
+                // false, including NaNs and signed-zero ties.
+                let maximum = if r.query_self_aln_score < r.target_self_aln_score {
+                    r.target_self_aln_score
+                } else {
+                    r.query_self_aln_score
+                };
+                write!(writer, "{}", format_fixed_float(r.bit_score() / maximum))?;
+            }
             FieldId::NormalizedNident => write!(
                 writer,
-                "{:.6}",
-                r.identities() as f64
-                    / (r.query_index(r.hsp.frame).len() as i32).max(r.subject_len) as f64
+                "{}",
+                format_fixed_float(
+                    r.identities() as f64
+                        / (r.query_index(r.hsp.frame).len() as i32).max(r.subject_len) as f64
+                )
             )?,
             FieldId::STaxIds
             | FieldId::SSciNames
@@ -1960,16 +2546,63 @@ pub fn write_tabular_context_row<W: Write>(
             | FieldId::NegEValue
             | FieldId::Reserved1
             | FieldId::Reserved2
-            | FieldId::Count => write!(writer, "N/A")?,
+            | FieldId::Count
+            | FieldId::SCellularRoot
+            | FieldId::SAcellularRoot
+            | FieldId::SDomain
+            | FieldId::SRealm
+            | FieldId::SKingdom
+            | FieldId::SSubkingdom
+            | FieldId::SSuperphylum
+            | FieldId::SPhylum
+            | FieldId::SSubphylum
+            | FieldId::SSuperclass
+            | FieldId::SClassRank
+            | FieldId::SSubclass
+            | FieldId::SInfraclass
+            | FieldId::SCohort
+            | FieldId::SSubcohort
+            | FieldId::SSuperorder
+            | FieldId::SOrder
+            | FieldId::SSuborder
+            | FieldId::SInfraorder
+            | FieldId::SParvorder
+            | FieldId::SSuperfamily
+            | FieldId::SFamily
+            | FieldId::SSubfamily
+            | FieldId::STribe
+            | FieldId::SSubtribe
+            | FieldId::SGenus
+            | FieldId::SSubgenus
+            | FieldId::SSection
+            | FieldId::SSubsection
+            | FieldId::SSeries
+            | FieldId::SSpeciesGroup
+            | FieldId::SSpeciesSubgroup
+            | FieldId::SSpecies
+            | FieldId::SSubspecies
+            | FieldId::SVarietas
+            | FieldId::SForma
+            | FieldId::SStrain
+            | FieldId::SBiotype
+            | FieldId::SClade
+            | FieldId::SFormaSpecialis
+            | FieldId::SGenotype
+            | FieldId::SIsolate
+            | FieldId::SMorph
+            | FieldId::SPathogroup
+            | FieldId::SSerogroup
+            | FieldId::SSerotype
+            | FieldId::SSubvariety => write!(writer, "N/A")?,
         }
     }
     writeln!(writer)?;
     Ok(())
 }
 
-pub fn write_tabular_context_row_json<W: Write>(
+pub fn write_tabular_context_row_json_bytes<W: Write, T: AsRef<[u8]>>(
     writer: &mut W,
-    r: &HspContext,
+    r: &HspContext<T>,
     leading_comma: bool,
     fields: &[FieldId],
     query_translated: bool,
@@ -1978,7 +2611,7 @@ pub fn write_tabular_context_row_json<W: Write>(
     snum_offset: u64,
     subject_taxids: &[TaxId],
     tree: Option<&TaxonomyTree>,
-    query_qual: &str,
+    query_qual: &[u8],
     mate_seq: Option<&[crate::basic::value::Letter]>,
 ) -> io::Result<()> {
     if leading_comma {
@@ -2036,73 +2669,89 @@ pub fn write_tabular_context_row_json<W: Write>(
             }
         } else {
             match field {
-                FieldId::SAllSeqId | FieldId::SAllacc => write!(
-                    writer,
-                    "{}",
-                    print_title(&r.target_title, false, true, ",", true)
-                )?,
-                FieldId::STitle | FieldId::Stitle0 => write!(
-                    writer,
-                    "{}",
-                    print_title(&r.target_title, true, false, ",", false)
-                )?,
-                FieldId::SAllTitles => write!(
-                    writer,
-                    "{}",
-                    print_title(&r.target_title, true, true, ",", true)
-                )?,
+                field if field.taxonomy_rank().is_some() => {
+                    if let Some(tree) = tree {
+                        writer.write_all(&print_dynamic_rank_names_bytes(
+                            subject_taxids,
+                            tree,
+                            field.taxonomy_rank().unwrap(),
+                        ))?;
+                    }
+                }
+                FieldId::SAllSeqId | FieldId::SAllacc => writer.write_all(&print_title_bytes(
+                    r.target_title.as_ref(),
+                    false,
+                    true,
+                    b",",
+                    true,
+                ))?,
+                FieldId::STitle | FieldId::Stitle0 => writer.write_all(&print_title_bytes(
+                    r.target_title.as_ref(),
+                    true,
+                    false,
+                    b",",
+                    false,
+                ))?,
+                FieldId::SAllTitles => writer.write_all(&print_title_bytes(
+                    r.target_title.as_ref(),
+                    true,
+                    true,
+                    b",",
+                    true,
+                ))?,
                 FieldId::STaxIds => write!(writer, "{}", print_staxids(subject_taxids, true))?,
                 FieldId::SSciNames => {
                     if let Some(tree) = tree {
-                        write!(
-                            writer,
-                            "{}",
-                            print_taxon_names(subject_taxids.iter().copied(), tree, true)
-                        )?;
+                        writer.write_all(&print_taxon_names_bytes(
+                            subject_taxids.iter().copied(),
+                            tree,
+                            true,
+                        ))?;
                     }
                 }
                 FieldId::SSKingdoms => {
                     if let Some(tree) = tree {
-                        write!(
-                            writer,
-                            "{}",
-                            print_rank_taxon_names(subject_taxids, tree, "superkingdom", true)
-                        )?;
+                        writer.write_all(&print_rank_taxon_names_bytes(
+                            subject_taxids,
+                            tree,
+                            "superkingdom",
+                            true,
+                        ))?;
                     }
                 }
                 FieldId::SKingdoms => {
                     if let Some(tree) = tree {
-                        write!(
-                            writer,
-                            "{}",
-                            print_rank_taxon_names(subject_taxids, tree, "kingdom", true)
-                        )?;
+                        writer.write_all(&print_rank_taxon_names_bytes(
+                            subject_taxids,
+                            tree,
+                            "kingdom",
+                            false,
+                        ))?;
                     }
                 }
                 FieldId::SPhylums => {
                     if let Some(tree) = tree {
-                        write!(
-                            writer,
-                            "{}",
-                            print_rank_taxon_names(subject_taxids, tree, "phylum", true)
-                        )?;
+                        writer.write_all(&print_rank_taxon_names_bytes(
+                            subject_taxids,
+                            tree,
+                            "phylum",
+                            false,
+                        ))?;
                     }
                 }
                 FieldId::SLineages => {
                     if let Some(tree) = tree {
-                        write!(writer, "{}", print_lineage(subject_taxids, tree, true))?;
+                        writer.write_all(&print_lineage_bytes(subject_taxids, tree, true))?;
                     }
                 }
-                FieldId::QQual => write!(
-                    writer,
-                    "{}",
-                    print_qqual(query_qual, *r.query_source_range())
-                )?,
-                FieldId::FullQQual => write!(writer, "{}", print_full_qqual(query_qual))?,
+                FieldId::QQual => {
+                    writer.write_all(&print_qqual_bytes(query_qual, *r.query_source_range()))?
+                }
+                FieldId::FullQQual => writer.write_all(&print_full_qqual_bytes(query_qual))?,
                 FieldId::FullQSeqMate => write!(writer, "{}", print_full_qseq_mate(mate_seq))?,
                 _ => {
                     let mut cell = Vec::new();
-                    write_tabular_context_row(
+                    write_tabular_context_row_bytes(
                         &mut cell,
                         r,
                         std::slice::from_ref(field),
@@ -2111,13 +2760,11 @@ pub fn write_tabular_context_row_json<W: Write>(
                         qnum_offset,
                         snum_offset,
                     )?;
-                    let mut cell = String::from_utf8(cell).map_err(|err| {
-                        io::Error::new(io::ErrorKind::InvalidData, err.utf8_error())
-                    })?;
-                    if cell.ends_with('\n') {
+
+                    if cell.last() == Some(&b'\n') {
                         cell.pop();
                     }
-                    write!(writer, "{}", cell)?;
+                    writer.write_all(&cell)?;
                 }
             }
         }
@@ -2138,9 +2785,9 @@ pub fn write_tabular_context_row_json<W: Write>(
     Ok(())
 }
 
-pub fn write_tabular_context_row_with_taxonomy<W: Write>(
+pub fn write_tabular_context_row_with_taxonomy_bytes<W: Write, T: AsRef<[u8]>>(
     writer: &mut W,
-    r: &HspContext,
+    r: &HspContext<T>,
     fields: &[FieldId],
     query_translated: bool,
     frame_shift: bool,
@@ -2155,31 +2802,43 @@ pub fn write_tabular_context_row_with_taxonomy<W: Write>(
             write!(writer, "\t")?;
         }
         match field {
+            field if field.taxonomy_rank().is_some() => {
+                writer.write_all(&print_dynamic_rank_names_bytes(
+                    subject_taxids,
+                    tree,
+                    field.taxonomy_rank().unwrap(),
+                ))?
+            }
             FieldId::STaxIds => write!(writer, "{}", print_staxids(subject_taxids, json))?,
-            FieldId::SSciNames => write!(
-                writer,
-                "{}",
-                print_taxon_names(subject_taxids.iter().copied(), tree, json)
-            )?,
-            FieldId::SSKingdoms => write!(
-                writer,
-                "{}",
-                print_rank_taxon_names(subject_taxids, tree, "superkingdom", json)
-            )?,
-            FieldId::SKingdoms => write!(
-                writer,
-                "{}",
-                print_rank_taxon_names(subject_taxids, tree, "kingdom", json)
-            )?,
-            FieldId::SPhylums => write!(
-                writer,
-                "{}",
-                print_rank_taxon_names(subject_taxids, tree, "phylum", json)
-            )?,
-            FieldId::SLineages => write!(writer, "{}", print_lineage(subject_taxids, tree, json))?,
+            FieldId::SSciNames => writer.write_all(&print_taxon_names_bytes(
+                subject_taxids.iter().copied(),
+                tree,
+                json,
+            ))?,
+            FieldId::SSKingdoms => writer.write_all(&print_rank_taxon_names_bytes(
+                subject_taxids,
+                tree,
+                "superkingdom",
+                json,
+            ))?,
+            FieldId::SKingdoms => writer.write_all(&print_rank_taxon_names_bytes(
+                subject_taxids,
+                tree,
+                "kingdom",
+                false,
+            ))?,
+            FieldId::SPhylums => writer.write_all(&print_rank_taxon_names_bytes(
+                subject_taxids,
+                tree,
+                "phylum",
+                false,
+            ))?,
+            FieldId::SLineages => {
+                writer.write_all(&print_lineage_bytes(subject_taxids, tree, json))?
+            }
             _ => {
                 let mut cell = Vec::new();
-                write_tabular_context_row(
+                write_tabular_context_row_bytes(
                     &mut cell,
                     r,
                     std::slice::from_ref(field),
@@ -2188,12 +2847,11 @@ pub fn write_tabular_context_row_with_taxonomy<W: Write>(
                     qnum_offset,
                     snum_offset,
                 )?;
-                let mut cell = String::from_utf8(cell)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.utf8_error()))?;
-                if cell.ends_with('\n') {
+
+                if cell.last() == Some(&b'\n') {
                     cell.pop();
                 }
-                write!(writer, "{}", cell)?;
+                writer.write_all(&cell)?;
             }
         }
     }
@@ -2201,15 +2859,15 @@ pub fn write_tabular_context_row_with_taxonomy<W: Write>(
     Ok(())
 }
 
-pub fn write_tabular_context_row_with_query_info<W: Write>(
+pub fn write_tabular_context_row_with_query_info_bytes<W: Write, T: AsRef<[u8]>>(
     writer: &mut W,
-    r: &HspContext,
+    r: &HspContext<T>,
     fields: &[FieldId],
     query_translated: bool,
     frame_shift: bool,
     qnum_offset: u64,
     snum_offset: u64,
-    query_qual: &str,
+    query_qual: &[u8],
     mate_seq: Option<&[crate::basic::value::Letter]>,
 ) -> io::Result<()> {
     for (field_idx, field) in fields.iter().enumerate() {
@@ -2217,16 +2875,14 @@ pub fn write_tabular_context_row_with_query_info<W: Write>(
             write!(writer, "\t")?;
         }
         match field {
-            FieldId::QQual => write!(
-                writer,
-                "{}",
-                print_qqual(query_qual, *r.query_source_range())
-            )?,
-            FieldId::FullQQual => write!(writer, "{}", print_full_qqual(query_qual))?,
+            FieldId::QQual => {
+                writer.write_all(&print_qqual_bytes(query_qual, *r.query_source_range()))?
+            }
+            FieldId::FullQQual => writer.write_all(&print_full_qqual_bytes(query_qual))?,
             FieldId::FullQSeqMate => write!(writer, "{}", print_full_qseq_mate(mate_seq))?,
             _ => {
                 let mut cell = Vec::new();
-                write_tabular_context_row(
+                write_tabular_context_row_bytes(
                     &mut cell,
                     r,
                     std::slice::from_ref(field),
@@ -2235,12 +2891,11 @@ pub fn write_tabular_context_row_with_query_info<W: Write>(
                     qnum_offset,
                     snum_offset,
                 )?;
-                let mut cell = String::from_utf8(cell)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.utf8_error()))?;
-                if cell.ends_with('\n') {
+
+                if cell.last() == Some(&b'\n') {
                     cell.pop();
                 }
-                write!(writer, "{}", cell)?;
+                writer.write_all(&cell)?;
             }
         }
     }
@@ -2248,13 +2903,33 @@ pub fn write_tabular_context_row_with_query_info<W: Write>(
     Ok(())
 }
 
-pub fn write_tabular_query_intro<W: Write>(
+pub fn write_tabular_query_intro_bytes<W: Write>(
     writer: &mut W,
-    query_title: &str,
+    query_title: &[u8],
     query_len: i32,
     query_seq: &[crate::basic::value::Letter],
     fields: &[FieldId],
     report_unaligned: bool,
+) -> io::Result<()> {
+    write_tabular_query_intro_for_type_bytes(
+        writer,
+        query_title,
+        query_len,
+        query_seq,
+        fields,
+        report_unaligned,
+        false,
+    )
+}
+
+pub fn write_tabular_query_intro_for_type_bytes<W: Write>(
+    writer: &mut W,
+    query_title: &[u8],
+    query_len: i32,
+    query_seq: &[crate::basic::value::Letter],
+    fields: &[FieldId],
+    report_unaligned: bool,
+    query_translated: bool,
 ) -> io::Result<()> {
     if !report_unaligned {
         return Ok(());
@@ -2264,20 +2939,37 @@ pub fn write_tabular_query_intro<W: Write>(
             write!(writer, "\t")?;
         }
         match field {
-            FieldId::QSeqId | FieldId::QAcc | FieldId::QAccVer => write!(
-                writer,
-                "{}",
-                print_title(query_title, false, false, "", false)
-            )?,
+            field if field.taxonomy_rank().is_some() => write!(writer, "*")?,
+            FieldId::HspNum
+            | FieldId::NormalizedBitscore
+            | FieldId::NormalizedNident
+            | FieldId::CorrectedBitScore
+            | FieldId::Reserved1
+            | FieldId::Reserved2 => {
+                let key = field
+                    .output_field()
+                    .map_or("reserved", |definition| definition.key);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid output field: {key}"),
+                ));
+            }
+            FieldId::QSeqId | FieldId::QAcc | FieldId::QAccVer => {
+                writer.write_all(&print_title_bytes(query_title, false, false, b"", false))?
+            }
             FieldId::QLen => write!(writer, "{}", query_len)?,
             FieldId::QFrame | FieldId::QFrameField => write!(writer, "0")?,
-            FieldId::QTitle => write!(writer, "{}", query_title)?,
+            FieldId::QTitle => writer.write_all(c_string_bytes(query_title))?,
             FieldId::FullQSeq => {
                 for &letter in query_seq {
                     write!(
                         writer,
                         "{}",
-                        AMINO_ACID_ALPHABET[(letter & LETTER_MASK) as usize] as char
+                        (if query_translated {
+                            &crate::basic::value::NUCLEOTIDE_ALPHABET[..]
+                        } else {
+                            &AMINO_ACID_ALPHABET[..]
+                        })[(letter & LETTER_MASK) as usize] as char
                     )?;
                 }
             }
@@ -2310,14 +3002,36 @@ pub fn write_tabular_query_intro<W: Write>(
     Ok(())
 }
 
-pub fn write_tabular_query_intro_with_quality<W: Write>(
+pub fn write_tabular_query_intro_with_quality_bytes<W: Write>(
     writer: &mut W,
-    query_title: &str,
+    query_title: &[u8],
     query_len: i32,
     query_seq: &[crate::basic::value::Letter],
-    query_qual: &str,
+    query_qual: &[u8],
     fields: &[FieldId],
     report_unaligned: bool,
+) -> io::Result<()> {
+    write_tabular_query_intro_with_quality_for_type_bytes(
+        writer,
+        query_title,
+        query_len,
+        query_seq,
+        query_qual,
+        fields,
+        report_unaligned,
+        false,
+    )
+}
+
+pub fn write_tabular_query_intro_with_quality_for_type_bytes<W: Write>(
+    writer: &mut W,
+    query_title: &[u8],
+    query_len: i32,
+    query_seq: &[crate::basic::value::Letter],
+    query_qual: &[u8],
+    fields: &[FieldId],
+    report_unaligned: bool,
+    query_translated: bool,
 ) -> io::Result<()> {
     if !report_unaligned {
         return Ok(());
@@ -2327,23 +3041,23 @@ pub fn write_tabular_query_intro_with_quality<W: Write>(
             write!(writer, "\t")?;
         }
         match field {
-            FieldId::FullQQual => write!(writer, "{}", print_full_qqual(query_qual))?,
+            FieldId::FullQQual => writer.write_all(&print_full_qqual_bytes(query_qual))?,
             _ => {
                 let mut cell = Vec::new();
-                write_tabular_query_intro(
+                write_tabular_query_intro_for_type_bytes(
                     &mut cell,
                     query_title,
                     query_len,
                     query_seq,
                     std::slice::from_ref(field),
                     true,
+                    query_translated,
                 )?;
-                let mut cell = String::from_utf8(cell)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.utf8_error()))?;
-                if cell.ends_with('\n') {
+
+                if cell.last() == Some(&b'\n') {
                     cell.pop();
                 }
-                write!(writer, "{}", cell)?;
+                writer.write_all(&cell)?;
             }
         }
     }
@@ -2482,51 +3196,54 @@ pub fn write_tabular_row_with_query_info<W: Write>(
             FieldId::STaxIds => write!(writer, "{}", print_staxids(subject_taxids, false))?,
             FieldId::SSciNames => {
                 if let Some(tree) = taxonomy {
-                    write!(
-                        writer,
-                        "{}",
-                        print_taxon_names(subject_taxids.iter().copied(), tree, false)
-                    )?;
+                    writer.write_all(&print_taxon_names_bytes(
+                        subject_taxids.iter().copied(),
+                        tree,
+                        false,
+                    ))?;
                 } else {
                     write!(writer, "N/A")?;
                 }
             }
             FieldId::SSKingdoms => {
                 if let Some(tree) = taxonomy {
-                    write!(
-                        writer,
-                        "{}",
-                        print_rank_taxon_names(subject_taxids, tree, "superkingdom", false)
-                    )?;
+                    writer.write_all(&print_rank_taxon_names_bytes(
+                        subject_taxids,
+                        tree,
+                        "superkingdom",
+                        false,
+                    ))?;
                 } else {
                     write!(writer, "N/A")?;
                 }
             }
             FieldId::SKingdoms => {
                 if let Some(tree) = taxonomy {
-                    write!(
-                        writer,
-                        "{}",
-                        print_rank_taxon_names(subject_taxids, tree, "kingdom", false)
-                    )?;
+                    writer.write_all(&print_rank_taxon_names_bytes(
+                        subject_taxids,
+                        tree,
+                        "kingdom",
+                        false,
+                    ))?;
                 } else {
                     write!(writer, "N/A")?;
                 }
             }
             FieldId::SPhylums => {
                 if let Some(tree) = taxonomy {
-                    write!(
-                        writer,
-                        "{}",
-                        print_rank_taxon_names(subject_taxids, tree, "phylum", false)
-                    )?;
+                    writer.write_all(&print_rank_taxon_names_bytes(
+                        subject_taxids,
+                        tree,
+                        "phylum",
+                        false,
+                    ))?;
                 } else {
                     write!(writer, "N/A")?;
                 }
             }
             FieldId::SLineages => {
                 if let Some(tree) = taxonomy {
-                    write!(writer, "{}", print_lineage(subject_taxids, tree, false))?;
+                    writer.write_all(&print_lineage_bytes(subject_taxids, tree, false))?;
                 } else {
                     write!(writer, "N/A")?;
                 }
@@ -2540,6 +3257,77 @@ pub fn write_tabular_row_with_query_info<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_output_selector_preserves_invalid_format_bytes() {
+        let error = super::get_output_format_bytes(
+            &[b"bad_\xff"],
+            std::path::Path::new(""),
+            super::OutputCommand::BlastP,
+            false,
+            0,
+            false,
+            b"BLOSUM62",
+        )
+        .unwrap_err();
+        assert_eq!(crate::util::io::RawDiagnosticError::find(&error),Some(b"Invalid output format: bad_\xff\nAllowed values: 0,5,xml,6,tab,100,daa,101,sam,102,103,104,paf".as_slice()));
+    }
+
+    #[test]
+    fn taxonomy_rows_preserve_opaque_scientific_name_bytes() {
+        let mut tree = crate::data::taxonomy::TaxonomyTree::new();
+        tree.add_node_bytes(crate::data::taxonomy::TaxonomyNode {
+            taxid: 1,
+            parent: 1,
+            rank: "no rank".into(),
+            name: b"root".to_vec(),
+        });
+        tree.add_node_bytes(crate::data::taxonomy::TaxonomyNode {
+            taxid: 2,
+            parent: 1,
+            rank: "superkingdom".into(),
+            name: b"Name\xff\0tail".to_vec(),
+        });
+        assert!(tree.try_taxon_scientific_name(2).is_err());
+        assert_eq!(
+            super::print_taxon_names_bytes([2], &tree, false),
+            b"Name\xff\0tail"
+        );
+        assert_eq!(
+            super::print_lineage_bytes(&[2], &tree, false),
+            b"Name\xff\0tail"
+        );
+        let context = crate::align::hsp::ByteHspContext::default();
+        let mut out = Vec::new();
+        super::write_tabular_context_row_with_taxonomy_bytes(
+            &mut out,
+            &context,
+            &[
+                super::FieldId::SSciNames,
+                super::FieldId::SSKingdoms,
+                super::FieldId::SLineages,
+            ],
+            false,
+            false,
+            0,
+            0,
+            &[2],
+            &tree,
+            false,
+        )
+        .unwrap();
+        assert_eq!(out, b"Name\xff\0tail\tName\xff\0tail\tName\xff\0tail\n");
+        out.clear();
+        crate::output::taxon::TaxonFormat {
+            taxid: 2,
+            evalue: 0.0,
+            include_lineage: true,
+            ..crate::output::taxon::TaxonFormat::new(true)
+        }
+        .print_query_epilog_bytes(&mut out, b"q", &tree)
+        .unwrap();
+        assert!(out.ends_with(b"\tName\xff\0tail\n"));
+    }
+
     use super::*;
     use crate::align::hsp::{Hsp as AlignHsp, HspContext};
     use crate::basic::packed_transcript::EditOperation;
@@ -2639,7 +3427,7 @@ mod tests {
         }
         assert_eq!(FieldId::from_name("unknown"), None);
         assert_eq!(FieldId::Count as u32, 77);
-        assert_eq!(FieldId::Count.output_field(), None);
+        assert_eq!(FieldId::Count.output_field().unwrap().key, "ssuperkingdom");
     }
 
     #[test]
@@ -3218,7 +4006,7 @@ mod tests {
         );
         assert_eq!(
             print_taxon_names([20, 30], &tree, true),
-            "\"Proteobacteria\",\"Euryarchaeota\""
+            "\"Proteobacteria\"\",Euryarchaeota\""
         );
         assert_eq!(print_taxon_names([], &tree, false), "N/A");
         assert_eq!(lineage(20, &tree), vec![20, 10, 2]);
@@ -3247,6 +4035,10 @@ mod tests {
         assert_eq!(print_qqual("", Interval::new(1, 3)), "*");
         assert_eq!(print_qqual("abcdef", Interval::new(1, 4)), "bcd");
         assert_eq!(print_qqual("abcdef", Interval::new(-2, 99)), "abcdef");
+        // The source pointer access is undefined for these short qualities.
+        // Native output deterministically clips to the available bytes.
+        assert_eq!(print_qqual("abc", Interval::new(0, 78)), "abc");
+        assert_eq!(print_qqual("abc", Interval::new(308, 379)), "");
         assert_eq!(print_full_qqual(""), "*");
         assert_eq!(print_full_qqual("abcdef"), "abcdef");
         assert_eq!(print_full_qseq_mate(None), "*");
@@ -3588,4 +4380,186 @@ mod tests {
         .unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), "query\tabcd\tARND\t-1\n");
     }
+}
+
+// Checked String-facing compatibility entry points. All writer rendering
+// below shares the canonical byte implementation.
+pub fn write_tabular_context_row<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    fields: &[FieldId],
+    query_translated: bool,
+    frame_shift: bool,
+    qnum_offset: u64,
+    snum_offset: u64,
+) -> io::Result<()> {
+    write_tabular_context_row_bytes(
+        writer,
+        r,
+        fields,
+        query_translated,
+        frame_shift,
+        qnum_offset,
+        snum_offset,
+    )
+}
+
+pub fn write_tabular_context_row_json<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    leading_comma: bool,
+    fields: &[FieldId],
+    query_translated: bool,
+    frame_shift: bool,
+    qnum_offset: u64,
+    snum_offset: u64,
+    subject_taxids: &[TaxId],
+    tree: Option<&TaxonomyTree>,
+    query_qual: &str,
+    mate_seq: Option<&[crate::basic::value::Letter]>,
+) -> io::Result<()> {
+    write_tabular_context_row_json_bytes(
+        writer,
+        r,
+        leading_comma,
+        fields,
+        query_translated,
+        frame_shift,
+        qnum_offset,
+        snum_offset,
+        subject_taxids,
+        tree,
+        query_qual.as_bytes(),
+        mate_seq,
+    )
+}
+
+pub fn write_tabular_context_row_with_taxonomy<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    fields: &[FieldId],
+    query_translated: bool,
+    frame_shift: bool,
+    qnum_offset: u64,
+    snum_offset: u64,
+    subject_taxids: &[TaxId],
+    tree: &TaxonomyTree,
+    json: bool,
+) -> io::Result<()> {
+    write_tabular_context_row_with_taxonomy_bytes(
+        writer,
+        r,
+        fields,
+        query_translated,
+        frame_shift,
+        qnum_offset,
+        snum_offset,
+        subject_taxids,
+        tree,
+        json,
+    )
+}
+
+pub fn write_tabular_context_row_with_query_info<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    fields: &[FieldId],
+    query_translated: bool,
+    frame_shift: bool,
+    qnum_offset: u64,
+    snum_offset: u64,
+    query_qual: &str,
+    mate_seq: Option<&[crate::basic::value::Letter]>,
+) -> io::Result<()> {
+    write_tabular_context_row_with_query_info_bytes(
+        writer,
+        r,
+        fields,
+        query_translated,
+        frame_shift,
+        qnum_offset,
+        snum_offset,
+        query_qual.as_bytes(),
+        mate_seq,
+    )
+}
+
+pub fn write_tabular_query_intro<W: Write>(
+    writer: &mut W,
+    query_title: &str,
+    query_len: i32,
+    query_seq: &[crate::basic::value::Letter],
+    fields: &[FieldId],
+    report_unaligned: bool,
+) -> io::Result<()> {
+    write_tabular_query_intro_bytes(
+        writer,
+        query_title.as_bytes(),
+        query_len,
+        query_seq,
+        fields,
+        report_unaligned,
+    )
+}
+
+pub fn write_tabular_query_intro_for_type<W: Write>(
+    writer: &mut W,
+    query_title: &str,
+    query_len: i32,
+    query_seq: &[crate::basic::value::Letter],
+    fields: &[FieldId],
+    report_unaligned: bool,
+    query_translated: bool,
+) -> io::Result<()> {
+    write_tabular_query_intro_for_type_bytes(
+        writer,
+        query_title.as_bytes(),
+        query_len,
+        query_seq,
+        fields,
+        report_unaligned,
+        query_translated,
+    )
+}
+
+pub fn write_tabular_query_intro_with_quality<W: Write>(
+    writer: &mut W,
+    query_title: &str,
+    query_len: i32,
+    query_seq: &[crate::basic::value::Letter],
+    query_qual: &str,
+    fields: &[FieldId],
+    report_unaligned: bool,
+) -> io::Result<()> {
+    write_tabular_query_intro_with_quality_bytes(
+        writer,
+        query_title.as_bytes(),
+        query_len,
+        query_seq,
+        query_qual.as_bytes(),
+        fields,
+        report_unaligned,
+    )
+}
+
+pub fn write_tabular_query_intro_with_quality_for_type<W: Write>(
+    writer: &mut W,
+    query_title: &str,
+    query_len: i32,
+    query_seq: &[crate::basic::value::Letter],
+    query_qual: &str,
+    fields: &[FieldId],
+    report_unaligned: bool,
+    query_translated: bool,
+) -> io::Result<()> {
+    write_tabular_query_intro_with_quality_for_type_bytes(
+        writer,
+        query_title.as_bytes(),
+        query_len,
+        query_seq,
+        query_qual.as_bytes(),
+        fields,
+        report_unaligned,
+        query_translated,
+    )
 }

@@ -1,0 +1,329 @@
+{
+  "source_commit": "1d162b4fefb5e6b4d868c24e6ad551cad2dcf246",
+  "binary_sha256": "d8d08608b96706db62e44036fc979f9a658e72f59fc19d8727546daa616c42d8",
+  "source_build": "2.1.24 build178; Linux x86_64 AVX2; EXTRA/WITH_DNA/WITH_MCL/WITH_AVX512 off",
+  "normalization": "Only XML database path replaced with @DATABASE@; all other bytes unchanged.",
+  "cases": [
+    {
+      "label": "blastp.6",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000001",
+        "-f",
+        "6",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastp.6.out"
+      ],
+      "output_sha256": "372a0ebbc003280c9ad8c72a87c2a3bff176f35301398e0bbce1a87987aef769"
+    },
+    {
+      "label": "blastp.0",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000001",
+        "-f",
+        "0",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastp.0.out"
+      ],
+      "output_sha256": "8efb4e3ff464677621b22659d5cfbb71625337bf9beb0cdf4711c0da8edcbc32"
+    },
+    {
+      "label": "blastp.xml",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000001",
+        "-f",
+        "xml",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastp.xml.out"
+      ],
+      "output_sha256": "6878717828d7610cfccf666e846155f4450c6a745e76bb18e0a0468a99726b9e"
+    },
+    {
+      "label": "blastp.paf",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000001",
+        "-f",
+        "paf",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastp.paf.out"
+      ],
+      "output_sha256": "18267b57376791851ef4cf77ad0aa3b2a66e5ae37d52ca1625f49fbd9c800a32"
+    },
+    {
+      "label": "blastp.100",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000001",
+        "-f",
+        "100",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastp.100.daa"
+      ],
+      "output_sha256": "1f471cb4331aa892e6ec4d22a0e480ffe490b477f179765aa720ed768f509ff1"
+    },
+    {
+      "label": "blastp.direct.100",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.00002",
+        "-f",
+        "100",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastp.direct.100.daa"
+      ],
+      "output_sha256": "74d31703bea009c70ae31ad6d201bcaf6a24ede3b2491ad52f32d8853d8aeb24"
+    },
+    {
+      "label": "blastx.6",
+      "args": [
+        "blastx",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.fna",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000001",
+        "-f",
+        "6",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastx.6.out"
+      ],
+      "output_sha256": "0d1be247b15f58e5f901fbb7a0c3cb873a7912f552613ce9a9e6569e6d25ea5b"
+    },
+    {
+      "label": "blastx.0",
+      "args": [
+        "blastx",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.fna",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000001",
+        "-f",
+        "0",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastx.0.out"
+      ],
+      "output_sha256": "9bcead0cf7ccbcf6aa0a35b6adc3737d7cbae6b0f6232d067ab886dbf1bd6506"
+    },
+    {
+      "label": "blastx.xml",
+      "args": [
+        "blastx",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.fna",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000001",
+        "-f",
+        "xml",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastx.xml.out"
+      ],
+      "output_sha256": "d69071ea4f85158c05793a427e4800a3976e2710bac4ebd7bca300b2e3d5351d"
+    },
+    {
+      "label": "blastx.paf",
+      "args": [
+        "blastx",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.fna",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000001",
+        "-f",
+        "paf",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastx.paf.out"
+      ],
+      "output_sha256": "47478b83a4760681fd1b203dfca482244f3f6ec3d84ec034da84caecadf3f095"
+    },
+    {
+      "label": "blastx.100",
+      "args": [
+        "blastx",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.fna",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000001",
+        "-f",
+        "100",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastx.100.daa"
+      ],
+      "output_sha256": "f0739f3a04e39e07ae40538fdb2fd8b31dfb89ac8d8a1e88891f687798e64102"
+    },
+    {
+      "label": "blastx.direct.100",
+      "args": [
+        "blastx",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/query.fna",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.00002",
+        "-f",
+        "100",
+        "--max-hsps",
+        "0",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/blastx.direct.100.daa"
+      ],
+      "output_sha256": "015dc53a8366de35ff81e558725524651b0cbda513bbb819a496bdb0b60888bf"
+    },
+    {
+      "label": "coverage.6",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/bins-query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000006",
+        "-f",
+        "6",
+        "--query-cover",
+        "99",
+        "--subject-cover",
+        "99",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/coverage.6.out"
+      ],
+      "output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "coverage.xml",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/bins-query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000006",
+        "-f",
+        "xml",
+        "--query-cover",
+        "99",
+        "--subject-cover",
+        "99",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/coverage.xml.out"
+      ],
+      "output_sha256": "963fe675c95203bc166fb25f855c3f802ffaba6aeba420e18edbc356d400aabd"
+    },
+    {
+      "label": "coverage.paf",
+      "args": [
+        "blastp",
+        "-q",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/bins-query.faa",
+        "-d",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_output/reference.faa",
+        "-p4",
+        "--masking",
+        "0",
+        "-b0.0000006",
+        "-f",
+        "paf",
+        "--query-cover",
+        "99",
+        "--subject-cover",
+        "99",
+        "-o",
+        "/data/henriksson/github/claude/diamond-rs/tests/data/search_blocks/coverage.paf.out"
+      ],
+      "output_sha256": "0c43b2d57ef4f04d497ff31028ba7a7b6f985ca891886423eb2cf755b1933199"
+    }
+  ]
+}

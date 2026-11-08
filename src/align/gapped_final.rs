@@ -3,10 +3,12 @@
 //! Configuration that is process-global in C++ is passed explicitly through
 //! `GappedScoreConfig`, the score matrix, and the requested output values.
 
+use std::sync::{Arc, Mutex};
+
+use super::culling::match_apply_filters_bytes;
 use super::hsp::Match;
 use super::target::{
-    culling_matches, match_apply_filters, match_inner_culling, recompute_alt_hsps,
-    GappedScoreConfig, Target,
+    culling_matches, match_inner_culling, recompute_alt_hsps, GappedScoreConfig, Target,
 };
 use crate::basic::consts::MAX_CONTEXT;
 use crate::basic::statistics::{StatValue, Statistics};
@@ -18,6 +20,63 @@ use crate::dp::swipe::{
 use crate::search::sensitivity::ExtensionMode;
 use crate::stats::cbs::TargetMatrix;
 use crate::stats::score_matrix::ScoreMatrix;
+
+/// Source's clustering expression is an HSP filter at the final-alignment
+/// boundary, before target/ranking truncation. It is not an output filter.
+fn apply_clustering_filter(
+    target: &mut Match,
+    source_query_len: i32,
+    query: &[&[Letter]],
+    cfg: &GappedScoreConfig,
+    matrix: &ScoreMatrix,
+) {
+    let Some(filter) = cfg
+        .clustering_filter
+        .as_ref()
+        .filter(|filter| filter.minimum.is_some())
+    else {
+        return;
+    };
+    let self_score = |sequence: &[Letter]| {
+        let bias = cfg.comp_based_stats_hauser.then(|| {
+            crate::stats::cbs::hauser_correction_window(
+                sequence,
+                matrix,
+                cfg.cbs_window as u32 as usize,
+            )
+        });
+        matrix.bitscore(
+            crate::dp::ungapped::self_score_with_cbs(sequence, bias.as_deref(), matrix) as f64,
+        )
+    };
+    let query_score = cfg
+        .clustering_query_self_score
+        .unwrap_or_else(|| self_score(query[0]));
+    let target_score = cfg
+        .clustering_target_self_scores
+        .as_ref()
+        .and_then(|scores| scores.get(target.target_block_id as usize))
+        .copied()
+        .unwrap_or_else(|| self_score(&target.seq));
+    target.hsps.retain(|hsp| {
+        let mut context: super::hsp::HspContext = super::hsp::HspContext::default();
+        context.hsp = hsp.clone();
+        context.query_source_len = source_query_len;
+        context.query_len = source_query_len;
+        context.query = query.iter().map(|frame| frame.to_vec()).collect();
+        context.subject_len = target.seq.len() as i32;
+        context.query_self_aln_score = query_score;
+        context.target_self_aln_score = target_score;
+        filter.accepts(&context, cfg.query_translated)
+    });
+    if let Some(best) = target.hsps.first() {
+        target.filter_score = best.score;
+        target.filter_evalue = best.evalue;
+    } else {
+        target.filter_score = 0;
+        target.filter_evalue = f64::MAX;
+    }
+}
 
 /// Matches C++ `filter_hspvalues`.
 pub fn filter_hspvalues(cfg: &GappedScoreConfig) -> HspValues {
@@ -132,7 +191,48 @@ pub fn align_targets_final(
     targets: &mut Vec<Target>,
     previous_matches: i64,
     query_seq: &[&[Letter]],
-    query_id: &str,
+    query_id: &(impl AsRef<[u8]> + ?Sized),
+    query_cbs: &[Vec<i8>],
+    source_query_len: i32,
+    _query_self_aln_score: f64,
+    flags: Flags,
+    first_round: HspValues,
+    first_round_culling: bool,
+    mode: ExtensionMode,
+    stat: &mut Statistics,
+    cfg: &GappedScoreConfig,
+    score_matrix: &ScoreMatrix,
+    output_hsp_values: HspValues,
+) -> Vec<Match> {
+    align_targets_final_with_block(
+        targets,
+        previous_matches,
+        query_seq,
+        query_id,
+        query_cbs,
+        source_query_len,
+        _query_self_aln_score,
+        flags,
+        first_round,
+        first_round_culling,
+        mode,
+        stat,
+        cfg,
+        score_matrix,
+        output_hsp_values,
+        None,
+    )
+}
+
+/// Final alignment with the source target-title lookup available for
+/// no-self-hit filtering. The ordinary adapter retains its existing wrapper;
+/// exhaustive extension supplies the actual reference block.
+#[allow(clippy::too_many_arguments)]
+pub fn align_targets_final_with_block(
+    targets: &mut Vec<Target>,
+    previous_matches: i64,
+    query_seq: &[&[Letter]],
+    query_id: &(impl AsRef<[u8]> + ?Sized),
     query_cbs: &[Vec<i8>],
     source_query_len: i32,
     _query_self_aln_score: f64,
@@ -144,6 +244,7 @@ pub fn align_targets_final(
     cfg: &GappedScoreConfig,
     score_matrix: &ScoreMatrix,
     output_hsp_values: HspValues,
+    subject_block: Option<&crate::data::block::Block>,
 ) -> Vec<Match> {
     const MIN_STEP: i64 = 16;
     let mut matches = Vec::new();
@@ -161,6 +262,7 @@ pub fn align_targets_final(
         );
     }
 
+    let swipe_statistics = Arc::new(Mutex::new(Statistics::new()));
     let mut hsp_values = output_hsp_values;
     let copy_all = cfg.max_hsps == 1
         && first_round.all(hsp_values)
@@ -185,13 +287,19 @@ pub fn align_targets_final(
     if matches.len() == targets.len() {
         for result in &mut matches {
             let subject_seq = result.seq.clone();
-            match_apply_filters(
+            let subject_title = subject_block.and_then(|block| {
+                block
+                    .ids()
+                    .ok()
+                    .map(|ids| ids.get(result.target_block_id as usize))
+            });
+            match_apply_filters_bytes(
                 result,
                 source_query_len as u32,
-                query_id,
+                query_id.as_ref(),
                 &query_seq[0],
                 subject_seq.len() as u32,
-                None,
+                subject_title,
                 &subject_seq,
                 cfg.min_id,
                 cfg.approx_min_id,
@@ -200,6 +308,7 @@ pub fn align_targets_final(
                 cfg.query_or_target_cover,
                 cfg.no_self_hits,
             );
+            apply_clustering_filter(result, source_query_len, query_seq, cfg, score_matrix);
         }
         return matches;
     }
@@ -223,7 +332,7 @@ pub fn align_targets_final(
         let remaining = targets.len() - target_begin;
         let step_size = if !first_round_culling && cfg.toppercent.is_none() {
             let wanted = (cfg.max_target_seqs - matches.len() as i64).max(MIN_STEP);
-            let rounded = ((wanted + MIN_STEP - 1) / MIN_STEP) * MIN_STEP;
+            let rounded = crate::util::misc::make_multiple(wanted, MIN_STEP);
             rounded.min(remaining as i64) as usize
         } else {
             remaining
@@ -263,22 +372,31 @@ pub fn align_targets_final(
                 .comp_based_stats_hauser
                 .then(|| query_cbs[frame].as_slice());
             let mut params = Params::new(&query_seq[frame], score_matrix);
-            params.query_id = Some(query_id);
+            params.query_id_bytes = Some(query_id.as_ref());
             params.frame = frame as i32;
             params.query_source_len = source_query_len;
             params.query_translated = cfg.query_translated;
             params.composition_bias = composition_bias;
             params.flags = flags;
             params.v = hsp_values;
+            params.band_bin = cfg.band_bin;
+            params.col_bin = cfg.col_bin;
             params.cutoff_score_8bit = cfg.cutoff_score_8bit;
             params.max_swipe_dp = cfg.max_swipe_dp;
+            params.swipe_task_size = cfg.swipe_task_size;
+            params.threads_align = cfg.threads_align;
+            params.target_parallel_verbosity = cfg.target_parallel_verbosity;
+            params.error_sink = cfg.swipe_error.clone();
+            params.transcript_len_estimate = cfg.transcript_len_estimate;
             params.approx_backtrace = cfg.approx_backtrace;
             params.max_evalue = cfg.max_evalue;
+            params.min_bit_score = cfg.min_bit_score;
             params.query_cover = cfg.query_cover;
             params.subject_cover = cfg.subject_cover;
             params.query_or_target_cover = cfg.query_or_target_cover;
             params.approx_min_id = cfg.approx_min_id;
             params.cbs_matrix_scale = cfg.cbs_matrix_scale;
+            params.statistics = Some(swipe_statistics.clone());
             for hsp in swipe(&dp_targets[frame], &mut params) {
                 let result = &mut matches[hsp.swipe_target as usize];
                 if hsp.score > result.filter_score {
@@ -296,13 +414,19 @@ pub fn align_targets_final(
                 result.filter_evalue = best.evalue;
             }
             let subject_seq = result.seq.clone();
-            match_apply_filters(
+            let subject_title = subject_block.and_then(|block| {
+                block
+                    .ids()
+                    .ok()
+                    .map(|ids| ids.get(result.target_block_id as usize))
+            });
+            match_apply_filters_bytes(
                 result,
                 source_query_len as u32,
-                query_id,
+                query_id.as_ref(),
                 &query_seq[0],
                 subject_seq.len() as u32,
-                None,
+                subject_title,
                 &subject_seq,
                 cfg.min_id,
                 cfg.approx_min_id,
@@ -311,6 +435,7 @@ pub fn align_targets_final(
                 cfg.query_or_target_cover,
                 cfg.no_self_hits,
             );
+            apply_clustering_filter(result, source_query_len, query_seq, cfg, score_matrix);
         }
         culling_matches(&mut matches, cfg.max_target_seqs, cfg.toppercent, |score| {
             score_matrix.bitscore(score as f64)
@@ -319,6 +444,7 @@ pub fn align_targets_final(
         target_begin += step_size;
     }
 
+    *stat += &swipe_statistics.lock().unwrap();
     recompute_alt_hsps(
         &mut matches,
         query_seq,

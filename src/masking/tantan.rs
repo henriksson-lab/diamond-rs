@@ -71,6 +71,7 @@ fn compute_lambda_flat(scores: &[i8], stride: usize, n: usize) -> f64 {
 }
 
 /// Pre-computed tantan masking state. Compute once, reuse for all sequences.
+#[derive(Debug, PartialEq)]
 pub struct TantanMasker {
     /// Likelihood ratio matrix: lr[i][j] = exp(lambda * score(i,j))
     lr_matrix: Vec<Vec<f32>>,
@@ -515,7 +516,7 @@ pub fn mask(
             }
         };
         #[cfg(target_arch = "x86_64")]
-        let z = if matches!(x86_backend(), X86Backend::Avx2) {
+        let z = if matches!(x86_backend(), X86Backend::Avx2) && super::tantan_simd::uses_fma() {
             b.mul_add(b2b, f_total * p_repeat_end)
         } else {
             b * b2b + f_total * p_repeat_end
@@ -530,7 +531,8 @@ pub fn mask(
 
         for i in (0..len).rev() {
             #[cfg(target_arch = "x86_64")]
-            let pf = if matches!(x86_backend(), X86Backend::Avx2) {
+            let pf = if matches!(x86_backend(), X86Backend::Avx2) && super::tantan_simd::uses_fma()
+            {
                 (pb[i] * b).mul_add(-zinv, 1.0)
             } else {
                 1.0 - (pb[i] * b * zinv)
@@ -586,6 +588,57 @@ pub fn mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// These are actual natural records at the p_mask boundary, captured from
+    /// unchanged Source AVX2 objects with and without compile-time FMA. They
+    /// exposed six bit differences in a complete 1.1-billion-residue database.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn natural_mask_boundaries_match_source_avx2_build_profile() {
+        if !super::super::tantan_simd::has_avx2() {
+            // The fixture's reduction order is the Source AVX2 profile.
+            return;
+        }
+        let traits = crate::basic::value::ValueTraits::new(
+            crate::basic::value::AMINO_ACID_ALPHABET,
+            MASK_LETTER,
+            b"-U",
+            crate::basic::value::SequenceType::AminoAcid,
+        );
+        let matrix = ScoreMatrix::new("BLOSUM62", 11, 1, 0, 1, 0).unwrap();
+        let masker = TantanMasker::from_score_matrix(&matrix, DEFAULT_MIN_MASK_PROB);
+        let expected_column = if super::super::tantan_simd::uses_fma() {
+            4
+        } else {
+            3
+        };
+        let mut count = 0;
+        for line in include_str!("../../tests/data/tantan_mask/natural_boundary.tsv").lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 5);
+            let mut sequence: Vec<Letter> = fields[2]
+                .bytes()
+                .map(|c| traits.from_char.convert(c).unwrap())
+                .collect();
+            let mut expected = sequence.clone();
+            if fields[expected_column] != "-" {
+                for position in fields[expected_column].split(',') {
+                    expected[position.parse::<usize>().unwrap()] |= SEED_MASK;
+                }
+            }
+            masker.mask_bit(&mut sequence);
+            assert_eq!(
+                sequence, expected,
+                "{} Source AVX2 build profile",
+                fields[1]
+            );
+            count += 1;
+        }
+        assert_eq!(count, 6);
+    }
 
     fn flat_ranges(ranges: &Ranges) -> Vec<(i32, i32)> {
         let (a, b) = ranges.as_slices();
@@ -903,7 +956,14 @@ mod tests {
             .filter_map(|(i, &letter)| (letter & SEED_MASK != 0).then_some(i))
             .collect();
 
-        assert_eq!(masked, (190..197).collect::<Vec<_>>());
+        // Actual immutable Source Masking/ScoreMatrix objects: the default
+        // non-FMA build includes position189, while -march=native does not.
+        let begin = if super::super::tantan_simd::uses_fma() {
+            190
+        } else {
+            189
+        };
+        assert_eq!(masked, (begin..197).collect::<Vec<_>>());
     }
 
     #[test]

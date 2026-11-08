@@ -53,8 +53,8 @@ impl Default for UngappedStageConfig {
             xdrop: 20,
             matrix_adjust_thresholds: CbsThresholds::default(),
             cbs_matrix_scale: 1,
-            matrix_adjust_tolerance: 0.0,
-            matrix_adjust_max_iterations: -1,
+            matrix_adjust_tolerance: 1e-8,
+            matrix_adjust_max_iterations: 2000,
         }
     }
 }
@@ -122,7 +122,7 @@ impl WorkTarget {
                 query_len_true_aa,
                 cfg.comp_based_stats,
                 &target.seq,
-                score_matrix.background_scores(),
+                score_matrix.background_freqs(),
                 cfg.matrix_adjust_thresholds,
             );
             if rule != MatrixAdjustRule::DontAdjustMatrix {

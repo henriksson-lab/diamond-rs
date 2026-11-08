@@ -1,7 +1,10 @@
 use crate::basic::consts::MAX_CONTEXT;
 use crate::basic::packed_transcript::{EditOperation, PackedTranscript};
 use crate::basic::translate::{Frame, Strand, TranslatedPosition};
-use crate::basic::value::{BlockId, Letter, OId, Score, AMINO_ACID_ALPHABET, LETTER_MASK};
+use crate::basic::value::{
+    BlockId, Letter, OId, Score, SequenceType, AMINO_ACID_ALPHABET, LETTER_MASK,
+    NUCLEOTIDE_ALPHABET,
+};
 use crate::dp::swipe::HspValues;
 use crate::output::intermediate::IntermediateRecord;
 use crate::stats;
@@ -182,6 +185,7 @@ impl Hsp {
         score_matrix: &ScoreMatrix,
     ) -> Self {
         let seed_only = record.seed_only();
+        let dna_statistics = score_matrix.source_dna_statistics();
         let mut hsp = Hsp {
             backtraced: !seed_only
                 && !IntermediateRecord::stats_mode(hsp_values)
@@ -189,12 +193,23 @@ impl Hsp {
             seed_only,
             score: record.score as Score,
             evalue: record.evalue,
-            bit_score: score_matrix.bitscore(record.score as f64),
-            corrected_bit_score: score_matrix.bitscore_corrected(
-                record.score as Score,
-                query_len as u32,
-                target_len as u32,
+            bit_score: dna_statistics.map_or_else(
+                || score_matrix.bitscore(record.score as f64),
+                |stats| stats.blast_bit_score(record.score as Score),
             ),
+            // Source's WITH_DNA constructor uses the separate Blastn_Score
+            // and does not initialize corrected_bit_score at all. Define that
+            // unsafe automatic-object field as 0; do not call global ALP or
+            // invent a corrected nucleotide statistic.
+            corrected_bit_score: if dna_statistics.is_some() {
+                0.0
+            } else {
+                score_matrix.bitscore_corrected(
+                    record.score as Score,
+                    query_len as u32,
+                    target_len as u32,
+                )
+            },
             transcript: record.transcript.clone(),
             ..Self::default()
         };
@@ -727,11 +742,15 @@ impl<'a> HspIterator<'a> {
 
 /// Matches C++ `HspContext::HspContext()`.
 #[derive(Debug, Clone)]
-pub struct HspContext {
+pub struct HspContext<T = String> {
+    /// Source's alignment alphabet, distinct from translated DNA input.
+    pub sequence_type: SequenceType,
     pub query: Vec<Vec<Letter>>,
+    /// Original input sequence (DNA for translated queries).
+    pub query_source: Option<Vec<Letter>>,
     pub query_source_len: i32,
-    pub query_title: String,
-    pub target_title: String,
+    pub query_title: T,
+    pub target_title: T,
     pub query_id: BlockId,
     pub query_oid: OId,
     pub subject_oid: OId,
@@ -745,13 +764,15 @@ pub struct HspContext {
     pub hsp: Hsp,
 }
 
-impl Default for HspContext {
+impl<T: Default> Default for HspContext<T> {
     fn default() -> Self {
         HspContext {
+            sequence_type: SequenceType::AminoAcid,
             query: Vec::new(),
+            query_source: None,
             query_source_len: 0,
-            query_title: String::new(),
-            target_title: String::new(),
+            query_title: T::default(),
+            target_title: T::default(),
             query_id: 0,
             query_oid: 0,
             subject_oid: 0,
@@ -767,7 +788,10 @@ impl Default for HspContext {
     }
 }
 
-impl HspContext {
+/// Canonical Source title-byte context, sharing all alignment/statistical code.
+pub type ByteHspContext = HspContext<Vec<u8>>;
+
+impl HspContext<String> {
     pub fn new(
         hsp: Hsp,
         query_id: BlockId,
@@ -784,11 +808,135 @@ impl HspContext {
         query_self_aln_score: f64,
         target_self_aln_score: f64,
     ) -> Self {
-        HspContext {
+        // Source HspContext's inputs are const char*, while the two owned
+        // fields are std::string: construction stops at the first NUL.
+        let mut query_title = query_title.into();
+        let mut subject_title = subject_title.into();
+        query_title.truncate(query_title.find('\0').unwrap_or(query_title.len()));
+        subject_title.truncate(subject_title.find('\0').unwrap_or(subject_title.len()));
+        Self::new_with_titles(
+            hsp,
+            query_id,
+            query_oid,
             query,
             query_source_len,
-            query_title: query_title.into(),
-            target_title: subject_title.into(),
+            query_title,
+            subject_oid,
+            subject_len,
+            subject_title,
+            hit_num,
+            hsp_num,
+            subject_seq,
+            query_self_aln_score,
+            target_self_aln_score,
+        )
+    }
+}
+
+impl HspContext<Vec<u8>> {
+    pub fn new_bytes(
+        hsp: Hsp,
+        query_id: BlockId,
+        query_oid: OId,
+        query: Vec<Vec<Letter>>,
+        query_source_len: i32,
+        query_title: impl Into<Vec<u8>>,
+        subject_oid: OId,
+        subject_len: i32,
+        subject_title: impl Into<Vec<u8>>,
+        hit_num: u32,
+        hsp_num: u32,
+        subject_seq: Vec<Letter>,
+        query_self_aln_score: f64,
+        target_self_aln_score: f64,
+    ) -> Self {
+        let mut query_title = query_title.into();
+        let mut subject_title = subject_title.into();
+        query_title.truncate(crate::util::sequence::c_string_bytes(&query_title).len());
+        subject_title.truncate(crate::util::sequence::c_string_bytes(&subject_title).len());
+        Self::new_with_titles(
+            hsp,
+            query_id,
+            query_oid,
+            query,
+            query_source_len,
+            query_title,
+            subject_oid,
+            subject_len,
+            subject_title,
+            hit_num,
+            hsp_num,
+            subject_seq,
+            query_self_aln_score,
+            target_self_aln_score,
+        )
+    }
+}
+
+impl<T: AsRef<[u8]>> HspContext<T> {
+    /// Checked compatibility bridge for legacy String-only output callbacks.
+    /// Native byte output must call the raw callback and never take this path.
+    pub fn try_to_string_context(&self) -> std::io::Result<HspContext<String>> {
+        Ok(HspContext {
+            sequence_type: self.sequence_type,
+            query: self.query.clone(),
+            query_source: self.query_source.clone(),
+            query_source_len: self.query_source_len,
+            query_title: std::str::from_utf8(self.query_title.as_ref())
+                .map_err(std::io::Error::other)?
+                .to_owned(),
+            target_title: std::str::from_utf8(self.target_title.as_ref())
+                .map_err(std::io::Error::other)?
+                .to_owned(),
+            query_id: self.query_id,
+            query_oid: self.query_oid,
+            subject_oid: self.subject_oid,
+            query_len: self.query_len,
+            subject_len: self.subject_len,
+            hit_num: self.hit_num,
+            hsp_num: self.hsp_num,
+            query_self_aln_score: self.query_self_aln_score,
+            target_self_aln_score: self.target_self_aln_score,
+            subject_seq: self.subject_seq.clone(),
+            hsp: self.hsp.clone(),
+        })
+    }
+}
+
+impl<T> HspContext<T> {
+    pub fn alphabet(&self) -> &'static [u8] {
+        match self.sequence_type {
+            SequenceType::AminoAcid => AMINO_ACID_ALPHABET,
+            SequenceType::Nucleotide => NUCLEOTIDE_ALPHABET,
+        }
+    }
+
+    /// Rust owned-storage core. Unlike Source's const-char constructors this
+    /// retains the supplied values verbatim; new/new_bytes implement that
+    /// Source pointer boundary before delegating here.
+    pub fn new_with_titles(
+        hsp: Hsp,
+        query_id: BlockId,
+        query_oid: OId,
+        query: Vec<Vec<Letter>>,
+        query_source_len: i32,
+        query_title: T,
+        subject_oid: OId,
+        subject_len: i32,
+        subject_title: T,
+        hit_num: u32,
+        hsp_num: u32,
+        subject_seq: Vec<Letter>,
+        query_self_aln_score: f64,
+        target_self_aln_score: f64,
+    ) -> Self {
+        HspContext {
+            sequence_type: SequenceType::AminoAcid,
+            query,
+            query_source: None,
+            query_source_len,
+            query_title,
+            target_title: subject_title,
             query_id,
             query_oid,
             subject_oid,
@@ -803,7 +951,7 @@ impl HspContext {
         }
     }
 
-    pub fn begin(&self) -> HspContextIterator<'_> {
+    pub fn begin(&self) -> HspContextIterator<'_, T> {
         HspContextIterator::new(self)
     }
 
@@ -1040,34 +1188,34 @@ impl Hsp {
     }
 }
 
-impl PartialEq for HspContext {
+impl<T> PartialEq for HspContext<T> {
     fn eq(&self, other: &Self) -> bool {
         self.query_oid == other.query_oid
     }
 }
 
-impl Eq for HspContext {}
+impl<T> Eq for HspContext<T> {}
 
-impl PartialOrd for HspContext {
+impl<T> PartialOrd for HspContext<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for HspContext {
+impl<T> Ord for HspContext<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.query_oid.cmp(&other.query_oid)
     }
 }
 
 /// Matches C++ `HspContext::Iterator::Iterator(const HspContext&)`.
-pub struct HspContextIterator<'a> {
-    parent: &'a HspContext,
+pub struct HspContextIterator<'a, T = String> {
+    parent: &'a HspContext<T>,
     inner: HspIterator<'a>,
 }
 
-impl<'a> HspContextIterator<'a> {
-    pub fn new(parent: &'a HspContext) -> Self {
+impl<'a, T> HspContextIterator<'a, T> {
+    pub fn new(parent: &'a HspContext<T>) -> Self {
         HspContextIterator {
             parent,
             inner: parent.hsp.begin(),
@@ -1100,6 +1248,41 @@ impl<'a> HspContextIterator<'a> {
         self.parent.query[frame][self.inner.query_pos.translated as usize]
     }
 
+    pub fn try_query(&self) -> std::io::Result<Letter> {
+        let position = self.inner.query_pos;
+        self.parent.query.get(position.frame.index() as usize)
+            .and_then(|sequence| usize::try_from(position.translated).ok().and_then(|index| sequence.get(index)))
+            .copied().ok_or_else(|| std::io::Error::other("Source query-character lookup dereferences an empty or out-of-range translated sequence context."))
+    }
+
+    pub fn try_query_char(&self) -> std::io::Result<char> {
+        Ok(match self.op() {
+            EditOperation::Deletion => '-',
+            EditOperation::FrameshiftForward => '\\',
+            EditOperation::FrameshiftReverse => '/',
+            _ => self.parent.alphabet()[(self.try_query()? & LETTER_MASK) as usize] as char,
+        })
+    }
+
+    pub fn try_subject(&self) -> std::io::Result<Letter> {
+        match self.op() {
+            EditOperation::Substitution | EditOperation::Deletion => Ok(self.inner.letter()),
+            _ => self.try_query(),
+        }
+    }
+
+    pub fn try_subject_char(&self) -> std::io::Result<char> {
+        Ok(match self.op() {
+            EditOperation::Insertion
+            | EditOperation::FrameshiftForward
+            | EditOperation::FrameshiftReverse => '-',
+            EditOperation::Substitution | EditOperation::Deletion => {
+                self.parent.alphabet()[(self.inner.letter() & LETTER_MASK) as usize] as char
+            }
+            _ => self.parent.alphabet()[(self.try_query()? & LETTER_MASK) as usize] as char,
+        })
+    }
+
     pub fn subject(&self) -> Letter {
         match self.op() {
             EditOperation::Substitution | EditOperation::Deletion => self.inner.letter(),
@@ -1112,7 +1295,7 @@ impl<'a> HspContextIterator<'a> {
             EditOperation::Deletion => '-',
             EditOperation::FrameshiftForward => '\\',
             EditOperation::FrameshiftReverse => '/',
-            _ => AMINO_ACID_ALPHABET[(self.query() & LETTER_MASK) as usize] as char,
+            _ => self.parent.alphabet()[(self.query() & LETTER_MASK) as usize] as char,
         }
     }
 
@@ -1121,14 +1304,14 @@ impl<'a> HspContextIterator<'a> {
             EditOperation::Insertion
             | EditOperation::FrameshiftForward
             | EditOperation::FrameshiftReverse => '-',
-            _ => AMINO_ACID_ALPHABET[(self.subject() & LETTER_MASK) as usize] as char,
+            _ => self.parent.alphabet()[(self.subject() & LETTER_MASK) as usize] as char,
         }
     }
 
     pub fn midline_char(&self, score: i32) -> char {
         match self.op() {
             EditOperation::Match => {
-                AMINO_ACID_ALPHABET[(self.query() & LETTER_MASK) as usize] as char
+                self.parent.alphabet()[(self.query() & LETTER_MASK) as usize] as char
             }
             EditOperation::Substitution => {
                 if score > 0 {
@@ -1273,6 +1456,14 @@ impl Match {
         m
     }
 
+    /// Source's synthetic --add-self-aln hit is appended after HSP filters.
+    /// These sentinel scores cannot be produced by the ordinary DP kernels.
+    pub fn is_synthetic_self_alignment(&self) -> bool {
+        self.hsps
+            .iter()
+            .any(|hsp| hsp.score == Score::MAX && hsp.bit_score == f64::MAX)
+    }
+
     /// Best score among all HSPs.
     pub fn top_score(&self) -> Score {
         if self.hsps.is_empty() {
@@ -1300,6 +1491,46 @@ impl Match {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_context_constructors_stop_titles_at_nul_without_decoding_bytes() {
+        let text = HspContext::new(
+            Hsp::default(),
+            0,
+            0,
+            vec![vec![0; 4]],
+            4,
+            "q\0ignored",
+            1,
+            4,
+            "s\0ignored",
+            0,
+            0,
+            vec![0; 4],
+            0.0,
+            0.0,
+        );
+        assert_eq!(text.query_title, "q");
+        assert_eq!(text.target_title, "s");
+        let bytes = ByteHspContext::new_bytes(
+            Hsp::default(),
+            0,
+            0,
+            vec![vec![0; 4]],
+            4,
+            b"q\xff\0ignored".to_vec(),
+            1,
+            4,
+            b"s\xfe\0ignored".to_vec(),
+            0,
+            0,
+            vec![0; 4],
+            0.0,
+            0.0,
+        );
+        assert_eq!(bytes.query_title, b"q\xff");
+        assert_eq!(bytes.target_title, b"s\xfe");
+    }
 
     #[test]
     fn test_hsp_defaults() {

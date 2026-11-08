@@ -1,16 +1,17 @@
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::align::hsp::{Hsp, HspContext};
+use crate::align::hsp::{ByteHspContext, Hsp, HspContext};
 use crate::basic::packed_sequence::PackedSequence;
 use crate::basic::packed_transcript::{PackedOperation, PackedTranscript};
 use crate::basic::translate::translate_6_frames;
 use crate::basic::value::{AlignMode, Letter, SequenceType};
 use crate::output::format::{
-    write_tabular_context_row, write_tabular_context_row_json, write_tabular_query_intro,
-    TabularFormat,
+    write_tabular_context_row_bytes, write_tabular_context_row_json_bytes,
+    write_tabular_query_intro_for_type_bytes, TabularFormat,
 };
 use crate::output::get_segment_flag_hsp;
 use crate::output::intermediate::IntermediateRecord;
@@ -18,7 +19,6 @@ use crate::output::{edge, paf, pairwise, sam, xml};
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::binary_buffer::BinaryBufferIterator;
 use crate::util::interval::Interval;
-use crate::util::text_buffer::find_first_of;
 
 /// Magic number identifying a DAA (DIAMOND Alignment Archive) file.
 pub const DAA_MAGIC_NUMBER: u64 = 0x3c0e53476d3ee36b;
@@ -68,7 +68,7 @@ impl DaaHeader1 {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.magic_number != DAA_MAGIC_NUMBER {
-            return Err("File is not a DAA file.".into());
+            return Err("Input file is not a DAA file.".into());
         }
         if self.version > DAA_VERSION {
             return Err("DAA version requires later version of DIAMOND.".into());
@@ -155,6 +155,35 @@ impl DaaHeader2 {
         score_matrix: &str,
         mode: u32,
     ) -> Self {
+        Self::with_params_bytes(
+            db_seqs,
+            db_letters,
+            gap_open,
+            gap_extend,
+            reward,
+            penalty,
+            k,
+            lambda,
+            evalue,
+            score_matrix.as_bytes(),
+            mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_params_bytes(
+        db_seqs: u64,
+        db_letters: u64,
+        gap_open: i32,
+        gap_extend: i32,
+        reward: i32,
+        penalty: i32,
+        k: f64,
+        lambda: f64,
+        evalue: f64,
+        score_matrix: &[u8],
+        mode: u32,
+    ) -> Self {
         let mut h = Self {
             db_seqs,
             db_letters,
@@ -168,12 +197,12 @@ impl DaaHeader2 {
             mode: mode as i32,
             ..Self::default()
         };
-        h.set_matrix_name(score_matrix);
+        h.set_matrix_name_bytes(score_matrix);
         h
     }
 
     /// Matches C++ `DAA_header2::DAA_header2(daa)`.
-    pub fn from_daa_file(daa: &DaaFile) -> Self {
+    pub fn from_daa_file<N: DaaName>(daa: &DaaFile<N>) -> Self {
         let mut h = Self::with_params(
             daa.db_seqs(),
             daa.db_letters(),
@@ -184,9 +213,10 @@ impl DaaHeader2 {
             daa.kappa(),
             daa.lambda(),
             daa.evalue(),
-            &daa.score_matrix(),
+            "",
             daa.mode(),
         );
+        h.set_matrix_name_bytes(daa.score_matrix_bytes());
         h.block_type[0] = BlockType::Alignments as u8;
         h.block_type[1] = BlockType::RefNames as u8;
         h.block_type[2] = BlockType::RefLengths as u8;
@@ -277,35 +307,107 @@ impl DaaHeader2 {
         Ok(())
     }
 
-    /// Get the score matrix name as a string.
-    pub fn matrix_name(&self) -> String {
-        let end = self.score_matrix.iter().position(|&b| b == 0).unwrap_or(16);
-        String::from_utf8_lossy(&self.score_matrix[..end]).to_string()
+    pub fn matrix_name_bytes(&self) -> &[u8] {
+        let end = self
+            .score_matrix
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(16);
+        &self.score_matrix[..end]
     }
 
-    /// Set the score matrix name.
+    pub fn matrix_name_utf8(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(self.matrix_name_bytes())
+    }
+
+    /// Checked legacy String accessor. Raw archives use matrix_name_bytes;
+    /// an unrepresentable name never receives replacement characters.
+    pub fn matrix_name(&self) -> String {
+        self.matrix_name_utf8()
+            .expect("DAA matrix name is not UTF-8; use matrix_name_bytes or matrix_name_utf8")
+            .to_owned()
+    }
+
     pub fn set_matrix_name(&mut self, name: &str) {
+        self.set_matrix_name_bytes(name.as_bytes());
+    }
+    pub fn set_matrix_name_bytes(&mut self, name: &[u8]) {
         self.score_matrix = [0; 16];
-        let bytes = name.as_bytes();
-        let len = bytes.len().min(15);
-        self.score_matrix[..len].copy_from_slice(&bytes[..len]);
+        let len = name
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(name.len())
+            .min(15);
+        self.score_matrix[..len].copy_from_slice(&name[..len]);
     }
 }
 
 /// Reader state for a DAA file.
-pub struct DaaFile {
-    reader: BufReader<File>,
+pub struct DaaFile<N = String> {
+    reader: crate::output::daa::buffered_io::DaaInput,
     query_count: usize,
     h1: DaaHeader1,
     h2: DaaHeader2,
-    ref_name: Vec<String>,
+    ref_name: Vec<N>,
     ref_len: Vec<u32>,
 }
 
-impl DaaFile {
-    /// Matches C++ `DAAFile::DAAFile(file_name)`.
+pub type ByteDaaFile = DaaFile<Vec<u8>>;
+
+impl DaaFile<String> {
     pub fn open<P: AsRef<Path>>(file_name: P) -> io::Result<Self> {
-        let mut reader = BufReader::new(File::open(file_name)?);
+        Self::open_with_buffer_size(
+            file_name,
+            crate::output::daa::buffered_io::DEFAULT_BUFFER_SIZE,
+        )
+    }
+    pub fn open_with_buffer_size<P: AsRef<Path>>(
+        file_name: P,
+        file_buffer_size: usize,
+    ) -> io::Result<Self> {
+        let file = Self::open_impl(file_name, file_buffer_size)?;
+        file.score_matrix_utf8()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(file)
+    }
+    pub fn ref_name(&self, i: usize) -> &str {
+        &self.ref_name[i]
+    }
+    pub fn read_query_record(&mut self) -> io::Result<Option<DaaQueryRecord>> {
+        self.read_query_buffer()?
+            .map(|(buffer, ordinal)| {
+                DaaQueryRecord::from_buffer(self, &buffer, ordinal)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            })
+            .transpose()
+    }
+}
+impl DaaFile<Vec<u8>> {
+    pub fn read_query_record_bytes(&mut self) -> io::Result<Option<ByteDaaQueryRecord>> {
+        self.read_query_buffer()?
+            .map(|(buffer, ordinal)| {
+                ByteDaaQueryRecord::from_buffer_bytes(self, &buffer, ordinal)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            })
+            .transpose()
+    }
+    pub fn open_bytes<P: AsRef<Path>>(file_name: P) -> io::Result<Self> {
+        Self::open_bytes_with_buffer_size(
+            file_name,
+            crate::output::daa::buffered_io::DEFAULT_BUFFER_SIZE,
+        )
+    }
+    pub fn open_bytes_with_buffer_size<P: AsRef<Path>>(
+        file_name: P,
+        file_buffer_size: usize,
+    ) -> io::Result<Self> {
+        Self::open_impl(file_name, file_buffer_size)
+    }
+}
+impl<N: DaaName> DaaFile<N> {
+    fn open_impl<P: AsRef<Path>>(file_name: P, file_buffer_size: usize) -> io::Result<Self> {
+        let mut reader =
+            crate::output::daa::buffered_io::DaaInput::open(file_name.as_ref(), file_buffer_size)?;
         let h1 = DaaHeader1::read_from(&mut reader)?;
         h1.validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -318,9 +420,7 @@ impl DaaFile {
             ));
         }
 
-        reader.seek(SeekFrom::Start(
-            (DAA_HEADER1_SIZE + DAA_HEADER2_SIZE) as u64 + h2.block_size[0],
-        ))?;
+        reader.seek_absolute((DAA_HEADER1_SIZE + DAA_HEADER2_SIZE) as u64 + h2.block_size[0])?;
         let mut ref_name = Vec::with_capacity(h2.db_seqs_used as usize);
         for _ in 0..h2.db_seqs_used {
             let mut s = Vec::new();
@@ -332,7 +432,10 @@ impl DaaFile {
                 }
                 s.push(c[0]);
             }
-            ref_name.push(String::from_utf8_lossy(&s).to_string());
+            ref_name.push(
+                N::from_daa_bytes(s)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            );
         }
 
         let mut ref_len = Vec::with_capacity(h2.db_seqs_used as usize);
@@ -342,9 +445,7 @@ impl DaaFile {
             ref_len.push(u32::from_le_bytes(buf));
         }
 
-        reader.seek(SeekFrom::Start(
-            (DAA_HEADER1_SIZE + DAA_HEADER2_SIZE) as u64,
-        ))?;
+        reader.seek_absolute((DAA_HEADER1_SIZE + DAA_HEADER2_SIZE) as u64)?;
 
         Ok(Self {
             reader,
@@ -374,6 +475,24 @@ impl DaaFile {
     /// Matches C++ `DAAFile::db_letters()`.
     pub fn db_letters(&self) -> u64 {
         self.h2.db_letters
+    }
+
+    pub fn score_matrix_bytes(&self) -> &[u8] {
+        self.h2.matrix_name_bytes()
+    }
+    pub fn score_matrix_utf8(&self) -> Result<&str, std::str::Utf8Error> {
+        self.h2.matrix_name_utf8()
+    }
+
+    /// Actual Source matrix-construction boundary. Invalid UTF-8 cannot name
+    /// a supported built-in matrix; preserve its original exception bytes.
+    /// Combined invalid-matrix/other-error precedence needs separate evidence.
+    pub fn score_matrix_for_alignment(&self) -> io::Result<&str> {
+        self.score_matrix_utf8().map_err(|_| {
+            let mut message = b"Unknown scoring matrix: ".to_vec();
+            message.extend_from_slice(self.score_matrix_bytes());
+            io::Error::other(crate::util::io::RawDiagnosticError(message))
+        })
     }
 
     /// Matches C++ `DAAFile::score_matrix()`.
@@ -411,12 +530,18 @@ impl DaaFile {
         self.h2.mode as u32
     }
 
-    /// Matches C++ `DAAFile::ref_name(i)`.
-    pub fn ref_name(&self, i: usize) -> &str {
+    pub(crate) fn stored_ref_name(&self, i: usize) -> &N {
         &self.ref_name[i]
     }
 
-    /// Matches C++ `DAAFile::ref_len(i)`.
+    /// Raw archive title, with no Unicode requirement or replacement bytes.
+    pub fn ref_name_bytes(&self, i: usize) -> &[u8] {
+        self.ref_name[i].daa_bytes()
+    }
+    pub fn ref_name_utf8(&self, i: usize) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(self.ref_name_bytes(i))
+    }
+
     pub fn ref_len_at(&self, i: usize) -> u32 {
         self.ref_len[i]
     }
@@ -481,10 +606,36 @@ pub fn translate_query(query: &[Letter]) -> [Vec<Letter>; 6] {
     translate_6_frames(&dna).map(|frame| frame.into_iter().map(|letter| letter as Letter).collect())
 }
 
+/// Identifier storage used by the checked String compatibility API and the
+/// canonical byte-oriented archive/view path. No lossy conversion is allowed.
+pub trait DaaName: Clone + Eq + std::hash::Hash {
+    fn daa_bytes(&self) -> &[u8];
+    fn from_daa_bytes(bytes: Vec<u8>) -> Result<Self, String>;
+}
+impl DaaName for String {
+    fn daa_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+    fn from_daa_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        String::from_utf8(bytes).map_err(|error| error.to_string())
+    }
+}
+impl DaaName for Vec<u8> {
+    fn daa_bytes(&self) -> &[u8] {
+        self
+    }
+    fn from_daa_bytes(bytes: Vec<u8>) -> Result<Self, String> {
+        Ok(bytes)
+    }
+}
+
+pub type ByteDaaQueryRecord = DaaQueryRecord<Vec<u8>>;
+pub type ByteDaaMatch = DaaMatch<Vec<u8>>;
+
 /// Query record decoded from a DAA alignment block.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DaaQueryRecord {
-    pub query_name: String,
+pub struct DaaQueryRecord<N = String> {
+    pub query_name: N,
     pub query_num: usize,
     pub source_seq: Vec<Letter>,
     pub context: [Vec<Letter>; 6],
@@ -492,12 +643,31 @@ pub struct DaaQueryRecord {
     mode: u32,
 }
 
-impl DaaQueryRecord {
-    /// Matches C++ `DAA_query_record::DAA_query_record(file, buf, query_num)`.
+impl DaaQueryRecord<String> {
     pub fn from_buffer(file: &DaaFile, buf: &[u8], query_num: usize) -> Result<Self, String> {
+        Self::from_buffer_storage(file, buf, query_num)
+    }
+}
+impl DaaQueryRecord<Vec<u8>> {
+    pub fn from_buffer_bytes(
+        file: &ByteDaaFile,
+        buf: &[u8],
+        query_num: usize,
+    ) -> Result<Self, String> {
+        Self::from_buffer_storage(file, buf, query_num)
+    }
+}
+
+impl<N: DaaName> DaaQueryRecord<N> {
+    /// Matches C++ `DAA_query_record::DAA_query_record(file, buf, query_num)`.
+    pub(crate) fn from_buffer_storage(
+        file: &DaaFile<N>,
+        buf: &[u8],
+        query_num: usize,
+    ) -> Result<Self, String> {
         let mut it = BinaryBufferIterator::new(buf);
         let query_len = it.read::<u32>()? as usize;
-        let query_name = it.read_string()?;
+        let query_name = N::from_daa_bytes(it.read_cstring_bytes()?.to_vec())?;
         let flags = it.read::<u8>()?;
         let mut source_seq = Vec::new();
         let mut context: [Vec<Letter>; 6] = Default::default();
@@ -538,9 +708,9 @@ impl DaaQueryRecord {
     /// Matches C++ `DAA_query_record::begin(file, score_matrix)`.
     pub fn begin<'a>(
         &'a self,
-        file: &'a DaaFile,
+        file: &'a DaaFile<N>,
         score_matrix: &'a ScoreMatrix,
-    ) -> DaaMatchIterator<'a> {
+    ) -> DaaMatchIterator<'a, N> {
         DaaMatchIterator::new(self, file, score_matrix)
     }
 
@@ -572,19 +742,19 @@ impl DaaQueryRecord {
 
 /// Decoded DAA match.
 #[derive(Debug, Clone)]
-pub struct DaaMatch {
+pub struct DaaMatch<N = String> {
     pub hsp: Hsp,
     pub hsp_num: u32,
     pub hit_num: u32,
     pub subject_id: u32,
     pub subject_len: u32,
-    pub subject_name: String,
+    pub subject_name: N,
 }
 
 impl DaaMatch {
     /// Matches C++ `DAA_query_record::Match::context(parent)`.
     pub fn context(&self, parent: &DaaQueryRecord) -> HspContext {
-        HspContext::new(
+        let mut context = HspContext::new(
             self.hsp.clone(),
             parent.query_num as u32,
             // C++ `DAA_query_record::Match::context()` passes a literal 0 as
@@ -601,14 +771,39 @@ impl DaaMatch {
             Vec::new(),
             0.0,
             0.0,
-        )
+        );
+        context.query_source = Some(parent.query_source().to_vec());
+        context
+    }
+}
+
+impl<N: DaaName> DaaMatch<N> {
+    pub fn context_bytes(&self, parent: &DaaQueryRecord<N>) -> ByteHspContext {
+        let mut context = ByteHspContext::new_bytes(
+            self.hsp.clone(),
+            parent.query_num as u32,
+            0,
+            parent.context.to_vec(),
+            parent.query_len() as i32,
+            parent.query_name.daa_bytes(),
+            self.subject_id as u64,
+            self.subject_len as i32,
+            self.subject_name.daa_bytes(),
+            self.hit_num,
+            self.hsp_num,
+            Vec::new(),
+            0.0,
+            0.0,
+        );
+        context.query_source = Some(parent.query_source().to_vec());
+        context
     }
 }
 
 /// Iterator over decoded DAA matches.
-pub struct DaaMatchIterator<'a> {
-    parent: &'a DaaQueryRecord,
-    file: &'a DaaFile,
+pub struct DaaMatchIterator<'a, N = String> {
+    parent: &'a DaaQueryRecord<N>,
+    file: &'a DaaFile<N>,
     score_matrix: &'a ScoreMatrix,
     it: BinaryBufferIterator<'a>,
     subject_id: u32,
@@ -616,10 +811,10 @@ pub struct DaaMatchIterator<'a> {
     hit_num: u32,
 }
 
-impl<'a> DaaMatchIterator<'a> {
+impl<'a, N: DaaName> DaaMatchIterator<'a, N> {
     pub fn new(
-        parent: &'a DaaQueryRecord,
-        file: &'a DaaFile,
+        parent: &'a DaaQueryRecord<N>,
+        file: &'a DaaFile<N>,
         score_matrix: &'a ScoreMatrix,
     ) -> Self {
         Self {
@@ -634,8 +829,8 @@ impl<'a> DaaMatchIterator<'a> {
     }
 }
 
-impl<'a> Iterator for DaaMatchIterator<'a> {
-    type Item = Result<DaaMatch, String>;
+impl<'a, N: DaaName> Iterator for DaaMatchIterator<'a, N> {
+    type Item = Result<DaaMatch<N>, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.it.good() {
@@ -690,7 +885,11 @@ impl<'a> Iterator for DaaMatchIterator<'a> {
         }
 
         let subject_len = self.file.ref_len_at(self.subject_id as usize);
-        let subject_name = self.file.ref_name(self.subject_id as usize).to_string();
+        let subject_name =
+            match N::from_daa_bytes(self.file.ref_name_bytes(self.subject_id as usize).to_vec()) {
+                Ok(name) => name,
+                Err(error) => return Some(Err(error)),
+            };
         if let Err(e) = hsp.parse_with_query(
             &self.parent.context,
             self.parent.query_len() as i32,
@@ -827,16 +1026,16 @@ pub fn output_range(
 }
 
 /// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
-pub fn view_query_daa(
-    r: &DaaQueryRecord,
-    file: &DaaFile,
+pub fn view_query_daa<N: DaaName>(
+    r: &DaaQueryRecord<N>,
+    file: &DaaFile<N>,
     out: &mut Vec<u8>,
     score_matrix: &ScoreMatrix,
     cfg: &DaaViewConfig,
 ) -> Result<(), String> {
-    let seek_pos = write_daa_query_record(
+    let seek_pos = write_daa_query_record_bytes(
         out,
-        &r.query_name,
+        r.query_name.daa_bytes(),
         r.query_source(),
         r.input_sequence_type(),
     );
@@ -865,23 +1064,48 @@ pub fn view_query_daa(
 }
 
 /// Matches C++ `view_query(r, file, out, score_matrix, format, cfg, report_unaligned)`.
-pub fn view_query_tabular(
-    r: &DaaQueryRecord,
-    file: &DaaFile,
+pub fn view_query_tabular<N: DaaName>(
+    r: &DaaQueryRecord<N>,
+    file: &DaaFile<N>,
     out: &mut Vec<u8>,
     score_matrix: &ScoreMatrix,
     format: &TabularFormat,
     cfg: &DaaViewConfig,
     report_unaligned: bool,
 ) -> Result<(), String> {
+    view_query_tabular_with_options(
+        r,
+        file,
+        out,
+        score_matrix,
+        format,
+        cfg,
+        report_unaligned,
+        false,
+    )
+}
+
+/// Source EXTRA's global frame-shift setting selects translated callbacks;
+/// the existing archive/query owners and ordinary typed API remain unchanged.
+pub fn view_query_tabular_with_options<N: DaaName>(
+    r: &DaaQueryRecord<N>,
+    file: &DaaFile<N>,
+    out: &mut Vec<u8>,
+    score_matrix: &ScoreMatrix,
+    format: &TabularFormat,
+    cfg: &DaaViewConfig,
+    report_unaligned: bool,
+    frame_shift: bool,
+) -> Result<(), String> {
     if !format.is_json {
-        write_tabular_query_intro(
+        write_tabular_query_intro_for_type_bytes(
             out,
-            &r.query_name,
+            r.query_name.daa_bytes(),
             r.query_len() as i32,
             r.query_source(),
             &format.fields,
             report_unaligned,
+            file.mode() == 3,
         )
         .map_err(|e| e.to_string())?;
     }
@@ -897,22 +1121,24 @@ pub fn view_query_tabular(
     // C++ reuses one Match/HspContext while advancing the DAA iterator. Keep
     // the query frames and query title owned once per query record rather than
     // cloning them, the target title, and the packed transcript for every row.
-    let mut context = HspContext::new(
+    let mut context = ByteHspContext::new_bytes(
         Hsp::new(),
         r.query_num as u32,
         0,
         r.context.to_vec(),
         r.query_len() as i32,
-        &r.query_name,
+        r.query_name.daa_bytes(),
         0,
         0,
-        "",
+        b"",
         0,
         0,
         Vec::new(),
         0.0,
         0.0,
     );
+
+    context.query_source = Some(r.query_source().to_vec());
 
     for m in first.into_iter().map(Ok).chain(matches) {
         let m = m?;
@@ -932,33 +1158,54 @@ pub fn view_query_tabular(
         context.subject_oid = m.subject_id as u64;
         context.subject_len = m.subject_len as i32;
         context.target_title.clear();
-        context.target_title.push_str(&m.subject_name);
+        context
+            .target_title
+            .extend_from_slice(m.subject_name.daa_bytes());
         context.hit_num = m.hit_num;
         context.hsp_num = m.hsp_num;
         if format.is_json {
-            write_tabular_context_row_json(
+            write_tabular_context_row_json_bytes(
                 out,
                 &context,
                 json_records_written != 0,
                 &format.fields,
                 file.mode() == 3,
-                false,
+                frame_shift,
                 cfg.qnum_offset,
                 cfg.snum_offset,
                 &[],
                 None,
-                "",
+                b"",
                 None,
             )
             .map_err(|e| e.to_string())?;
             json_records_written += 1;
-        } else {
-            write_tabular_context_row(
+        } else if format
+            .fields
+            .contains(&crate::output::format::FieldId::FullQSeqMate)
+        {
+            // Source view's Info contains no mate and its Config rejects two
+            // query files. The actual FullQSeqMate callback prints '*', rather
+            // than the HSP-only renderer's unavailable-field marker.
+            crate::output::format::write_tabular_context_row_with_query_info_bytes(
                 out,
                 &context,
                 &format.fields,
                 file.mode() == 3,
-                false,
+                frame_shift,
+                cfg.qnum_offset,
+                cfg.snum_offset,
+                b"",
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            write_tabular_context_row_bytes(
+                out,
+                &context,
+                &format.fields,
+                file.mode() == 3,
+                frame_shift,
                 cfg.qnum_offset,
                 cfg.snum_offset,
             )
@@ -969,82 +1216,14 @@ pub fn view_query_tabular(
 }
 
 /// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
-pub fn view_query_paf(
-    r: &DaaQueryRecord,
-    file: &DaaFile,
+pub fn view_query_paf<N: DaaName>(
+    r: &DaaQueryRecord<N>,
+    file: &DaaFile<N>,
     out: &mut Vec<u8>,
     score_matrix: &ScoreMatrix,
     cfg: &DaaViewConfig,
 ) -> Result<(), String> {
-    paf::print_query_intro(out, &r.query_name, false).map_err(|e| e.to_string())?;
-    let mut matches = r.begin(file, score_matrix);
-    let first = matches.next().transpose()?;
-    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
-
-    for m in first.into_iter().map(Ok).chain(matches) {
-        let m = m?;
-        if m.hsp.frame > 2 && cfg.forward_only {
-            continue;
-        }
-        if !output_range(
-            m.hit_num,
-            m.hsp.score,
-            top_score,
-            cfg.max_target_seqs,
-            cfg.toppercent,
-        ) {
-            break;
-        }
-        let context = m.context(r);
-        paf::print_match_context(out, &context, score_matrix).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// Matches C++ `view_query(r, file, out, score_matrix, cfg, sam_qlen_field)`.
-pub fn view_query_sam(
-    r: &DaaQueryRecord,
-    file: &DaaFile,
-    out: &mut Vec<u8>,
-    score_matrix: &ScoreMatrix,
-    cfg: &DaaViewConfig,
-    sam_qlen_field: bool,
-) -> Result<(), String> {
-    sam::print_query_intro(out, &r.query_name, false).map_err(|e| e.to_string())?;
-    let mut matches = r.begin(file, score_matrix);
-    let first = matches.next().transpose()?;
-    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
-
-    for m in first.into_iter().map(Ok).chain(matches) {
-        let m = m?;
-        if m.hsp.frame > 2 && cfg.forward_only {
-            continue;
-        }
-        if !output_range(
-            m.hit_num,
-            m.hsp.score,
-            top_score,
-            cfg.max_target_seqs,
-            cfg.toppercent,
-        ) {
-            break;
-        }
-        let context = m.context(r);
-        sam::print_match_context(out, &context, score_matrix, true, true, sam_qlen_field)
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
-pub fn view_query_pairwise(
-    r: &DaaQueryRecord,
-    file: &DaaFile,
-    out: &mut Vec<u8>,
-    score_matrix: &ScoreMatrix,
-    cfg: &DaaViewConfig,
-) -> Result<(), String> {
-    pairwise::print_query_intro(out, &r.query_name, r.query_len() as i32, false)
+    paf::print_query_intro_bytes(out, r.query_name.daa_bytes(), false)
         .map_err(|e| e.to_string())?;
     let mut matches = r.begin(file, score_matrix);
     let first = matches.next().transpose()?;
@@ -1064,8 +1243,78 @@ pub fn view_query_pairwise(
         ) {
             break;
         }
-        let context = m.context(r);
-        pairwise::print_match_context(out, &context, score_matrix, file.mode() == 3, false)
+        let context = m.context_bytes(r);
+        paf::print_match_context_bytes(out, &context, score_matrix).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Matches C++ `view_query(r, file, out, score_matrix, cfg, sam_qlen_field)`.
+pub fn view_query_sam<N: DaaName>(
+    r: &DaaQueryRecord<N>,
+    file: &DaaFile<N>,
+    out: &mut Vec<u8>,
+    score_matrix: &ScoreMatrix,
+    cfg: &DaaViewConfig,
+    sam_qlen_field: bool,
+) -> Result<(), String> {
+    sam::print_query_intro_bytes(out, r.query_name.daa_bytes(), false)
+        .map_err(|e| e.to_string())?;
+    let mut matches = r.begin(file, score_matrix);
+    let first = matches.next().transpose()?;
+    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
+
+    for m in first.into_iter().map(Ok).chain(matches) {
+        let m = m?;
+        if m.hsp.frame > 2 && cfg.forward_only {
+            continue;
+        }
+        if !output_range(
+            m.hit_num,
+            m.hsp.score,
+            top_score,
+            cfg.max_target_seqs,
+            cfg.toppercent,
+        ) {
+            break;
+        }
+        let context = m.context_bytes(r);
+        sam::print_match_context_bytes(out, &context, score_matrix, true, true, sam_qlen_field)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
+pub fn view_query_pairwise<N: DaaName>(
+    r: &DaaQueryRecord<N>,
+    file: &DaaFile<N>,
+    out: &mut Vec<u8>,
+    score_matrix: &ScoreMatrix,
+    cfg: &DaaViewConfig,
+) -> Result<(), String> {
+    pairwise::print_query_intro_bytes(out, r.query_name.daa_bytes(), r.query_len() as i32, false)
+        .map_err(|e| e.to_string())?;
+    let mut matches = r.begin(file, score_matrix);
+    let first = matches.next().transpose()?;
+    let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
+
+    for m in first.into_iter().map(Ok).chain(matches) {
+        let m = m?;
+        if m.hsp.frame > 2 && cfg.forward_only {
+            continue;
+        }
+        if !output_range(
+            m.hit_num,
+            m.hsp.score,
+            top_score,
+            cfg.max_target_seqs,
+            cfg.toppercent,
+        ) {
+            break;
+        }
+        let context = m.context_bytes(r);
+        pairwise::print_match_context_bytes(out, &context, score_matrix, file.mode() == 3, false)
             .map_err(|e| e.to_string())?;
     }
     pairwise::print_query_epilog(out).map_err(|e| e.to_string())?;
@@ -1073,15 +1322,33 @@ pub fn view_query_pairwise(
 }
 
 /// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
-pub fn view_query_xml(
-    r: &DaaQueryRecord,
-    file: &DaaFile,
+pub fn view_query_xml<N: DaaName>(
+    r: &DaaQueryRecord<N>,
+    file: &DaaFile<N>,
     out: &mut Vec<u8>,
     score_matrix: &ScoreMatrix,
     cfg: &DaaViewConfig,
 ) -> Result<(), String> {
-    xml::print_query_intro(out, r.query_num as u64, &r.query_name, r.query_len() as i32)
-        .map_err(|e| e.to_string())?;
+    view_query_xml_with_options(r, file, out, score_matrix, cfg, false, false)
+}
+
+/// Source XML view flags are global configuration values under EXTRA.
+pub fn view_query_xml_with_options<N: DaaName>(
+    r: &DaaQueryRecord<N>,
+    file: &DaaFile<N>,
+    out: &mut Vec<u8>,
+    score_matrix: &ScoreMatrix,
+    cfg: &DaaViewConfig,
+    xml_blord_format: bool,
+    no_parse_seqids: bool,
+) -> Result<(), String> {
+    xml::print_query_intro_bytes(
+        out,
+        r.query_num as u64,
+        r.query_name.daa_bytes(),
+        r.query_len() as i32,
+    )
+    .map_err(|e| e.to_string())?;
     let mut matches = r.begin(file, score_matrix);
     let first = matches.next().transpose()?;
     let top_score = first.as_ref().map(|m| m.hsp.score).unwrap_or(0);
@@ -1100,9 +1367,16 @@ pub fn view_query_xml(
         ) {
             break;
         }
-        let context = m.context(r);
-        xml::print_match_context(out, &context, score_matrix, file.mode() == 3, false, false)
-            .map_err(|e| e.to_string())?;
+        let context = m.context_bytes(r);
+        xml::print_match_context_bytes(
+            out,
+            &context,
+            score_matrix,
+            file.mode() == 3,
+            xml_blord_format,
+            no_parse_seqids,
+        )
+        .map_err(|e| e.to_string())?;
     }
     xml::print_query_epilog(
         out,
@@ -1117,9 +1391,9 @@ pub fn view_query_xml(
 }
 
 /// Matches C++ `view_query(r, file, score_matrix, cfg)`.
-pub fn view_query_null(
-    r: &DaaQueryRecord,
-    file: &DaaFile,
+pub fn view_query_null<N: DaaName>(
+    r: &DaaQueryRecord<N>,
+    file: &DaaFile<N>,
     score_matrix: &ScoreMatrix,
     cfg: &DaaViewConfig,
 ) -> Result<(), String> {
@@ -1149,9 +1423,9 @@ pub fn view_query_null(
 }
 
 /// Matches C++ `view_query(r, file, out, score_matrix, cfg)`.
-pub fn view_query_edge(
-    r: &DaaQueryRecord,
-    file: &DaaFile,
+pub fn view_query_edge<N: DaaName>(
+    r: &DaaQueryRecord<N>,
+    file: &DaaFile<N>,
     out: &mut Vec<u8>,
     score_matrix: &ScoreMatrix,
     cfg: &DaaViewConfig,
@@ -1174,7 +1448,7 @@ pub fn view_query_edge(
         ) {
             break;
         }
-        let context = m.context(r);
+        let context = m.context_bytes(r);
         edge::print_match(out, &context).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -1215,11 +1489,23 @@ pub fn write_daa_query_record(
     query: &[Letter],
     input_sequence_type: SequenceType,
 ) -> usize {
+    write_daa_query_record_bytes(buf, query_name.as_bytes(), query, input_sequence_type)
+}
+
+pub fn write_daa_query_record_bytes(
+    buf: &mut Vec<u8>,
+    query_name: &[u8],
+    query: &[Letter],
+    input_sequence_type: SequenceType,
+) -> usize {
     let seek_pos = buf.len();
     buf.extend_from_slice(&0u32.to_ne_bytes());
     buf.extend_from_slice(&(query.len() as u32).to_ne_bytes());
-    let name_len = find_first_of(query_name, DAA_ID_DELIMITERS);
-    buf.extend_from_slice(&query_name.as_bytes()[..name_len]);
+    let name_len = query_name
+        .iter()
+        .position(|byte| *byte == 0 || DAA_ID_DELIMITERS.as_bytes().contains(byte))
+        .unwrap_or(query_name.len());
+    buf.extend_from_slice(&query_name[..name_len]);
     buf.push(0);
     let s = PackedSequence::new(query, input_sequence_type);
     buf.push(if s.has_n() { 1 } else { 0 });
@@ -1290,7 +1576,10 @@ pub fn write_header2<W: Write + Seek>(writer: &mut W, h2: &DaaHeader2) -> io::Re
 }
 
 /// Matches C++ `finish_daa(writer, daa_in)`.
-pub fn finish_daa_from_file<W: Write + Seek>(writer: &mut W, daa_in: &DaaFile) -> io::Result<()> {
+pub fn finish_daa_from_file<W: Write + Seek, N: DaaName>(
+    writer: &mut W,
+    daa_in: &DaaFile<N>,
+) -> io::Result<()> {
     let mut h2 = DaaHeader2::from_daa_file(daa_in);
     terminate_aln_block(writer, &mut h2)?;
 
@@ -1298,7 +1587,7 @@ pub fn finish_daa_from_file<W: Write + Seek>(writer: &mut W, daa_in: &DaaFile) -
     h2.query_records = daa_in.query_records();
 
     for name in &daa_in.ref_name {
-        writer.write_all(name.as_bytes())?;
+        writer.write_all(name.daa_bytes())?;
         writer.write_all(&[0])?;
     }
     h2.block_size[1] = daa_in.block_size(1);
@@ -1319,6 +1608,25 @@ pub fn finish_daa_from_refs<W: Write + Seek>(
     seq_lens: &[u32],
     query_count: i64,
 ) -> io::Result<()> {
+    finish_daa_from_refs_impl(writer, daa_in, seq_ids, seq_lens, query_count)
+}
+pub fn finish_daa_from_refs_bytes<W: Write + Seek>(
+    writer: &mut W,
+    daa_in: &ByteDaaFile,
+    seq_ids: &[Vec<u8>],
+    seq_lens: &[u32],
+    query_count: i64,
+) -> io::Result<()> {
+    finish_daa_from_refs_impl(writer, daa_in, seq_ids, seq_lens, query_count)
+}
+
+fn finish_daa_from_refs_impl<W: Write + Seek, N: DaaName, I: DaaName>(
+    writer: &mut W,
+    daa_in: &DaaFile<N>,
+    seq_ids: &[I],
+    seq_lens: &[u32],
+    query_count: i64,
+) -> io::Result<()> {
     let mut h2 = DaaHeader2::from_daa_file(daa_in);
     terminate_aln_block(writer, &mut h2)?;
     h2.db_seqs_used = seq_ids.len() as u64;
@@ -1326,9 +1634,9 @@ pub fn finish_daa_from_refs<W: Write + Seek>(
 
     let mut s = 0u64;
     for id in seq_ids {
-        writer.write_all(id.as_bytes())?;
+        writer.write_all(id.daa_bytes())?;
         writer.write_all(&[0])?;
-        s += id.len() as u64 + 1;
+        s += id.daa_bytes().len() as u64 + 1;
     }
     h2.block_size[1] = s;
 
@@ -1454,7 +1762,7 @@ mod tests {
         h2.mode = mode;
         (
             DaaFile {
-                reader: BufReader::new(File::open(&path).unwrap()),
+                reader: crate::output::daa::buffered_io::DaaInput::open(&path, 67_108_864).unwrap(),
                 query_count: 0,
                 h1: DaaHeader1::new(),
                 h2,
@@ -1518,6 +1826,55 @@ mod tests {
         finish_daa_from_refs(&mut f, &daa, &seq_ids, &seq_lens, 1).unwrap();
 
         std::fs::remove_file(daa_path).unwrap();
+    }
+
+    #[test]
+    fn raw_archive_names_survive_view_and_merge_without_unicode_replacement() {
+        let id = DAA_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("diamond-raw-daa-{}-{id}.daa", std::process::id()));
+        let merged = path.with_extension("merged.daa");
+        write_synthetic_daa(&path, &[("ref0", 100)], "query0", &[0, 1, 2], 0, 42);
+        let original = DaaFile::open(&path).unwrap();
+        let reference_offset =
+            DAA_HEADER1_SIZE + DAA_HEADER2_SIZE + original.block_size(0) as usize;
+        drop(original);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[DAA_HEADER1_SIZE + DAA_HEADER2_SIZE + 8] = 0xff;
+        bytes[reference_offset] = 0xfe;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            DaaFile::open(&path).is_err(),
+            "String compatibility constructor must check UTF-8"
+        );
+        let mut daa = ByteDaaFile::open_bytes(&path).unwrap();
+        assert_eq!(daa.ref_name_bytes(0), b"\xfeef0");
+        let record = daa.read_query_record_bytes().unwrap().unwrap();
+        assert_eq!(record.query_name, b"\xffuery0");
+        let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, daa.db_letters()).unwrap();
+        let format =
+            TabularFormat::new(&["6", "qseqid", "sseqid"], false, 0, false, "blosum62").unwrap();
+        let mut output = Vec::new();
+        view_query_tabular(
+            &record,
+            &daa,
+            &mut output,
+            &matrix,
+            &format,
+            &DaaViewConfig::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(output, b"\xffuery0\t\xfeef0\n");
+        merge_daa_files(&[&path], &merged).unwrap();
+        let mut daa = ByteDaaFile::open_bytes(&merged).unwrap();
+        assert_eq!(daa.ref_name_bytes(0), b"\xfeef0");
+        assert_eq!(
+            daa.read_query_record_bytes().unwrap().unwrap().query_name,
+            b"\xffuery0"
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(merged).unwrap();
     }
 
     #[test]

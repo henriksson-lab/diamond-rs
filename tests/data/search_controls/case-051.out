@@ -1,0 +1,7 @@
+mixed_query	mixed	402
+mixed_query	complex	174
+complex_query	complex	174
+complex_query	mixed	174
+mutation_query	mutation0	404
+mutation_query	mutation9	345
+motif_query	motif	303

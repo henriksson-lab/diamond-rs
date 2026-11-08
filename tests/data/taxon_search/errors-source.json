@@ -1,0 +1,212 @@
+[
+  {
+    "database": "none",
+    "lineage": false,
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-taxon-20261107/none.dmnd",
+      "-f",
+      "102"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Options require taxonomy information included in the database. Please use the respective options to build this information into the database when running diamond makedb: taxonomy mapping information (--taxonmap option), taxonomy nodes information (--taxonnodes option)\n"
+  },
+  {
+    "database": "none",
+    "lineage": true,
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-taxon-20261107/none.dmnd",
+      "-f",
+      "102",
+      "--include-lineage"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Options require taxonomy information included in the database. Please use the respective options to build this information into the database when running diamond makedb: taxonomy mapping information (--taxonmap option), taxonomy nodes information (--taxonnodes option), taxonomy names information (--taxonnames option)\n"
+  },
+  {
+    "database": "map",
+    "lineage": false,
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-taxon-20261107/map.dmnd",
+      "-f",
+      "102"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Options require taxonomy information included in the database. Please use the respective options to build this information into the database when running diamond makedb: taxonomy nodes information (--taxonnodes option)\n"
+  },
+  {
+    "database": "map",
+    "lineage": true,
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-taxon-20261107/map.dmnd",
+      "-f",
+      "102",
+      "--include-lineage"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Options require taxonomy information included in the database. Please use the respective options to build this information into the database when running diamond makedb: taxonomy nodes information (--taxonnodes option), taxonomy names information (--taxonnames option)\n"
+  },
+  {
+    "database": "no_names",
+    "lineage": false,
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-taxon-20261107/no_names.dmnd",
+      "-f",
+      "102"
+    ],
+    "status": 0,
+    "stdout": "domain_query\t4\t2.88e-59\n",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\n"
+  },
+  {
+    "database": "no_names",
+    "lineage": true,
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-taxon-20261107/no_names.dmnd",
+      "-f",
+      "102",
+      "--include-lineage"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Options require taxonomy information included in the database. Please use the respective options to build this information into the database when running diamond makedb: taxonomy names information (--taxonnames option)\n"
+  },
+  {
+    "flags": [
+      "--include-lineage",
+      "1"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-taxon-20261107/full.dmnd",
+      "-f",
+      "102",
+      "--include-lineage",
+      "1"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid parameter count for option '--include-lineage'\n",
+    "stdout": ""
+  },
+  {
+    "flags": [
+      "--include-lineage=1"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-taxon-20261107/full.dmnd",
+      "-f",
+      "102",
+      "--include-lineage=1"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid option: include-lineage=1\n",
+    "stdout": ""
+  },
+  {
+    "flags": [
+      "--top",
+      "101"
+    ],
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-taxon-20261107/full.dmnd",
+      "-f",
+      "102",
+      "--top",
+      "101"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Allowed value range for --top is between 0.0 and 100.0\n"
+  },
+  {
+    "flags": [
+      "--top",
+      "-1"
+    ],
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-taxon-20261107/full.dmnd",
+      "-f",
+      "102",
+      "--top",
+      "-1"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Allowed value range for --top is between 0.0 and 100.0\n"
+  },
+  {
+    "flags": [
+      "--top",
+      "10",
+      "-k1"
+    ],
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-taxon-20261107/full.dmnd",
+      "-f",
+      "102",
+      "--top",
+      "10",
+      "-k1"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: --top and -k/--max-target-seqs are mutually exclusive.\n"
+  }
+]

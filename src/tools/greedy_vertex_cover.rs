@@ -134,12 +134,21 @@ pub fn greedy_vertex_cover(
     edges_text: &str,
     config: &GreedyVertexCoverConfig,
 ) -> Result<GreedyVertexCoverOutput, String> {
+    greedy_vertex_cover_with_capacity(mapping_text, edges_text, config, None)
+}
+
+fn greedy_vertex_cover_with_capacity(
+    mapping_text: &str,
+    edges_text: &str,
+    config: &GreedyVertexCoverConfig,
+    mapping_capacity: Option<usize>,
+) -> Result<GreedyVertexCoverOutput, String> {
     let triplets = config.edge_format == "triplet";
     if !triplets && config.symmetric {
         return Err("--symmetric requires triplet edge format".to_owned());
     }
 
-    let mut accession_to_oid = HashMap::<String, u64>::new();
+    let mut accession_to_oid = HashMap::<String, u64>::with_capacity(mapping_capacity.unwrap_or(0));
     for line in source_lines(mapping_text) {
         let accession = line.split('\t').next().unwrap_or_default();
         let next_oid = accession_to_oid.len() as u64;
@@ -266,6 +275,92 @@ pub fn greedy_vertex_cover_from_files(
     if let Some(path) = &config.output_file {
         fs::write(path, output.assignments_text())
             .map_err(|error| format!("Failed to write output file {}: {error}", path.display()))?;
+    }
+    Ok(output)
+}
+
+/// Source command I/O, retaining the actual failed OS operation through the
+/// typed error boundary and decoding the same gzip/zlib build profile.
+/// The public String-returning in-memory/plain-file APIs remain independent.
+pub fn greedy_vertex_cover_from_source_files(
+    config: &GreedyVertexCoverConfig,
+    buffer_size: usize,
+) -> std::io::Result<GreedyVertexCoverOutput> {
+    use crate::util::io::InputFile;
+    use std::io::{self, Read, Write};
+    let path_text = |path: &std::path::Path| {
+        path.to_str()
+            .ok_or_else(|| io::Error::other("GVC input path is not valid UTF-8"))
+            .map(str::to_owned)
+    };
+    let open = |path: &std::path::Path| -> io::Result<InputFile> {
+        InputFile::with_source_profile(&path_text(path)?, 0, buffer_size).map_err(io::Error::other)
+    };
+    // Source rejects this combination before count_lines or TextInputFile.
+    if config.edge_format != "triplet" && config.symmetric {
+        return Err(io::Error::other("--symmetric requires triplet edge format"));
+    }
+    // Source reserves the accession table from a complete decoded line-count
+    // pass, then opens the mapping parser. Keep both real input lifetimes.
+    let mut counter = open(&config.database)?;
+    let mut mapping_capacity = 0usize;
+    loop {
+        let mut line = Vec::new();
+        let delimiter = counter
+            .read_to(&mut line, b'\n')
+            .map_err(io::Error::other)?;
+        if !line.is_empty() || delimiter {
+            mapping_capacity = mapping_capacity
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("GVC mapping count exceeds address space"))?;
+        }
+        if !delimiter {
+            break;
+        }
+    }
+    counter.close().map_err(io::Error::other)?;
+    let mut mapping = open(&config.database)?;
+    let mut mapping_text = String::new();
+    mapping.read_to_string(&mut mapping_text)?;
+    mapping.close().map_err(io::Error::other)?;
+    let mut edges = open(&config.edges)?;
+    let mut edges_text = String::new();
+    edges.read_to_string(&mut edges_text)?;
+    edges.close().map_err(io::Error::other)?;
+    let output = greedy_vertex_cover_with_capacity(
+        &mapping_text,
+        &edges_text,
+        config,
+        Some(mapping_capacity),
+    )
+    .map_err(io::Error::other)?;
+    // Source uses exception-disabled std::ofstream here, unlike FileSink.
+    // Failed construction/writes set stream state and remain silent. Both
+    // streams are opened before output, including for empty assignments.
+    let mut centroids = config
+        .centroid_out
+        .as_ref()
+        .and_then(|path| fs::File::create(path).ok());
+    let mut assignments = config
+        .output_file
+        .as_ref()
+        .and_then(|path| fs::File::create(path).ok());
+    let (mut centroid_failed, mut assignments_failed) = (false, false);
+    for (centroid, member) in &output.assignments {
+        if centroid == member && !centroid_failed {
+            if let Some(file) = centroids.as_mut() {
+                centroid_failed = writeln!(file, "{member}")
+                    .and_then(|()| file.flush())
+                    .is_err();
+            }
+        }
+        if !assignments_failed {
+            if let Some(file) = assignments.as_mut() {
+                assignments_failed = writeln!(file, "{centroid}\t{member}")
+                    .and_then(|()| file.flush())
+                    .is_err();
+            }
+        }
     }
     Ok(output)
 }

@@ -1,0 +1,27 @@
+{
+  "source_commit": "1d162b4fefb5e6b4d868c24e6ad551cad2dcf246",
+  "source_version": "DIAMOND 2.1.24 build 178",
+  "cpp_binary_sha256": "d8d08608b96706db62e44036fc979f9a658e72f59fc19d8727546daa616c42d8",
+  "inputs": {
+    "tests/data/multi_hsp/reference.faa": "0ffbcb8c7a9055f15aa950d87e1a964b91259d422b5028485377bf6f7a5f2ed7",
+    "tests/data/multi_hsp/query.faa": "96ae78e030483789f2c57c02a005eadcd5d82faa20b701fb4485fb2660f42193",
+    "tests/data/multi_hsp/query.fna": "b2fc379922206979a3c21c496220cf65a790847a2de4b5c90c563b5ed063c239"
+  },
+  "fields": [
+    "6",
+    "qseqid",
+    "sseqid",
+    "score",
+    "bitscore",
+    "evalue",
+    "qstart",
+    "qend",
+    "sstart",
+    "send",
+    "positive"
+  ],
+  "max_evalue": "1e-200",
+  "source_cases": 48,
+  "daa_cases": 4,
+  "note": "Outputs captured from the immutable pinned C++ executable. All native tests are self-contained and read only packaged fixture files."
+}

@@ -6,7 +6,7 @@ use crate::data::taxon_list::TaxonList;
 use crate::data::taxonomy_nodes::TaxonomyNodes;
 use crate::util::io::{Deserializer, VecStream};
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Magic number identifying a DIAMOND database file.
@@ -95,26 +95,18 @@ impl ReferenceHeader {
         if self.magic_number != MAGIC_NUMBER {
             return Err("Database file is not a DIAMOND database.".into());
         }
-        if self.db_version < MIN_DB_VERSION {
-            return Err(format!(
-                "Database version {} is not supported (minimum: {})",
-                self.db_version, MIN_DB_VERSION
-            ));
+        // Source DatabaseFile::init tests the old build/version condition
+        // first, including when a header also advertises a newer version.
+        if self.build < MIN_BUILD_VERSION || self.db_version < MIN_DB_VERSION {
+            return Err(
+                "Database was built with an older version of Diamond and is incompatible.".into(),
+            );
         }
         let max_db_version = CURRENT_DB_VERSION_PROT.max(CURRENT_DB_VERSION_NUCL);
         if self.db_version > max_db_version {
-            return Err(format!(
-                "Database version {} is newer than this build supports (max: {}). \
-                 Please use a newer DIAMOND version.",
-                self.db_version, max_db_version
-            ));
-        }
-        if self.build < MIN_BUILD_VERSION {
-            return Err(format!(
-                "Database was built with build version {} which is too old (minimum: {}). \
-                 Please rebuild the database.",
-                self.build, MIN_BUILD_VERSION
-            ));
+            return Err(
+                "Database was built with a newer version of Diamond and is incompatible.".into(),
+            );
         }
         if self.sequences == 0 {
             return Err(
@@ -133,10 +125,26 @@ pub struct ReferenceHeader2 {
     pub taxon_array_size: u64,
     pub taxon_nodes_offset: u64,
     pub taxon_names_offset: u64,
+    /// Source EXTRA's int32 SequenceType tail; absent baseline records use 0.
+    pub db_type: i32,
+}
+
+// Source prefixes sizeof(ReferenceHeader2), including C ABI tail alignment,
+// while serializing only the actual fields (no padding bytes).
+#[repr(C)]
+struct Header2ExtraLayout {
+    hash: [u8; 16],
+    offsets: [u64; 4],
+    db_type: i32,
 }
 
 impl ReferenceHeader2 {
-    pub const PAYLOAD_SIZE: usize = 48;
+    pub const PAYLOAD_SIZE: usize = if cfg!(feature = "extra") { 52 } else { 48 };
+    pub const RECORD_SIZE: usize = if cfg!(feature = "extra") {
+        std::mem::size_of::<Header2ExtraLayout>()
+    } else {
+        48
+    };
     pub fn new() -> Self {
         Self::default()
     }
@@ -146,45 +154,82 @@ impl ReferenceHeader2 {
         reader.read_exact(&mut hash)?;
         let mut buf = [0u8; 32];
         reader.read_exact(&mut buf)?;
-        Ok(ReferenceHeader2 {
+        let mut db_type = 0;
+        if cfg!(feature = "extra") {
+            let mut tail = [0; 4];
+            reader.read_exact(&mut tail)?;
+            db_type = i32::from_le_bytes(tail);
+        }
+        Ok(Self {
             hash,
             taxon_array_offset: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
             taxon_array_size: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
             taxon_nodes_offset: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
             taxon_names_offset: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+            db_type,
         })
     }
-
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&self.hash)?;
         writer.write_all(&self.taxon_array_offset.to_le_bytes())?;
         writer.write_all(&self.taxon_array_size.to_le_bytes())?;
         writer.write_all(&self.taxon_nodes_offset.to_le_bytes())?;
         writer.write_all(&self.taxon_names_offset.to_le_bytes())?;
+        if cfg!(feature = "extra") {
+            writer.write_all(&self.db_type.to_le_bytes())?;
+        }
         Ok(())
     }
-
-    /// Write the dynamic-record size prefix followed by the payload, matching
-    /// C++ `operator<<(Serializer&, const ReferenceHeader2&)`.
     pub fn write_record_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&(Self::PAYLOAD_SIZE as u64).to_le_bytes())?;
+        writer.write_all(&(Self::RECORD_SIZE as u64).to_le_bytes())?;
         self.write_to(writer)
     }
-
-    /// Read a size-delimited Header2 record and skip any future extension.
-    pub fn read_record_from<R: Read + Seek>(reader: &mut R) -> io::Result<Self> {
-        let mut size = [0; 8];
-        reader.read_exact(&mut size)?;
-        let size = u64::from_le_bytes(size);
-        if size < Self::PAYLOAD_SIZE as u64 {
+    /// Source DynamicRecordReader fills a field with zero when it does not
+    /// fit, without consuming that field's bytes; Finish consumes the remainder.
+    pub fn read_record_from<R: Read>(reader: &mut R) -> io::Result<Self> {
+        fn field<R: Read, const N: usize>(reader: &mut R, left: &mut u64) -> io::Result<[u8; N]> {
+            let mut bytes = [0; N];
+            if *left >= N as u64 {
+                reader.read_exact(&mut bytes)?;
+                *left -= N as u64;
+            }
+            Ok(bytes)
+        }
+        let mut bytes = [0; 8];
+        reader.read_exact(&mut bytes)?;
+        let mut left = u64::from_le_bytes(bytes);
+        let hash = field(reader, &mut left)?;
+        let taxon_array_offset = u64::from_le_bytes(field(reader, &mut left)?);
+        let taxon_array_size = u64::from_le_bytes(field(reader, &mut left)?);
+        let taxon_nodes_offset = u64::from_le_bytes(field(reader, &mut left)?);
+        let taxon_names_offset = u64::from_le_bytes(field(reader, &mut left)?);
+        let db_type = if cfg!(feature = "extra") {
+            i32::from_le_bytes(field(reader, &mut left)?)
+        } else {
+            0
+        };
+        let skipped = io::copy(&mut (&mut *reader).take(left), &mut io::sink())?;
+        if skipped != left {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ReferenceHeader2 record is too short",
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected end of file.",
             ));
         }
-        let header = Self::read_from(reader)?;
-        reader.seek(SeekFrom::Current(size as i64 - Self::PAYLOAD_SIZE as i64))?;
-        Ok(header)
+        Ok(Self {
+            hash,
+            taxon_array_offset,
+            taxon_array_size,
+            taxon_nodes_offset,
+            taxon_names_offset,
+            db_type,
+        })
+    }
+    pub fn sequence_type(&self) -> Result<crate::basic::value::SequenceType, String> {
+        match self.db_type {
+            0 => Ok(crate::basic::value::SequenceType::AminoAcid),
+            1 => Ok(crate::basic::value::SequenceType::Nucleotide),
+            value => Err(format!("Invalid database sequence type: {value}")),
+        }
     }
 }
 
@@ -296,13 +341,223 @@ pub struct DatabaseOpenOptions {
     pub load_taxon_nodes: bool,
     pub load_taxon_scientific_names: bool,
     pub load_lengths: bool,
+    /// Explicit source input-buffer capacity; None retains the library default.
+    pub file_buffer_size: Option<usize>,
+}
+
+#[derive(Debug)]
+enum DatabaseInput {
+    Raw(File),
+    Source {
+        input: crate::util::io::InputFile,
+        consumed: u64,
+    },
+}
+impl Read for DatabaseInput {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Raw(file) => file.read(bytes),
+            Self::Source { input, consumed } => {
+                let count = input.read(bytes)?;
+                *consumed += count as u64;
+                Ok(count)
+            }
+        }
+    }
+}
+impl Seek for DatabaseInput {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::Raw(file) => file.seek(from),
+            Self::Source { input, consumed } => {
+                // This position is private Rust buffering bookkeeping, never
+                // Source InputFile::tell (which is invalid on decoded streams).
+                if from == SeekFrom::Current(0) {
+                    return Ok(*consumed);
+                }
+                let position = match from {
+                    SeekFrom::Start(position) => position,
+                    SeekFrom::Current(offset) => consumed
+                        .checked_add_signed(offset)
+                        .ok_or_else(|| io::Error::other("Invalid input seek."))?,
+                    SeekFrom::End(offset) => (input.file_size().map_err(io::Error::other)? as u64)
+                        .checked_add_signed(offset)
+                        .ok_or_else(|| io::Error::other("Invalid input seek."))?,
+                };
+                input.seek(position as i64).map_err(io::Error::other)?;
+                *consumed = position;
+                Ok(position)
+            }
+        }
+    }
+}
+impl DatabaseInput {
+    fn source_profile(&self) -> bool {
+        matches!(self, Self::Source { .. })
+    }
+    fn seekable(&self) -> bool {
+        match self {
+            Self::Raw(_) => true,
+            Self::Source { input, .. } => input.seekable(),
+        }
+    }
+    fn file_len(&mut self) -> io::Result<u64> {
+        match self {
+            Self::Raw(file) => Ok(file.metadata()?.len()),
+            Self::Source { input, .. } => Ok(input.file_size().map_err(io::Error::other)? as u64),
+        }
+    }
+}
+trait SourceSeekPolicy {
+    fn requires_absolute_seek(&self) -> bool;
+}
+impl SourceSeekPolicy for File {
+    fn requires_absolute_seek(&self) -> bool {
+        false
+    }
+}
+impl SourceSeekPolicy for DatabaseInput {
+    fn requires_absolute_seek(&self) -> bool {
+        !self.seekable()
+    }
+}
+fn seek_buffered<R: Read + Seek + SourceSeekPolicy>(
+    reader: &mut BufReader<R>,
+    position: u64,
+) -> io::Result<()> {
+    if reader.get_ref().requires_absolute_seek() {
+        // Never let BufReader satisfy a Source seek from prefetched decoded
+        // bytes: the actual codec owner must reject every unsupported seek.
+        return reader.seek(SeekFrom::Start(position)).map(|_| ());
+    }
+    let current = reader.stream_position()?;
+    if let Ok(offset) = i64::try_from(position as i128 - current as i128) {
+        reader.seek_relative(offset)
+    } else {
+        reader.seek(SeekFrom::Start(position)).map(|_| ())
+    }
+}
+
+/// Concrete Source command owner over InputFile's decoded stream. Sequential
+/// commands preserve the constructor cursor; indexed loads perform actual
+/// InputFile seeks, which compressed streams reject rather than emulate.
+#[derive(Debug)]
+pub(crate) struct SourceDatabaseFile {
+    input: crate::util::io::InputFile,
+    pub ref_header: ReferenceHeader,
+}
+
+impl SourceDatabaseFile {
+    pub(crate) fn open(path: &Path, options: DatabaseOpenOptions) -> io::Result<Self> {
+        let mut input = crate::util::io::InputFile::with_source_profile_path(
+            path,
+            crate::util::io::InputFile::BUFFERED,
+            options.file_buffer_size.unwrap_or(67_108_864),
+        )
+        .map_err(io::Error::other)?;
+        let ref_header =
+            ReferenceHeader::read_from(&mut input).map_err(source_stream_read_error)?;
+        if ref_header.magic_number != MAGIC_NUMBER {
+            return Err(io::Error::other("Database file is not a DIAMOND database."));
+        }
+        // Source init returns immediately for NO_COMPATIBILITY_CHECK.
+        if !options.no_compatibility_check {
+            ref_header.validate().map_err(io::Error::other)?;
+            ReferenceHeader2::read_record_from(&mut input).map_err(source_stream_read_error)?;
+        }
+        Ok(Self { input, ref_header })
+    }
+
+    pub(crate) fn read_seq(&mut self) -> io::Result<(Vec<Letter>, String)> {
+        let (sequence, title) = self.read_seq_bytes()?;
+        Ok((
+            sequence,
+            String::from_utf8(title).map_err(io::Error::other)?,
+        ))
+    }
+    pub(crate) fn read_seq_bytes(&mut self) -> io::Result<(Vec<Letter>, Vec<u8>)> {
+        let mut marker = [0];
+        let _ = self.input.read(&mut marker)?;
+        let mut sequence = Vec::new();
+        self.input
+            .read_to(&mut sequence, 0xff)
+            .map_err(io::Error::other)?;
+        let mut title = Vec::new();
+        self.input
+            .read_to(&mut title, 0)
+            .map_err(io::Error::other)?;
+        Ok((
+            sequence
+                .into_iter()
+                .map(|letter| letter as Letter)
+                .collect(),
+            title,
+        ))
+    }
+
+    /// Source load_twopass with SEQS and without TITLES, as makeindex uses it.
+    /// Retain only the position metadata and one decoded sequence at a time;
+    /// the caller owns the actual complete indexing Block.
+    pub(crate) fn visit_sequences(
+        &mut self,
+        max_letters: u64,
+        mut visit: impl FnMut(u64, &[Letter]) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.input
+            .seek(self.ref_header.pos_array_offset as i64)
+            .map_err(io::Error::other)?;
+        let mut current = SeqInfo::read_from(&mut self.input).map_err(source_stream_read_error)?;
+        let mut positions = Vec::new();
+        let mut letters = 0u64;
+        while current.seq_len > 0 && letters < max_letters {
+            let next = SeqInfo::read_from(&mut self.input).map_err(source_stream_read_error)?;
+            letters += u64::from(current.seq_len);
+            positions.push(current);
+            current = next;
+        }
+        let Some(first) = positions.first() else {
+            return Ok(());
+        };
+        self.input
+            .seek(first.pos as i64)
+            .map_err(io::Error::other)?;
+        let mut sequence = Vec::new();
+        for (oid, info) in positions.into_iter().enumerate() {
+            sequence.resize(info.seq_len as usize + 2, 0u8);
+            self.input
+                .read_exact(&mut sequence)
+                .map_err(source_stream_read_error)?;
+            // Source read_seq_data reads delimiter-framed bytes but replaces
+            // the perimeter instead of validating the stored marker values.
+            let letters = unsafe {
+                std::slice::from_raw_parts(
+                    sequence[1..sequence.len() - 1].as_ptr().cast::<Letter>(),
+                    info.seq_len as usize,
+                )
+            };
+            visit(oid as u64, letters)?;
+            if !self.input.seek_forward_delim(0).map_err(io::Error::other)? {
+                return Err(io::Error::other("Unexpected end of file."));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn source_stream_read_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected end of input.")
+    } else {
+        error
+    }
 }
 
 /// Read-side implementation of C++ `DatabaseFile`.
 #[derive(Debug)]
 pub struct DatabaseFile {
     path: PathBuf,
-    file: File,
+    file: BufReader<DatabaseInput>,
+    index_file: Option<BufReader<File>>,
     pub ref_header: ReferenceHeader,
     pub header2: ReferenceHeader2,
     pub partition: DatabasePartition,
@@ -311,9 +566,11 @@ pub struct DatabaseFile {
     data_start: u64,
     seq_length: Vec<Loc>,
     seqids: Vec<String>,
+    pub(crate) accession_spool:
+        Option<std::sync::Arc<crate::data::accession_spool::AccessionSpool>>,
     taxon_list: Option<TaxonList>,
     taxon_nodes: Option<TaxonomyNodes>,
-    taxon_scientific_names: Vec<String>,
+    taxon_scientific_names: Vec<Vec<u8>>,
 }
 
 impl DatabaseFile {
@@ -333,6 +590,14 @@ impl DatabaseFile {
         crate::data::db_builder::build_db(input_files, output_path, sequence_type)
     }
 
+    pub fn make_db_paths(
+        input_files: &[&Path],
+        output_path: &Path,
+        sequence_type: SequenceType,
+    ) -> io::Result<crate::data::db_builder::BuildStats> {
+        crate::data::db_builder::build_db_paths(input_files, output_path, sequence_type)
+    }
+
     pub fn read_header<R: Read>(stream: &mut R) -> Result<ReferenceHeader, String> {
         let header = ReferenceHeader::read_from(stream).map_err(|e| e.to_string())?;
         if header.magic_number != MAGIC_NUMBER {
@@ -346,20 +611,102 @@ impl DatabaseFile {
         path: impl AsRef<Path>,
         options: DatabaseOpenOptions,
     ) -> Result<Self, String> {
-        let path = resolve_database_path(path.as_ref());
-        let mut file = File::open(&path).map_err(|error| error.to_string())?;
-        let ref_header = ReferenceHeader::read_from(&mut file).map_err(|e| e.to_string())?;
+        Self::open_with_options_io(path, options).map_err(|error| error.to_string())
+    }
+
+    /// Source command constructor preserving actual file-open failures.
+    pub fn open_with_options_io(
+        path: impl AsRef<Path>,
+        options: DatabaseOpenOptions,
+    ) -> io::Result<Self> {
+        Self::open_profile(path.as_ref(), options, false, false)
+    }
+
+    /// Actual Source command owner, retaining the decoder for metadata and
+    /// record operations. Indexed library constructors retain their raw profile.
+    pub(crate) fn open_source_with_options_io(
+        path: &Path,
+        options: DatabaseOpenOptions,
+        require_ranks: bool,
+    ) -> io::Result<Self> {
+        Self::open_profile(path, options, true, require_ranks)
+    }
+
+    fn open_profile(
+        path: &Path,
+        options: DatabaseOpenOptions,
+        source_profile: bool,
+        require_ranks: bool,
+    ) -> io::Result<Self> {
+        let path = resolve_database_path(path);
+        let input = if source_profile {
+            DatabaseInput::Source {
+                input: crate::util::io::InputFile::with_source_profile_path(
+                    &path,
+                    crate::util::io::InputFile::BUFFERED,
+                    options.file_buffer_size.unwrap_or(67_108_864),
+                )
+                .map_err(io::Error::other)?,
+                consumed: 0,
+            }
+        } else {
+            let file = File::open(&path)
+                .map_err(|error| crate::util::io::FileOpenError::into_io(&path, error))?;
+            if let Some(size) = options.file_buffer_size {
+                if size < 4 && file.metadata()?.len() >= size as u64 {
+                    return Err(io::Error::other("Invalid peek"));
+                }
+            }
+            DatabaseInput::Raw(file)
+        };
+        // InputFile already owns Source's configured buffer. This small outer
+        // window provides the historical BufRead API without duplicating it.
+        let mut file = BufReader::with_capacity(
+            if source_profile {
+                8192
+            } else {
+                options.file_buffer_size.unwrap_or(8192).max(1)
+            },
+            input,
+        );
+        let source_read_error = |error: io::Error| {
+            if error.kind() == io::ErrorKind::UnexpectedEof {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected end of input.")
+            } else {
+                error
+            }
+        };
+        let ref_header = ReferenceHeader::read_from(&mut file).map_err(source_read_error)?;
         if ref_header.magic_number != MAGIC_NUMBER {
-            return Err("Database file is not a DIAMOND database.".to_string());
+            return Err(io::Error::other("Database file is not a DIAMOND database."));
         }
         if !options.no_compatibility_check {
-            ref_header.validate()?;
+            ref_header.validate().map_err(io::Error::other)?;
         }
-        let header2 = ReferenceHeader2::read_record_from(&mut file).map_err(|e| e.to_string())?;
-        let data_start = file.stream_position().map_err(|e| e.to_string())?;
+        // Source DatabaseFile::init returns immediately after Header1 when
+        // NO_COMPATIBILITY_CHECK is requested (dbinfo). In particular this
+        // inspection path does not require a complete Header2 record.
+        let header2 = if options.no_compatibility_check {
+            ReferenceHeader2::default()
+        } else {
+            ReferenceHeader2::read_record_from(&mut file).map_err(source_read_error)?
+        };
+        let data_start = file.stream_position()?;
+        // Keep index and sequence readahead independent: alternating between
+        // their distant offsets must not refill a large buffer per record.
+        let index_file = if !file.get_ref().seekable() {
+            None
+        } else {
+            Some(BufReader::with_capacity(
+                options.file_buffer_size.unwrap_or(8192).clamp(1, 1 << 20),
+                File::open(&path)
+                    .map_err(|error| crate::util::io::FileOpenError::into_io(&path, error))?,
+            ))
+        };
         let mut db = Self {
             path,
             file,
+            index_file,
             ref_header,
             header2,
             partition: DatabasePartition::default(),
@@ -368,16 +715,23 @@ impl DatabaseFile {
             data_start,
             seq_length: Vec::new(),
             seqids: Vec::new(),
+            accession_spool: None,
             taxon_list: None,
             taxon_nodes: None,
             taxon_scientific_names: Vec::new(),
         };
-        db.validate_requested_metadata(options)?;
-        db.load_requested_metadata(options)?;
+        db.validate_requested_metadata(options, require_ranks)
+            .map_err(io::Error::other)?;
+        db.load_requested_metadata(options)
+            .map_err(io::Error::other)?;
         Ok(db)
     }
 
-    fn validate_requested_metadata(&self, options: DatabaseOpenOptions) -> Result<(), String> {
+    fn validate_requested_metadata(
+        &self,
+        options: DatabaseOpenOptions,
+        require_ranks: bool,
+    ) -> Result<(), String> {
         let mut missing = Vec::new();
         if options.load_taxon_mapping && !self.has_taxon_id_lists() {
             missing.push("taxonomy mapping information (--taxonmap option)");
@@ -387,6 +741,9 @@ impl DatabaseFile {
         }
         if options.load_taxon_scientific_names && !self.has_taxon_scientific_names() {
             missing.push("taxonomy names information (--taxonnames option)");
+        }
+        if require_ranks && self.ref_header.build < 131 {
+            missing.push("taxonomy ranks information (database needs to be built with diamond version >= 0.9.30");
         }
         if missing.is_empty() {
             Ok(())
@@ -411,11 +768,17 @@ impl DatabaseFile {
                 self.header2.taxon_array_size as usize,
             )?);
         }
+        if self.file.get_ref().source_profile() && options.load_taxon_scientific_names {
+            self.file
+                .seek(SeekFrom::Start(self.header2.taxon_names_offset))
+                .map_err(|e| e.to_string())?;
+            self.taxon_scientific_names = read_string_vector(&mut self.file)?;
+        }
         if options.load_taxon_nodes {
             self.file
                 .seek(SeekFrom::Start(self.header2.taxon_nodes_offset))
                 .map_err(|e| e.to_string())?;
-            let file_len = self.file.metadata().map_err(|e| e.to_string())?.len();
+            let file_len = self.file.get_mut().file_len().map_err(|e| e.to_string())?;
             let end = metadata_end(self.header2.taxon_nodes_offset, &self.header2, file_len);
             let mut data = vec![0; (end - self.header2.taxon_nodes_offset) as usize];
             self.file.read_exact(&mut data).map_err(|e| e.to_string())?;
@@ -425,7 +788,7 @@ impl DatabaseFile {
                     .map_err(|e| e.to_string())?,
             );
         }
-        if options.load_taxon_scientific_names {
+        if !self.file.get_ref().source_profile() && options.load_taxon_scientific_names {
             self.file
                 .seek(SeekFrom::Start(self.header2.taxon_names_offset))
                 .map_err(|e| e.to_string())?;
@@ -479,12 +842,17 @@ impl DatabaseFile {
     }
 
     fn seq_info_at(&mut self, oid: OId) -> Result<SeqInfo, String> {
-        self.file
-            .seek(SeekFrom::Start(
-                self.ref_header.pos_array_offset + SeqInfo::SIZE as u64 * oid,
-            ))
-            .map_err(|e| e.to_string())?;
-        SeqInfo::read_from(&mut self.file).map_err(|e| e.to_string())
+        self.seq_info_at_io(oid).map_err(|error| error.to_string())
+    }
+    fn seq_info_at_io(&mut self, oid: OId) -> io::Result<SeqInfo> {
+        let position = self.ref_header.pos_array_offset + SeqInfo::SIZE as u64 * oid;
+        if let Some(index_file) = &mut self.index_file {
+            seek_buffered(index_file, position)?;
+            SeqInfo::read_from(index_file).map_err(source_stream_read_error)
+        } else {
+            seek_buffered(&mut self.file, position)?;
+            SeqInfo::read_from(&mut self.file).map_err(source_stream_read_error)
+        }
     }
 
     pub fn init_seq_access(&mut self) {
@@ -497,41 +865,203 @@ impl DatabaseFile {
     }
 
     pub fn read_seq(&mut self) -> Result<Option<(Vec<Letter>, String)>, String> {
+        self.read_seq_bytes()?
+            .map(|(sequence, title)| {
+                Ok((
+                    sequence,
+                    String::from_utf8(title).map_err(|error| error.to_string())?,
+                ))
+            })
+            .transpose()
+    }
+
+    /// Indexed OID cursor service, independent of Source's physical stream.
+    pub fn read_seq_bytes(&mut self) -> Result<Option<(Vec<Letter>, Vec<u8>)>, String> {
         if self.sequence_cursor >= self.ref_header.sequences {
             return Ok(None);
         }
-        let record = self.record(self.sequence_cursor)?;
+        let record = self
+            .record_bytes_io(self.sequence_cursor)
+            .map_err(|error| error.to_string())?;
         self.sequence_cursor += 1;
         Ok(Some(record))
+    }
+
+    /// Source init_seq_access seeks its fixed C ABI header layout, which can
+    /// differ from both the constructor cursor and indexed record positions.
+    /// getseq deliberately does not call this before its direct first read.
+    pub(crate) fn init_source_sequential(&mut self) -> io::Result<()> {
+        let source_start = ReferenceHeader::SIZE as u64 + 8 + ReferenceHeader2::RECORD_SIZE as u64;
+        seek_buffered(&mut self.file, source_start)
+    }
+
+    /// Source `DatabaseFile::read_seq` on the existing physical descriptor.
+    /// In particular, getseq starts at the cursor left by Header2 extraction,
+    /// including DynamicRecordReader::Finish's advertised-size consumption.
+    /// Indexed `record`/`read_seq` callers retain their independent OID service.
+    pub(crate) fn read_source_sequential(&mut self) -> io::Result<(Vec<Letter>, String)> {
+        let (sequence, title) = self.read_source_sequential_bytes()?;
+        Ok((
+            sequence,
+            String::from_utf8(title).map_err(io::Error::other)?,
+        ))
+    }
+
+    /// Source std::string can contain non-UTF8 bytes, including bytes reached
+    /// by its fixed physical header cursor. MCL writes these directly.
+    pub(crate) fn read_source_sequential_bytes(&mut self) -> io::Result<(Vec<Letter>, Vec<u8>)> {
+        use std::io::BufRead;
+        let mut marker = [0u8; 1];
+        // Source ignores both the leading byte value and its short-read count.
+        let _ = self.file.read(&mut marker)?;
+        let mut sequence = Vec::new();
+        self.file.read_until(0xff, &mut sequence)?;
+        if sequence.last() == Some(&0xff) {
+            sequence.pop();
+        }
+        let mut title = Vec::new();
+        self.file.read_until(0, &mut title)?;
+        if title.last() == Some(&0) {
+            title.pop();
+        }
+        Ok((
+            sequence.into_iter().map(|byte| byte as Letter).collect(),
+            title,
+        ))
     }
 
     pub fn skip_seq(&mut self) -> Result<(), String> {
         if self.sequence_cursor >= self.ref_header.sequences {
             return Err("Unexpected end of file.".to_string());
         }
-        self.record(self.sequence_cursor)?;
+        self.record_bytes_io(self.sequence_cursor)
+            .map_err(|error| error.to_string())?;
         self.sequence_cursor += 1;
         Ok(())
     }
 
-    fn record(&mut self, oid: OId) -> Result<(Vec<Letter>, String), String> {
-        let info = self.seq_info_at(oid)?;
-        self.file
-            .seek(SeekFrom::Start(info.pos))
-            .map_err(|e| e.to_string())?;
+    /// Source read_seqid_list, without retaining decoded sequence bytes or IDs.
+    /// Scan the actual delimiter framing and preserve title repair diagnostics.
+    pub(crate) fn write_accession_spool(
+        &mut self,
+        spool: &crate::data::accession_spool::AccessionSpool,
+    ) -> io::Result<()> {
+        use std::io::BufRead;
+        fn until(
+            reader: &mut impl BufRead,
+            delimiter: u8,
+            mut text: Option<&mut Vec<u8>>,
+        ) -> io::Result<()> {
+            loop {
+                let bytes = reader.fill_buf()?;
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                let stop = bytes.iter().position(|&byte| byte == delimiter);
+                let count = stop.unwrap_or(bytes.len());
+                if let Some(out) = text.as_mut() {
+                    out.extend_from_slice(&bytes[..count]);
+                }
+                reader.consume(count + usize::from(stop.is_some()));
+                if stop.is_some() {
+                    return Ok(());
+                }
+            }
+        }
+        // Source read_seqid_list calls init_seq_access, which seeks a fixed
+        // C ABI layout offset, independently of DynamicRecordReader's consumed
+        // byte count and independently of the position-array record API.
+        let source_start = ReferenceHeader::SIZE as u64 + 8 + ReferenceHeader2::RECORD_SIZE as u64;
+        seek_buffered(&mut self.file, source_start).map_err(io::Error::other)?;
+        for _ in 0..self.sequence_count() {
+            let mut marker = [0u8; 1];
+            // Source read_seq ignores the byte's value and its short-read count.
+            let _ = self.file.read(&mut marker)?;
+            until(&mut self.file, 0xff, None)?;
+            let mut title = Vec::new();
+            until(&mut self.file, 0, Some(&mut title))?;
+            if let Some(message) = crate::util::sequence::fix_title_bytes(&mut title) {
+                crate::util::log_stream::message_stream()
+                    .lock()
+                    .unwrap()
+                    .write(format!("Warning: {message}\n"))?;
+            }
+            spool.push_bytes(&crate::util::sequence::seqid_bytes(&title))?;
+        }
+        Ok(())
+    }
+
+    /// Read only the title of a physical OID, without allocating its sequence
+    /// or changing either logical sequence cursor. Keep framing validation.
+    pub fn title(&mut self, oid: OId) -> Result<String, String> {
+        self.title_bytes_io(oid)
+            .map_err(|error| error.to_string())
+            .and_then(|id| String::from_utf8(id).map_err(|error| error.to_string()))
+    }
+    pub(crate) fn title_bytes_io(&mut self, oid: OId) -> io::Result<Vec<u8>> {
+        let info = self.seq_info_at_io(oid)?;
+        let end = info
+            .pos
+            .checked_add(u64::from(info.seq_len))
+            .and_then(|pos| pos.checked_add(1))
+            .ok_or_else(|| io::Error::other("Invalid sequence offset in DIAMOND database."))?;
+        seek_buffered(&mut self.file, info.pos)?;
+        let mut first = [0u8; 1];
+        self.file.read_exact(&mut first)?;
+        seek_buffered(&mut self.file, end)?;
+        let mut last = [0u8; 1];
+        self.file.read_exact(&mut last)?;
+        if first != [0xff] || last != [0xff] {
+            return Err(io::Error::other(
+                "Invalid sequence framing in DIAMOND database.",
+            ));
+        }
+        let mut id = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            self.file.read_exact(&mut byte).map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    io::Error::other("Unexpected end of file.")
+                } else {
+                    error
+                }
+            })?;
+            if byte[0] == 0 {
+                break;
+            }
+            id.push(byte[0]);
+        }
+        Ok(id)
+    }
+
+    /// Read an OID without changing either logical sequence cursor.
+    pub fn record(&mut self, oid: OId) -> Result<(Vec<Letter>, String), String> {
+        self.record_io(oid).map_err(|error| error.to_string())
+    }
+    pub(crate) fn record_io(&mut self, oid: OId) -> io::Result<(Vec<Letter>, String)> {
+        let (sequence, id) = self.record_bytes_io(oid)?;
+        Ok((sequence, String::from_utf8(id).map_err(io::Error::other)?))
+    }
+    pub(crate) fn record_bytes_io(&mut self, oid: OId) -> io::Result<(Vec<Letter>, Vec<u8>)> {
+        let info = self.seq_info_at_io(oid)?;
+        seek_buffered(&mut self.file, info.pos)?;
         let mut framed = vec![0; info.seq_len as usize + 2];
-        self.file
-            .read_exact(&mut framed)
-            .map_err(|e| e.to_string())?;
+        self.file.read_exact(&mut framed)?;
         if framed.first() != Some(&0xff) || framed.last() != Some(&0xff) {
-            return Err("Invalid sequence framing in DIAMOND database.".to_string());
+            return Err(io::Error::other(
+                "Invalid sequence framing in DIAMOND database.",
+            ));
         }
         let mut id = Vec::new();
         loop {
             let mut byte = [0];
-            self.file
-                .read_exact(&mut byte)
-                .map_err(|_| "Unexpected end of file.".to_string())?;
+            self.file.read_exact(&mut byte).map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    io::Error::other("Unexpected end of file.")
+                } else {
+                    error
+                }
+            })?;
             if byte[0] == 0 {
                 break;
             }
@@ -542,7 +1072,7 @@ impl DatabaseFile {
                 .iter()
                 .map(|&letter| letter as Letter)
                 .collect(),
-            String::from_utf8_lossy(&id).into_owned(),
+            id,
         ))
     }
 
@@ -735,7 +1265,20 @@ impl DatabaseFile {
             .max())
     }
 
+    /// Checked String convenience for UTF-8 taxonomy metadata.
     pub fn taxon_scientific_name(&self, taxid: TaxId) -> String {
+        self.try_taxon_scientific_name(taxid)
+            .expect("Raw taxonomy name is not UTF-8; use taxon_scientific_name_bytes")
+    }
+
+    pub fn try_taxon_scientific_name(
+        &self,
+        taxid: TaxId,
+    ) -> Result<String, std::string::FromUtf8Error> {
+        String::from_utf8(self.taxon_scientific_name_bytes(taxid))
+    }
+
+    pub fn taxon_scientific_name_bytes(&self, taxid: TaxId) -> Vec<u8> {
         if taxid >= 0 {
             if let Some(name) = self.taxon_scientific_names.get(taxid as usize) {
                 if !name.is_empty() {
@@ -743,7 +1286,7 @@ impl DatabaseFile {
                 }
             }
         }
-        taxid.to_string()
+        taxid.to_string().into_bytes()
     }
 
     pub fn seq_length(&mut self, oid: usize) -> Result<Loc, String> {
@@ -816,7 +1359,9 @@ impl DatabaseFile {
     }
 
     pub fn read_sequence_with_delimiters(&mut self, oid: OId) -> Result<Vec<Letter>, String> {
-        let (sequence, _) = self.record(oid)?;
+        let (sequence, _) = self
+            .record_bytes_io(oid)
+            .map_err(|error| error.to_string())?;
         let mut output = Vec::with_capacity(sequence.len() + 2);
         output.push(DELIMITER_LETTER);
         output.extend(sequence);
@@ -829,11 +1374,9 @@ fn resolve_database_path(path: &Path) -> PathBuf {
     if path.exists() {
         return path.to_path_buf();
     }
-    let appended = PathBuf::from(format!(
-        "{}{}",
-        path.display(),
-        DatabaseFile::FILE_EXTENSION
-    ));
+    let mut appended = path.as_os_str().to_os_string();
+    appended.push(DatabaseFile::FILE_EXTENSION);
+    let appended = PathBuf::from(appended);
     if appended.exists() {
         appended
     } else {
@@ -854,7 +1397,7 @@ fn metadata_end(offset: u64, header2: &ReferenceHeader2, file_len: u64) -> u64 {
     .unwrap_or(file_len)
 }
 
-fn read_string_vector<R: Read>(reader: &mut R) -> Result<Vec<String>, String> {
+fn read_string_vector<R: Read>(reader: &mut R) -> Result<Vec<Vec<u8>>, String> {
     let mut count = [0; 4];
     reader.read_exact(&mut count).map_err(|e| e.to_string())?;
     let count = u32::from_le_bytes(count) as usize;
@@ -869,7 +1412,7 @@ fn read_string_vector<R: Read>(reader: &mut R) -> Result<Vec<String>, String> {
             }
             bytes.push(byte[0]);
         }
-        strings.push(String::from_utf8_lossy(&bytes).into_owned());
+        strings.push(bytes);
     }
     Ok(strings)
 }
@@ -958,7 +1501,11 @@ mod tests {
         header.letters = 5;
         header.pos_array_offset = 110;
         header.write_to(&mut bytes).unwrap();
-        ReferenceHeader2::new().write_record_to(&mut bytes).unwrap();
+        // Deliberately a baseline database under every build profile. This
+        // verifies position-array access to legacy files; EXTRA's writer has
+        // a different physical field count and advertised C ABI record size.
+        bytes.extend_from_slice(&48u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 48]);
         assert_eq!(bytes.len(), 96);
 
         bytes.extend_from_slice(&[0xff, 0, 1, 2, 0xff, b'a', 0]);
@@ -967,6 +1514,36 @@ mod tests {
         SeqInfo::new(103, 2).write_to(&mut bytes).unwrap();
         SeqInfo::new(110, 0).write_to(&mut bytes).unwrap();
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn inspection_reads_header1_without_requiring_header2() {
+        let path = fixture_path("header-only-inspection");
+        let header = ReferenceHeader {
+            sequences: 3,
+            letters: 1280,
+            ..ReferenceHeader::default()
+        };
+        let mut bytes = Vec::new();
+        header.write_to(&mut bytes).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let inspection = DatabaseFile::open_with_options_io(
+            &path,
+            DatabaseOpenOptions {
+                no_compatibility_check: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(inspection.sequence_count(), 3);
+        assert_eq!(inspection.letters(), 1280);
+        drop(inspection);
+        let checked = DatabaseFile::open_with_options_io(&path, DatabaseOpenOptions::default())
+            .err()
+            .unwrap();
+        assert_eq!(checked.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(checked.to_string(), "Unexpected end of input.");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -995,17 +1572,28 @@ mod tests {
             taxon_array_size: 12,
             taxon_nodes_offset: 13,
             taxon_names_offset: 14,
+            db_type: 0,
         };
         let mut bytes = Vec::new();
         header.write_record_to(&mut bytes).unwrap();
         assert_eq!(bytes.len(), 8 + ReferenceHeader2::PAYLOAD_SIZE);
         assert_eq!(
             &bytes[..8],
-            &(ReferenceHeader2::PAYLOAD_SIZE as u64).to_le_bytes()
+            &(ReferenceHeader2::RECORD_SIZE as u64).to_le_bytes()
+        );
+        // These are following-stream bytes consumed by Source Finish due
+        // to the ABI tail alignment advertised by the size prefix. The writer
+        // itself emits no such padding.
+        let finish_tail = ReferenceHeader2::RECORD_SIZE - ReferenceHeader2::PAYLOAD_SIZE;
+        bytes.extend(std::iter::repeat(0xA5).take(finish_tail));
+        let mut input = Cursor::new(bytes);
+        assert_eq!(
+            ReferenceHeader2::read_record_from(&mut input).unwrap(),
+            header
         );
         assert_eq!(
-            ReferenceHeader2::read_record_from(&mut Cursor::new(bytes)).unwrap(),
-            header
+            input.position(),
+            (8 + ReferenceHeader2::PAYLOAD_SIZE + finish_tail) as u64
         );
 
         let mut seq_info = Vec::new();
@@ -1018,6 +1606,50 @@ mod tests {
         .unwrap();
         assert_eq!(seq_info.len(), SeqInfo::SIZE);
         assert_eq!(&seq_info[12..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn positional_readers_use_seqinfo_offsets_despite_header2_abi_padding() {
+        let path = fixture_path("positional-header2");
+        let start = ReferenceHeader::SIZE as u64 + 8 + ReferenceHeader2::PAYLOAD_SIZE as u64;
+        let mut header = ReferenceHeader::new();
+        header.sequences = 2;
+        header.letters = 5;
+        header.pos_array_offset = start + 14;
+        let mut bytes = Vec::new();
+        header.write_to(&mut bytes).unwrap();
+        ReferenceHeader2::new().write_record_to(&mut bytes).unwrap();
+        assert_eq!(bytes.len() as u64, start);
+        bytes.extend_from_slice(&[0xff, 0, 1, 2, 0xff, b'a', 0]);
+        bytes.extend_from_slice(&[0xff, 3, 4, 0xff, b'b', b'b', 0]);
+        SeqInfo::new(start, 3).write_to(&mut bytes).unwrap();
+        SeqInfo::new(start + 7, 2).write_to(&mut bytes).unwrap();
+        SeqInfo::new(start + 14, 0).write_to(&mut bytes).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let (_, records) = crate::data::dmnd_reader::read_dmnd(&path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.id.as_str(), r.sequence.as_slice()))
+                .collect::<Vec<_>>(),
+            [("a", &[0i8, 1, 2][..]), ("bb", &[3i8, 4][..])]
+        );
+        let mut streamed = Vec::new();
+        crate::data::dmnd_reader::for_each_dmnd_record(&path, |oid, id, seq| {
+            streamed.push((oid, id.to_owned(), seq.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            streamed,
+            [
+                (0, "a".to_owned(), vec![0, 1, 2]),
+                (1, "bb".to_owned(), vec![3, 4])
+            ]
+        );
+        let mut db = DatabaseFile::open(&path).unwrap();
+        assert_eq!(db.record(0).unwrap(), (vec![0, 1, 2], "a".to_owned()));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

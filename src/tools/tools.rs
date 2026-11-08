@@ -7,12 +7,12 @@
 use crate::basic::reduction::Reduction;
 use crate::basic::value::{Letter, AMINO_ACID_ALPHABET};
 use crate::util::hash::murmurhash3_x64_128;
-use crate::util::sequence::seqid;
+use crate::util::sequence::seqid_bytes;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SequenceRecord {
-    pub title: String,
+pub struct SequenceRecord<N = String> {
+    pub title: N,
     pub sequence: Vec<Letter>,
 }
 
@@ -34,6 +34,13 @@ impl SeedCollector {
 /// Translation of `split`: format sequences as FASTA chunks, switching files
 /// before a record whenever the current chunk has reached the letter limit.
 pub fn split(records: &[SequenceRecord], chunk_letters: usize) -> Vec<Vec<u8>> {
+    split_bytes(records, chunk_letters)
+}
+
+pub fn split_bytes<N: AsRef<[u8]>>(
+    records: &[SequenceRecord<N>],
+    chunk_letters: usize,
+) -> Vec<Vec<u8>> {
     let mut chunks = vec![Vec::new()];
     let mut letters = 0_usize;
     for record in records {
@@ -43,7 +50,7 @@ pub fn split(records: &[SequenceRecord], chunk_letters: usize) -> Vec<Vec<u8>> {
         }
         let output = chunks.last_mut().expect("initial chunk exists");
         output.push(b'>');
-        output.extend_from_slice(seqid(&record.title).as_bytes());
+        output.extend_from_slice(&seqid_bytes(record.title.as_ref()));
         output.push(b'\n');
         for &letter in &record.sequence {
             output.push(AMINO_ACID_ALPHABET[letter as usize]);
@@ -58,13 +65,24 @@ pub fn split(records: &[SequenceRecord], chunk_letters: usize) -> Vec<Vec<u8>> {
 /// writing process-global stdout. The commented-out upstream FASTA parser is
 /// represented by the finite record slice.
 pub fn hash_seqs(records: &[SequenceRecord]) -> Vec<String> {
+    hash_seqs_bytes(records)
+        .into_iter()
+        .map(|line| String::from_utf8(line).expect("UTF-8 names and ASCII hashes render UTF-8"))
+        .collect()
+}
+
+pub fn hash_seqs_bytes<N: AsRef<[u8]>>(records: &[SequenceRecord<N>]) -> Vec<Vec<u8>> {
     records
         .iter()
         .map(|record| {
             let bytes: Vec<u8> = record.sequence.iter().map(|&letter| letter as u8).collect();
             let hash = murmurhash3_x64_128(&bytes, &[0; 16]);
-            let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
-            format!("{}\t{hex}", seqid(&record.title))
+            let mut line = seqid_bytes(record.title.as_ref());
+            line.push(b'\t');
+            for byte in hash {
+                line.extend_from_slice(format!("{byte:02x}").as_bytes());
+            }
+            line
         })
         .collect()
 }
@@ -121,6 +139,18 @@ mod tests {
             "A R N D C Q E G H I L K M F P S T W Y V",
             AMINO_ACID_ALPHABET,
         )
+    }
+
+    #[test]
+    fn raw_split_and_hash_keep_non_utf8_ids_and_c_string_boundaries() {
+        let records = [SequenceRecord {
+            title: b"id\xff\0hidden description".to_vec(),
+            sequence: vec![0, 1],
+        }];
+        assert_eq!(split_bytes(&records, 10), vec![b">id\xff\nAR\n".to_vec()]);
+        let lines = hash_seqs_bytes(&records);
+        assert_eq!(&lines[0][..4], b"id\xff\t");
+        assert_eq!(lines[0].len(), 36);
     }
 
     #[test]

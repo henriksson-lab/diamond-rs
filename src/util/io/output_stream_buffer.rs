@@ -22,16 +22,26 @@ impl<S: StreamEntity> OutputStreamBuffer<S> {
 
     /// Explicit-config form replacing C++ `config.file_buffer_size`.
     pub fn with_buffer_size(prev: S, file_buffer_size: usize) -> Self {
-        let buf_size = if prev.file_name().is_empty() {
+        let buf_size = if prev.file_path().as_os_str().is_empty() {
             Self::STDOUT_BUF_SIZE
         } else {
             file_buffer_size
         };
         assert!(buf_size != 0, "output stream buffer size must be nonzero");
+        Self::with_source_buffer_size(prev, file_buffer_size)
+    }
+
+    /// Source permits zero named-file staging and fixes stdout at 4096 bytes.
+    pub fn with_source_buffer_size(prev: S, file_buffer_size: usize) -> Self {
+        let buf_size = if prev.file_path().as_os_str().is_empty() {
+            Self::STDOUT_BUF_SIZE
+        } else {
+            file_buffer_size
+        };
         Self {
             prev,
             buf_size,
-            buf: Vec::with_capacity(buf_size),
+            buf: Vec::new(),
         }
     }
 
@@ -45,6 +55,20 @@ impl<S: StreamEntity> OutputStreamBuffer<S> {
 
     pub fn write_buffer_range(&mut self) -> (&mut [u8], usize) {
         self.write_buffer()
+    }
+
+    /// Bounded initialized scratch for a streaming codec; repeated calls drain
+    /// the same logical output regardless of the scratch allocation size.
+    pub(crate) fn write_buffer_range_bounded(&mut self, limit: usize) -> (&mut [u8], usize) {
+        let size = self.buf_size.min(limit);
+        self.buf.resize(size, 0);
+        (self.buf.as_mut_slice(), size)
+    }
+
+    /// The serializer owns its writable staging buffer. Its flush corresponds
+    /// to C++ flush(count), which forwards bytes rather than buffering again.
+    pub(crate) fn forward_write(&mut self, bytes: &[u8]) -> IoResult<()> {
+        self.prev.write(bytes)
     }
 
     /// C++ `flush(size_t)`; kept distinct from the no-argument Rust stream
@@ -74,6 +98,11 @@ impl<S: StreamEntity> StreamEntity for OutputStreamBuffer<S> {
     /// Compatibility extension used by the safe Rust serializer. The C++
     /// serializer writes through `write_buffer` and `flush(count)` directly.
     fn write(&mut self, ptr: &[u8]) -> IoResult<()> {
+        if self.buf_size == 0 && !ptr.is_empty() {
+            return Err(IoError::Other(
+                "Source zero-capacity output cannot make progress.".into(),
+            ));
+        }
         let mut offset = 0;
         while offset < ptr.len() {
             let available = self.buf_size - self.buf.len();
@@ -115,13 +144,24 @@ impl<S: StreamEntity> StreamEntity for OutputStreamBuffer<S> {
         self.prev.close()
     }
 
+    fn file_path(&self) -> &std::path::Path {
+        self.prev.file_path()
+    }
     fn file_name(&self) -> &str {
         self.prev.file_name()
     }
 
+    #[cfg(any(unix, windows))]
+    fn shared_stdio(&mut self) -> IoResult<Option<super::cstdio_file::SharedCstdio>> {
+        self.prev.shared_stdio()
+    }
+
     fn file(&mut self) -> IoResult<&mut StdFile> {
-        self.flush()?;
         self.prev.file()
+    }
+
+    fn clone_file(&mut self) -> IoResult<StdFile> {
+        self.prev.clone_file()
     }
 
     fn file_size(&mut self) -> IoResult<i64> {

@@ -74,10 +74,14 @@ impl Shape {
 
     /// Create a shape from a pattern code string (e.g., "111101011").
     pub fn from_code(code: &str, reduction: &Reduction) -> Self {
+        Self::from_code_bytes(code.as_bytes(), reduction)
+    }
+    pub fn from_code_bytes(code: &[u8], reduction: &Reduction) -> Self {
+        let code = crate::util::sequence::c_string_bytes(code);
         let b = reduction.bit_size() as u64;
         let mut shape = Shape::new();
 
-        for (i, ch) in code.bytes().enumerate() {
+        for (i, &ch) in code.iter().enumerate() {
             shape.rev_mask <<= 1;
             shape.long_mask <<= b;
             if ch == b'1' {
@@ -428,6 +432,19 @@ impl std::fmt::Display for Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_shape_pattern_uses_bytes_and_source_c_string_boundary() {
+        let reduction = Reduction::default_reduction();
+        let raw = Shape::from_code_bytes(b"1\xff1\0ignored1", &reduction);
+        let reference = Shape::from_code("101", &reduction);
+        assert_eq!(raw.length, 3);
+        assert_eq!(raw.weight, 2);
+        assert_eq!(raw.mask, reference.mask);
+        assert_eq!(raw.rev_mask, reference.rev_mask);
+        assert_eq!(raw.long_mask, reference.long_mask);
+        assert_eq!(raw.positions, reference.positions);
+    }
 
     #[test]
     fn test_shape_contiguous() {

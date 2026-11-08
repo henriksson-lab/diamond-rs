@@ -16,7 +16,9 @@ use crate::util::interval::{Interval, IntervalPartition};
 
 /// Explicit replacement for the C++ `translated_query`, score globals, and
 /// `banded_3frame_swipe` dispatch.
-pub trait BandedSwipeBackend: QueryMapperBackend {
+pub trait BandedSwipeBackend<T: ?Sized + ToOwned + AsRef<[u8]> = str>:
+    QueryMapperBackend<T>
+{
     fn log(&self, _message: &str) {}
 
     fn banded_3frame_swipe(
@@ -221,15 +223,15 @@ impl QueryTarget {
     }
 }
 
-pub struct Pipeline<'a, 'd, B: BandedSwipeBackend> {
-    pub mapper: QueryMapper<'a, B>,
+pub struct Pipeline<'a, 'd, B: BandedSwipeBackend<T>, T: ?Sized + ToOwned + AsRef<[u8]> = str> {
+    pub mapper: QueryMapper<'a, B, T>,
     pub dp_stat: &'d mut DpStat,
     pub config: PipelineConfig,
 }
 
-impl<'a, 'd, B: BandedSwipeBackend> Pipeline<'a, 'd, B> {
+impl<'a, 'd, B: BandedSwipeBackend<T>, T: ?Sized + ToOwned + AsRef<[u8]>> Pipeline<'a, 'd, B, T> {
     pub fn new(
-        mapper: QueryMapper<'a, B>,
+        mapper: QueryMapper<'a, B, T>,
         dp_stat: &'d mut DpStat,
         config: PipelineConfig,
     ) -> Self {

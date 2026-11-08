@@ -32,6 +32,12 @@ impl<S: StreamEntity> InputStreamBuffer<S> {
             file_buffer_size != 0,
             "input stream buffer size must be nonzero"
         );
+        Self::with_source_buffer_size(prev, flags, file_buffer_size)
+    }
+
+    /// Source allocates even a zero-byte buffer. Reads then make no progress;
+    /// Deserializer::peek, rather than construction, diagnoses Invalid peek.
+    pub fn with_source_buffer_size(prev: S, flags: i32, file_buffer_size: usize) -> Self {
         let async_ = flags & Self::ASYNC != 0;
         Self {
             prev,
@@ -168,8 +174,16 @@ impl<S: StreamEntity> StreamEntity for InputStreamBuffer<S> {
         self.prev.seekable()
     }
 
+    fn file_path(&self) -> &std::path::Path {
+        self.prev.file_path()
+    }
     fn file_name(&self) -> &str {
         self.prev.file_name()
+    }
+
+    #[cfg(any(unix, windows))]
+    fn shared_stdio(&mut self) -> IoResult<Option<super::cstdio_file::SharedCstdio>> {
+        self.prev.shared_stdio()
     }
 
     fn file(&mut self) -> IoResult<&mut StdFile> {

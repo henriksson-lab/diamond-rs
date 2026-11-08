@@ -174,8 +174,8 @@ impl JoinRecord {
 
 /// Rust translation of C++ `JoinFetcher`.
 #[derive(Debug)]
-pub struct JoinFetcher {
-    files: Vec<Cursor<Vec<u8>>>,
+pub struct StreamJoinFetcher<R: Read> {
+    files: Vec<R>,
     query_ids: Vec<u32>,
     query_last: u32,
     pub buf: Vec<Vec<u8>>,
@@ -183,25 +183,32 @@ pub struct JoinFetcher {
     pub unaligned_from: u32,
 }
 
-impl JoinFetcher {
-    /// Matches C++ `JoinFetcher::init(files)`.
+pub type JoinFetcher = StreamJoinFetcher<Cursor<Vec<u8>>>;
+
+impl StreamJoinFetcher<Cursor<Vec<u8>>> {
+    /// In-memory adapter retained for callers and conformance fixtures.
     pub fn init(files: Vec<Vec<u8>>) -> io::Result<Self> {
+        Self::from_readers(files.into_iter().map(Cursor::new).collect())
+    }
+}
+
+impl<R: Read> StreamJoinFetcher<R> {
+    /// Source streaming boundary: only one query payload per reference block
+    /// is resident, irrespective of the total intermediate-file size.
+    pub fn from_readers(mut files: Vec<R>) -> io::Result<Self> {
         if files.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "join_blocks requires at least one input block",
             ));
         }
-        let mut cursors = Vec::with_capacity(files.len());
         let mut query_ids = Vec::with_capacity(files.len());
-        for file in files {
-            let mut cursor = Cursor::new(file);
-            query_ids.push(read_u32(&mut cursor)?);
-            cursors.push(cursor);
+        for file in &mut files {
+            query_ids.push(read_u32(file)?);
         }
-        let blocks = cursors.len();
+        let blocks = files.len();
         Ok(Self {
-            files: cursors,
+            files,
             query_ids,
             query_last: u32::MAX,
             buf: vec![Vec::new(); blocks],
@@ -297,7 +304,7 @@ pub fn join_query<D: JoinBlocksDb, C: JoinQueryCallbacks>(
 /// loop, then reorders buffers by task number; emitting the same buffers in
 /// this sequential implementation has identical externally visible ordering.
 pub fn join_worker<D: JoinBlocksDb, C: JoinBlocksCallbacks>(
-    fetcher: &mut JoinFetcher,
+    fetcher: &mut StreamJoinFetcher<impl Read>,
     db: &D,
     output_format: &OutputFormat,
     config: &JoinBlocksConfig,

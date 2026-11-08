@@ -105,6 +105,54 @@ pub fn limits(targets: &[Target]) -> (i32, i32) {
     (band, target_len)
 }
 
+fn padded_subject_letter(target: &Target, column: usize) -> Letter {
+    if column == 0 || column > target.seq.len() {
+        return crate::basic::value::MASK_LETTER;
+    }
+    let position = if target.reverse {
+        target.seq.len() - column
+    } else {
+        column - 1
+    };
+    target.seq[position] & LETTER_MASK
+}
+fn padded_substitution(
+    query: &[Letter],
+    target: &Target,
+    subject: Letter,
+    position: i32,
+    matrix: &ScoreMatrix,
+    profile: Option<&LongScoreProfile<i16>>,
+    reverse_profile: Option<&LongScoreProfile<i16>>,
+) -> i32 {
+    if target.matrix.is_none() {
+        if let Some(profile) = if target.reverse {
+            reverse_profile
+        } else {
+            profile
+        } {
+            let offset = position as i64 + profile.padding as i64;
+            return usize::try_from(offset)
+                .ok()
+                .and_then(|offset| profile.data[subject as usize].get(offset))
+                .copied()
+                .map_or(-1, i32::from);
+        }
+    }
+    if position < 0 || position as usize >= query.len() {
+        return -1;
+    }
+    let q = query[if target.reverse {
+        query.len() - 1 - position as usize
+    } else {
+        position as usize
+    }] & LETTER_MASK;
+    target.matrix.as_ref().map_or_else(
+        || matrix.score(q, subject),
+        |matrix| matrix.scores[subject as usize * 32 + q as usize] as i32,
+    )
+}
+
 pub fn smith_waterman(
     query: &[Letter],
     targets: &mut [Target],
@@ -136,72 +184,49 @@ pub(crate) fn smith_waterman_profiled(
         let gap_open = (score_matrix.gap_open() + score_matrix.gap_extend()) * scale;
         let gap_extend = score_matrix.gap_extend() * scale;
 
-        let qlen = target.query_length.max(0).min(
-            query
-                .len()
-                .saturating_sub(target.query_start.max(0) as usize) as i32,
-        ) as usize;
-        let slen = target.seq.len();
-        let rows = qlen + 1;
-        let idx = |i: usize, j: usize| -> usize { j * rows + i };
-        let mut h = vec![neg_inf; rows * (slen + 1)];
-        let mut hgap = vec![neg_inf; rows * (slen + 1)];
-        let mut vgap = vec![neg_inf; rows * (slen + 1)];
-
-        if target.d_begin <= 0 && target.d_end > 0 {
-            h[idx(0, 0)] = 0;
+        // C++ TargetIterator prepends MASK_LETTER and scans complete
+        // thirteen-column blocks, using score-profile padding outside the
+        // true query. Those cells permit leading gaps at the anchor.
+        let band = target.band() as usize;
+        let mut h = vec![neg_inf; band];
+        let mut gap = vec![neg_inf; band + 1];
+        let origin = -target.d_begin;
+        if origin >= 0 && (origin as usize) < band {
+            h[origin as usize] = 0;
         }
-
         let mut best_score = -1;
-        let mut best_i = 0usize;
-        let mut best_j = 0usize;
-
-        for j in 1..=slen {
-            let target_pos = if target.reverse { slen - j } else { j - 1 };
-            let lower = (target.d_begin + (j as i32 - 1)).max(0);
-            let upper = (target.d_end + (j as i32 - 1)).min(qlen as i32 - 1);
-            if lower > upper {
-                continue;
-            }
-            for i in (lower as usize + 1)..=(upper as usize + 1) {
-                let qpos = target.query_start + i as i32 - 1;
-                let qidx = if target.reverse {
-                    query.len() - 1 - qpos as usize
-                } else {
-                    qpos as usize
-                };
-                let q = query[qidx] & LETTER_MASK;
-                let s = target.seq[target_pos] & LETTER_MASK;
-                let current = idx(i, j);
-                let substitution = target.matrix.as_ref().map_or_else(
-                    || {
-                        let active_profile = if target.reverse {
-                            profile_reverse
-                        } else {
-                            profile
-                        };
-                        active_profile.map_or_else(
-                            || score_matrix.score(q, s),
-                            |profile| profile.get(s, qpos as usize)[0] as i32,
-                        )
-                    },
-                    |matrix| matrix.scores[s as usize * 32 + q as usize] as i32,
+        let mut best_i = 0i32;
+        let mut best_j = 0i32;
+        let columns = (target.seq.len() + 1).div_ceil(13) * 13;
+        for j in 0..columns {
+            let mut vertical = neg_inf;
+            let mut next_h = vec![neg_inf; band];
+            let mut next_gap = vec![neg_inf; band + 1];
+            let letter = padded_subject_letter(target, j);
+            for r in 0..band {
+                let qrel = target.d_begin + j as i32 + r as i32 - 1;
+                let substitution = padded_substitution(
+                    query,
+                    target,
+                    letter,
+                    target.query_start + qrel,
+                    score_matrix,
+                    profile,
+                    profile_reverse,
                 );
-                let diag = h[idx(i - 1, j - 1)] + substitution;
-                let h_open = h[idx(i, j - 1)] - gap_open;
-                let h_extend = hgap[idx(i, j - 1)] - gap_extend;
-                hgap[current] = h_open.max(h_extend);
-                let v_open = h[idx(i - 1, j)] - gap_open;
-                let v_extend = vgap[idx(i - 1, j)] - gap_extend;
-                vgap[current] = v_open.max(v_extend);
-                let score = diag.max(hgap[current]).max(vgap[current]);
-                h[current] = score;
+                let score = (h[r] + substitution).max(gap[r + 1]).max(vertical);
+                let open = score - gap_open;
+                next_h[r] = score;
+                next_gap[r] = (gap[r + 1] - gap_extend).max(open);
+                vertical = (vertical - gap_extend).max(open);
                 if score > best_score {
                     best_score = score;
-                    best_i = i;
-                    best_j = j;
+                    best_i = qrel + 1;
+                    best_j = j as i32;
                 }
             }
+            h = next_h;
+            gap = next_gap;
         }
 
         if best_score >= 0 {
@@ -315,7 +340,7 @@ unsafe fn smith_waterman_avx2(
         let mut best_i = [0i32; LANES];
         let mut best_j = [0i32; LANES];
 
-        for j in 0..max_subject_len {
+        for j in 0..(max_subject_len + 1).div_ceil(13) * 13 {
             curr_h.fill(neg);
             curr_gap.fill(neg);
             let mut vertical = neg;
@@ -326,49 +351,23 @@ unsafe fn smith_waterman_avx2(
                 let mut gap_extend = [0i32; LANES];
                 let mut q_positions = [0i32; LANES];
                 for (lane, target) in chunk.iter().enumerate() {
-                    let qrel = target.d_begin + j as i32 + r as i32;
-                    let qlen = target.query_length.max(0).min(
-                        query
-                            .len()
-                            .saturating_sub(target.query_start.max(0) as usize)
-                            as i32,
-                    );
+                    let qrel = target.d_begin + j as i32 + r as i32 - 1;
                     let in_band = !target.blank()
-                        && j < target.seq.len()
-                        && (r as i32) < target.band()
-                        && qrel >= 0
-                        && qrel < qlen;
+                        && j < (target.seq.len() + 1).div_ceil(13) * 13
+                        && (r as i32) < target.band();
                     if !in_band {
                         continue;
                     }
                     valid[lane] = -1;
                     q_positions[lane] = qrel;
-                    let qpos = target.query_start + qrel;
-                    let qidx = if target.reverse {
-                        query.len() - 1 - qpos as usize
-                    } else {
-                        qpos as usize
-                    };
-                    let target_pos = if target.reverse {
-                        target.seq.len() - 1 - j
-                    } else {
-                        j
-                    };
-                    let q = query[qidx] & LETTER_MASK;
-                    let s = target.seq[target_pos] & LETTER_MASK;
-                    subst[lane] = target.matrix.as_ref().map_or_else(
-                        || {
-                            let active_profile = if target.reverse {
-                                profile_reverse
-                            } else {
-                                profile
-                            };
-                            active_profile.map_or_else(
-                                || score_matrix.score(q, s),
-                                |profile| profile.get(s, qpos as usize)[0] as i32,
-                            )
-                        },
-                        |matrix| matrix.scores[s as usize * 32 + q as usize] as i32,
+                    subst[lane] = padded_substitution(
+                        query,
+                        target,
+                        padded_subject_letter(target, j),
+                        target.query_start + qrel,
+                        score_matrix,
+                        profile,
+                        profile_reverse,
                     );
                     let scale = target.matrix_scale.max(1);
                     gap_open[lane] = (score_matrix.gap_open() + score_matrix.gap_extend()) * scale;
@@ -401,7 +400,7 @@ unsafe fn smith_waterman_avx2(
                     if valid[lane] != 0 && values[lane] > best[lane] {
                         best[lane] = values[lane];
                         best_i[lane] = q_positions[lane] + 1;
-                        best_j[lane] = j as i32 + 1;
+                        best_j[lane] = j as i32;
                     }
                 }
             }

@@ -1,0 +1,6 @@
+compat-case-044-algo	blastx	1	0.0000001	seg	0	0	default	6	detailed	
+compat-case-045-algo	blastx	1	0.0000001	seg	75	0	default	6	detailed	
+compat-case-060-algo	blastp	1	0.0000001	seg	75	1	0	6	detailed	
+compat-case-061-algo	blastp	1	0.0000001	seg	75	1	1	6	detailed	
+compat-case-064-algo	blastx	1	0.0000001	seg	75	1	0	6	detailed	
+compat-case-065-algo	blastx	1	0.0000001	seg	75	1	1	6	detailed	

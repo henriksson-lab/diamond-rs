@@ -1,0 +1,1445 @@
+{
+  "qualification": "Direct source CLI field requirements; when present only the leading ANSI reset associated with the version-age warning was removed before comparing TSV content. No TSV data was normalized.",
+  "cases": [
+    {
+      "label": "blastp.cbs0.score0",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs0.score0",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs0.score100",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "eb6594d597d24fdea358362783bf509d0817a78642557448bdc94197b383904e"
+    },
+    {
+      "label": "blastp.cbs0.score100",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "ad00010c3b8d0504a77f73adb8956a07e2559afa2a3428141d409ec994835098"
+    },
+    {
+      "label": "blastp.cbs0.score170",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "2e42fa977cb310fd7b8672d7380b3d5986b59bd2785683507410d88a018ab31a"
+    },
+    {
+      "label": "blastp.cbs0.score170",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "c1ee1cd6e6e2299cca72649116968c292a5121f407f1ac73d7200908ab296c8c"
+    },
+    {
+      "label": "blastp.cbs0.score175",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs0.score175",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs0.score180",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs0.score180",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs1.score0",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs1.score0",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs1.score100",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "1e9674b23c3f43867f9197daf432821c9e8f87eaf32717cc634d2e59731abf12"
+    },
+    {
+      "label": "blastp.cbs1.score100",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "d4b5aa77fc2e66cbe0a0f0927a5d3d37b7b44f58e4291d9f2e84752ab75499bd"
+    },
+    {
+      "label": "blastp.cbs1.score170",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "77116e9c0edb4ecd35411d0b85fae2adee358397591e4a27ed54cdca15c3b1ea"
+    },
+    {
+      "label": "blastp.cbs1.score170",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "c0d2565b5886b814dbcfe8baab1ce4ec1f24a01a966a04b26c7b3ad5df142673"
+    },
+    {
+      "label": "blastp.cbs1.score175",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "77116e9c0edb4ecd35411d0b85fae2adee358397591e4a27ed54cdca15c3b1ea"
+    },
+    {
+      "label": "blastp.cbs1.score175",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "c0d2565b5886b814dbcfe8baab1ce4ec1f24a01a966a04b26c7b3ad5df142673"
+    },
+    {
+      "label": "blastp.cbs1.score180",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs1.score180",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs2.score0",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs2.score0",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs2.score100",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "04653f07a02225748c507f791be4906fbc69c5bac3b443cc7b8c3d45e8ff0a8e"
+    },
+    {
+      "label": "blastp.cbs2.score100",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "4aa0405c5569e7d63dbe7c7ef3e01f9f15a6bbc1cc097b06a1029885fb151698"
+    },
+    {
+      "label": "blastp.cbs2.score170",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs2.score170",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs2.score175",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs2.score175",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs2.score180",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs2.score180",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs3.score0",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs3.score0",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs3.score100",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "04653f07a02225748c507f791be4906fbc69c5bac3b443cc7b8c3d45e8ff0a8e"
+    },
+    {
+      "label": "blastp.cbs3.score100",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "4aa0405c5569e7d63dbe7c7ef3e01f9f15a6bbc1cc097b06a1029885fb151698"
+    },
+    {
+      "label": "blastp.cbs3.score170",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs3.score170",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs3.score175",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs3.score175",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs3.score180",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs3.score180",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs4.score0",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs4.score0",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs4.score100",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "04653f07a02225748c507f791be4906fbc69c5bac3b443cc7b8c3d45e8ff0a8e"
+    },
+    {
+      "label": "blastp.cbs4.score100",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "4aa0405c5569e7d63dbe7c7ef3e01f9f15a6bbc1cc097b06a1029885fb151698"
+    },
+    {
+      "label": "blastp.cbs4.score170",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs4.score170",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs4.score175",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs4.score175",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs4.score180",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs4.score180",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs5.score0",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs5.score0",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs5.score100",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "04653f07a02225748c507f791be4906fbc69c5bac3b443cc7b8c3d45e8ff0a8e"
+    },
+    {
+      "label": "blastp.cbs5.score100",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "4aa0405c5569e7d63dbe7c7ef3e01f9f15a6bbc1cc097b06a1029885fb151698"
+    },
+    {
+      "label": "blastp.cbs5.score170",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs5.score170",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs5.score175",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs5.score175",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs5.score180",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs5.score180",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs0.score0",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs0.score0",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs0.score100",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "81c40dbc91329719f5b50dbd95da5bc9db1e3d575b3ad5e465f15b1726d8916d"
+    },
+    {
+      "label": "blastx.cbs0.score100",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "72fa905d890e94dd2b87d44ddf449e3097133b03cefa3d6a98cd8b5770f518b4"
+    },
+    {
+      "label": "blastx.cbs0.score170",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "eb14c5844e6ff5042b469da88f65ffbb04fa193f99a9446c828b298469fbe5dc"
+    },
+    {
+      "label": "blastx.cbs0.score170",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "a9e11c5913e1363609bcb7f1026ebdb954bd25eba250c7b91a6b05d86de381a5"
+    },
+    {
+      "label": "blastx.cbs0.score175",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs0.score175",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs0.score180",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs0.score180",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs1.score0",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs1.score0",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs1.score100",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "cb4d4c578b803c7a3ad75b6a20231d92adf638a58605cc0d3028c13e5b08583c"
+    },
+    {
+      "label": "blastx.cbs1.score100",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "0465af5288efabe07b391af366100d0bd57f1c8bbdd501faec869ae49554552a"
+    },
+    {
+      "label": "blastx.cbs1.score170",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "224c27d4008fef5d540a17c4878243a6e1efe1b6ed06c52ccd53b1b9dab1909f"
+    },
+    {
+      "label": "blastx.cbs1.score170",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "dd95a3e9b0d5228ec745b9cda1c281aa79b4297d776710bc33f3e46480bf27a2"
+    },
+    {
+      "label": "blastx.cbs1.score175",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "224c27d4008fef5d540a17c4878243a6e1efe1b6ed06c52ccd53b1b9dab1909f"
+    },
+    {
+      "label": "blastx.cbs1.score175",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "dd95a3e9b0d5228ec745b9cda1c281aa79b4297d776710bc33f3e46480bf27a2"
+    },
+    {
+      "label": "blastx.cbs1.score180",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs1.score180",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs0.score174.5",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs0.score174.5",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs1.score174.5",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "77116e9c0edb4ecd35411d0b85fae2adee358397591e4a27ed54cdca15c3b1ea"
+    },
+    {
+      "label": "blastp.cbs1.score174.5",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "c0d2565b5886b814dbcfe8baab1ce4ec1f24a01a966a04b26c7b3ad5df142673"
+    },
+    {
+      "label": "blastp.cbs2.score174.5",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs2.score174.5",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs3.score174.5",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs3.score174.5",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs4.score174.5",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs4.score174.5",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs5.score174.5",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastp.cbs5.score174.5",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs0.score174.5",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs0.score174.5",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "label": "blastx.cbs1.score174.5",
+      "format": "score",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score"
+      ],
+      "projection_exact": true,
+      "sha256": "224c27d4008fef5d540a17c4878243a6e1efe1b6ed06c52ccd53b1b9dab1909f"
+    },
+    {
+      "label": "blastx.cbs1.score174.5",
+      "format": "coordinates",
+      "fields": [
+        "6",
+        "qseqid",
+        "sseqid",
+        "score",
+        "bitscore",
+        "evalue",
+        "qstart",
+        "qend",
+        "sstart",
+        "send"
+      ],
+      "projection_exact": true,
+      "sha256": "dd95a3e9b0d5228ec745b9cda1c281aa79b4297d776710bc33f3e46480bf27a2"
+    }
+  ]
+}

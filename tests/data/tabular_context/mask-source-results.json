@@ -1,0 +1,154 @@
+[
+  {
+    "label": "blastp.mask1.b1",
+    "command": "blastp",
+    "extension": "faa",
+    "mask": "1",
+    "block": "1",
+    "fields": [
+      "qseqid",
+      "sseqid",
+      "qseq",
+      "sseq",
+      "full_sseq",
+      "full_qseq",
+      "cigar",
+      "normalized_bitscore",
+      "approx_pident"
+    ],
+    "sha256": "069007eafdeef2ab0e04d5428b003a3b58264995f1df25e8282405dbac259d9f"
+  },
+  {
+    "label": "blastp.mask1.b0.0000001",
+    "command": "blastp",
+    "extension": "faa",
+    "mask": "1",
+    "block": "0.0000001",
+    "fields": [
+      "qseqid",
+      "sseqid",
+      "qseq",
+      "sseq",
+      "full_sseq",
+      "full_qseq",
+      "cigar",
+      "normalized_bitscore",
+      "approx_pident"
+    ],
+    "sha256": "069007eafdeef2ab0e04d5428b003a3b58264995f1df25e8282405dbac259d9f"
+  },
+  {
+    "label": "blastp.maskseg.b1",
+    "command": "blastp",
+    "extension": "faa",
+    "mask": "seg",
+    "block": "1",
+    "fields": [
+      "qseqid",
+      "sseqid",
+      "qseq",
+      "sseq",
+      "full_sseq",
+      "full_qseq",
+      "cigar",
+      "normalized_bitscore",
+      "approx_pident"
+    ],
+    "sha256": "069007eafdeef2ab0e04d5428b003a3b58264995f1df25e8282405dbac259d9f"
+  },
+  {
+    "label": "blastp.maskseg.b0.0000001",
+    "command": "blastp",
+    "extension": "faa",
+    "mask": "seg",
+    "block": "0.0000001",
+    "fields": [
+      "qseqid",
+      "sseqid",
+      "qseq",
+      "sseq",
+      "full_sseq",
+      "full_qseq",
+      "cigar",
+      "normalized_bitscore",
+      "approx_pident"
+    ],
+    "sha256": "069007eafdeef2ab0e04d5428b003a3b58264995f1df25e8282405dbac259d9f"
+  },
+  {
+    "label": "blastx.mask1.b1",
+    "command": "blastx",
+    "extension": "fna",
+    "mask": "1",
+    "block": "1",
+    "fields": [
+      "qseqid",
+      "sseqid",
+      "qseq",
+      "sseq",
+      "full_sseq",
+      "full_qseq",
+      "cigar",
+      "normalized_bitscore",
+      "approx_pident"
+    ],
+    "sha256": "08f1d56febb5b5f3e0cb7ab16173e34d6074926b92bf522b0d5f6aab6b5ef0ee"
+  },
+  {
+    "label": "blastx.mask1.b0.0000001",
+    "command": "blastx",
+    "extension": "fna",
+    "mask": "1",
+    "block": "0.0000001",
+    "fields": [
+      "qseqid",
+      "sseqid",
+      "qseq",
+      "sseq",
+      "full_sseq",
+      "full_qseq",
+      "cigar",
+      "normalized_bitscore",
+      "approx_pident"
+    ],
+    "sha256": "f4b44a396dba0ead6da7b51bf3582d7b96e8947b7a7a84b056469b7e62efe363"
+  },
+  {
+    "label": "blastx.maskseg.b1",
+    "command": "blastx",
+    "extension": "fna",
+    "mask": "seg",
+    "block": "1",
+    "fields": [
+      "qseqid",
+      "sseqid",
+      "qseq",
+      "sseq",
+      "full_sseq",
+      "full_qseq",
+      "cigar",
+      "normalized_bitscore",
+      "approx_pident"
+    ],
+    "sha256": "7868b6d02ff94df73d933ada19108a4b89dfcbce265ab1da77f39868fdf15f29"
+  },
+  {
+    "label": "blastx.maskseg.b0.0000001",
+    "command": "blastx",
+    "extension": "fna",
+    "mask": "seg",
+    "block": "0.0000001",
+    "fields": [
+      "qseqid",
+      "sseqid",
+      "qseq",
+      "sseq",
+      "full_sseq",
+      "full_qseq",
+      "cigar",
+      "normalized_bitscore",
+      "approx_pident"
+    ],
+    "sha256": "f4b44a396dba0ead6da7b51bf3582d7b96e8947b7a7a84b056469b7e62efe363"
+  }
+]

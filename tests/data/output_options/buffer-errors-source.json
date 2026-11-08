@@ -1,0 +1,102 @@
+[
+  {
+    "value": "0",
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--file-buffer-size",
+      "0",
+      "-o",
+      ".tmp/native-output-options-20261107/invalid-buffer.out"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: .tmp/native-output-options-20261107\n#Target sequences to report alignments for: 25\nOpening the database... Error: Invalid peek\n"
+  },
+  {
+    "value": "1",
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--file-buffer-size",
+      "1",
+      "-o",
+      ".tmp/native-output-options-20261107/invalid-buffer.out"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: .tmp/native-output-options-20261107\n#Target sequences to report alignments for: 25\nOpening the database... Error: Invalid peek\n"
+  },
+  {
+    "value": "2",
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--file-buffer-size",
+      "2",
+      "-o",
+      ".tmp/native-output-options-20261107/invalid-buffer.out"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: .tmp/native-output-options-20261107\n#Target sequences to report alignments for: 25\nOpening the database... Error: Invalid peek\n"
+  },
+  {
+    "value": "3",
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--file-buffer-size",
+      "3",
+      "-o",
+      ".tmp/native-output-options-20261107/invalid-buffer.out"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: .tmp/native-output-options-20261107\n#Target sequences to report alignments for: 25\nOpening the database... Error: Invalid peek\n"
+  },
+  {
+    "value": "-1",
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-output-options-20261107/plain.dmnd",
+      "-f",
+      "6",
+      "--file-buffer-size",
+      "-1",
+      "-o",
+      ".tmp/native-output-options-20261107/invalid-buffer.out"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: Failed to allocate sufficient memory. Please refer to the online wiki for instructions on memory usage.\n"
+  }
+]

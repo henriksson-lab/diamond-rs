@@ -9,10 +9,31 @@ on:
 permissions:
   contents: read
 
+# The package matrix builds several profiles and integration executables on
+# hosted runners with limited disk space. Keep test assertions and behavior,
+# while avoiding duplicate debug-symbol and incremental-codegen artifacts.
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   package:
-    name: Verify packaged crate (Linux)
-    runs-on: ubuntu-latest
+    name: Verify packaged crate (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux x86-64
+            os: ubuntu-latest
+            host: x86_64-unknown-linux-gnu
+          - platform: macOS ARM64
+            os: macos-latest
+            host: aarch64-apple-darwin
+          - platform: macOS Intel
+            os: macos-15-intel
+            host: x86_64-apple-darwin
 
     steps:
       - name: Checkout
@@ -23,6 +44,17 @@ jobs:
 
       - name: Select Rust
         run: rustup default stable
+
+      # Check the native host explicitly so a runner-label change cannot
+      # silently drop either Apple architecture from package validation.
+      - name: Verify native compiler host
+        shell: bash
+        env:
+          EXPECTED_RUST_HOST: ${{ matrix.host }}
+        run: |
+          rustc -vV
+          cargo -V
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_RUST_HOST"
 
       # Build from Cargo's isolated package staging directory. This catches
       # accidental compile-time dependencies on checkout-only files (notably
@@ -37,6 +69,25 @@ jobs:
           package_dir="$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'diamond-rs-*' -print -quit)"
           test -n "$package_dir"
           cargo test --locked --all-targets --manifest-path "$package_dir/Cargo.toml"
+
+      # Execute optional native workflows on each package host as well as
+      # compiling them. Keep the diagnostic C++ bridge out of this test run.
+      - name: Test optional native features in the isolated package
+        shell: bash
+        run: |
+          package_dir="$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'diamond-rs-*' -print -quit)"
+          test -n "$package_dir"
+          cargo test --locked --all-targets --features dna,mcl,zstd --manifest-path "$package_dir/Cargo.toml"
+
+      # The published package omits diamond/. Even with ffi requested, it
+      # must compile on both Apple architectures without the C++ source tree.
+      - name: Build the isolated package with all features
+        shell: bash
+        run: |
+          package_dir="$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'diamond-rs-*' -print -quit)"
+          test -n "$package_dir"
+          test ! -e "$package_dir/diamond"
+          cargo build --locked --all-targets --all-features --manifest-path "$package_dir/Cargo.toml"
 
   build:
     name: Build (${{ matrix.os }})

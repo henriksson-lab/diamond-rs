@@ -1,0 +1,4 @@
+cseqid	mseqid	approx_pident	pident	length	mismatch	gapopen	cstart	cend	mstart	mend	evalue	Bitscore	score	clen	mlen	nident	positive	gaps
+domain_query	single_domain	100	100	78	0	0	1	78	1	78	7.86e-59	174	441	379	78	78	78	0
+domain_query	domain_query	100	100	379	0	0	1	379	1	379	5.31e-158	438	1126	379	379	379	379	0
+domain_query	reordered	100	100	78	0	0	1	78	302	379	4.87e-55	174	441	379	379	78	78	0

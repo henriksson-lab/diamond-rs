@@ -40,6 +40,26 @@ pub struct EnumSeedsContext<'a> {
     pub query_contexts: usize,
 }
 
+/// Convert a round-local source bitset for the source-shaped EnumCfg API.
+/// All protein contexts of one translated query share the same skip bit.
+pub(crate) fn source_query_skip_vec(
+    skip: Option<&crate::util::data_structures::BitVector>,
+    contexts: usize,
+    sequence_count: usize,
+) -> Result<Option<Vec<bool>>, String> {
+    if contexts == 0 {
+        return Err("Query context count must be positive.".to_owned());
+    }
+    let Some(skip) = skip else {
+        return Ok(None);
+    };
+    let sources = sequence_count.div_ceil(contexts);
+    if skip.size() as usize != sources {
+        return Err("Source-query skip mask does not cover the context block.".to_owned());
+    }
+    Ok(Some((0..sources).map(|source| skip.get(source)).collect()))
+}
+
 pub fn enum_seeds<F, Filter>(
     seqs: &mut SequenceSet,
     f: &mut F,
@@ -209,6 +229,7 @@ pub fn enum_seeds_hashed<F, const BITS: u64, Filter>(
 /// invariants out of the inner loop lets this match upstream's specialized
 /// `HashedSeedSetCallback` instantiation without changing seed order or hash
 /// table insertion behavior.
+#[allow(dead_code)] // Compatibility wrapper; active search supplies its signed threshold.
 pub(crate) fn enum_seeds_hashed_unfiltered<F, const BITS: u64>(
     seqs: &SequenceSet,
     f: &mut F,
@@ -219,7 +240,28 @@ pub(crate) fn enum_seeds_hashed_unfiltered<F, const BITS: u64>(
 ) where
     F: EnumSeedsCallback,
 {
+    enum_seeds_hashed_unfiltered_with_min_query_len::<F, BITS>(
+        seqs, f, begin, end, shapes, reduction, 0, 1,
+    );
+}
+
+pub(crate) fn enum_seeds_hashed_unfiltered_with_min_query_len<F, const BITS: u64>(
+    seqs: &SequenceSet,
+    f: &mut F,
+    begin: u32,
+    end: u32,
+    shapes: &ShapeConfig,
+    reduction: &Reduction,
+    min_query_len: Loc,
+    query_contexts: usize,
+) where
+    F: EnumSeedsCallback,
+{
     for i in begin as usize..end as usize {
+        if min_query_len > 0 && seqs.source_length_with_contexts(i, query_contexts) < min_query_len
+        {
+            continue;
+        }
         for shape_id in 0..shapes.count() {
             let sh = shapes.get(shape_id as usize);
             if seqs.length(i) < sh.length {

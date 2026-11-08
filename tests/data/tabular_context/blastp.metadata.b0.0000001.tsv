@@ -1,0 +1,5 @@
+domain_query	domain_query <alpha>& description	single_domain	single_domain control	single_domain	single_domain control	0	1	0
+domain_query	domain_query <alpha>& description	reordered	reordered three disjoint domains	reordered	reordered three disjoint domains	0	0	0
+domain_query	domain_query <alpha>& description	reordered	reordered three disjoint domains	reordered	reordered three disjoint domains	0	0	1
+domain_query	domain_query <alpha>& description	reordered	reordered three disjoint domains	reordered	reordered three disjoint domains	0	0	2
+domain_query	domain_query <alpha>& description	gapped_ref	gapped_ref indel <subject>& title	gapped_ref;alternate	gapped_ref indel <subject>& title<>alternate second title	0	2	0

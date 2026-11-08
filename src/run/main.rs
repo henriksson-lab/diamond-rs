@@ -5,6 +5,7 @@
 //! boundaries explicit while [`main`] retains the dispatch, diagnostics, and
 //! exit-status behavior of the original entry point.
 
+use std::ffi::OsString;
 use std::io::Write;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,9 +54,9 @@ pub struct MainConfig {
     pub command: RunCommand,
     pub program_name: String,
     pub version_string: String,
-    pub daa_file: String,
-    pub cluster_similarity: String,
-    pub cluster_algorithm: Option<String>,
+    pub daa_file: std::path::PathBuf,
+    pub cluster_similarity: Vec<u8>,
+    pub cluster_algorithm: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -68,14 +69,81 @@ pub struct RunFeatures {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
     BadAlloc(String),
+    /// Historical Source exception: its failing opener already emitted perror.
     FileOpen,
+    /// Native deferred counterpart, retaining the failing operation's captured
+    /// OS diagnostic across this cloneable execution boundary.
+    FileOpenDetails {
+        kind: std::io::ErrorKind,
+        error: crate::util::io::FileOpenError,
+    },
+    /// TempFile's constructor emits perror and then throws a standard error.
+    /// Keep both parts across the deferred native execution boundary.
+    TemporaryFileOpenDetails {
+        kind: std::io::ErrorKind,
+        error: crate::util::io::temp_file::TempFileOpenError,
+    },
+    StdioDetails {
+        kind: std::io::ErrorKind,
+        error: crate::util::io::cstdio_file::StdioError,
+    },
+    /// The Source perror part was emitted before a destructor ran. The
+    /// ordinary exception catch and log remain required for standard errors.
+    PerrorReported(Box<RunError>),
     Standard(String),
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    RawIo {
+        kind: std::io::ErrorKind,
+        message: Vec<u8>,
+    },
+    Untranslated,
+    /// Configuration already emitted its diagnostic or completed early.
+    Status(i32),
     Unknown,
 }
 
+impl RunError {
+    pub(crate) fn without_perror_marker(&self) -> &Self {
+        let mut error = self;
+        while let Self::PerrorReported(inner) = error {
+            error = inner;
+        }
+        error
+    }
+}
+
 pub trait RunBackend {
+    /// Concrete native execution can report an exception before releasing its
+    /// log, preserving Source's terminal-then-log order. Generic adapters leave
+    /// reporting to this module's supplied streams.
+    fn error_was_reported(&self) -> bool {
+        false
+    }
+    /// Release invocation-owned resources after success or a reported error.
+    /// Concrete native backends may be reused without retaining command locks.
+    fn finish_execution(&mut self) {}
+    /// Observe the real result while invocation-owned log streams still live.
+    fn finish_execution_result(&mut self, _: &Result<i32, RunError>) {
+        self.finish_execution();
+    }
     fn init_motif_table(&mut self) -> Result<(), RunError>;
     fn parse_config(&mut self, args: &[String]) -> Result<MainConfig, RunError>;
+    fn parse_config_os(&mut self, args: &[OsString]) -> Result<MainConfig, RunError> {
+        let args = args
+            .iter()
+            .map(|s| {
+                s.to_str().map(str::to_owned).ok_or_else(|| {
+                    RunError::Standard(
+                        "OS arguments are not UTF-8; implement parse_config_os".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.parse_config(&args)
+    }
     fn make_db(&mut self) -> Result<(), RunError>;
     fn search(&mut self) -> Result<(), RunError>;
     fn view_daa(&mut self) -> Result<(), RunError>;
@@ -87,7 +155,17 @@ pub trait RunBackend {
     fn info(&mut self) -> Result<(), RunError>;
     fn pairwise(&mut self) -> Result<(), RunError>;
     fn evaluate_cluster_similarity(&mut self, expression: &str) -> Result<(), RunError>;
+    fn evaluate_cluster_similarity_bytes(&mut self, expression: &[u8]) -> Result<(), RunError> {
+        self.evaluate_cluster_similarity(
+            std::str::from_utf8(expression).map_err(|e| RunError::Standard(e.to_string()))?,
+        )
+    }
     fn run_cluster(&mut self, algorithm: &str) -> Result<(), RunError>;
+    fn run_cluster_bytes(&mut self, algorithm: &[u8]) -> Result<(), RunError> {
+        self.run_cluster(
+            std::str::from_utf8(algorithm).map_err(|e| RunError::Standard(e.to_string()))?,
+        )
+    }
     fn benchmark(&mut self) -> Result<(), RunError>;
     fn split(&mut self) -> Result<(), RunError>;
     fn regression_test(&mut self) -> Result<i32, RunError>;
@@ -107,6 +185,11 @@ pub trait RunBackend {
     fn cut(&mut self) -> Result<(), RunError>;
     fn profile_recluster(&mut self) -> Result<(), RunError>;
     fn message(&mut self, text: &str);
+    fn message_bytes(&mut self, text: &[u8]) {
+        self.message(
+            std::str::from_utf8(text).expect("Message is not UTF-8; implement message_bytes"),
+        )
+    }
 }
 
 fn write_line<W: Write>(out: &mut W, text: &str) -> Result<(), RunError> {
@@ -129,7 +212,7 @@ fn dispatch<B: RunBackend, O: Write, E: Write>(
         RunCommand::MakeDb => backend.make_db()?,
         RunCommand::BlastP | RunCommand::BlastX => backend.search()?,
         RunCommand::View => {
-            if config.daa_file.is_empty() {
+            if config.daa_file.as_os_str().is_empty() {
                 return Err(RunError::Standard(
                     "The view command requires a DAA (option -a) input file.".to_owned(),
                 ));
@@ -145,16 +228,18 @@ fn dispatch<B: RunBackend, O: Write, E: Write>(
         RunCommand::SmithWaterman => backend.pairwise()?,
         RunCommand::Cluster | RunCommand::DeepClust | RunCommand::LinClust => {
             if features.with_mcl && !config.cluster_similarity.is_empty() {
-                if let Err(error) = backend.evaluate_cluster_similarity(&config.cluster_similarity)
+                if let Err(error) =
+                    backend.evaluate_cluster_similarity_bytes(&config.cluster_similarity)
                 {
-                    backend.message(&format!(
-                        "Could not evaluate the expression: {}\n",
-                        config.cluster_similarity
-                    ));
+                    let mut message = b"Could not evaluate the expression: ".to_vec();
+                    message.extend_from_slice(&config.cluster_similarity);
+                    message.push(b'\n');
+                    backend.message_bytes(&message);
                     return Err(error);
                 }
             }
-            backend.run_cluster(config.cluster_algorithm.as_deref().unwrap_or("cascaded"))?;
+            backend
+                .run_cluster_bytes(config.cluster_algorithm.as_deref().unwrap_or(b"cascaded"))?;
         }
         RunCommand::Benchmark => backend.benchmark()?,
         RunCommand::Split => backend.split()?,
@@ -205,21 +290,121 @@ pub fn main<B: RunBackend, O: Write, E: Write, L: Write>(
     err: &mut E,
     log: &mut L,
 ) -> i32 {
-    let result = backend
-        .init_motif_table()
-        .and_then(|()| backend.parse_config(args))
-        .and_then(|config| dispatch(backend, &config, features, out, err));
+    main_os(
+        backend,
+        &args.iter().map(OsString::from).collect::<Vec<_>>(),
+        features,
+        out,
+        err,
+        log,
+    )
+}
+pub fn main_os<B: RunBackend, O: Write, E: Write, L: Write>(
+    backend: &mut B,
+    args: &[OsString],
+    features: RunFeatures,
+    out: &mut O,
+    err: &mut E,
+    log: &mut L,
+) -> i32 {
+    let result = execute_os(backend, args, features, out, err);
+    if backend.error_was_reported() {
+        return match result {
+            Ok(status) | Err(RunError::Status(status)) => status,
+            _ => 1,
+        };
+    }
+    let (result, perror_reported) = match result {
+        Err(mut error) => {
+            let mut reported = false;
+            while let RunError::PerrorReported(inner) = error {
+                error = *inner;
+                reported = true;
+            }
+            (Err(error), reported)
+        }
+        ok => (ok, false),
+    };
     match result {
         Ok(status) => status,
+        Err(RunError::Status(status)) => status,
         Err(RunError::BadAlloc(message)) => {
             let _ = writeln!(err, "Failed to allocate sufficient memory. Please refer to the online wiki for instructions on memory usage.");
             let _ = writeln!(log, "Error: {message}");
             1
         }
         Err(RunError::FileOpen) => 1,
-        Err(RunError::Standard(message)) => {
+        Err(RunError::FileOpenDetails { error, .. }) => {
+            // Source prints this in the file constructor and its dedicated
+            // main catch returns silently. Native openers defer that one
+            // diagnostic to the supplied terminal stream; never the log.
+            if !perror_reported {
+                match error.try_perror_bytes() {
+                    Ok(bytes) => {
+                        let _ = err.write_all(&bytes);
+                    }
+                    Err(error) => {
+                        let _ = writeln!(err, "Error: {error}");
+                    }
+                }
+            }
+            1
+        }
+        Err(RunError::TemporaryFileOpenDetails { error, .. }) => {
+            if !perror_reported {
+                let _ = err.write_all(&error.reason);
+                let _ = err.write_all(b"\n");
+            }
+            match error.try_message_bytes() {
+                Ok(bytes) => {
+                    for stream in [&mut *err as &mut dyn Write, &mut *log as &mut dyn Write] {
+                        let _ = stream.write_all(b"Error: ");
+                        let _ = stream.write_all(&bytes);
+                        let _ = stream.write_all(b"\n");
+                    }
+                }
+                Err(error) => {
+                    let _ = writeln!(err, "Error: {error}");
+                    let _ = writeln!(log, "Error: {error}");
+                }
+            }
+            1
+        }
+        Err(RunError::StdioDetails { error, .. }) => {
+            if !perror_reported {
+                if let Some(perror) = &error.perror {
+                    let _ = err.write_all(perror);
+                    let _ = err.write_all(b"\n");
+                }
+            }
+            let _ = out.flush();
+            for stream in [&mut *err as &mut dyn Write, &mut *log as &mut dyn Write] {
+                let _ = stream.write_all(b"Error: ");
+                let _ = stream.write_all(error.message_bytes());
+                let _ = stream.write_all(b"\n");
+            }
+            1
+        }
+        Err(RunError::PerrorReported(_)) => unreachable!("perror wrappers were removed"),
+        Err(RunError::Standard(message) | RunError::Io { message, .. }) => {
             let _ = writeln!(err, "Error: {message}");
             let _ = writeln!(log, "Error: {message}");
+            1
+        }
+        Err(RunError::RawIo { message, .. }) => {
+            let message = message.split(|&byte| byte == 0).next().unwrap_or_default();
+            for stream in [&mut *err as &mut dyn Write, &mut *log as &mut dyn Write] {
+                let _ = stream.write_all(b"Error: ");
+                let _ = stream.write_all(message);
+                let _ = stream.write_all(b"\n");
+            }
+            1
+        }
+        Err(RunError::Untranslated) => {
+            let _ = writeln!(
+                err,
+                "Error: Native execution of this command or option is not yet connected."
+            );
             1
         }
         Err(RunError::Unknown) => {
@@ -227,6 +412,40 @@ pub fn main<B: RunBackend, O: Write, E: Write, L: Write>(
             1
         }
     }
+}
+
+/// Prepare and execute one translated entry point, leaving error reporting to
+/// its caller. The executable and safe native facade retain the same concrete
+/// backend without recursively entering command setup or printing errors twice.
+pub fn execute<B: RunBackend, O: Write, E: Write>(
+    backend: &mut B,
+    args: &[String],
+    features: RunFeatures,
+    out: &mut O,
+    err: &mut E,
+) -> Result<i32, RunError> {
+    execute_os(
+        backend,
+        &args.iter().map(OsString::from).collect::<Vec<_>>(),
+        features,
+        out,
+        err,
+    )
+}
+pub fn execute_os<B: RunBackend, O: Write, E: Write>(
+    backend: &mut B,
+    args: &[OsString],
+    features: RunFeatures,
+    out: &mut O,
+    err: &mut E,
+) -> Result<i32, RunError> {
+    let result = (|| {
+        backend.init_motif_table()?;
+        let config = backend.parse_config_os(args)?;
+        dispatch(backend, &config, features, out, err)
+    })();
+    backend.finish_execution_result(&result);
+    result
 }
 
 #[cfg(test)]
@@ -248,8 +467,8 @@ mod tests {
                     command,
                     program_name: "diamond".to_owned(),
                     version_string: "2.1".to_owned(),
-                    daa_file: String::new(),
-                    cluster_similarity: String::new(),
+                    daa_file: std::path::PathBuf::new(),
+                    cluster_similarity: Vec::new(),
                     cluster_algorithm: None,
                 }),
                 fail: None,
@@ -379,8 +598,8 @@ mod tests {
 
         let mut backend = Backend::new(RunCommand::Cluster);
         if let Ok(config) = &mut backend.config {
-            config.cluster_similarity = "identity >= 50".to_owned();
-            config.cluster_algorithm = Some("linclust".to_owned());
+            config.cluster_similarity = b"identity >= 50".to_vec();
+            config.cluster_algorithm = Some(b"linclust".to_vec());
         }
         assert_eq!(
             run(
@@ -451,5 +670,29 @@ mod tests {
         let result = run(&mut backend, RunFeatures::default());
         assert_eq!(result.2, "Exception of unknown type!\n");
         assert!(result.3.is_empty());
+    }
+
+    #[test]
+    fn exception_diagnostic_preserves_raw_accession_bytes_and_what_terminator() {
+        let mut backend = Backend::new(RunCommand::MakeDb);
+        backend.config = Err(RunError::RawIo {
+            kind: std::io::ErrorKind::Other,
+            message: b"Missing accession: \xff\0ignored".to_vec(),
+        });
+        let (mut out, mut err, mut log) = (Vec::new(), Vec::new(), Vec::new());
+        assert_eq!(
+            super::main(
+                &mut backend,
+                &[],
+                RunFeatures::default(),
+                &mut out,
+                &mut err,
+                &mut log,
+            ),
+            1
+        );
+        assert!(out.is_empty());
+        assert_eq!(err, b"Error: Missing accession: \xff\n");
+        assert_eq!(log, err);
     }
 }

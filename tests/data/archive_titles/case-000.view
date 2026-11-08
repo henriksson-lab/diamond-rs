@@ -1,0 +1,5 @@
+domain_query	single_domain	single_domain	single_domain	single_domain	176
+domain_query	sp|R001|main	sp|R001|main	sp|R001|main	sp|R001|main	176
+domain_query	sp|R001|main	sp|R001|main	sp|R001|main	sp|R001|main	169
+domain_query	sp|R001|main	sp|R001|main	sp|R001|main	sp|R001|main	162
+domain_query	gapped_refraw	gapped_refraw	gapped_refraw	gapped_refraw	157

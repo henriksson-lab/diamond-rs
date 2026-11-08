@@ -1,0 +1,6 @@
+domain_query	379	0	77	+	single_domain	78	0	77	78	78	255	AS:i:176	ZR:i:445	ZE:f:1.27e-59
+domain_query	379	0	77	+	reordered	379	301	378	78	78	255	AS:i:176	ZR:i:445	ZE:f:8.09e-56
+domain_query	379	308	378	+	reordered	379	0	70	71	71	255	AS:i:169	ZR:i:428	ZE:f:2.49e-53
+domain_query	379	158	227	+	reordered	379	151	220	70	70	255	AS:i:162	ZR:i:411	ZE:f:7.54e-51
+domain_query	379	0	77	+	gapped_ref	79	0	78	76	81	255	AS:i:157	ZR:i:398	ZE:f:1.36e-52
+unaligned	4	*	0	255	*	*	0	0	*	*

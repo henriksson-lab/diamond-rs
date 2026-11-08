@@ -1,0 +1,34 @@
+{
+  "purpose": "Frozen Source numerical stage vectors; standalone Rust test needs neither Source nor C++ runtime",
+  "source_commit": "1d162b4fefb5e6b4d868c24e6ad551cad2dcf246",
+  "mcl_caller_tree": "8a8f9b7f58ed88154d088899877271141c2a2a6d",
+  "eigen_tree": "96d4fedf977d0cc2c0e3cc5383ba0b7dfb55aa9e",
+  "eigen_version": "3.3.8",
+  "compiler": "g++11.4.0 Ubuntu22.04 x86_64, -O3 -DNDEBUG -std=gnu++23, baseline SSE, no fastmath",
+  "source_kernel_binary_sha256": "a0dabd040841dd1009534390831c6714bb6cf7af493c40567ee9a4020fb0d3c5",
+  "source_harness_sha256": "5dc0c1097ded769a57e446e95172993e11229f08cbc86068e4d5306a8e13e7d1",
+  "fixture_sha256": "2c8d74bdbec492a1ae4610baef5d8edb41840ae4d52fb5df0cbdccec01fa8bf0",
+  "fixture_count": 54,
+  "source_headers_sha256": {
+    "Eigen/src/Eigenvalues/RealSchur.h": "a1946063ac4a46d57fef4dd6395291e4cb7cb7bf3e8f932ec108bce52919a817",
+    "Eigen/src/Eigenvalues/EigenSolver.h": "1190506d0c3b5af4a22828b8401d1faa505c4378f17eb8efd69d03431ae37b02",
+    "Eigen/src/Eigenvalues/HessenbergDecomposition.h": "6403bb9ed1fa48ad93f3881a05a1f0d8120fef7daf700aabd4df1bc640de001c",
+    "Eigen/src/Householder/Householder.h": "63fe489f1eabd51399649cc0102803dd616689ef831a2224afe53d48c013d5e0",
+    "Eigen/src/Householder/HouseholderSequence.h": "c38234f5ae691e94bf11bc8f42b173a954b2b140c47e5af1d8cdcbc3551e16fe",
+    "Eigen/src/Jacobi/Jacobi.h": "afd01aa5bfb86c1fe18e7fa0c041e20508ceff41b97998f0a8620d2f170f99e4",
+    "Eigen/src/Core/Redux.h": "10bbaae343fe3a93676da261fa9c14deec1779d2663c586e4f66522a1cd3375d",
+    "Eigen/src/Core/Dot.h": "8a78da80e2bf939bcde97058170fa4e6895a60da369c489048cea10f02ee96b8",
+    "Eigen/src/Core/SelfCwiseBinaryOp.h": "4d0f02140378c8fd28bb05d2f13dc50dd867bdbc2dddce223fe37b82dbf17ab5",
+    "Eigen/src/Core/arch/SSE/Complex.h": "a3e376cf6dd4bfe6b8b5f64056ed0be86e7eb88a40dafd3e1b49f8cd3b7162a8",
+    "Eigen/src/LU/PartialPivLU.h": "293705038ad44b122383fb6627294ab5fdccf53c44f14269d2097dba615b1245"
+  },
+  "original_source_edits": [],
+  "source_runtime_dependency": false,
+  "full_mcl_cli_parity_claim": false,
+  "platform_scope": "Exact GNU11/Eigen3.3.8 f32 protocol. Expected bits retained on every Rust platform; unexplained platform differences must fail rather than be silently tolerated or skipped.",
+  "limitations": [
+    "Full pinned MCL CLI cannot build unchanged (deleted reference.h and task_timer type); this is exact numerical helper proof only.",
+    "Fractional first expansion with rejected eigenvector determinant leaves uninitialized C++ output; Rust allocating convenience uses definedzero. The exp-retain fixture instead probes actual defined initialized output ownership.",
+    "Cases cover dense/sparse builders/gamma/exp/markov, duplicate order, tiny-value pruning, empty columns, convergence counters and valid fractional sizes2,3,5,8. Larger numerical/ordering scope remains subject to actual comparison. Nonnegative cyclic matrices additionally exercise complex-conjugate eigenvectors at3,5,8. n17 cases cover recursive-LU/packet thresholds."
+  ]
+}

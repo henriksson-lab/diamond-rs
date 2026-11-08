@@ -1,0 +1,8 @@
+translated_query	1137	0	233	+	single_domain	78	0	77	78	78	255	AS:i:174	ZR:i:441	ZE:f:4.30e-59
+translated_query	1137	0	233	+	reordered	379	301	378	78	78	255	AS:i:174	ZR:i:441	ZE:f:2.66e-55
+translated_query	1137	924	1136	+	reordered	379	0	70	71	71	255	AS:i:171	ZR:i:432	ZE:f:5.53e-54
+translated_query	1137	474	683	+	reordered	379	151	220	70	70	255	AS:i:163	ZR:i:413	ZE:f:3.29e-51
+reverse_query	1137	903	1136	-	single_domain	78	0	77	78	78	255	AS:i:174	ZR:i:441	ZE:f:4.30e-59
+reverse_query	1137	903	1136	-	reordered	379	301	378	78	78	255	AS:i:174	ZR:i:441	ZE:f:2.66e-55
+reverse_query	1137	0	212	-	reordered	379	0	70	71	71	255	AS:i:171	ZR:i:432	ZE:f:5.53e-54
+reverse_query	1137	453	662	-	reordered	379	151	220	70	70	255	AS:i:163	ZR:i:413	ZE:f:3.29e-51

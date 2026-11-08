@@ -10,7 +10,8 @@
 use crate::basic::value::OId;
 use crate::masking::{MaskingAlgo, MaskingStat};
 use crate::util::algo::HyperLogLog;
-use crate::util::io::{CompressedBuffer, InputFile};
+use crate::util::io::source_c_path;
+use crate::util::io::{Compressor, InputFile, IoErrorOwner, IoResult, OutputFile};
 use crate::util::parallel::Atomic;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,9 +22,8 @@ use std::time::Instant;
 
 use super::pair_table::{Bucket, RadixedTable, RADIX_BITS, RADIX_COUNT};
 use super::seed_table::{SequenceVolumeReader, VolumedFile};
-use crate::basic::sequence_utils;
 use crate::basic::value::AMINO_ACID_ALPHABET;
-use crate::cluster::cascaded::helpers::cluster_steps;
+use crate::cluster::cascaded::helpers::cluster_steps_bytes;
 use crate::config::Sensitivity;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -182,6 +182,7 @@ pub struct Job {
     round_count: i32,
     input_count: Vec<u64>,
     start: Instant,
+    io_errors: IoErrorOwner,
 }
 
 impl Job {
@@ -192,8 +193,27 @@ impl Job {
         root_dir: impl AsRef<Path>,
         worker_id: i64,
     ) -> Result<Self, String> {
+        Self::new_owned(
+            max_oid,
+            volumes,
+            mem_limit,
+            root_dir,
+            worker_id,
+            IoErrorOwner::default(),
+        )
+    }
+
+    pub fn new_owned(
+        max_oid: OId,
+        volumes: usize,
+        mem_limit: u64,
+        root_dir: impl AsRef<Path>,
+        worker_id: i64,
+        io_errors: IoErrorOwner,
+    ) -> Result<Self, String> {
         let root_dir = root_dir.as_ref().to_path_buf();
-        fs::create_dir_all(root_dir.join("round0")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(source_c_path(&(root_dir.join("round0"))).as_ref())
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             max_oid,
             volumes,
@@ -204,6 +224,7 @@ impl Job {
             round_count: 0,
             input_count: Vec::new(),
             start: Instant::now(),
+            io_errors,
         })
     }
 
@@ -215,10 +236,59 @@ impl Job {
         mem_limit: u64,
         root_dir: impl AsRef<Path>,
     ) -> Result<Self, String> {
+        Self::new_shared_owned(
+            max_oid,
+            volumes,
+            mem_limit,
+            root_dir,
+            IoErrorOwner::default(),
+        )
+    }
+
+    pub fn new_shared_owned(
+        max_oid: OId,
+        volumes: usize,
+        mem_limit: u64,
+        root_dir: impl AsRef<Path>,
+        io_errors: IoErrorOwner,
+    ) -> Result<Self, String> {
         let root_dir = root_dir.as_ref().to_path_buf();
-        fs::create_dir_all(&root_dir).map_err(|error| error.to_string())?;
+        fs::create_dir_all(source_c_path(&root_dir).as_ref()).map_err(|error| error.to_string())?;
         let worker_id = Atomic::new(root_dir.join("worker_id")).fetch_add_one()?;
-        Self::new(max_oid, volumes, mem_limit, root_dir, worker_id)
+        Self::new_owned(max_oid, volumes, mem_limit, root_dir, worker_id, io_errors)
+    }
+
+    pub fn io_errors(&self) -> IoErrorOwner {
+        self.io_errors.clone()
+    }
+
+    pub fn capture_io<T>(&self, result: std::io::Result<T>) -> Result<T, String> {
+        self.io_errors.capture(result)
+    }
+
+    pub fn io<T>(&self, result: IoResult<T>) -> Result<T, String> {
+        self.capture_io(result.map_err(std::io::Error::other))
+    }
+
+    pub fn open_input(&self, path: &Path, flags: i32) -> Result<InputFile, String> {
+        self.io(InputFile::with_source_profile_path(path, flags, 65_536))
+    }
+
+    pub fn create_output(&self, path: &Path) -> Result<OutputFile, String> {
+        self.io(OutputFile::with_source_profile_path(
+            path,
+            Compressor::None,
+            "wb",
+            65_536,
+        ))
+    }
+
+    pub fn read_plain_file(&self, path: &Path) -> Result<Vec<u8>, String> {
+        let mut input = self.open_input(path, InputFile::NO_AUTODETECT)?;
+        let mut bytes = Vec::new();
+        self.capture_io(std::io::Read::read_to_end(&mut input, &mut bytes))?;
+        self.io(input.close())?;
+        Ok(bytes)
     }
 
     pub fn worker_id(&self) -> i64 {
@@ -244,7 +314,7 @@ impl Job {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.root_dir.join("diamond_job.log"))
+            .open(source_c_path(&(self.root_dir.join("diamond_job.log"))).as_ref())
             .map_err(|error| error.to_string())?;
         file.write_all(line.as_bytes())
             .map_err(|error| error.to_string())?;
@@ -276,7 +346,8 @@ impl Job {
 
     pub fn next_round(&mut self) -> Result<(), String> {
         self.round += 1;
-        fs::create_dir_all(self.base_dir(None)).map_err(|error| error.to_string())
+        fs::create_dir_all(source_c_path(&(self.base_dir(None))).as_ref())
+            .map_err(|error| error.to_string())
     }
 
     pub fn round_index(&self) -> i32 {
@@ -314,19 +385,30 @@ pub fn base_path(file_name: &Path) -> Result<PathBuf, String> {
 
 pub struct ClusterChunk {
     pub id: i32,
-    pairs_out: BufWriter<File>,
+    pairs_out: OutputFile,
+    io_errors: IoErrorOwner,
+    closed: bool,
     pub size: SizeCounter,
 }
 
 impl ClusterChunk {
     pub fn new(id: i32, chunks_path: &Path) -> Result<Self, String> {
+        Self::new_owned(id, chunks_path, IoErrorOwner::default())
+    }
+
+    pub fn new_owned(id: i32, chunks_path: &Path, io_errors: IoErrorOwner) -> Result<Self, String> {
         let dir = chunks_path.join(id.to_string());
-        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-        let pairs_out =
-            BufWriter::new(File::create(dir.join("pairs")).map_err(|error| error.to_string())?);
+        fs::create_dir_all(source_c_path(&dir).as_ref()).map_err(|error| error.to_string())?;
+        let path = dir.join("pairs");
+        let pairs_out = io_errors.capture(
+            OutputFile::with_source_profile_path(&path, Compressor::None, "wb", 65_536)
+                .map_err(std::io::Error::other),
+        )?;
         Ok(Self {
             id,
             pairs_out,
+            io_errors,
+            closed: false,
             size: SizeCounter::default(),
         })
     }
@@ -336,25 +418,37 @@ impl ClusterChunk {
         pairs: &mut Vec<PairEntryShort>,
         size: &mut SizeCounter,
     ) -> Result<(), String> {
-        self.pairs_out
-            .write_all(&(pairs.len() as u64).to_ne_bytes())
-            .map_err(|error| error.to_string())?;
-        for pair in pairs.iter() {
+        self.io_errors.capture(
             self.pairs_out
-                .write_all(&pair.rep_oid.to_ne_bytes())
-                .and_then(|_| self.pairs_out.write_all(&pair.member_oid.to_ne_bytes()))
-                .map_err(|error| error.to_string())?;
+                .write_raw(&(pairs.len() as u64).to_ne_bytes())
+                .map_err(std::io::Error::other),
+        )?;
+        for pair in pairs.iter() {
+            self.io_errors.capture(
+                self.pairs_out
+                    .write_raw(&pair.rep_oid.to_ne_bytes())
+                    .and_then(|_| self.pairs_out.write_raw(&pair.member_oid.to_ne_bytes()))
+                    .map_err(std::io::Error::other),
+            )?;
         }
         pairs.clear();
         self.size.hll.merge(&size.hll).map_err(str::to_string)?;
         size.hll = HyperLogLog::with_default_precision();
         Ok(())
     }
+    fn close(&mut self) -> Result<(), String> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.io_errors
+            .capture(self.pairs_out.close().map_err(std::io::Error::other))
+    }
 }
 
 impl Drop for ClusterChunk {
     fn drop(&mut self) {
-        let _ = self.pairs_out.flush();
+        let _ = self.close();
     }
 }
 
@@ -411,7 +505,7 @@ pub fn build_chunk_table_in_memory(
         index = end;
     }
     table.sort_unstable();
-    fs::create_dir_all(job.base_dir(None).join("chunk_table"))
+    fs::create_dir_all(source_c_path(&(job.base_dir(None).join("chunk_table"))).as_ref())
         .map_err(|error| error.to_string())?;
     Ok(ChunkBuild { table, chunks })
 }
@@ -429,7 +523,7 @@ pub fn build_chunks_in_memory(
     chunk_count: usize,
 ) -> Result<Vec<PathBuf>, String> {
     let chunks_dir = job.base_dir(None).join("chunks");
-    fs::create_dir_all(&chunks_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(source_c_path(&chunks_dir).as_ref()).map_err(|error| error.to_string())?;
     let mut wanted = BTreeMap::<OId, BTreeSet<i32>>::new();
     for entry in chunk_table {
         if entry.chunk < 0 || entry.chunk as usize >= chunk_count {
@@ -441,10 +535,10 @@ pub fn build_chunks_in_memory(
     let mut paths = Vec::with_capacity(chunk_count);
     for id in 0..chunk_count {
         let dir = chunks_dir.join(id.to_string());
-        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        fs::create_dir_all(source_c_path(&dir).as_ref()).map_err(|error| error.to_string())?;
         let path = dir.join("sequences.fasta");
         writers.push(BufWriter::new(
-            File::create(&path).map_err(|error| error.to_string())?,
+            File::create(source_c_path(&path).as_ref()).map_err(|error| error.to_string())?,
         ));
         paths.push(path);
     }
@@ -497,14 +591,19 @@ pub fn build_chunk_table(
     let shift = bit_length(max_oid).saturating_sub(RADIX_BITS);
     let table_dir = job.base_dir(None).join("chunk_table");
     let chunks_dir = job.base_dir(None).join("chunks");
-    fs::create_dir_all(&table_dir).map_err(|error| error.to_string())?;
-    fs::create_dir_all(&chunks_dir).map_err(|error| error.to_string())?;
-    let mut table_buckets = vec![Vec::<ChunkTableEntry>::new(); RADIX_COUNT];
+    fs::create_dir_all(source_c_path(&table_dir).as_ref()).map_err(|error| error.to_string())?;
+    fs::create_dir_all(source_c_path(&chunks_dir).as_ref()).map_err(|error| error.to_string())?;
+    let mut table_buckets = super::storage::BucketWriter::new_owned(
+        &table_dir,
+        job.worker_id(),
+        RADIX_COUNT,
+        job.io_errors(),
+    )?;
     let queue = Atomic::new(table_dir.join("queue"));
     let next_chunk = Atomic::new(table_dir.join("next_chunk"));
     let mut chunk_id =
         i32::try_from(next_chunk.fetch_add_one()?).map_err(|_| "Chunk id overflow.".to_owned())?;
-    let mut current = ClusterChunk::new(chunk_id, &chunks_dir)?;
+    let mut current = ClusterChunk::new_owned(chunk_id, &chunks_dir, job.io_errors())?;
     let mut buckets_processed = 0_i64;
 
     loop {
@@ -513,7 +612,7 @@ pub fn build_chunk_table(
         let Some(bucket) = pair_table.get(bucket_index) else {
             break;
         };
-        let (mut pairs, storage) = read_pair_bucket(bucket)?;
+        let (mut pairs, storage) = read_pair_bucket(job, bucket)?;
         job.log(&format!(
             "Building chunk table. Bucket={}/{} Records={} Size={}",
             bucket_index + 1,
@@ -552,10 +651,11 @@ pub fn build_chunk_table(
                     current.write(&mut pair_buffer, &mut size)?;
                     processed = 0;
                     if current.size.hll.estimate() >= max_chunk_size {
+                        current.close()?;
                         drop(current);
                         chunk_id = i32::try_from(next_chunk.fetch_add_one()?)
                             .map_err(|_| "Chunk id overflow.".to_owned())?;
-                        current = ClusterChunk::new(chunk_id, &chunks_dir)?;
+                        current = ClusterChunk::new_owned(chunk_id, &chunks_dir, job.io_errors())?;
                         push_chunk_entry(&mut table_buckets, shift, rep_oid, current.id)?;
                         size.add(rep_oid, rep_len);
                         processed += i64::from(rep_len);
@@ -566,27 +666,23 @@ pub fn build_chunk_table(
             begin = end;
         }
         if current.size.hll.estimate() >= max_chunk_size {
+            current.close()?;
             drop(current);
             chunk_id = i32::try_from(next_chunk.fetch_add_one()?)
                 .map_err(|_| "Chunk id overflow.".to_owned())?;
-            current = ClusterChunk::new(chunk_id, &chunks_dir)?;
+            current = ClusterChunk::new_owned(chunk_id, &chunks_dir, job.io_errors())?;
         }
         remove_manifest_storage(&bucket.path, &storage);
         buckets_processed += 1;
     }
+    // Source publishes/closes the chunk table before releasing its current
+    // chunk, then enters the completion-counter wait.
+    let table = table_buckets.finish()?;
+    current.close()?;
     drop(current);
-    let mut table = write_chunk_table(job, &table_dir, table_buckets)?;
     let finished = Atomic::new(table_dir.join("finished"));
     finished.fetch_add(buckets_processed)?;
     finished.await_value(pair_table.len() as i64)?;
-    for bucket in table.iter_mut() {
-        bucket.records = Some(
-            read_manifest(&bucket.path)?
-                .iter()
-                .map(|(_, count)| *count as u64)
-                .sum(),
-        );
-    }
     let chunk_count = usize::try_from(next_chunk.get()?)
         .map_err(|_| "Chunk count does not fit memory.".to_owned())?;
     Ok((table, chunk_count))
@@ -601,17 +697,29 @@ pub fn build_chunks<R: SequenceVolumeReader>(
     reader: &mut R,
 ) -> Result<Vec<PathBuf>, String> {
     let chunks_dir = job.base_dir(None).join("chunks");
-    fs::create_dir_all(&chunks_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(source_c_path(&chunks_dir).as_ref()).map_err(|error| error.to_string())?;
     let queue = Atomic::new(chunks_dir.join("queue"));
-    let mut wanted = BTreeMap::<OId, BTreeSet<i32>>::new();
+    let mut output = super::storage::BucketWriter::new_owned(
+        &chunks_dir,
+        job.worker_id(),
+        chunk_count,
+        job.io_errors(),
+    )?;
     let mut buckets_processed = 0_i64;
+    let traits = crate::basic::value::ValueTraits::new(
+        AMINO_ACID_ALPHABET,
+        crate::basic::value::MASK_LETTER,
+        b"UO-",
+        crate::basic::value::SequenceType::AminoAcid,
+    );
     loop {
         let bucket_index = usize::try_from(queue.fetch_add_one()?)
             .map_err(|_| "Negative bucket id.".to_owned())?;
         let Some(bucket) = chunk_table.get(bucket_index) else {
             break;
         };
-        let (mut entries, storage) = read_chunk_table_bucket(bucket)?;
+        let (mut entries, storage) = read_chunk_table_bucket(job, bucket)?;
+        entries.sort_unstable();
         job.log(&format!(
             "Building chunks. Bucket={}/{} Records={} Size={}",
             bucket_index + 1,
@@ -619,70 +727,61 @@ pub fn build_chunks<R: SequenceVolumeReader>(
             entries.len(),
             entries.len() * ChunkTableEntry::ENCODED_SIZE
         ))?;
-        entries.sort_unstable();
+        // Retain only one radix bucket's OID-to-chunk mapping, as in Source.
+        let mut wanted = BTreeMap::<OId, BTreeSet<i32>>::new();
         for entry in entries {
             if entry.chunk < 0 || entry.chunk as usize >= chunk_count {
                 return Err(format!("Invalid chunk id: {}", entry.chunk));
             }
             wanted.entry(entry.oid).or_default().insert(entry.chunk);
         }
+        if let (Some((&first, _)), Some((&last, _))) =
+            (wanted.first_key_value(), wanted.last_key_value())
+        {
+            let mut buffer = crate::util::text_buffer::TextBuffer::new();
+            for volume in &database.0 {
+                if volume.oid_end != 0 && (volume.oid_end <= first || volume.oid_begin > last) {
+                    continue;
+                }
+                let mut sequential_oid = volume.oid_begin;
+                reader.visit_volume_bytes(&volume.path, &mut |record| {
+                    let oid = if job.round_index() > 0 {
+                        parse_oid_like_atoll(&record.id)
+                    } else {
+                        sequential_oid
+                    };
+                    sequential_oid = oid.wrapping_add(1);
+                    let Some(chunks) = wanted.get(&oid) else {
+                        return Ok(());
+                    };
+                    buffer.clear();
+                    crate::util::sequence::format(
+                        &record.sequence,
+                        &oid.to_string(),
+                        None,
+                        &mut buffer,
+                        "fasta",
+                        &traits,
+                        160,
+                    )?;
+                    for &chunk in chunks {
+                        // Source BufferArray's byte-string overload counts
+                        // FASTA bytes, not sequences, in this volume manifest.
+                        output.write_count(
+                            chunk as usize,
+                            buffer.data(),
+                            buffer.data().len() as u64,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            }
+        }
         remove_manifest_storage(&bucket.path, &storage);
         buckets_processed += 1;
     }
-
-    let mut outputs = Vec::with_capacity(chunk_count);
-    let mut writers = Vec::with_capacity(chunk_count);
-    for chunk in 0..chunk_count {
-        let directory = chunks_dir.join(chunk.to_string());
-        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-        let path = directory.join(format!("worker_{}_volume_0", job.worker_id()));
-        outputs.push(path.clone());
-        writers.push(BufWriter::new(
-            File::create(path).map_err(|error| error.to_string())?,
-        ));
-    }
-    let mut counts = vec![0_u64; chunk_count];
-    for volume in &database.0 {
-        let records = reader.read_volume(&volume.path)?;
-        let mut sequential_oid = volume.oid_begin;
-        for record in records {
-            let oid = if job.round_index() > 0 {
-                parse_oid_like_atoll(&record.id)
-            } else {
-                sequential_oid
-            };
-            sequential_oid = oid.wrapping_add(1);
-            let Some(chunks) = wanted.get(&oid) else {
-                continue;
-            };
-            let sequence = sequence_utils::to_string(&record.sequence, AMINO_ACID_ALPHABET);
-            for &chunk in chunks {
-                writeln!(writers[chunk as usize], ">{oid}\n{sequence}")
-                    .map_err(|error| error.to_string())?;
-                counts[chunk as usize] += 1;
-            }
-        }
-    }
-    for (chunk, writer) in writers.iter_mut().enumerate() {
-        writer.flush().map_err(|error| error.to_string())?;
-        let manifest = chunks_dir.join(chunk.to_string()).join("bucket.tsv");
-        let mut manifest_out = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&manifest)
-            .map_err(|error| error.to_string())?;
-        if counts[chunk] == 0 {
-            let _ = fs::remove_file(&outputs[chunk]);
-        } else {
-            writeln!(
-                manifest_out,
-                "{}\t{}",
-                outputs[chunk].display(),
-                counts[chunk]
-            )
-            .map_err(|error| error.to_string())?;
-        }
-    }
+    let table = output.finish()?;
+    let outputs = table.iter().map(|bucket| bucket.path.clone()).collect();
     let finished = Atomic::new(chunks_dir.join("finished"));
     finished.fetch_add(buckets_processed)?;
     finished.await_value(chunk_table.len() as i64)?;
@@ -690,66 +789,32 @@ pub fn build_chunks<R: SequenceVolumeReader>(
 }
 
 fn push_chunk_entry(
-    buckets: &mut [Vec<ChunkTableEntry>],
+    buckets: &mut super::storage::BucketWriter,
     shift: u32,
     oid: OId,
     chunk: i32,
 ) -> Result<(), String> {
     let radix = usize::try_from(oid >> shift)
         .map_err(|_| "Chunk table radix does not fit memory.".to_owned())?;
-    let bucket = buckets
-        .get_mut(radix)
-        .ok_or_else(|| format!("Chunk table radix out of range: {radix}"))?;
-    bucket.push(ChunkTableEntry::new(oid, chunk));
-    Ok(())
+    let mut bytes = Vec::with_capacity(ChunkTableEntry::ENCODED_SIZE);
+    ChunkTableEntry::new(oid, chunk).serialize(&mut bytes);
+    buckets.write(radix, &bytes)
 }
 
-fn write_chunk_table(
+fn read_pair_bucket(
     job: &Job,
-    base_dir: &Path,
-    buckets: Vec<Vec<ChunkTableEntry>>,
-) -> Result<RadixedTable, String> {
-    let mut table = Vec::with_capacity(RADIX_COUNT);
-    for (radix, entries) in buckets.into_iter().enumerate() {
-        let directory = base_dir.join(radix.to_string());
-        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-        let manifest = directory.join("bucket.tsv");
-        let mut manifest_out = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&manifest)
-            .map_err(|error| error.to_string())?;
-        if !entries.is_empty() {
-            let volume = directory.join(format!("worker_{}_volume_0", job.worker_id()));
-            let mut compressed = CompressedBuffer::new();
-            for entry in &entries {
-                let mut bytes = Vec::with_capacity(ChunkTableEntry::ENCODED_SIZE);
-                entry.serialize(&mut bytes);
-                compressed
-                    .write(&bytes)
-                    .map_err(|error| error.to_string())?;
-            }
-            compressed.finish().map_err(|error| error.to_string())?;
-            fs::write(&volume, compressed.data()).map_err(|error| error.to_string())?;
-            writeln!(manifest_out, "{}\t{}", volume.display(), entries.len())
-                .map_err(|error| error.to_string())?;
-        }
-        table.push(Bucket::new(manifest, Some(entries.len() as u64)));
-    }
-    Ok(RadixedTable(table))
-}
-
-fn read_pair_bucket(bucket: &Bucket) -> Result<(Vec<PairEntry>, Vec<(PathBuf, usize)>), String> {
-    let storage = read_manifest(&bucket.path)?;
+    bucket: &Bucket,
+) -> Result<(Vec<PairEntry>, Vec<(PathBuf, usize)>), String> {
+    let storage = read_manifest_owned(&bucket.path, &job.io_errors())?;
     let mut pairs = Vec::new();
     for (path, count) in &storage {
-        let mut input = open_input(path)?;
+        let mut input = job.open_input(path, 0)?;
         for _ in 0..*count {
             pairs.push(PairEntry {
-                rep_oid: input.read_u64().map_err(|error| error.to_string())?,
-                member_oid: input.read_u64().map_err(|error| error.to_string())?,
-                rep_len: input.read_u32().map_err(|error| error.to_string())?,
-                member_len: input.read_u32().map_err(|error| error.to_string())?,
+                rep_oid: job.io(input.read_u64())?,
+                member_oid: job.io(input.read_u64())?,
+                rep_len: job.io(input.read_u32())?,
+                member_len: job.io(input.read_u32())?,
             });
         }
     }
@@ -757,16 +822,17 @@ fn read_pair_bucket(bucket: &Bucket) -> Result<(Vec<PairEntry>, Vec<(PathBuf, us
 }
 
 fn read_chunk_table_bucket(
+    job: &Job,
     bucket: &Bucket,
 ) -> Result<(Vec<ChunkTableEntry>, Vec<(PathBuf, usize)>), String> {
-    let storage = read_manifest(&bucket.path)?;
+    let storage = read_manifest_owned(&bucket.path, &job.io_errors())?;
     let mut entries = Vec::new();
     for (path, count) in &storage {
-        let mut input = open_input(path)?;
+        let mut input = job.open_input(path, 0)?;
         for _ in 0..*count {
             entries.push(ChunkTableEntry {
-                oid: input.read_u64().map_err(|error| error.to_string())?,
-                chunk: input.read_i32().map_err(|error| error.to_string())?,
+                oid: job.io(input.read_u64())?,
+                chunk: job.io(input.read_i32())?,
             });
         }
     }
@@ -774,40 +840,52 @@ fn read_chunk_table_bucket(
 }
 
 fn read_manifest(path: &Path) -> Result<Vec<(PathBuf, usize)>, String> {
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
+    read_manifest_owned(path, &IoErrorOwner::default())
+}
+pub(crate) fn read_manifest_owned(
+    path: &Path,
+    errors: &IoErrorOwner,
+) -> Result<Vec<(PathBuf, usize)>, String> {
+    let bytes = fs::read(source_c_path(&(path)).as_ref()).map_err(|error| error.to_string())?;
+    bytes
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
         .map(|line| {
-            let mut fields = line.split_whitespace();
-            let path = fields
-                .next()
-                .ok_or_else(|| "Format error in VolumedFile".to_owned())?;
-            let count = fields
-                .next()
-                .ok_or_else(|| "Format error in VolumedFile".to_owned())?
-                .parse::<usize>()
-                .map_err(|_| "Format error in VolumedFile".to_owned())?;
-            Ok((PathBuf::from(path), count))
+            let mut fields = manifest_fields(line);
+            let path = fields.next().ok_or("Format error in VolumedFile")?;
+            let count = parse_manifest_number(fields.next().ok_or("Format error in VolumedFile")?)?;
+            Ok((
+                PathBuf::from(errors.capture(
+                    crate::util::io::source_bytes_os(path).map_err(std::io::Error::other),
+                )?),
+                count,
+            ))
         })
         .collect()
 }
 
+fn manifest_fields(line: &[u8]) -> impl Iterator<Item = &[u8]> {
+    line.split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty())
+}
+fn parse_manifest_number<T: std::str::FromStr>(field: &[u8]) -> Result<T, String> {
+    std::str::from_utf8(field)
+        .ok()
+        .and_then(|field| field.parse().ok())
+        .ok_or_else(|| "Format error in VolumedFile".to_owned())
+}
+
 fn open_input(path: &Path) -> Result<InputFile, String> {
-    InputFile::new(
-        path.to_str()
-            .ok_or_else(|| "Non-UTF-8 external-clustering path.".to_owned())?,
-        0,
-    )
-    .map_err(|error| error.to_string())
+    InputFile::source_new_path(path, 0).map_err(|error| error.to_string())
 }
 
 fn remove_manifest_storage(path: &Path, storage: &[(PathBuf, usize)]) {
     for (volume, _) in storage {
-        let _ = fs::remove_file(volume);
+        let _ = fs::remove_file(source_c_path(&(volume)).as_ref());
     }
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(source_c_path(&(path)).as_ref());
     if let Some(parent) = path.parent() {
-        let _ = fs::remove_dir(parent);
+        let _ = fs::remove_dir(source_c_path(&(parent)).as_ref());
     }
 }
 
@@ -815,18 +893,31 @@ fn bit_length(value: OId) -> u32 {
     OId::BITS - value.leading_zeros()
 }
 
-fn parse_oid_like_atoll(value: &str) -> OId {
-    let value = value.trim_start();
-    let (negative, digits) = match value.as_bytes().first() {
+fn parse_oid_like_atoll(value: impl AsRef<[u8]>) -> OId {
+    let value = crate::util::sequence::c_string_bytes(value.as_ref());
+    let value = &value[value
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count()..];
+    let (negative, digits) = match value.first() {
         Some(b'-') => (true, &value[1..]),
         Some(b'+') => (false, &value[1..]),
         _ => (false, value),
     };
     let end = digits
-        .bytes()
+        .iter()
         .position(|byte| !byte.is_ascii_digit())
         .unwrap_or(digits.len());
-    let magnitude = digits[..end].parse::<u64>().unwrap_or(0);
+    let magnitude = if end == 0 {
+        0
+    } else {
+        digits[..end]
+            .iter()
+            .try_fold(0_u64, |n, digit| {
+                n.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+            })
+            .unwrap_or(0)
+    };
     if negative {
         0_u64.wrapping_sub(magnitude)
     } else {
@@ -877,6 +968,7 @@ pub struct ExternalConfig {
     pub sensitivity: Sensitivity,
     pub min_length_ratio: f64,
     pub linclust_chunk_size: u64,
+    pub cluster_steps: Vec<Vec<u8>>,
     pub file_buffer_size: usize,
     pub query_cover: f64,
     pub subject_cover: f64,
@@ -896,7 +988,8 @@ impl Default for ExternalConfig {
             approx_min_id: 50.0,
             sensitivity: Sensitivity::Default,
             min_length_ratio: 0.0,
-            linclust_chunk_size: 4 * 1024 * 1024 * 1024,
+            linclust_chunk_size: 10_000_000_000,
+            cluster_steps: Vec::new(),
             file_buffer_size: 0,
             query_cover: 0.0,
             subject_cover: 0.0,
@@ -909,6 +1002,9 @@ impl Default for ExternalConfig {
 /// translation units. Stateful implementations may retain the shared
 /// `PairFileArray` between `begin_pair_table` and `finish_pair_table`.
 pub trait ExternalPipeline: SequenceVolumeReader {
+    fn io_errors(&self) -> IoErrorOwner {
+        IoErrorOwner::default()
+    }
     fn shape_count(&self, sensitivity: Sensitivity) -> usize;
     fn build_seed_table(
         &mut self,
@@ -959,9 +1055,9 @@ pub fn round<B: ExternalPipeline>(
         };
     }
     job.log(&format!(
-        "Starting round {} sensitivity {:?} {} shapes",
+        "Starting round {} sensitivity {} {} shapes\n",
         job.round_index(),
-        config.sensitivity,
+        crate::run::config::sensitivity_name(config.sensitivity),
         shape_count
     ))?;
     job.set_round(volumes.0.iter().map(|volume| volume.record_count).sum());
@@ -1021,11 +1117,12 @@ pub fn external<B: ExternalPipeline>(
         return Err("Thread count must be positive.".to_owned());
     }
     config.file_buffer_size = 64 * 1024;
-    let mut job = Job::new_shared(
+    let mut job = Job::new_shared_owned(
         volumes_max_oid(database),
         database.0.len(),
         config.memory_limit,
         &config.root_dir,
+        backend.io_errors(),
     )?;
     if job.worker_id() == 0 {
         job.log(&format!(
@@ -1035,9 +1132,14 @@ pub fn external<B: ExternalPipeline>(
             } else {
                 "Uni-directional"
             },
-            config.mutual_cover.unwrap_or(config.member_cover)
+            crate::output::format::format_fixed_float(
+                config.mutual_cover.unwrap_or(config.member_cover)
+            )
         ))?;
-        job.log(&format!("Approx. id = {}", config.approx_min_id))?;
+        job.log(&format!(
+            "Approx. id = {}",
+            crate::output::format::format_fixed_float(config.approx_min_id)
+        ))?;
         job.log(&format!("#Volumes = {}", database.0.len()))?;
         job.log(&format!(
             "#Sequences = {}",
@@ -1057,15 +1159,23 @@ pub fn external<B: ExternalPipeline>(
         config.query_cover = 0.0;
         config.subject_cover = 0.0;
     }
-    let steps = cluster_steps(config.approx_min_id, true);
+    // Source raises the Windows CRT's FILE limit before creating the round's
+    // bucket arrays. The CRT limit is distinct from Rust/Win32 handle limits.
+    #[cfg(windows)]
+    crate::util::io::cstdio_file::source_external_stdio_limit();
+    let steps = if config.cluster_steps.is_empty() {
+        cluster_steps_bytes(config.approx_min_id, true)
+    } else {
+        config.cluster_steps.clone()
+    };
     job.set_round_count(steps.len() as i32);
     let mut representatives = PathBuf::new();
     for (index, step) in steps.iter().enumerate() {
-        config.sensitivity = sensitivity_from_step(step)?;
+        config.sensitivity = job.capture_io(sensitivity_from_step_bytes(step))?;
         let volumes = if index == 0 {
             database.clone()
         } else {
-            read_volumed_file_manifest(&representatives)?
+            read_volumed_file_manifest_owned(&representatives, &job.io_errors())?
         };
         representatives = round(&mut job, &volumes, config, backend)?;
         if index + 1 < steps.len() {
@@ -1098,47 +1208,75 @@ fn volumes_max_oid(volumes: &VolumedFile) -> OId {
         .unwrap_or(0)
 }
 
-fn read_volumed_file_manifest(path: &Path) -> Result<VolumedFile, String> {
-    let text =
-        fs::read_to_string(path).map_err(|_| format!("Error opening file {}", path.display()))?;
+pub fn read_volumed_file_manifest(path: &Path) -> Result<VolumedFile, String> {
+    read_volumed_file_manifest_owned(path, &IoErrorOwner::default())
+}
+
+pub fn read_volumed_file_manifest_owned(
+    path: &Path,
+    errors: &IoErrorOwner,
+) -> Result<VolumedFile, String> {
+    // Source uses ifstream here: retain its runtime diagnostic, not the
+    // distinct InputFile/FileOpenException class.
+    let text = match fs::read(source_c_path(&(path)).as_ref()) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let mut message = b"Error opening file ".to_vec();
+            message.extend(errors.capture(
+                crate::util::io::path_diagnostic_bytes(path).map_err(std::io::Error::other),
+            )?);
+            return errors.capture(Err(crate::util::io::RawDiagnosticError(message).into_io()));
+        }
+    };
     let mut volumes = Vec::new();
     let mut next_oid = 0_u64;
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
+    for line in text
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let fields = manifest_fields(line).collect::<Vec<_>>();
         if fields.len() < 2 {
             return Err("Format error in VolumedFile".to_owned());
         }
-        let count = fields[1]
-            .parse::<u64>()
-            .map_err(|_| "Format error in VolumedFile".to_owned())?;
+        let count = parse_manifest_number::<u64>(fields[1])?;
         let (begin, end) = if fields.len() >= 4 {
             (
-                fields[2]
-                    .parse::<u64>()
-                    .map_err(|_| "Format error in VolumedFile".to_owned())?,
-                fields[3]
-                    .parse::<u64>()
-                    .map_err(|_| "Format error in VolumedFile".to_owned())?,
+                parse_manifest_number::<u64>(fields[2])?,
+                parse_manifest_number::<u64>(fields[3])?,
             )
         } else {
-            (next_oid, next_oid + count)
+            (
+                next_oid,
+                next_oid.checked_add(count).ok_or("Volume OID overflow")?,
+            )
         };
-        next_oid += count;
-        volumes.push(super::seed_table::Volume::new(fields[0], begin, end, count));
+        let (begin, end) = if begin == 0 && end == 0 {
+            (
+                next_oid,
+                next_oid.checked_add(count).ok_or("Volume OID overflow")?,
+            )
+        } else {
+            (begin, end)
+        };
+        next_oid = next_oid.checked_add(count).ok_or("Volume OID overflow")?;
+        volumes.push(super::seed_table::Volume::new(
+            PathBuf::from(errors.capture(
+                crate::util::io::source_bytes_os(fields[0]).map_err(std::io::Error::other),
+            )?),
+            begin,
+            end,
+            count,
+        ));
     }
     volumes.sort_by_key(|volume| volume.oid_begin);
     Ok(VolumedFile(volumes))
 }
 
 fn sensitivity_from_step(step: &str) -> Result<Sensitivity, String> {
-    match step.strip_suffix("_lin").unwrap_or(step) {
-        "faster" => Ok(Sensitivity::Faster),
-        "fast" => Ok(Sensitivity::Fast),
-        "default" => Ok(Sensitivity::Default),
-        "linclust-40" => Ok(Sensitivity::Linclust40),
-        "linclust-20" => Ok(Sensitivity::Linclust20),
-        value => Err(format!("Invalid sensitivity level: {value}")),
-    }
+    sensitivity_from_step_bytes(step.as_bytes()).map_err(|error| error.to_string())
+}
+fn sensitivity_from_step_bytes(step: &[u8]) -> std::io::Result<Sensitivity> {
+    crate::basic::config::sensitivity_from_bytes(step.strip_suffix(b"_lin").unwrap_or(step))
 }
 
 #[cfg(test)]
@@ -1367,6 +1505,10 @@ mod tests {
             max_oid: OId,
         ) -> Result<RadixedTable, String> {
             self.events.push(format!("align:{chunk_count}:{max_oid}"));
+            // Model align.cpp's actual stage owner as well as its edge table;
+            // cluster claims buckets through alignments/queue.
+            fs::create_dir_all(job.base_dir(None).join("alignments"))
+                .map_err(|error| error.to_string())?;
             let path = job.base_dir(None).join("edges.tsv");
             fs::write(&path, []).map_err(|error| error.to_string())?;
             Ok(RadixedTable(vec![Bucket::new(path, Some(0))]))
@@ -1447,14 +1589,22 @@ mod tests {
         let outputs =
             build_chunks(&job, &database, &chunk_table, chunk_count, &mut reader).unwrap();
         assert!(chunk_manifests.iter().all(|path| !path.exists()));
-        assert_eq!(
-            fs::read_to_string(&outputs[0]).unwrap(),
-            ">0\nAAAA\n>1\nRRR\n>2\nNN\n"
-        );
+        // build_chunks returns Source VolumedFile manifests, whose counts
+        // are FASTA bytes. Decode the listed compressed volume payloads.
+        let volumes = read_manifest(&outputs[0]).unwrap();
+        let mut fasta = Vec::new();
+        for (path, count) in volumes {
+            let mut input = open_input(&path).unwrap();
+            let mut bytes = vec![0u8; count];
+            input.read_values(&mut bytes).unwrap();
+            fasta.extend(bytes);
+            assert_eq!(input.read_raw(&mut [0u8; 1]).unwrap(), 0);
+        }
+        assert_eq!(fasta, b">0\nAAAA\n>1\nRRR\n>2\nNN\n");
         assert!(
             fs::read_to_string(job.base_dir(None).join("chunks/0/bucket.tsv"))
                 .unwrap()
-                .ends_with("\t3\n")
+                .ends_with("\t21\n")
         );
         fs::remove_dir_all(dir).unwrap();
     }

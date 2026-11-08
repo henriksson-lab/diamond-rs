@@ -1,14 +1,19 @@
 use crate::basic::sequence::Sequence;
 use crate::basic::value::{BlockId, DictId, Letter, Loc, OId, SequenceType, MASK_LETTER};
-use crate::data::flags::SeqInfo;
+use crate::data::flags::{ByteSeqInfo, SeqInfo};
 use crate::data::seed_histogram::SeedHistogram;
-use crate::data::sequence_file::{DictionaryEntry, SequenceDictionary, SequenceFileFlags};
+use crate::data::sequence_file::{
+    ByteDictionaryEntry, ByteSequenceDictionary, DictionaryEntry, SequenceDictionary,
+    SequenceFileFlags,
+};
 use crate::data::sequence_set::{SequenceSet, StringSet, TranslatedSequenceView};
 use crate::dp::ungapped::self_score;
 use crate::masking::{mask_sequence, MaskingAlgo, MaskingTable};
 use crate::output::format::OutputFlags;
 use crate::stats::score_matrix::ScoreMatrix;
-use crate::util::sequence::{all_seqids, find_orfs, seqid, translate as translate_sequence};
+use crate::util::sequence::{
+    all_seqids_bytes, c_string_bytes, find_orfs, seqid_bytes, translate as translate_sequence,
+};
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +41,9 @@ impl AlignModeBlock {
 pub struct Block {
     seqs: SequenceSet,
     source_seqs: SequenceSet,
+    // Retain the source loader's returned ORF-letter budget; this cannot be
+    // reconstructed from masked/disabled contexts after translation.
+    translated_load_letters: Vec<u64>,
     unmasked_seqs: SequenceSet,
     ids: StringSet,
     qual: StringSet,
@@ -45,6 +53,8 @@ pub struct Block {
     self_aln_score: Vec<f64>,
     soft_masking_table: MaskingTable,
     soft_masked: bool,
+    configured_soft_masking: bool,
+    max_motif_len: i32,
     raw_bytes: u64,
 }
 
@@ -53,6 +63,7 @@ impl Block {
         Self {
             seqs: SequenceSet::new(),
             source_seqs: SequenceSet::new(),
+            translated_load_letters: Vec::new(),
             unmasked_seqs: SequenceSet::new(),
             ids: StringSet::new(),
             qual: StringSet::new(),
@@ -62,6 +73,8 @@ impl Block {
             self_aln_score: Vec::new(),
             soft_masking_table: MaskingTable::new(),
             soft_masked: false,
+            configured_soft_masking: false,
+            max_motif_len: 30,
             raw_bytes: 0,
         }
     }
@@ -147,6 +160,10 @@ impl Block {
         &mut self.unmasked_seqs
     }
 
+    pub fn push_source_quality(&mut self, quality: &[u8]) {
+        self.qual.push_back(quality);
+    }
+
     pub fn qual(&self) -> &StringSet {
         &self.qual
     }
@@ -199,7 +216,7 @@ impl Block {
         self.masked[block_id] = true;
     }
 
-    /// Rust ownership adapter for C++ `Block::dict_id`.
+    /// Checked String convenience over the canonical byte dictionary entry.
     pub fn dict_id<F>(
         &self,
         block: usize,
@@ -212,22 +229,55 @@ impl Block {
     where
         F: FnMut(OId, bool, bool) -> Result<String, String>,
     {
+        let entry =
+            self.dictionary_entry_bytes(block_id, db_flags, format_flags, |oid, all, full| {
+                database_seqid(oid, all, full).map(String::into_bytes)
+            })?;
+        let entry = DictionaryEntry::<String>::try_from(entry)
+            .map_err(|error| format!("Invalid UTF-8 sequence title: {error}"))?;
+        dictionary.dict_id(block, block_id as usize, entry)
+    }
+    pub fn dict_id_bytes<F>(
+        &self,
+        block: usize,
+        block_id: BlockId,
+        dictionary: &mut ByteSequenceDictionary,
+        db_flags: SequenceFileFlags,
+        format_flags: OutputFlags,
+        database_seqid: F,
+    ) -> Result<DictId, String>
+    where
+        F: FnMut(OId, bool, bool) -> Result<Vec<u8>, String>,
+    {
+        let entry =
+            self.dictionary_entry_bytes(block_id, db_flags, format_flags, database_seqid)?;
+        dictionary.dict_id(block, block_id as usize, entry)
+    }
+    fn dictionary_entry_bytes<F>(
+        &self,
+        block_id: BlockId,
+        db_flags: SequenceFileFlags,
+        format_flags: OutputFlags,
+        mut database_seqid: F,
+    ) -> Result<ByteDictionaryEntry, String>
+    where
+        F: FnMut(OId, bool, bool) -> Result<Vec<u8>, String>,
+    {
         let block_id = block_id as usize;
         let oid = self.block_id2oid(block_id as BlockId);
         let title = if self.has_ids() {
-            let title = std::str::from_utf8(self.ids.get(block_id))
-                .map_err(|e| format!("Invalid UTF-8 sequence title: {e}"))?;
+            let title = self.ids.get(block_id);
             if format_flags.any(OutputFlags::FULL_TITLES) {
-                title.to_owned()
+                c_string_bytes(title).to_vec()
             } else if format_flags.any(OutputFlags::ALL_SEQIDS) {
-                all_seqids(title)
+                all_seqids_bytes(title)
             } else {
-                seqid(title)
+                seqid_bytes(title)
             }
         } else if format_flags.any(OutputFlags::SSEQID) {
             database_seqid(oid, format_flags.any(OutputFlags::ALL_SEQIDS), true)?
         } else {
-            String::new()
+            Vec::new()
         };
         let self_aln_score = if db_flags.contains(SequenceFileFlags::SELF_ALN_SCORES) {
             if !self.has_self_aln() {
@@ -237,35 +287,46 @@ impl Block {
         } else {
             0.0
         };
-        dictionary.dict_id(
-            block,
-            block_id,
-            DictionaryEntry {
-                oid,
-                len: self.seqs.length(block_id),
-                title,
-                seq: if self.unmasked_seqs.is_empty() {
-                    Vec::new()
-                } else {
-                    self.unmasked_seqs.get(block_id).to_vec()
-                },
-                self_aln_score,
+        Ok(ByteDictionaryEntry {
+            oid,
+            len: self.seqs.length(block_id),
+            // Source hands t.c_str() to SequenceFile::dict_id, even when the
+            // database callback returned an embedded-NUL std::string.
+            title: c_string_bytes(&title).to_vec(),
+            seq: if self.unmasked_seqs.is_empty() {
+                Vec::new()
+            } else {
+                self.unmasked_seqs.get(block_id).to_vec()
             },
-        )
+            self_aln_score,
+        })
+    }
+
+    /// Install the command's combined soft-mask table, computed with its active
+    /// score matrix. Empty tables are prepared too: do not recompute with a
+    /// different default matrix on a later histogram or seed-array pass.
+    pub(crate) fn set_soft_masking_table(&mut self, table: MaskingTable) {
+        debug_assert!(!self.soft_masked);
+        self.soft_masking_table = table;
+        self.configured_soft_masking = true;
+    }
+
+    pub(crate) fn set_max_motif_len(&mut self, max_motif_len: i32) {
+        self.max_motif_len = max_motif_len;
     }
 
     pub fn soft_mask(&mut self, algo: MaskingAlgo) {
         if self.soft_masked {
             return;
         }
-        if self.soft_masking_table.blank() {
+        if self.soft_masking_table.blank() && !self.configured_soft_masking {
             for block_id in 0..self.seqs.len() {
                 if algo == MaskingAlgo::Motif {
                     crate::masking::mask_motifs_into_table(
                         self.seqs.get_mut(block_id),
                         block_id,
                         &mut self.soft_masking_table,
-                        crate::masking::MaskingConfig::default().max_motif_len,
+                        self.max_motif_len.max(0) as usize,
                     );
                     continue;
                 }
@@ -302,7 +363,11 @@ impl Block {
     /// `config.threads_`. Discover motif ranges in parallel, then apply them
     /// in block order so the translated masking table stays deterministic.
     pub fn soft_mask_with_threads(&mut self, algo: MaskingAlgo, threads: usize) {
-        if threads <= 1 || algo != MaskingAlgo::Motif || !self.soft_masking_table.blank() {
+        if threads <= 1
+            || algo != MaskingAlgo::Motif
+            || !self.soft_masking_table.blank()
+            || self.configured_soft_masking
+        {
             self.soft_mask(algo);
             return;
         }
@@ -310,7 +375,7 @@ impl Block {
             return;
         }
 
-        let max_motif_len = crate::masking::MaskingConfig::default().max_motif_len;
+        let max_motif_len = self.max_motif_len.max(0) as usize;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
@@ -393,6 +458,30 @@ impl Block {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_back_bytes(
+        &mut self,
+        seq: &[Letter],
+        id: Option<&[u8]>,
+        quals: Option<&[u8]>,
+        oid: OId,
+        seq_type: SequenceType,
+        frame_mask: i32,
+        dna_translation: bool,
+    ) -> Result<i64, String> {
+        self.push_back_with_min_orf_bytes(
+            seq,
+            id,
+            quals,
+            oid,
+            seq_type,
+            frame_mask,
+            dna_translation,
+            0,
+            false,
+        )
+    }
+
     /// Explicit-config equivalent of the C++ global `config.min_orf_len`.
     #[allow(clippy::too_many_arguments)]
     pub fn push_back_with_min_orf(
@@ -407,12 +496,38 @@ impl Block {
         run_len: Loc,
         frame_shift: bool,
     ) -> Result<i64, String> {
+        self.push_back_with_min_orf_bytes(
+            seq,
+            id.map(str::as_bytes),
+            quals,
+            oid,
+            seq_type,
+            frame_mask,
+            dna_translation,
+            run_len,
+            frame_shift,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_back_with_min_orf_bytes(
+        &mut self,
+        seq: &[Letter],
+        id: Option<&[u8]>,
+        quals: Option<&[u8]>,
+        oid: OId,
+        seq_type: SequenceType,
+        frame_mask: i32,
+        dna_translation: bool,
+        run_len: Loc,
+        frame_shift: bool,
+    ) -> Result<i64, String> {
         const OVERFLOW_ERR: &str = "Sequences in block exceed supported maximum.";
         if self.block2oid.len() == BlockId::MAX as usize {
             return Err(OVERFLOW_ERR.to_string());
         }
         if let Some(id) = id {
-            self.ids.push_back(id.as_bytes());
+            self.ids.push_back(id);
         }
         if let Some(quals) = quals {
             self.qual.push_back(quals);
@@ -445,6 +560,7 @@ impl Block {
                 self.seqs.fill(frame.len(), MASK_LETTER);
             }
         }
+        self.translated_load_letters.push(letters as u64);
         Ok(letters)
     }
 
@@ -464,6 +580,61 @@ impl Block {
         run_len: Loc,
         genetic_code: u32,
     ) -> Result<i64, String> {
+        let translator = crate::basic::translate::Translator::init(genetic_code)?;
+        self.push_back_translated_with_translator(seq, id, oid, frame_mask, run_len, &translator)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_back_translated_with_genetic_code_bytes(
+        &mut self,
+        seq: &[Letter],
+        id: Option<&[u8]>,
+        oid: OId,
+        frame_mask: i32,
+        run_len: Loc,
+        genetic_code: u32,
+    ) -> Result<i64, String> {
+        let translator = crate::basic::translate::Translator::init(genetic_code)?;
+        self.push_back_translated_with_translator_bytes(
+            seq,
+            id,
+            oid,
+            frame_mask,
+            run_len,
+            &translator,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_back_translated_with_translator(
+        &mut self,
+        seq: &[Letter],
+        id: Option<&str>,
+        oid: OId,
+        frame_mask: i32,
+        run_len: Loc,
+        translator: &crate::basic::translate::Translator,
+    ) -> Result<i64, String> {
+        self.push_back_translated_with_translator_bytes(
+            seq,
+            id.map(str::as_bytes),
+            oid,
+            frame_mask,
+            run_len,
+            translator,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_back_translated_with_translator_bytes(
+        &mut self,
+        seq: &[Letter],
+        id: Option<&[u8]>,
+        oid: OId,
+        frame_mask: i32,
+        run_len: Loc,
+        translator: &crate::basic::translate::Translator,
+    ) -> Result<i64, String> {
         const OVERFLOW_ERR: &str = "Sequences in block exceed supported maximum.";
         if self.block2oid.len() == BlockId::MAX as usize
             || self.seqs.len() > BlockId::MAX as usize - 6
@@ -471,14 +642,13 @@ impl Block {
             return Err(OVERFLOW_ERR.to_string());
         }
         if let Some(id) = id {
-            self.ids.push_back(id.as_bytes());
+            self.ids.push_back(id);
         }
         self.block2oid.push(oid);
         self.source_seqs.push(seq);
 
         let dna: Vec<u8> = seq.iter().map(|&letter| letter as u8).collect();
-        let mut translated =
-            crate::basic::translate::translate_6_frames_with_genetic_code(&dna, genetic_code)?;
+        let mut translated = translator.translate_6_frames(&dna);
         let min_len = if run_len != 0 {
             run_len
         } else if translated[0].len() < 30 {
@@ -502,7 +672,48 @@ impl Block {
                 self.seqs.fill(frame.len(), MASK_LETTER);
             }
         }
+        self.translated_load_letters.push(letters as u64);
         Ok(letters)
+    }
+
+    pub(crate) fn translated_load_letters(&self, source: usize) -> Result<u64, String> {
+        self.translated_load_letters
+            .get(source)
+            .copied()
+            .ok_or_else(|| "Translated block is missing source loader statistics.".to_owned())
+    }
+
+    /// Copy a contiguous source range without retranslating its six contexts.
+    /// Used by the in-memory query loader before search preprocessing.
+    pub(crate) fn translated_source_range(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> Result<Block, String> {
+        if range.end > self.source_seqs.len()
+            || range.start > range.end
+            || self.seqs.len() != self.source_seqs.len().saturating_mul(6)
+            || self.block2oid.len() != self.source_seqs.len()
+        {
+            return Err("Invalid translated query block layout.".to_owned());
+        }
+        let mut output = Block::new();
+        for source in range {
+            output
+                .translated_load_letters
+                .push(self.translated_load_letters(source)?);
+            output.source_seqs.push(self.source_seqs.get(source));
+            output.block2oid.push(self.block2oid[source]);
+            if !self.ids.empty() {
+                output.ids.push_back(self.ids.get(source));
+            }
+            if !self.qual.empty() {
+                output.qual.push_back(self.qual.get(source));
+            }
+            for frame in source * 6..source * 6 + 6 {
+                output.seqs.push(self.seqs.get(frame));
+            }
+        }
+        Ok(output)
     }
 
     pub fn append(&mut self, b: &Block) {
@@ -517,18 +728,32 @@ impl Block {
         self.block2oid.extend_from_slice(&b.block2oid);
     }
 
+    /// Existing String view for representable records. Use the canonical byte
+    /// view for arbitrary Source titles, or try_seq_info for checked conversion.
     pub fn seq_info(&self, id: BlockId, align_mode: AlignModeBlock) -> SeqInfo<'_> {
+        self.try_seq_info(id, align_mode)
+            .expect("Block contains non-UTF-8 metadata; use seq_info_bytes or try_seq_info")
+    }
+    pub fn try_seq_info(
+        &self,
+        id: BlockId,
+        align_mode: AlignModeBlock,
+    ) -> Result<SeqInfo<'_>, String> {
+        SeqInfo::<&str>::try_from(self.seq_info_bytes(id, align_mode))
+            .map_err(|error| error.to_string())
+    }
+    pub fn seq_info_bytes(&self, id: BlockId, align_mode: AlignModeBlock) -> ByteSeqInfo<'_> {
         let id_usize = id as usize;
         let mate_id = if id % 2 == 0 { id + 1 } else { id - 1 };
         let title = if self.ids.empty() {
             None
         } else {
-            Some(std::str::from_utf8(self.ids.get(id_usize)).unwrap_or(""))
+            Some(self.ids.get(id_usize))
         };
         let qual = if self.qual.empty() {
-            Some("")
+            Some(&b""[..])
         } else {
-            Some(std::str::from_utf8(self.qual.get(id_usize)).unwrap_or(""))
+            Some(self.qual.get(id_usize))
         };
         SeqInfo {
             block_id: id,
@@ -558,6 +783,7 @@ impl Block {
         let mut lengths = self.seqs.lengths();
         lengths.sort_by(|a, b| b.cmp(a));
         let mut b = Block::new();
+        b.max_motif_len = self.max_motif_len;
         for (_, j) in lengths {
             b.seqs.push(self.seqs.get(j as usize));
             if !self.ids.empty() {
@@ -586,6 +812,7 @@ impl Block {
     pub fn mem_size(&self) -> i64 {
         self.seqs.mem_size() as i64
             + self.source_seqs.mem_size() as i64
+            + (self.translated_load_letters.capacity() * std::mem::size_of::<u64>()) as i64
             + self.unmasked_seqs.mem_size() as i64
             + self.ids.mem_size()
             + self.qual.mem_size()
@@ -624,6 +851,83 @@ mod tests {
     use crate::basic::value::STOP_LETTER;
     use crate::data::block::{BlockWrapper, BlockWrapperSeqInfo};
     use crate::stats::score_matrix::ScoreMatrix;
+
+    #[test]
+    fn byte_block_views_dictionary_and_wrapper_preserve_opaque_metadata() {
+        let title = b"q\xff\0tail";
+        let quality = b"!\xfe\0?";
+        let mut block = Block::new();
+        block
+            .push_back_bytes(
+                &[0, 1, 2, 3],
+                Some(title),
+                Some(quality),
+                7,
+                SequenceType::AminoAcid,
+                1,
+                false,
+            )
+            .unwrap();
+        let info = block.seq_info_bytes(0, AlignModeBlock::blastp());
+        assert_eq!(info.title, Some(title.as_slice()));
+        assert_eq!(info.qual, Some(quality.as_slice()));
+        assert_eq!(info.len, 4);
+        assert!(block.try_seq_info(0, AlignModeBlock::blastp()).is_err());
+        let mut dictionary = ByteSequenceDictionary::default();
+        dictionary.init_block(0, 1, false);
+        let id = block
+            .dict_id_bytes(
+                0,
+                0,
+                &mut dictionary,
+                SequenceFileFlags::NONE,
+                OutputFlags::FULL_TITLES,
+                |_, _, _| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(dictionary.entry(id).unwrap().title, b"q\xff");
+        let wrapper = super::super::block_wrapper::BlockWrapper::new(&block);
+        assert_eq!(wrapper.seqid_bytes(0, false, false).unwrap(), b"q\xff");
+        assert_eq!(wrapper.read_id_data_bytes(0, false, false).unwrap(), title);
+        assert!(wrapper.seqid(0, false, false).is_err());
+        assert!(wrapper.read_id_data(0, false, false).is_err());
+    }
+
+    #[test]
+    fn translated_source_ranges_preserve_loader_budgets_oids_and_existing_contexts() {
+        let mut block = Block::new();
+        let dna = crate::data::fasta::read_fasta_nucleotide(
+            &b">first\nATGNNNTAATGG\n>second\nATGAAATGATAG\n"[..],
+        )
+        .unwrap();
+        let mut budgets = Vec::new();
+        for (id, record) in dna.iter().enumerate() {
+            budgets.push(
+                block
+                    .push_back_translated_with_genetic_code(
+                        &record.sequence,
+                        Some(&record.id),
+                        91 + id as u64,
+                        0b000111,
+                        1,
+                        4,
+                    )
+                    .unwrap() as u64,
+            );
+        }
+        // The API must copy the caller's actual contexts, not recreate them
+        // from DNA with a default genetic code or strip seed annotations.
+        block.seqs_mut().get_mut(7)[0] |= crate::basic::value::SEED_MASK;
+        let sliced = block.translated_source_range(1..2).unwrap();
+        assert_eq!(sliced.block_id2oid(0), 92);
+        assert_eq!(sliced.source_seqs().get(0), dna[1].sequence);
+        assert_eq!(sliced.ids().unwrap().get(0), b"second");
+        assert_eq!(sliced.translated_load_letters(0).unwrap(), budgets[1]);
+        for frame in 0..6 {
+            assert_eq!(sliced.seqs().get(frame), block.seqs().get(6 + frame));
+        }
+        assert!(block.translated_source_range(1..3).is_err());
+    }
 
     #[test]
     fn test_block_push_accessors_and_oids() {

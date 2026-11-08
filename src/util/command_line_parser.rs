@@ -4,11 +4,83 @@ use std::rc::Rc;
 
 use crate::util::options::OptionValue;
 
+fn raw_error(message: Vec<u8>) -> std::io::Error {
+    crate::util::io::RawDiagnosticError(message).into_io()
+}
+fn source_os_bytes(value: &std::ffi::OsStr) -> std::io::Result<std::borrow::Cow<'_, [u8]>> {
+    crate::util::io::source_os_bytes(value).map_err(std::io::Error::other)
+}
+fn source_bytes_os(value: &[u8]) -> std::io::Result<std::ffi::OsString> {
+    crate::util::io::source_bytes_os(value).map_err(std::io::Error::other)
+}
+#[derive(Clone)]
+enum Argument {
+    Bytes(Vec<u8>),
+    Os(std::ffi::OsString),
+}
+impl Argument {
+    fn bytes(&self) -> std::io::Result<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            Self::Bytes(s) => Ok(std::borrow::Cow::Borrowed(s)),
+            Self::Os(s) => source_os_bytes(s),
+        }
+    }
+    fn attached(&self) -> std::io::Result<Self> {
+        match self {
+            Self::Bytes(s) => Ok(Self::Bytes(s[2..].to_vec())),
+            Self::Os(s) => {
+                // Only split after the two ASCII option-prefix code units.
+                // Both are complete boundaries in OsStr's encoded representation.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+                    Ok(Self::Os(std::ffi::OsString::from_vec(
+                        s.as_bytes()[2..].to_vec(),
+                    )))
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+                    Ok(Self::Os(std::ffi::OsString::from_wide(
+                        &s.encode_wide().skip(2).collect::<Vec<_>>(),
+                    )))
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    let encoded = s.as_encoded_bytes();
+                    let tail =
+                        unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&encoded[2..]) };
+                    Ok(Self::Os(tail.to_owned()))
+                }
+            }
+        }
+    }
+}
+
+/// Typed option readers. Raw entrypoints preserve Source argv bytes; OS readers
+/// additionally allow path cells to retain their native representation.
 pub trait ReadOption: Clone + 'static {
     fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String>;
+    fn read_option_bytes(dst: &mut Self, v: &[Vec<u8>]) -> std::io::Result<()> {
+        let values = v
+            .iter()
+            .map(|s| String::from_utf8(s.clone()).map_err(std::io::Error::other))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Self::read_option(dst, &values).map_err(|message| raw_error(message.into_bytes()))
+    }
+    fn read_option_os(dst: &mut Self, v: &[std::ffi::OsString]) -> std::io::Result<()> {
+        let values = v
+            .iter()
+            .map(|s| source_os_bytes(s).map(|v| v.into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Self::read_option_bytes(dst, &values)
+    }
     fn check_pcount(v: &[String], min_count: i32) -> bool {
         let _ = min_count;
         v.len() == 1
+    }
+    fn check_pcount_len(count: usize, min_count: i32) -> bool {
+        Self::check_pcount(&vec![String::new(); count], min_count)
     }
     fn check_present(&self) -> bool {
         false
@@ -19,215 +91,204 @@ pub trait ReadOption: Clone + 'static {
     fn set_base_ptr(&mut self, _base: &OptionBase) {}
 }
 
-fn c_atoll(value: &str) -> i64 {
-    let bytes = value.trim_start().as_bytes();
-    let (negative, mut i) = match bytes.first() {
-        Some(b'-') => (true, 1),
-        Some(b'+') => (false, 1),
-        _ => (false, 0),
-    };
-    let mut found = false;
-    let mut magnitude = 0u64;
-    let limit = if negative {
-        i64::MAX as u64 + 1
-    } else {
-        i64::MAX as u64
-    };
-    while let Some(&byte) = bytes.get(i) {
-        if !byte.is_ascii_digit() {
-            break;
-        }
-        found = true;
-        magnitude = magnitude
-            .saturating_mul(10)
-            .saturating_add((byte - b'0') as u64)
-            .min(limit);
-        i += 1;
-    }
-    if !found {
-        0
-    } else if negative && magnitude == i64::MAX as u64 + 1 {
-        i64::MIN
-    } else if negative {
-        -(magnitude as i64)
-    } else {
-        magnitude as i64
-    }
+fn c_input(value: &[u8]) -> Vec<u8> {
+    let mut value = value.split(|&b| b == 0).next().unwrap_or_default().to_vec();
+    value.push(0);
+    value
 }
-
-fn c_atof(value: &str) -> f64 {
-    let value = value.trim_start();
-    for end in value
-        .char_indices()
-        .map(|(index, _)| index)
-        .chain(std::iter::once(value.len()))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        if let Ok(parsed) = value[..end].parse::<f64>() {
-            return parsed;
-        }
-    }
-    0.0
+fn c_atoll_bytes(value: &[u8]) -> i64 {
+    unsafe { libc::atoll(c_input(value).as_ptr().cast()) as i64 }
 }
-
-macro_rules! impl_read_option_signed {
-    ($($t:ty),* $(,)?) => {$ (
+fn c_atof_bytes(value: &[u8]) -> f64 {
+    unsafe { libc::atof(c_input(value).as_ptr().cast()) }
+}
+macro_rules! impl_numeric {
+    ($t:ty,$parse:expr) => {
         impl ReadOption for $t {
             fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
-                *dst = c_atoll(&v[0]) as $t;
+                Self::read_option_bytes(
+                    dst,
+                    &v.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>(),
+                )
+                .map_err(|e| e.to_string())
+            }
+            fn read_option_bytes(dst: &mut Self, v: &[Vec<u8>]) -> std::io::Result<()> {
+                *dst = ($parse)(&v[0]) as $t;
                 Ok(())
             }
         }
-    )* };
+    };
 }
-
-impl_read_option_signed!(i32, u32, i64, u64, usize, isize);
-
-impl ReadOption for f64 {
-    fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
-        *dst = c_atof(&v[0]);
-        Ok(())
-    }
-}
+impl_numeric!(i32, |v: &[u8]| unsafe {
+    libc::atoi(c_input(v).as_ptr().cast())
+});
+impl_numeric!(u32, |v: &[u8]| unsafe {
+    libc::atoi(c_input(v).as_ptr().cast())
+});
+impl_numeric!(i64, c_atoll_bytes);
+impl_numeric!(u64, c_atoll_bytes);
+impl_numeric!(usize, c_atoll_bytes);
+impl_numeric!(isize, c_atoll_bytes);
+impl_numeric!(f64, c_atof_bytes);
 
 impl ReadOption for bool {
-    fn read_option(dst: &mut Self, _v: &[String]) -> Result<(), String> {
+    fn read_option(dst: &mut Self, _: &[String]) -> Result<(), String> {
         *dst = true;
         Ok(())
     }
-
-    fn check_pcount(v: &[String], _min_count: i32) -> bool {
+    fn read_option_bytes(dst: &mut Self, _: &[Vec<u8>]) -> std::io::Result<()> {
+        *dst = true;
+        Ok(())
+    }
+    fn check_pcount(v: &[String], _: i32) -> bool {
         v.is_empty()
     }
+    fn check_pcount_len(n: usize, _: i32) -> bool {
+        n == 0
+    }
 }
-
 impl ReadOption for String {
     fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
         *dst = v[0].clone();
         Ok(())
     }
-
     fn check_present(&self) -> bool {
         !self.is_empty()
     }
 }
-
 impl ReadOption for Vec<String> {
     fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
         *dst = v.to_vec();
         Ok(())
     }
-
-    fn check_pcount(v: &[String], min_count: i32) -> bool {
-        v.len() >= min_count as usize
+    fn check_pcount(v: &[String], m: i32) -> bool {
+        v.len() >= m as usize
+    }
+    fn check_pcount_len(n: usize, m: i32) -> bool {
+        n >= m as usize
     }
 }
-
-macro_rules! impl_read_option_value_signed {
-    ($($t:ty),* $(,)?) => {$ (
-        impl ReadOption for OptionValue<$t> {
+impl ReadOption for Vec<u8> {
+    fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
+        *dst = v[0].as_bytes().to_vec();
+        Ok(())
+    }
+    fn read_option_bytes(dst: &mut Self, v: &[Vec<u8>]) -> std::io::Result<()> {
+        *dst = v[0].clone();
+        Ok(())
+    }
+    fn check_present(&self) -> bool {
+        !self.is_empty()
+    }
+}
+impl ReadOption for Vec<Vec<u8>> {
+    fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
+        *dst = v.iter().map(|s| s.as_bytes().to_vec()).collect();
+        Ok(())
+    }
+    fn read_option_bytes(dst: &mut Self, v: &[Vec<u8>]) -> std::io::Result<()> {
+        *dst = v.to_vec();
+        Ok(())
+    }
+    fn check_pcount(v: &[String], m: i32) -> bool {
+        v.len() >= m as usize
+    }
+    fn check_pcount_len(n: usize, m: i32) -> bool {
+        n >= m as usize
+    }
+}
+impl ReadOption for std::ffi::OsString {
+    fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
+        *dst = v[0].clone().into();
+        Ok(())
+    }
+    fn read_option_bytes(dst: &mut Self, v: &[Vec<u8>]) -> std::io::Result<()> {
+        *dst = source_bytes_os(&v[0])?;
+        Ok(())
+    }
+    fn read_option_os(dst: &mut Self, v: &[std::ffi::OsString]) -> std::io::Result<()> {
+        *dst = v[0].clone();
+        Ok(())
+    }
+    fn check_present(&self) -> bool {
+        !self.is_empty()
+    }
+}
+impl ReadOption for std::path::PathBuf {
+    fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
+        *dst = v[0].clone().into();
+        Ok(())
+    }
+    fn read_option_bytes(dst: &mut Self, v: &[Vec<u8>]) -> std::io::Result<()> {
+        *dst = source_bytes_os(&v[0])?.into();
+        Ok(())
+    }
+    fn read_option_os(dst: &mut Self, v: &[std::ffi::OsString]) -> std::io::Result<()> {
+        *dst = v[0].clone().into();
+        Ok(())
+    }
+    fn check_present(&self) -> bool {
+        !self.as_os_str().is_empty()
+    }
+}
+macro_rules! impl_os_vector {
+    ($t:ty) => {
+        impl ReadOption for Vec<$t> {
             fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
-                dst.set(c_atoll(&v[0]) as $t);
+                *dst = v.iter().cloned().map(Into::into).collect();
                 Ok(())
             }
-
-            fn check_present(&self) -> bool {
-                self.present()
+            fn read_option_bytes(dst: &mut Self, v: &[Vec<u8>]) -> std::io::Result<()> {
+                *dst = v
+                    .iter()
+                    .map(|s| source_bytes_os(s).map(Into::into))
+                    .collect::<std::io::Result<_>>()?;
+                Ok(())
             }
-
-            fn set_option_default(_dst: &mut Self, _value: &Self) {}
-
-            fn set_base_ptr(&mut self, base: &OptionBase) {
-                let value = self.get_present().ok();
-                *self = OptionValue::with_base(crate::util::options::OptionBase::new(
-                    &base.id,
-                    base.short_id,
-                    &base.desc,
-                    base.disabled,
-                    Some(&base.group_title),
-                ));
-                if let Some(value) = value {
-                    self.set(value);
-                }
+            fn read_option_os(dst: &mut Self, v: &[std::ffi::OsString]) -> std::io::Result<()> {
+                *dst = v.iter().cloned().map(Into::into).collect();
+                Ok(())
+            }
+            fn check_pcount(v: &[String], m: i32) -> bool {
+                v.len() >= m as usize
+            }
+            fn check_pcount_len(n: usize, m: i32) -> bool {
+                n >= m as usize
             }
         }
-    )* };
+    };
 }
-
-impl_read_option_value_signed!(i32, u32, i64, u64, usize, isize);
-
-impl ReadOption for OptionValue<f64> {
+impl_os_vector!(std::ffi::OsString);
+impl_os_vector!(std::path::PathBuf);
+impl<T: ReadOption + Default> ReadOption for OptionValue<T> {
     fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
-        dst.set(c_atof(&v[0]));
+        let mut value = T::default();
+        T::read_option(&mut value, v)?;
+        dst.set(value);
         Ok(())
     }
-
+    fn read_option_bytes(dst: &mut Self, v: &[Vec<u8>]) -> std::io::Result<()> {
+        let mut value = T::default();
+        T::read_option_bytes(&mut value, v)?;
+        dst.set(value);
+        Ok(())
+    }
+    fn read_option_os(dst: &mut Self, v: &[std::ffi::OsString]) -> std::io::Result<()> {
+        let mut value = T::default();
+        T::read_option_os(&mut value, v)?;
+        dst.set(value);
+        Ok(())
+    }
+    fn check_pcount(v: &[String], m: i32) -> bool {
+        T::check_pcount(v, m)
+    }
+    fn check_pcount_len(n: usize, m: i32) -> bool {
+        T::check_pcount_len(n, m)
+    }
     fn check_present(&self) -> bool {
         self.present()
     }
-
-    fn set_option_default(_dst: &mut Self, _value: &Self) {}
-
-    fn set_base_ptr(&mut self, base: &OptionBase) {
-        let value = self.get_present().ok();
-        *self = OptionValue::with_base(crate::util::options::OptionBase::new(
-            &base.id,
-            base.short_id,
-            &base.desc,
-            base.disabled,
-            Some(&base.group_title),
-        ));
-        if let Some(value) = value {
-            self.set(value);
-        }
-    }
-}
-
-impl ReadOption for OptionValue<String> {
-    fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
-        dst.set(v[0].clone());
-        Ok(())
-    }
-
-    fn check_present(&self) -> bool {
-        self.present()
-    }
-
-    fn set_option_default(_dst: &mut Self, _value: &Self) {}
-
-    fn set_base_ptr(&mut self, base: &OptionBase) {
-        let value = self.get_present().ok();
-        *self = OptionValue::with_base(crate::util::options::OptionBase::new(
-            &base.id,
-            base.short_id,
-            &base.desc,
-            base.disabled,
-            Some(&base.group_title),
-        ));
-        if let Some(value) = value {
-            self.set(value);
-        }
-    }
-}
-
-impl ReadOption for OptionValue<Vec<String>> {
-    fn read_option(dst: &mut Self, v: &[String]) -> Result<(), String> {
-        dst.set(v.to_vec());
-        Ok(())
-    }
-
-    fn check_pcount(v: &[String], min_count: i32) -> bool {
-        v.len() >= min_count as usize
-    }
-
-    fn check_present(&self) -> bool {
-        self.present()
-    }
-
-    fn set_option_default(_dst: &mut Self, _value: &Self) {}
-
+    fn set_option_default(_: &mut Self, _: &Self) {}
     fn set_base_ptr(&mut self, base: &OptionBase) {
         let value = self.get_present().ok();
         *self = OptionValue::with_base(crate::util::options::OptionBase::new(
@@ -245,6 +306,13 @@ impl ReadOption for OptionValue<Vec<String>> {
 
 pub fn read_option<T: ReadOption>(dst: &mut T, v: &[String]) -> Result<(), String> {
     T::read_option(dst, v)
+}
+
+pub fn read_option_bytes<T: ReadOption>(dst: &mut T, v: &[Vec<u8>]) -> std::io::Result<()> {
+    T::read_option_bytes(dst, v)
+}
+pub fn read_option_os<T: ReadOption>(dst: &mut T, v: &[std::ffi::OsString]) -> std::io::Result<()> {
+    T::read_option_os(dst, v)
 }
 
 pub fn check_pcount<T: ReadOption>(v: &[String], min_count: i32) -> bool {
@@ -276,6 +344,21 @@ pub struct OptionBase {
 pub trait OptionDescBase {
     fn base(&self) -> &OptionBase;
     fn read(&self, v: &[String]) -> Result<(), String>;
+    fn read_bytes(&self, v: &[Vec<u8>]) -> std::io::Result<()> {
+        let values = v
+            .iter()
+            .map(|s| String::from_utf8(s.clone()).map_err(std::io::Error::other))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        self.read(&values)
+            .map_err(|message| raw_error(message.into_bytes()))
+    }
+    fn read_os(&self, v: &[std::ffi::OsString]) -> std::io::Result<()> {
+        let values = v
+            .iter()
+            .map(|s| source_os_bytes(s).map(|s| s.into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        self.read_bytes(&values)
+    }
     fn present(&self) -> bool;
     fn set_default(&self);
 }
@@ -317,26 +400,44 @@ impl<T: ReadOption> OptionDesc<T> {
     }
 }
 
+impl<T: ReadOption> OptionDesc<T> {
+    fn validate_count(&self, n: usize) -> std::io::Result<()> {
+        if T::check_pcount_len(n, self.min_count) {
+            return Ok(());
+        }
+        let prefix = if self.base.short_id != '\0' {
+            format!("-{}/", self.base.short_id)
+        } else {
+            String::new()
+        };
+        Err(raw_error(
+            format!(
+                "Invalid parameter count for option '{}--{}'",
+                prefix, self.base.id
+            )
+            .into_bytes(),
+        ))
+    }
+}
+
 impl<T: ReadOption> OptionDescBase for OptionDesc<T> {
     fn base(&self) -> &OptionBase {
         &self.base
     }
 
     fn read(&self, v: &[String]) -> Result<(), String> {
-        if !T::check_pcount(v, self.min_count) {
-            let prefix = if self.base.short_id != '\0' {
-                format!("-{}/", self.base.short_id)
-            } else {
-                String::new()
-            };
-            return Err(format!(
-                "Invalid parameter count for option '{}--{}'",
-                prefix, self.base.id
-            ));
-        }
-        T::read_option(&mut self.store.borrow_mut(), v)
+        self.read_bytes(&v.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>())
+            .map_err(|e| e.to_string())
     }
 
+    fn read_bytes(&self, v: &[Vec<u8>]) -> std::io::Result<()> {
+        self.validate_count(v.len())?;
+        T::read_option_bytes(&mut self.store.borrow_mut(), v)
+    }
+    fn read_os(&self, v: &[std::ffi::OsString]) -> std::io::Result<()> {
+        self.validate_count(v.len())?;
+        T::read_option_os(&mut self.store.borrow_mut(), v)
+    }
     fn present(&self) -> bool {
         self.store.borrow().check_present()
     }
@@ -433,33 +534,120 @@ impl CommandLineParser {
     }
 
     pub fn store(&self, args: &[&str], command: &mut u32) -> Result<(), String> {
+        self.store_bytes(
+            &args.iter().map(|s| s.as_bytes()).collect::<Vec<_>>(),
+            command,
+        )
+        .map_err(|e| e.to_string())
+    }
+    pub fn store_bytes(&self, args: &[&[u8]], command: &mut u32) -> std::io::Result<()> {
+        self.store_tokens(
+            args.iter().map(|s| Argument::Bytes(s.to_vec())).collect(),
+            command,
+        )
+    }
+    pub fn store_os(&self, args: &[&std::ffi::OsStr], command: &mut u32) -> std::io::Result<()> {
+        self.store_tokens(
+            args.iter().map(|s| Argument::Os((*s).to_owned())).collect(),
+            command,
+        )
+    }
+    fn store_tokens(&self, args: Vec<Argument>, command: &mut u32) -> std::io::Result<()> {
         if args.len() < 2 {
-            return Err(
-                "Syntax: diamond COMMAND [OPTIONS]. To print help message: diamond help"
-                    .to_string(),
-            );
+            return Err(raw_error(
+                b"Syntax: diamond COMMAND [OPTIONS]. To print help message: diamond help".to_vec(),
+            ));
         }
-        let mut cmd = args[1].to_string();
-        if cmd.starts_with("--") {
-            cmd = cmd[2..].to_string();
-        }
-        *command = *self.command_codes.get(&cmd).ok_or_else(|| {
-            format!("Invalid command: {cmd}. To print help message: diamond help")
-        })?;
-
+        let cmd = args[1].bytes()?;
+        let cmd = cmd.strip_prefix(b"--").unwrap_or(&cmd);
+        *command = *std::str::from_utf8(cmd)
+            .ok()
+            .and_then(|s| self.command_codes.get(s))
+            .ok_or_else(|| {
+                let mut message = b"Invalid command: ".to_vec();
+                message.extend_from_slice(cmd);
+                message.extend_from_slice(b". To print help message: diamond help");
+                raw_error(message)
+            })?;
         for option in self.map.values() {
             option.set_default();
         }
-
-        let mut v = Vec::new();
-        for arg in args.iter().skip(2) {
-            if arg.starts_with('-') && arg.len() > 1 && !arg.as_bytes()[1].is_ascii_digit() {
-                self.store_option(&v, *command)?;
-                v.clear();
+        let mut group = Vec::new();
+        for arg in args.into_iter().skip(2) {
+            let bytes = arg.bytes()?;
+            if bytes.len() > 1 && bytes[0] == b'-' && !bytes[1].is_ascii_digit() {
+                self.store_token_option(&group, *command)?;
+                group.clear();
             }
-            v.push((*arg).to_string());
+            group.push(arg);
         }
-        self.store_option(&v, *command)
+        self.store_token_option(&group, *command)
+    }
+    fn store_token_option(&self, v: &[Argument], command: u32) -> std::io::Result<()> {
+        if v.is_empty() {
+            return Ok(());
+        }
+        let token = v[0].bytes()?;
+        if token.len() <= 1 {
+            return Err(raw_error(b"Invalid option syntax.".to_vec()));
+        }
+        let (id, option, attached) = if token.starts_with(b"--") {
+            let id = &token[2..];
+            (
+                id,
+                std::str::from_utf8(id)
+                    .ok()
+                    .and_then(|s| self.map.get(s))
+                    .cloned(),
+                false,
+            )
+        } else if token[0] == b'-' {
+            (
+                &token[1..2],
+                self.map_short.get(&(token[1] as char)).cloned(),
+                token.len() > 2,
+            )
+        } else {
+            return Err(raw_error(
+                b"Command line options must begin with - or --.".to_vec(),
+            ));
+        };
+        let error = |prefix: &[u8]| {
+            let mut message = prefix.to_vec();
+            message.extend_from_slice(id);
+            raw_error(message)
+        };
+        let option = option.ok_or_else(|| error(b"Invalid option: "))?;
+        if option.base().disabled {
+            return Err(error(b"Invalid option: "));
+        }
+        if !cfg!(feature = "extra") && !option.base().commands.contains(&command) {
+            return Err(error(b"Option is not permitted for this workflow: "));
+        }
+        let mut values = Vec::new();
+        if attached {
+            values.push(v[0].attached()?);
+        }
+        values.extend_from_slice(&v[1..]);
+        if matches!(v[0], Argument::Os(_)) {
+            let values = values
+                .into_iter()
+                .map(|v| match v {
+                    Argument::Os(s) => s,
+                    Argument::Bytes(_) => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            option.read_os(&values)
+        } else {
+            let values = values
+                .into_iter()
+                .map(|v| match v {
+                    Argument::Bytes(s) => s,
+                    Argument::Os(_) => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            option.read_bytes(&values)
+        }
     }
 
     pub fn require(&self, option: &str) -> Result<(), String> {
@@ -471,7 +659,7 @@ impl CommandLineParser {
             return Err(format!(
                 "Missing parameter: --{}/-{}",
                 o.base().id,
-                o.base().short_id
+                o.base().short_id.to_string().trim_end_matches('\0')
             ));
         }
         Ok(())
@@ -525,45 +713,142 @@ impl CommandLineParser {
         out.push('\n');
         out
     }
-
-    fn store_option(&self, v: &[String], command: u32) -> Result<(), String> {
-        if v.is_empty() {
-            return Ok(());
-        }
-        let o;
-        let id;
-        let mut v2 = Vec::new();
-        if v[0].len() <= 1 {
-            return Err("Invalid option syntax.".to_string());
-        } else if v[0].starts_with("--") {
-            id = v[0][2..].to_string();
-            o = self.map.get(&id).cloned();
-        } else if v[0].starts_with('-') {
-            id = v[0].chars().nth(1).unwrap().to_string();
-            let short = v[0].chars().nth(1).unwrap();
-            o = self.map_short.get(&short).cloned();
-            if v[0].len() > 2 {
-                v2.push(v[0][2..].to_string());
-            }
-        } else {
-            return Err("Command line options must begin with - or --.".to_string());
-        }
-
-        let o = o.ok_or_else(|| format!("Invalid option: {id}"))?;
-        if o.base().disabled {
-            return Err(format!("Invalid option: {id}"));
-        }
-        if !o.base().commands.contains(&command) {
-            return Err(format!("Option is not permitted for this workflow: {id}"));
-        }
-        v2.extend_from_slice(&v[1..]);
-        o.read(&v2)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_values_numeric_crt_and_optionvalue_share_parser() {
+        let text = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let values = Rc::new(RefCell::new(OptionValue::<Vec<Vec<u8>>>::new()));
+        let floating = Rc::new(RefCell::new(0.0f64));
+        let mut parser = CommandLineParser::new();
+        parser.add_command("run", "", 1);
+        let group = parser.add_group("test", vec![1], false);
+        parser
+            .add_option(group, "text", 't', "", text.clone(), Vec::<u8>::new(), 1)
+            .add_option(
+                group,
+                "values",
+                'v',
+                "",
+                values.clone(),
+                OptionValue::new(),
+                1,
+            )
+            .add_option(group, "float", 'f', "", floating.clone(), 0.0, 1);
+        let mut command = 0;
+        parser
+            .store_bytes(
+                &[
+                    b"diamond",
+                    b"run",
+                    b"-t\xff",
+                    b"--values",
+                    b"\xfe",
+                    b"a",
+                    b"--values",
+                    b"\xfd",
+                    b"--float",
+                    b"0x1.8p+2tail",
+                ],
+                &mut command,
+            )
+            .unwrap();
+        assert_eq!(*text.borrow(), b"\xff");
+        assert_eq!(
+            values.borrow().get_present().unwrap(),
+            vec![b"\xfd".to_vec()]
+        );
+        assert_eq!(*floating.borrow(), 6.0);
+        let mut integer = 99i64;
+        ReadOption::read_option_bytes(&mut integer, &[b"\xc2\xa012".to_vec()]).unwrap();
+        assert_eq!(integer, 0); // Unicode NBSP is not a C-locale space.
+        let error = parser
+            .store_bytes(&[b"diamond", b"run", b"--\xff"], &mut command)
+            .unwrap_err();
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error),
+            Some(b"Invalid option: \xff".as_slice())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn os_paths_keep_raw_bytes_in_scalar_vector_and_optional_cells() {
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+        let path = Rc::new(RefCell::new(PathBuf::new()));
+        let paths = Rc::new(RefCell::new(OptionValue::<Vec<PathBuf>>::new()));
+        let mut parser = CommandLineParser::new();
+        parser.add_command("run", "", 1);
+        let group = parser.add_group("test", vec![1], false);
+        parser
+            .add_option(group, "path", 'p', "", path.clone(), PathBuf::new(), 1)
+            .add_option(
+                group,
+                "paths",
+                'q',
+                "",
+                paths.clone(),
+                OptionValue::new(),
+                1,
+            );
+        let attached = OsString::from_vec(b"-pdir/\xff".to_vec());
+        let second = OsString::from_vec(b"other/\xfe".to_vec());
+        parser
+            .store_os(
+                &[
+                    OsStr::new("diamond"),
+                    OsStr::new("run"),
+                    attached.as_os_str(),
+                    OsStr::new("--paths"),
+                    second.as_os_str(),
+                ],
+                &mut 0,
+            )
+            .unwrap();
+        assert_eq!(
+            *path.borrow(),
+            PathBuf::from(OsString::from_vec(b"dir/\xff".to_vec()))
+        );
+        assert_eq!(
+            paths.borrow().get_present().unwrap(),
+            vec![PathBuf::from(second)]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn os_path_cells_retain_utf16_even_when_source_narrow_text_cannot() {
+        use std::ffi::{OsStr, OsString};
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use std::path::PathBuf;
+        let path = Rc::new(RefCell::new(PathBuf::new()));
+        let mut parser = CommandLineParser::new();
+        parser.add_command("run", "", 1);
+        let group = parser.add_group("test", vec![1], false);
+        parser.add_option(group, "path", 'p', "", path.clone(), PathBuf::new(), 1);
+        let raw = OsString::from_wide(&[b'x' as u16, 0xd800, b'y' as u16]);
+        parser
+            .store_os(
+                &[
+                    OsStr::new("diamond"),
+                    OsStr::new("run"),
+                    OsStr::new("--path"),
+                    raw.as_os_str(),
+                ],
+                &mut 0,
+            )
+            .unwrap();
+        assert_eq!(
+            path.borrow().as_os_str().encode_wide().collect::<Vec<_>>(),
+            vec![b'x' as u16, 0xd800, b'y' as u16]
+        );
+    }
 
     #[test]
     fn test_read_option_helpers() {
@@ -643,10 +928,21 @@ mod tests {
         assert!(docs.contains("--threads"));
 
         let err = parser.store(&["diamond", "makedb", "--db", "x"], &mut command);
-        assert_eq!(
-            err.unwrap_err(),
-            "Option is not permitted for this workflow: db"
-        );
+        if cfg!(feature = "extra") {
+            err.unwrap();
+            assert_eq!(db.borrow().as_str(), "x");
+        } else {
+            assert_eq!(
+                err.unwrap_err(),
+                "Option is not permitted for this workflow: db"
+            );
+            assert!(db.borrow().is_empty());
+        }
+        // store resets every option before applying the next command, even
+        // when EXTRA bypasses group membership or baseline rejects the store.
+        assert_eq!(command, 2);
+        assert_eq!(*threads.borrow(), 1);
+        assert!(!*verbose.borrow());
     }
 
     #[test]

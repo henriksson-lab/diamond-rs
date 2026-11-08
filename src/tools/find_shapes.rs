@@ -52,7 +52,7 @@ pub fn process_window(p: Pattern, patterns: &mut BTreeSet<Pattern>) {
 }
 
 fn process_pattern_with(
-    sequence: &str,
+    sequence: impl AsRef<[u8]>,
     patterns: &mut BTreeSet<Pattern>,
     weight: usize,
     length: usize,
@@ -60,7 +60,7 @@ fn process_pattern_with(
 ) {
     let mask = (1_u32 << length) - 1;
     let mut pattern = 0_u32;
-    for byte in sequence.bytes() {
+    for &byte in sequence.as_ref() {
         pattern = (pattern << 1) & mask;
         if byte == b'1' {
             pattern |= 1;
@@ -76,8 +76,8 @@ pub fn process_pattern(sequence: &str, patterns: &mut BTreeSet<Pattern>) {
     process_pattern_with(sequence, patterns, W, L, T);
 }
 
-fn is_excluded_with(
-    lines: &[&str],
+fn is_excluded_with<T: AsRef<[u8]>>(
+    lines: &[T],
     exclude: &BTreeSet<Pattern>,
     weight: usize,
     length: usize,
@@ -88,7 +88,7 @@ fn is_excluded_with(
     let mask = (1_u32 << length) - 1;
     for line in lines {
         let mut pattern = 0_u32;
-        for byte in line.bytes() {
+        for &byte in line.as_ref() {
             pattern <<= 1;
             if byte == b'1' {
                 pattern |= 1;
@@ -111,11 +111,14 @@ pub fn is_excluded(lines: &[&str], exclude: &BTreeSet<Pattern>) -> bool {
 }
 
 pub fn is_id(sequence: &str) -> bool {
-    sequence.bytes().all(|byte| byte == b'1')
+    is_id_bytes(sequence.as_bytes())
+}
+pub fn is_id_bytes(sequence: &[u8]) -> bool {
+    sequence.iter().all(|&byte| byte == b'1')
 }
 
-fn process_aln_with(
-    lines: &[&str],
+fn process_aln_with<T: AsRef<[u8]>>(
+    lines: &[T],
     exclude: &BTreeSet<Pattern>,
     counts: &mut HashMap<Pattern, usize>,
     weight: usize,
@@ -202,9 +205,87 @@ pub fn find_shapes(lines: &[String]) -> Vec<ShapeRound> {
     find_shapes_with(lines, N, W, L, T)
 }
 
+/// Concrete Source file workflow. Reopen the text input on every round rather
+/// than retaining its entire contents; the pattern counts are bounded by 2^L.
+/// The source's zero-pattern formatter dereferences an empty string. Report
+/// that undefined boundary explicitly instead of indexing outside a Rust string.
+pub fn find_shapes_file(path: &str, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    find_shapes_file_with_buffer_size(path, out, 1 << 20)
+}
+
+pub fn find_shapes_file_with_buffer_size(
+    path: &str,
+    out: &mut impl std::io::Write,
+    buffer_size: usize,
+) -> std::io::Result<()> {
+    find_shapes_file_path_with_buffer_size(std::path::Path::new(path), out, buffer_size)
+}
+pub fn find_shapes_file_path_with_buffer_size(
+    path: &std::path::Path,
+    out: &mut impl std::io::Write,
+    buffer_size: usize,
+) -> std::io::Result<()> {
+    use crate::util::io::ByteTextInputFile;
+    let mut exclude = BTreeSet::new();
+    for _ in 0..N {
+        let mut input =
+            ByteTextInputFile::from_source_path_bytes_with_buffer_size(path, buffer_size)
+                .map_err(std::io::Error::other)?;
+        let mut counts = HashMap::new();
+        let (mut alignments, mut total) = (0usize, 0usize);
+        loop {
+            input.getline().map_err(std::io::Error::other)?;
+            if input.eof() && input.line.is_empty() {
+                break;
+            }
+            let fields = crate::util::string::tokenize_bytes(&input.line, b"\t");
+            let fields: Vec<&[u8]> = fields.iter().map(Vec::as_slice).collect();
+            if fields.len() > 1 || !is_id_bytes(fields[0]) {
+                if !is_excluded_with(&fields, &exclude, W, L) {
+                    process_aln_with(&fields, &exclude, &mut counts, W, L, T);
+                    alignments += 1;
+                }
+                total += 1;
+            }
+            if total % 100_000 == 0 {
+                writeln!(out, "Processed = {total}")?;
+            }
+        }
+        // C++ scans its dense table in ascending pattern order, replacing the
+        // winner only on a strictly larger count.
+        let winner = counts
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .min_by_key(|(pattern, count)| (usize::MAX - **count, **pattern));
+        writeln!(out, "Alignments: {alignments} / {total}")?;
+        let Some((&pattern, &hits)) = winner else {
+            return Err(std::io::Error::other(
+                "No nonzero seed pattern remains (upstream zero-pattern formatting is undefined).",
+            ));
+        };
+        writeln!(out, "Pattern: {}", as_string(pattern))?;
+        writeln!(out, "Hit: {hits}")?;
+        exclude.insert(pattern);
+        for pattern in &exclude {
+            writeln!(out, "{}", as_string(*pattern))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_pattern_bytes_share_the_string_algorithm() {
+        let mut raw = BTreeSet::new();
+        let mut text = BTreeSet::new();
+        process_pattern_with(b"1\xff11", &mut raw, 2, 4, 1);
+        process_pattern_with("1011", &mut text, 2, 4, 1);
+        assert_eq!(raw, text);
+        assert!(!is_id_bytes(b"1\xff1"));
+    }
 
     #[test]
     fn window_enumeration_selects_exact_weight_and_formats_without_padding() {

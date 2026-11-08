@@ -1,0 +1,64 @@
+[
+  {
+    "args": [
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-tabular-context-20261107/source.dmnd",
+      "-f",
+      "6",
+      "qacc"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Invalid output field: qacc\n"
+  },
+  {
+    "args": [
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-tabular-context-20261107/source.dmnd",
+      "-f",
+      "6",
+      "full_qseq_mate"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Output field only supported for translated search.\n"
+  },
+  {
+    "args": [
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-tabular-context-20261107/source.dmnd",
+      "-f",
+      "6",
+      "qseq_translated"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Output field only supported for translated search.\n"
+  },
+  {
+    "args": [
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/query.faa",
+      "-d",
+      ".tmp/native-tabular-context-20261107/source.dmnd",
+      "--matrix",
+      "PAM30",
+      "-f",
+      "6",
+      "approx_pident"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nError: Approximate identity is only supported for the BLOSUM62 scoring matrix.\n"
+  }
+]

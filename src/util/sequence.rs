@@ -3,7 +3,6 @@ use crate::basic::value::{
     letter_mask, Letter, Loc, Score, ValueTraits, AMINO_ACID_COUNT, MASK_LETTER, STOP_LETTER,
     TRUE_AA,
 };
-use crate::util::string::{StringDelimiters, Tokenizer};
 use crate::util::text_buffer::{find_first_of, TextBuffer};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -45,8 +44,35 @@ pub fn format(
     value_traits: &ValueTraits,
     wrap: Loc,
 ) -> Result<(), String> {
-    if format == "fasta" {
-        out.append_char('>').append_str(id).append_char('\n');
+    format_bytes(seq, id.as_bytes(), qual, out, format, value_traits, wrap)
+}
+
+pub fn format_bytes(
+    seq: &[Letter],
+    id: &[u8],
+    qual: Option<&[u8]>,
+    out: &mut TextBuffer,
+    format: &str,
+    value_traits: &ValueTraits,
+    wrap: Loc,
+) -> Result<(), String> {
+    format_bytes_with_format(seq, id, qual, out, format.as_bytes(), value_traits, wrap)
+}
+
+pub fn format_bytes_with_format(
+    seq: &[Letter],
+    id: &[u8],
+    qual: Option<&[u8]>,
+    out: &mut TextBuffer,
+    format: &[u8],
+    value_traits: &ValueTraits,
+    wrap: Loc,
+) -> Result<(), String> {
+    let id = c_string_bytes(id);
+    if format == b"fasta" {
+        out.append_char('>');
+        out.write_raw(id);
+        out.append_char('\n');
         let mut i = 0usize;
         let wrap = wrap as usize;
         while i < seq.len() {
@@ -57,8 +83,10 @@ pub fn format(
             out.append_char('\n');
             i += wrap;
         }
-    } else if format == "fastq" {
-        out.append_char('@').append_str(id).append_char('\n');
+    } else if format == b"fastq" {
+        out.append_char('@');
+        out.write_raw(id);
+        out.append_char('\n');
         for &letter in seq {
             let l = letter as i32;
             if (l & 128) == 0 {
@@ -68,7 +96,7 @@ pub fn format(
             }
         }
         out.append_str("\n+\n");
-        out.write_raw(qual.unwrap_or(&[]));
+        out.write_raw(c_string_bytes(qual.unwrap_or(&[])));
         out.append_char('\n');
     } else {
         return Err("Invalid sequence file format".to_string());
@@ -109,104 +137,171 @@ pub fn clip(seq: &[Letter], anchor: i32) -> &[Letter] {
     }
 }
 
-pub fn seqid(title: &str) -> String {
+/// Source const-char consumers stop at NUL; stored std::string titles do not.
+pub fn c_string_bytes(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len())]
+}
+pub fn seqid_bytes(title: &[u8]) -> Vec<u8> {
+    let title = c_string_bytes(title);
     let end = title
-        .find(|c| ID_DELIMITERS.contains(c))
+        .iter()
+        .position(|byte| ID_DELIMITERS.as_bytes().contains(byte))
         .unwrap_or(title.len());
-    title[..end].to_string()
+    title[..end].to_vec()
+}
+pub fn seqid(title: &str) -> String {
+    String::from_utf8(seqid_bytes(title.as_bytes())).expect("ASCII delimiter preserves UTF-8")
 }
 
-pub fn get_accession(title: &str, stat: &mut AccessionParsing) -> String {
-    let mut t = title.to_string();
-    if t.starts_with("UniRef") {
-        let n = t.find('_').map(|i| i + 1).unwrap_or(0);
+pub fn get_accession_bytes(title: &[u8], stat: &mut AccessionParsing) -> Vec<u8> {
+    let mut t = title.to_vec();
+    if t.starts_with(b"UniRef") {
+        let n = t.iter().position(|&byte| byte == b'_').map_or(0, |i| i + 1);
         t.drain(..n);
         stat.uniref_prefix += 1;
-    } else if let Some(mut i) = t.find('|') {
-        if t.starts_with("gi|") {
-            let erase_to = t[i + 1..].find('|').map(|j| i + 1 + j + 1).unwrap_or(0);
-            t.drain(..erase_to);
-            i = t.find('|').unwrap_or(usize::MAX);
+    } else if let Some(mut i) = t.iter().position(|&byte| byte == b'|') {
+        if t.starts_with(b"gi|") {
+            let n = t[i + 1..]
+                .iter()
+                .position(|&byte| byte == b'|')
+                .map_or(0, |j| i + j + 2);
+            t.drain(..n);
+            i = t
+                .iter()
+                .position(|&byte| byte == b'|')
+                .unwrap_or(usize::MAX);
             stat.gi_prefix += 1;
         }
-        // C++ size_t arithmetic makes `npos + 1 == 0`, hence no erase.
-        let erase_to = i.wrapping_add(1);
-        if erase_to != 0 {
-            t.drain(..erase_to);
+        let n = i.wrapping_add(1);
+        if n != 0 {
+            t.drain(..n);
         }
         stat.prefix_before_pipe += 1;
-        if let Some(j) = t.find('|') {
+        if let Some(j) = t.iter().position(|&byte| byte == b'|') {
             t.truncate(j);
             stat.suffix_after_pipe += 1;
         }
     }
-    if let Some(i) = t.rfind('.') {
+    if let Some(i) = t.iter().rposition(|&byte| byte == b'.') {
         t.truncate(i);
         stat.suffix_after_dot += 1;
     }
     t
 }
+pub fn get_accession(title: &str, stat: &mut AccessionParsing) -> String {
+    String::from_utf8(get_accession_bytes(title.as_bytes(), stat))
+        .expect("ASCII delimiter preserves UTF-8")
+}
 
+/// StringDelimiters scans delimiters in declaration priority, not earliest position.
+fn title_tokens(title: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = c_string_bytes(title);
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (end, skip) = if let Some(i) = rest.iter().position(|&byte| byte == 1) {
+            (i, 1)
+        } else if let Some(i) = rest.windows(2).position(|bytes| bytes == b" >") {
+            (i, 2)
+        } else {
+            (rest.len(), 0)
+        };
+        let token = &rest[..end];
+        rest = &rest[end + skip..];
+        Some(token)
+    })
+}
+pub fn accession_from_title_bytes(
+    title: &[u8],
+    parse_seqids: bool,
+    stat: &mut AccessionParsing,
+) -> Vec<Vec<u8>> {
+    title_tokens(title)
+        .map(|token| {
+            let id = seqid_bytes(token);
+            if parse_seqids {
+                get_accession_bytes(&id, stat)
+            } else {
+                id
+            }
+        })
+        .collect()
+}
 pub fn accession_from_title(
     title: &str,
     parse_seqids: bool,
     stat: &mut AccessionParsing,
 ) -> Vec<String> {
+    accession_from_title_bytes(title.as_bytes(), parse_seqids, stat)
+        .into_iter()
+        .map(|id| String::from_utf8(id).expect("ASCII delimiter preserves UTF-8"))
+        .collect()
+}
+pub fn all_seqids_bytes(title: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut tok = Tokenizer::new(title, StringDelimiters::new(&FASTA_HEADER_SEP));
-    while tok.good() {
-        let s = tok.read_string().map_err(|e| e.to_string()).unwrap();
-        let id = seqid(&s);
-        out.push(if parse_seqids {
-            get_accession(&id, stat)
-        } else {
-            id
-        });
-    }
-    out
-}
-
-pub fn all_seqids(s: &str) -> String {
-    let mut out = String::new();
-    let mut tok = Tokenizer::new(s, StringDelimiters::new(&FASTA_HEADER_SEP));
-    while tok.good() {
-        if tok.ptr() != Some(0) {
-            out.push('\u{0001}');
+    for (n, token) in title_tokens(title).enumerate() {
+        if n != 0 {
+            out.push(1);
         }
-        let t = tok.read_string().map_err(|e| e.to_string()).unwrap();
-        out.push_str(&seqid(&t));
+        out.extend(seqid_bytes(token));
     }
     out
 }
-
-pub fn fix_title(s: &mut String) -> Option<&'static str> {
-    let mut i = 0usize;
-    let bytes = s.as_bytes();
-    while i < bytes.len() && bytes[i] < 33 {
-        i += 1;
+pub fn all_seqids(title: &str) -> String {
+    String::from_utf8(all_seqids_bytes(title.as_bytes())).expect("ASCII delimiter preserves UTF-8")
+}
+pub fn fix_title_bytes(title: &mut Vec<u8>) -> Option<&'static str> {
+    // Preserve the target C ABI char signedness used by Source.
+    let n = title
+        .iter()
+        .take_while(|&&byte| (byte as libc::c_char) < 33)
+        .count();
+    let mut result = None;
+    if n > 0 {
+        title.drain(..n);
+        result = Some(SPACES_ERR);
     }
-    let mut r = None;
-    if i > 0 {
-        s.drain(..i);
-        r = Some(SPACES_ERR);
-    }
-    if s.is_empty() {
-        s.push_str("N/A");
+    if title.is_empty() {
+        title.extend_from_slice(b"N/A");
         return Some(BLANK_ERR);
     }
-    let mut j = 0usize;
-    while j < s.len() {
-        if s.as_bytes()[j] == b'\t' {
-            s.replace_range(j..j + 1, "\\t");
-            r = Some(TAB_ERR);
-            j += 2;
+    let mut i = 0;
+    while i < title.len() {
+        if title[i] == b'\t' {
+            title.splice(i..i + 1, b"\\t".iter().copied());
+            result = Some(TAB_ERR);
+            i += 2;
         } else {
-            j += 1;
+            i += 1;
         }
     }
-    r
+    result
+}
+pub fn fix_title(title: &mut String) -> Option<&'static str> {
+    let mut bytes = std::mem::take(title).into_bytes();
+    let result = fix_title_bytes(&mut bytes);
+    *title = String::from_utf8(bytes).expect("ASCII edits preserve UTF-8");
+    result
 }
 
+pub fn get_title_def_bytes(title: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let end = title
+        .iter()
+        .position(|byte| *byte == 0 || ID_DELIMITERS.as_bytes().contains(byte))
+        .unwrap_or(title.len());
+    (
+        title[..end].to_vec(),
+        if end >= title.len() {
+            Vec::new()
+        } else {
+            title[end + 1..].to_vec()
+        },
+    )
+}
 pub fn get_title_def(s: &str) -> (String, String) {
     let i = find_first_of(s, ID_DELIMITERS);
     let title = s[..i].to_string();
@@ -353,6 +448,28 @@ mod tests {
     use crate::basic::value::{
         SequenceType, AMINO_ACID_ALPHABET, MASK_LETTER, NUCLEOTIDE_ALPHABET,
     };
+
+    #[test]
+    fn byte_title_utilities_preserve_storage_and_apply_c_string_boundaries() {
+        assert_eq!(seqid_bytes(b"q\xff rest\0tail"), b"q\xff");
+        assert_eq!(
+            all_seqids_bytes(b"a\xff desc\x01b\xfe rest"),
+            b"a\xff\x01b\xfe"
+        );
+        assert_eq!(
+            get_title_def_bytes(b"id\0raw\xff"),
+            (b"id".to_vec(), b"raw\xff".to_vec())
+        );
+        let mut title = b"q\xff\tdesc".to_vec();
+        assert_eq!(fix_title_bytes(&mut title), Some(TAB_ERR));
+        assert_eq!(title, b"q\xff\\tdesc");
+        let mut stats = AccessionParsing::default();
+        assert_eq!(
+            get_accession_bytes(b"sp|A\xff.2|desc", &mut stats),
+            b"A\xff"
+        );
+        assert_eq!(stats.prefix_before_pipe, 1);
+    }
 
     #[test]
     fn test_seqid_and_all_seqids() {

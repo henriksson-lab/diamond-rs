@@ -13,7 +13,7 @@ use crate::masking::MaskingAlgo;
 use crate::search::kmer_ranking::KmerRanking;
 use crate::search::seed_complexity::{mask_seeds, MaskSeedsStats, SeedLocBytes};
 use crate::util::algo::Partition;
-use crate::util::algo::{hash_join, Relation};
+use crate::util::algo::{try_hash_join_with_config, HashJoinConfig, Relation};
 use crate::util::data_structures::DoubleArray;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,10 +32,12 @@ pub enum ReferenceSeedFilter<'a> {
 }
 
 /// Explicit inputs for the C++ `search_shape` orchestration.
+#[derive(Clone, Copy)]
 pub struct SearchShapeConfig<'a> {
     pub shapes: &'a ShapeConfig,
     pub reduction: &'a Reduction,
     pub seedp_bits: i32,
+    pub hash_join: HashJoinConfig,
     pub index_chunks: usize,
     pub threads: usize,
     pub seed_encoding: SeedEncoding,
@@ -63,6 +65,7 @@ impl<'a> SearchShapeConfig<'a> {
             shapes,
             reduction,
             seedp_bits: 10,
+            hash_join: HashJoinConfig::default(),
             index_chunks: 1,
             threads: 1,
             seed_encoding: SeedEncoding::SpacedFactor,
@@ -171,6 +174,29 @@ pub fn seed_join_worker<SeedLoc>(
 where
     SeedLoc: SeedLocation + crate::util::algo::HashJoinValue,
 {
+    seed_join_worker_with_config(
+        query_seeds,
+        ref_seeds,
+        seedp_begin,
+        partition_count,
+        query_seed_hits,
+        ref_seed_hits,
+        &HashJoinConfig::default(),
+    )
+}
+
+pub fn seed_join_worker_with_config<SeedLoc>(
+    query_seeds: &SeedArray<SeedLoc>,
+    ref_seeds: &SeedArray<SeedLoc>,
+    seedp_begin: usize,
+    partition_count: usize,
+    query_seed_hits: &mut [DoubleArray],
+    ref_seed_hits: &mut [DoubleArray],
+    config: &HashJoinConfig,
+) -> Result<(), String>
+where
+    SeedLoc: SeedLocation + crate::util::algo::HashJoinValue,
+{
     let bits = query_seeds.key_bits();
     if bits != ref_seeds.key_bits() {
         return Err("Joining seed arrays with different key lengths.".to_string());
@@ -178,11 +204,12 @@ where
     for p in seedp_begin..partition_count {
         let query = query_seeds.begin(p);
         let reference = ref_seeds.begin(p);
-        let join = hash_join(
+        let join = try_hash_join_with_config(
             Relation::new(query, query.len()),
             Relation::new(reference, reference.len()),
             bits as u32,
-        );
+            config,
+        )?;
         query_seed_hits[p] = join.0;
         ref_seed_hits[p] = join.1;
     }
@@ -362,13 +389,14 @@ where
         let relative_count = range.size() as usize;
         let mut query_hits = vec![DoubleArray::new(); relative_count];
         let mut reference_hits = vec![DoubleArray::new(); relative_count];
-        seed_join_worker(
+        seed_join_worker_with_config(
             &query_seeds,
             &reference_seeds,
             0,
             relative_count,
             &mut query_hits,
             &mut reference_hits,
+            &config.hash_join,
         )?;
 
         let mut mask_stats = MaskSeedsStats::default();
@@ -398,11 +426,19 @@ where
             );
         }
 
+        if config.seed_encoding == SeedEncoding::SpacedFactor && frequent_seed_stats.is_none() {
+            crate::search::seed_complexity::report_masking(
+                &mask_stats,
+                query.seqs().letters() as usize,
+                reference.seqs().letters() as usize,
+            );
+        }
         let ranking = if config.keep_target_id && config.linear_stage1_query {
             SeedLoc::build_ranking(config.kmer_ranking, query, &query_hits, &reference_hits)
         } else {
             None
         };
+        let search_started = std::time::Instant::now();
         let mut searched_partitions = 0usize;
         for relative_partition in 0..relative_count {
             run_stage1(
@@ -423,6 +459,10 @@ where
             )?;
             searched_partitions += 1;
         }
+        crate::basic::statistics::inc_statistics(
+            crate::basic::statistics::StatValue::TimeSearch,
+            search_started.elapsed().as_micros() as i64,
+        );
         report.chunks.push(SearchShapeChunkReport {
             chunk,
             range,
@@ -468,6 +508,33 @@ where
             &mut run_stage1,
         )
     }
+}
+
+/// Iteration adapter retaining full query IDs and the source context grouping.
+/// The readonly mask is a snapshot for the whole round, not updated per target block.
+pub fn search_shape_with_skip<F>(
+    shape_id: u32,
+    query: &mut Block,
+    reference: &mut Block,
+    config: &SearchShapeConfig<'_>,
+    skip: Option<&crate::util::data_structures::BitVector>,
+    run_stage1: F,
+) -> Result<SearchShapeReport, String>
+where
+    F: FnMut(
+        SearchShapePartition<'_>,
+        &crate::data::sequence_set::SequenceSet,
+        &crate::data::sequence_set::SequenceSet,
+    ) -> Result<(), String>,
+{
+    let skip = crate::data::enum_seeds::source_query_skip_vec(
+        skip,
+        config.query_contexts,
+        query.seqs().len(),
+    )?;
+    let mut config = *config;
+    config.query_skip = skip.as_ref().or(config.query_skip);
+    search_shape(shape_id, query, reference, &config, run_stage1)
 }
 
 /// Matches C++ `search_shape(unsigned...)`.

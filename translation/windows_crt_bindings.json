@@ -1,0 +1,1434 @@
+{
+  "generator": "translation/generate_windows_crt_bindings.py",
+  "clang_version": "Ubuntu clang version 14.0.0-1ubuntu1.1\nTarget: x86_64-pc-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin\n",
+  "headers": {
+    "/usr/x86_64-w64-mingw32/include/stdio.h": "47647453d0bb4b4254ad477ad1fdb2665a9fa7e1b461996f4b93aadabbaf3adf",
+    "/usr/x86_64-w64-mingw32/include/errno.h": "85bb8bccd9322b2db53a7cc9ee3ebc89951f671f8180a56eac02b9b3bf97f1a5",
+    "/usr/x86_64-w64-mingw32/include/corecrt.h": "5d56222cdfd965e73a45fbcdf356f4be3046426bc098175064b5eb77ba0fb0e1",
+    "/usr/x86_64-w64-mingw32/include/vadefs.h": "abbcc279d0a64730caa533f2df975f4fa10ce9768783b6d98c420e48d8820458",
+    "/usr/x86_64-w64-mingw32/include/_mingw.h": "ea59112b9c55fe1847f5a65d5f0b752002fafdefd737c69113321a845c35a58a",
+    "/usr/x86_64-w64-mingw32/include/io.h": "c21bcab156ff730950c6efaabfa92fdbce8727dd62bb0b8d2a802c553da02cda",
+    "/usr/x86_64-w64-mingw32/include/sys/stat.h": "0710631d4d29faa499585bffdd2973ea6bd3ded54d29548d56bf7687bb5f2f30",
+    "/usr/x86_64-w64-mingw32/include/_mingw_stat64.h": "7534d5fa2bba9dc28b08db4caecad2c01fc18925e5cf33102863a74037d73fe8"
+  },
+  "targets": {
+    "x86_64-pc-windows-msvc": {
+      "_fseeki64": {
+        "argv": [
+          "clang",
+          "--target=x86_64-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_fseeki64",
+          "-"
+        ],
+        "signature": "int (FILE *, long long, int)",
+        "mangled_name": "_fseeki64",
+        "parameters": [
+          "FILE *",
+          "long long",
+          "int"
+        ]
+      },
+      "_ftelli64": {
+        "argv": [
+          "clang",
+          "--target=x86_64-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_ftelli64",
+          "-"
+        ],
+        "signature": "long long (FILE *)",
+        "mangled_name": "_ftelli64",
+        "parameters": [
+          "FILE *"
+        ]
+      },
+      "_errno": {
+        "argv": [
+          "clang",
+          "--target=x86_64-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_errno",
+          "-"
+        ],
+        "signature": "int *(void)",
+        "mangled_name": "_errno",
+        "parameters": []
+      },
+      "_get_errno": {
+        "argv": [
+          "clang",
+          "--target=x86_64-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_get_errno",
+          "-"
+        ],
+        "signature": "errno_t (int *)",
+        "mangled_name": "_get_errno",
+        "parameters": [
+          "int *"
+        ]
+      },
+      "__acrt_iob_func": {
+        "argv": [
+          "clang",
+          "--target=x86_64-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "__acrt_iob_func",
+          "-"
+        ],
+        "signature": "FILE *(unsigned int)",
+        "mangled_name": "__acrt_iob_func",
+        "parameters": [
+          "unsigned int"
+        ]
+      },
+      "_setmaxstdio": {
+        "argv": [
+          "clang",
+          "--target=x86_64-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_setmaxstdio",
+          "-"
+        ],
+        "signature": "int (int)",
+        "mangled_name": "_setmaxstdio",
+        "parameters": [
+          "int"
+        ]
+      },
+      "_wfopen": {
+        "argv": [
+          "clang",
+          "--target=x86_64-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wfopen",
+          "-"
+        ],
+        "signature": "FILE *(const wchar_t *restrict, const wchar_t *restrict)",
+        "mangled_name": "_wfopen",
+        "parameters": [
+          "const wchar_t *restrict",
+          "const wchar_t *restrict"
+        ]
+      },
+      "_wopen": {
+        "argv": [
+          "clang",
+          "--target=x86_64-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wopen",
+          "-"
+        ],
+        "signature": "int (const wchar_t *, int, ...)",
+        "mangled_name": "_wopen",
+        "parameters": [
+          "const wchar_t *",
+          "int"
+        ]
+      },
+      "_wstat64": {
+        "argv": [
+          "clang",
+          "--target=x86_64-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wstat64",
+          "-"
+        ],
+        "signature": "int (const wchar_t *, struct _stat64 *)",
+        "mangled_name": "_wstat64",
+        "parameters": [
+          "const wchar_t *",
+          "struct _stat64 *"
+        ]
+      }
+    },
+    "i686-pc-windows-msvc": {
+      "_fseeki64": {
+        "argv": [
+          "clang",
+          "--target=i686-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_fseeki64",
+          "-"
+        ],
+        "signature": "int (FILE *, long long, int)",
+        "mangled_name": "__fseeki64",
+        "parameters": [
+          "FILE *",
+          "long long",
+          "int"
+        ]
+      },
+      "_ftelli64": {
+        "argv": [
+          "clang",
+          "--target=i686-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_ftelli64",
+          "-"
+        ],
+        "signature": "long long (FILE *)",
+        "mangled_name": "__ftelli64",
+        "parameters": [
+          "FILE *"
+        ]
+      },
+      "_errno": {
+        "argv": [
+          "clang",
+          "--target=i686-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_errno",
+          "-"
+        ],
+        "signature": "int *(void)",
+        "mangled_name": "__errno",
+        "parameters": []
+      },
+      "_get_errno": {
+        "argv": [
+          "clang",
+          "--target=i686-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_get_errno",
+          "-"
+        ],
+        "signature": "errno_t (int *)",
+        "mangled_name": "__get_errno",
+        "parameters": [
+          "int *"
+        ]
+      },
+      "__acrt_iob_func": {
+        "argv": [
+          "clang",
+          "--target=i686-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "__acrt_iob_func",
+          "-"
+        ],
+        "signature": "FILE *(unsigned int)",
+        "mangled_name": "___acrt_iob_func",
+        "parameters": [
+          "unsigned int"
+        ]
+      },
+      "_setmaxstdio": {
+        "argv": [
+          "clang",
+          "--target=i686-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_setmaxstdio",
+          "-"
+        ],
+        "signature": "int (int)",
+        "mangled_name": "__setmaxstdio",
+        "parameters": [
+          "int"
+        ]
+      },
+      "_wfopen": {
+        "argv": [
+          "clang",
+          "--target=i686-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wfopen",
+          "-"
+        ],
+        "signature": "FILE *(const wchar_t *restrict, const wchar_t *restrict)",
+        "mangled_name": "__wfopen",
+        "parameters": [
+          "const wchar_t *restrict",
+          "const wchar_t *restrict"
+        ]
+      },
+      "_wopen": {
+        "argv": [
+          "clang",
+          "--target=i686-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wopen",
+          "-"
+        ],
+        "signature": "int (const wchar_t *, int, ...)",
+        "mangled_name": "__wopen",
+        "parameters": [
+          "const wchar_t *",
+          "int"
+        ]
+      },
+      "_wstat64": {
+        "argv": [
+          "clang",
+          "--target=i686-pc-windows-msvc",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wstat64",
+          "-"
+        ],
+        "signature": "int (const wchar_t *, struct _stat64 *)",
+        "mangled_name": "__wstat64",
+        "parameters": [
+          "const wchar_t *",
+          "struct _stat64 *"
+        ]
+      }
+    },
+    "x86_64-w64-windows-gnu": {
+      "_fseeki64": {
+        "argv": [
+          "clang",
+          "--target=x86_64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_fseeki64",
+          "-"
+        ],
+        "signature": "int (FILE *, long long, int)",
+        "mangled_name": "_fseeki64",
+        "parameters": [
+          "FILE *",
+          "long long",
+          "int"
+        ]
+      },
+      "_ftelli64": {
+        "argv": [
+          "clang",
+          "--target=x86_64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_ftelli64",
+          "-"
+        ],
+        "signature": "long long (FILE *)",
+        "mangled_name": "_ftelli64",
+        "parameters": [
+          "FILE *"
+        ]
+      },
+      "_errno": {
+        "argv": [
+          "clang",
+          "--target=x86_64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_errno",
+          "-"
+        ],
+        "signature": "int *(void)",
+        "mangled_name": "_errno",
+        "parameters": []
+      },
+      "_get_errno": {
+        "argv": [
+          "clang",
+          "--target=x86_64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_get_errno",
+          "-"
+        ],
+        "signature": "errno_t (int *)",
+        "mangled_name": "_get_errno",
+        "parameters": [
+          "int *"
+        ]
+      },
+      "__acrt_iob_func": {
+        "argv": [
+          "clang",
+          "--target=x86_64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "__acrt_iob_func",
+          "-"
+        ],
+        "signature": "FILE *(unsigned int)",
+        "mangled_name": "__acrt_iob_func",
+        "parameters": [
+          "unsigned int"
+        ]
+      },
+      "_setmaxstdio": {
+        "argv": [
+          "clang",
+          "--target=x86_64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_setmaxstdio",
+          "-"
+        ],
+        "signature": "int (int)",
+        "mangled_name": "_setmaxstdio",
+        "parameters": [
+          "int"
+        ]
+      },
+      "_wfopen": {
+        "argv": [
+          "clang",
+          "--target=x86_64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wfopen",
+          "-"
+        ],
+        "signature": "FILE *(const wchar_t *restrict, const wchar_t *restrict)",
+        "mangled_name": "_wfopen",
+        "parameters": [
+          "const wchar_t *restrict",
+          "const wchar_t *restrict"
+        ]
+      },
+      "_wopen": {
+        "argv": [
+          "clang",
+          "--target=x86_64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wopen",
+          "-"
+        ],
+        "signature": "int (const wchar_t *, int, ...)",
+        "mangled_name": "_wopen",
+        "parameters": [
+          "const wchar_t *",
+          "int"
+        ]
+      },
+      "_wstat64": {
+        "argv": [
+          "clang",
+          "--target=x86_64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wstat64",
+          "-"
+        ],
+        "signature": "int (const wchar_t *, struct _stat64 *)",
+        "mangled_name": "_wstat64",
+        "parameters": [
+          "const wchar_t *",
+          "struct _stat64 *"
+        ]
+      }
+    },
+    "i686-w64-windows-gnu": {
+      "_fseeki64": {
+        "argv": [
+          "clang",
+          "--target=i686-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_fseeki64",
+          "-"
+        ],
+        "signature": "int (FILE *, long long, int)",
+        "mangled_name": "__fseeki64",
+        "parameters": [
+          "FILE *",
+          "long long",
+          "int"
+        ]
+      },
+      "_ftelli64": {
+        "argv": [
+          "clang",
+          "--target=i686-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_ftelli64",
+          "-"
+        ],
+        "signature": "long long (FILE *)",
+        "mangled_name": "__ftelli64",
+        "parameters": [
+          "FILE *"
+        ]
+      },
+      "_errno": {
+        "argv": [
+          "clang",
+          "--target=i686-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_errno",
+          "-"
+        ],
+        "signature": "int *(void)",
+        "mangled_name": "__errno",
+        "parameters": []
+      },
+      "_get_errno": {
+        "argv": [
+          "clang",
+          "--target=i686-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_get_errno",
+          "-"
+        ],
+        "signature": "errno_t (int *)",
+        "mangled_name": "__get_errno",
+        "parameters": [
+          "int *"
+        ]
+      },
+      "__acrt_iob_func": {
+        "argv": [
+          "clang",
+          "--target=i686-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "__acrt_iob_func",
+          "-"
+        ],
+        "signature": "FILE *(unsigned int)",
+        "mangled_name": "___acrt_iob_func",
+        "parameters": [
+          "unsigned int"
+        ]
+      },
+      "_setmaxstdio": {
+        "argv": [
+          "clang",
+          "--target=i686-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_setmaxstdio",
+          "-"
+        ],
+        "signature": "int (int)",
+        "mangled_name": "__setmaxstdio",
+        "parameters": [
+          "int"
+        ]
+      },
+      "_wfopen": {
+        "argv": [
+          "clang",
+          "--target=i686-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wfopen",
+          "-"
+        ],
+        "signature": "FILE *(const wchar_t *restrict, const wchar_t *restrict)",
+        "mangled_name": "__wfopen",
+        "parameters": [
+          "const wchar_t *restrict",
+          "const wchar_t *restrict"
+        ]
+      },
+      "_wopen": {
+        "argv": [
+          "clang",
+          "--target=i686-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wopen",
+          "-"
+        ],
+        "signature": "int (const wchar_t *, int, ...)",
+        "mangled_name": "__wopen",
+        "parameters": [
+          "const wchar_t *",
+          "int"
+        ]
+      },
+      "_wstat64": {
+        "argv": [
+          "clang",
+          "--target=i686-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wstat64",
+          "-"
+        ],
+        "signature": "int (const wchar_t *, struct _stat64 *)",
+        "mangled_name": "__wstat64",
+        "parameters": [
+          "const wchar_t *",
+          "struct _stat64 *"
+        ]
+      }
+    },
+    "aarch64-w64-windows-gnu": {
+      "_fseeki64": {
+        "argv": [
+          "clang",
+          "--target=aarch64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_fseeki64",
+          "-"
+        ],
+        "signature": "int (FILE *, long long, int)",
+        "mangled_name": "_fseeki64",
+        "parameters": [
+          "FILE *",
+          "long long",
+          "int"
+        ]
+      },
+      "_ftelli64": {
+        "argv": [
+          "clang",
+          "--target=aarch64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_ftelli64",
+          "-"
+        ],
+        "signature": "long long (FILE *)",
+        "mangled_name": "_ftelli64",
+        "parameters": [
+          "FILE *"
+        ]
+      },
+      "_errno": {
+        "argv": [
+          "clang",
+          "--target=aarch64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_errno",
+          "-"
+        ],
+        "signature": "int *(void)",
+        "mangled_name": "_errno",
+        "parameters": []
+      },
+      "_get_errno": {
+        "argv": [
+          "clang",
+          "--target=aarch64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_get_errno",
+          "-"
+        ],
+        "signature": "errno_t (int *)",
+        "mangled_name": "_get_errno",
+        "parameters": [
+          "int *"
+        ]
+      },
+      "__acrt_iob_func": {
+        "argv": [
+          "clang",
+          "--target=aarch64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "__acrt_iob_func",
+          "-"
+        ],
+        "signature": "FILE *(unsigned int)",
+        "mangled_name": "__acrt_iob_func",
+        "parameters": [
+          "unsigned int"
+        ]
+      },
+      "_setmaxstdio": {
+        "argv": [
+          "clang",
+          "--target=aarch64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_setmaxstdio",
+          "-"
+        ],
+        "signature": "int (int)",
+        "mangled_name": "_setmaxstdio",
+        "parameters": [
+          "int"
+        ]
+      },
+      "_wfopen": {
+        "argv": [
+          "clang",
+          "--target=aarch64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wfopen",
+          "-"
+        ],
+        "signature": "FILE *(const wchar_t *restrict, const wchar_t *restrict)",
+        "mangled_name": "_wfopen",
+        "parameters": [
+          "const wchar_t *restrict",
+          "const wchar_t *restrict"
+        ]
+      },
+      "_wopen": {
+        "argv": [
+          "clang",
+          "--target=aarch64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wopen",
+          "-"
+        ],
+        "signature": "int (const wchar_t *, int, ...)",
+        "mangled_name": "_wopen",
+        "parameters": [
+          "const wchar_t *",
+          "int"
+        ]
+      },
+      "_wstat64": {
+        "argv": [
+          "clang",
+          "--target=aarch64-w64-windows-gnu",
+          "-isystem",
+          "/usr/x86_64-w64-mingw32/include",
+          "-x",
+          "c",
+          "-fsyntax-only",
+          "-Xclang",
+          "-ast-dump=json",
+          "-Xclang",
+          "-ast-dump-filter",
+          "-Xclang",
+          "_wstat64",
+          "-"
+        ],
+        "signature": "int (const wchar_t *, struct _stat64 *)",
+        "mangled_name": "_wstat64",
+        "parameters": [
+          "const wchar_t *",
+          "struct _stat64 *"
+        ]
+      }
+    }
+  },
+  "header_provenance": "Maintained MinGW-w64 distribution headers; stdio.h public-domain notice retained upstream. Only compiler-extracted declarations are emitted.",
+  "primary_sources": [
+    "https://raw.githubusercontent.com/mingw-w64/mingw-w64/master/mingw-w64-headers/crt/stdio.h",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fseek-fseeki64?view=msvc-170",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ftell-ftelli64?view=msvc-170",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/get-errno?view=msvc-170",
+    "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/setmaxstdio?view=msvc-170",
+    "https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes"
+  ],
+  "scope": "Compiler-generated function declarations only; FILE remains opaque libc::FILE. No fpos_t/layout is generated. MSVC ARM64 header/link/runtime validation remains pending; installed MinGW8 varargs headers reject that MSVC target.",
+  "linking": "No explicit CRT DLL import: Rust/libc target CRT selection supplies symbols, including crt-static. Do not pass a FILE between different CRT instances.",
+  "maintained_libc_stat64_layout_check": {
+    "x86_64-pc-windows-msvc": {
+      "argv": [
+        "clang",
+        "--target=x86_64-pc-windows-msvc",
+        "-isystem",
+        "/usr/x86_64-w64-mingw32/include",
+        "-x",
+        "c",
+        "-fsyntax-only",
+        "-Xclang",
+        "-fdump-record-layouts-complete",
+        "-"
+      ],
+      "extracted_layout": {
+        "size": 56,
+        "alignment": 8,
+        "fields": [
+          [
+            "st_dev",
+            0
+          ],
+          [
+            "st_ino",
+            4
+          ],
+          [
+            "st_mode",
+            6
+          ],
+          [
+            "st_nlink",
+            8
+          ],
+          [
+            "st_uid",
+            10
+          ],
+          [
+            "st_gid",
+            12
+          ],
+          [
+            "st_rdev",
+            16
+          ],
+          [
+            "st_size",
+            24
+          ],
+          [
+            "st_atime",
+            32
+          ],
+          [
+            "st_mtime",
+            40
+          ],
+          [
+            "st_ctime",
+            48
+          ]
+        ]
+      }
+    },
+    "i686-pc-windows-msvc": {
+      "argv": [
+        "clang",
+        "--target=i686-pc-windows-msvc",
+        "-isystem",
+        "/usr/x86_64-w64-mingw32/include",
+        "-x",
+        "c",
+        "-fsyntax-only",
+        "-Xclang",
+        "-fdump-record-layouts-complete",
+        "-"
+      ],
+      "extracted_layout": {
+        "size": 56,
+        "alignment": 8,
+        "fields": [
+          [
+            "st_dev",
+            0
+          ],
+          [
+            "st_ino",
+            4
+          ],
+          [
+            "st_mode",
+            6
+          ],
+          [
+            "st_nlink",
+            8
+          ],
+          [
+            "st_uid",
+            10
+          ],
+          [
+            "st_gid",
+            12
+          ],
+          [
+            "st_rdev",
+            16
+          ],
+          [
+            "st_size",
+            24
+          ],
+          [
+            "st_atime",
+            32
+          ],
+          [
+            "st_mtime",
+            40
+          ],
+          [
+            "st_ctime",
+            48
+          ]
+        ]
+      }
+    },
+    "x86_64-w64-windows-gnu": {
+      "argv": [
+        "clang",
+        "--target=x86_64-w64-windows-gnu",
+        "-isystem",
+        "/usr/x86_64-w64-mingw32/include",
+        "-x",
+        "c",
+        "-fsyntax-only",
+        "-Xclang",
+        "-fdump-record-layouts-complete",
+        "-"
+      ],
+      "extracted_layout": {
+        "size": 56,
+        "alignment": 8,
+        "fields": [
+          [
+            "st_dev",
+            0
+          ],
+          [
+            "st_ino",
+            4
+          ],
+          [
+            "st_mode",
+            6
+          ],
+          [
+            "st_nlink",
+            8
+          ],
+          [
+            "st_uid",
+            10
+          ],
+          [
+            "st_gid",
+            12
+          ],
+          [
+            "st_rdev",
+            16
+          ],
+          [
+            "st_size",
+            24
+          ],
+          [
+            "st_atime",
+            32
+          ],
+          [
+            "st_mtime",
+            40
+          ],
+          [
+            "st_ctime",
+            48
+          ]
+        ]
+      }
+    },
+    "i686-w64-windows-gnu": {
+      "argv": [
+        "clang",
+        "--target=i686-w64-windows-gnu",
+        "-isystem",
+        "/usr/x86_64-w64-mingw32/include",
+        "-x",
+        "c",
+        "-fsyntax-only",
+        "-Xclang",
+        "-fdump-record-layouts-complete",
+        "-"
+      ],
+      "extracted_layout": {
+        "size": 56,
+        "alignment": 8,
+        "fields": [
+          [
+            "st_dev",
+            0
+          ],
+          [
+            "st_ino",
+            4
+          ],
+          [
+            "st_mode",
+            6
+          ],
+          [
+            "st_nlink",
+            8
+          ],
+          [
+            "st_uid",
+            10
+          ],
+          [
+            "st_gid",
+            12
+          ],
+          [
+            "st_rdev",
+            16
+          ],
+          [
+            "st_size",
+            24
+          ],
+          [
+            "st_atime",
+            32
+          ],
+          [
+            "st_mtime",
+            40
+          ],
+          [
+            "st_ctime",
+            48
+          ]
+        ]
+      }
+    },
+    "aarch64-w64-windows-gnu": {
+      "argv": [
+        "clang",
+        "--target=aarch64-w64-windows-gnu",
+        "-isystem",
+        "/usr/x86_64-w64-mingw32/include",
+        "-x",
+        "c",
+        "-fsyntax-only",
+        "-Xclang",
+        "-fdump-record-layouts-complete",
+        "-"
+      ],
+      "extracted_layout": {
+        "size": 56,
+        "alignment": 8,
+        "fields": [
+          [
+            "st_dev",
+            0
+          ],
+          [
+            "st_ino",
+            4
+          ],
+          [
+            "st_mode",
+            6
+          ],
+          [
+            "st_nlink",
+            8
+          ],
+          [
+            "st_uid",
+            10
+          ],
+          [
+            "st_gid",
+            12
+          ],
+          [
+            "st_rdev",
+            16
+          ],
+          [
+            "st_size",
+            24
+          ],
+          [
+            "st_atime",
+            32
+          ],
+          [
+            "st_mtime",
+            40
+          ],
+          [
+            "st_ctime",
+            48
+          ]
+        ]
+      }
+    }
+  },
+  "windows_filename_policy": {
+    "conversion": "Rust Unicode str/path to NUL-terminated UTF16 at actual named fopen/open/stat boundaries, using matching wide CRT calls. No pathname reopen or stream-mode change.",
+    "strict_source_scope": "Same OS files for Source ACP-representable filenames; Source narrow-argv/ACP diagnostic-byte equivalence remains unverified.",
+    "native_extension": "Unicode filenames outside the Source narrow argv codepage are a deliberate safe Rust extension; not claimed identical to Source lossy/unrepresentable argv.",
+    "runtime_status": "Windows runtime validation pending; header generation and compile-time layout assertions are not runtime proof.",
+    "references": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fopen-wfopen?view=msvc-170",
+      "https://learn.microsoft.com/en-us/windows/apps/design/globalizing/use-utf8-code-page"
+    ]
+  },
+  "maintained_bindings": {
+    "_wopen": "libc::wopen",
+    "_wstat64": "libc::wstat; storage libc::stat, not a generated struct",
+    "libc_header": "/home/mahogny/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.191/src/windows/mod.rs",
+    "libc_header_sha256": "cee2e2d028fc9598837311aa08e30f3a0585d6291cf041a1cfeb586955d455d4",
+    "layout_policy": "Generated size/alignment/field-offset compile-time assertions verify maintained libc::stat against compiler-extracted _stat64; no alternate struct."
+  },
+  "format_command": [
+    "rustfmt",
+    "--edition",
+    "2021",
+    "src/util/io/windows_crt_bindings.rs"
+  ],
+  "generated_sha256": "57e62afd727509d528785a1fde5e98ee4d1dc048178d96b15f23be7b4834a68d",
+  "generator_sha256": "414f43d1dfd47d8e4cfc9f3c12fc7d70321e9176f7e1cd6e5b6cceb501e69f4f"
+}

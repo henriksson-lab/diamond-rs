@@ -1,0 +1,5 @@
+mixed_query	mixed	347	889	1	1	579	1	193	193M	0
+complex_query	mixed	176	446	-1	234	1	1	78	78M	0
+complex_query	complex	176	446	-1	234	1	1	78	78M	0
+mutation_query	mutation0	401	1031	-1	540	1	1	180	180M	0
+motif_query	motif	305	782	1	1	396	1	132	132M	0

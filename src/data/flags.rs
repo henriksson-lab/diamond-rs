@@ -97,14 +97,30 @@ pub struct EnumCfg<'a> {
     pub sketch_size: Loc,
 }
 
-pub struct SeqInfo<'a> {
+pub struct SeqInfo<'a, T = &'a str> {
     pub block_id: BlockId,
     pub oid: OId,
-    pub title: Option<&'a str>,
-    pub qual: Option<&'a str>,
+    pub title: Option<T>,
+    pub qual: Option<T>,
     pub len: Loc,
     pub source_seq: Sequence<'a>,
     pub mate_seq: Sequence<'a>,
+}
+
+pub type ByteSeqInfo<'a> = SeqInfo<'a, &'a [u8]>;
+impl<'a> TryFrom<ByteSeqInfo<'a>> for SeqInfo<'a> {
+    type Error = std::str::Utf8Error;
+    fn try_from(info: ByteSeqInfo<'a>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            block_id: info.block_id,
+            oid: info.oid,
+            title: info.title.map(std::str::from_utf8).transpose()?,
+            qual: info.qual.map(std::str::from_utf8).transpose()?,
+            len: info.len,
+            source_seq: info.source_seq,
+            mate_seq: info.mate_seq,
+        })
+    }
 }
 
 #[cfg(test)]

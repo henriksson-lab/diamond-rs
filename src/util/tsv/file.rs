@@ -291,6 +291,10 @@ impl File {
     }
 
     pub fn write_record_strings(&mut self, values: &[&str]) -> Result<(), String> {
+        let bytes: Vec<&[u8]> = values.iter().map(|value| value.as_bytes()).collect();
+        self.write_record_bytes(&bytes)
+    }
+    pub fn write_record_bytes(&mut self, values: &[&[u8]]) -> Result<(), String> {
         let stop = if self.flags.any(Flags::RECORD_ID_COLUMN) {
             self.schema.len().saturating_sub(1)
         } else {
@@ -307,11 +311,14 @@ impl File {
             if i > 0 {
                 self.write_buf.append_char('\t');
             }
-            self.write_buf.append_str(value);
+            self.write_buf.write_raw(value);
         }
         self.write_buf
             .append_char(self.config.line_delimiter as char);
-        let line = String::from_utf8(self.write_buf.data().to_vec()).map_err(|e| e.to_string())?;
+        let mut line = self.write_buf.data();
+        while line.last() == Some(&self.config.line_delimiter) {
+            line = &line[..line.len() - 1];
+        }
         let record_id = if self.flags.any(Flags::RECORD_ID_COLUMN) {
             let record_id = Some(self.record_id);
             self.record_id += 1;
@@ -319,10 +326,7 @@ impl File {
         } else {
             None
         };
-        self.table.push_back_line(
-            line.trim_end_matches(self.config.line_delimiter as char),
-            record_id,
-        )?;
+        self.table.push_back_raw_line(line, record_id)?;
         self.raw_text = None;
         Ok(())
     }
@@ -432,6 +436,16 @@ fn get_flags(mut flags: Flags) -> Result<Flags, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_record_write_preserves_non_utf8_through_table_serialization() {
+        let mut file = File::from_table(Table::new(vec![Type::String, Type::String]), Flags::TEMP);
+        file.write_record_bytes(&[b"q\xff", b"s\xfe"]).unwrap();
+        assert_eq!(file.table().record(0).string_bytes(0), b"q\xff");
+        let mut output = TextBuffer::new();
+        file.table().write(&mut output);
+        assert_eq!(output.data(), b"q\xff\ts\xfe\n");
+    }
 
     #[test]
     fn size_is_textual_file_size_not_binary_table_allocation() {

@@ -1,0 +1,10 @@
+translated_query	single_domain	single_domain;single_alias	single_domain	single_domain<>single_alias	176
+translated_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main	sp|R001|main<>tr|A001|alt<>lastAlias	176
+translated_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main	sp|R001|main<>tr|A001|alt<>lastAlias	169
+translated_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main	sp|R001|main<>tr|A001|alt<>lastAlias	162
+translated_query	gapped_refraw	gapped_refraw;gapped_alt;lastGap	gapped_refraw	gapped_refraw<>gapped_alt<>lastGap	157
+reverse_query	single_domain	single_domain;single_alias	single_domain	single_domain<>single_alias	176
+reverse_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main	sp|R001|main<>tr|A001|alt<>lastAlias	176
+reverse_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main	sp|R001|main<>tr|A001|alt<>lastAlias	169
+reverse_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main	sp|R001|main<>tr|A001|alt<>lastAlias	162
+reverse_query	gapped_refraw	gapped_refraw;gapped_alt;lastGap	gapped_refraw	gapped_refraw<>gapped_alt<>lastGap	157

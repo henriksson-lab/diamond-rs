@@ -1,8 +1,8 @@
 use crate::align::hsp::{Hsp, Match};
 use crate::basic::value::{BlockId, Letter};
 use crate::dna::alignment::{
-    build_hsp_from_cigar, compute_ksw_cigar, compute_wfa_cigar, AlignmentStatus, Cigar, DnaScoring,
-    KswMode, WFA_BAND_EXTENSION,
+    build_hsp_from_cigar, compute_wfa_cigar, try_compute_ksw_cigar, AlignmentStatus, Cigar,
+    DnaScoring, KswMode, WFA_BAND_EXTENSION,
 };
 use crate::dna::build_score::Blastn_Score;
 use crate::dna::chain::{
@@ -108,8 +108,10 @@ pub fn compute_chains(
         return Vec::new();
     }
 
+    let ungapped_started = std::time::Instant::now();
     seed_hits = merge_and_extend_seeds(&mut seed_hits, query, targets, kmer_size);
 
+    super::native::record_time(1, ungapped_started.elapsed());
     seed_hits.sort_by(|a, b| {
         if a.id() == b.id() {
             a.j().cmp(&b.j())
@@ -118,6 +120,7 @@ pub fn compute_chains(
         }
     });
 
+    let chain_started = std::time::Instant::now();
     let mut chains = Vec::new();
     let mut begin = 0usize;
     while begin < seed_hits.len() {
@@ -134,6 +137,7 @@ pub fn compute_chains(
         begin = end;
     }
 
+    super::native::record_time(6, chain_started.elapsed());
     chains
 }
 
@@ -155,7 +159,7 @@ fn align_segment(
             .map_err(|_| "WFA target contains a non-UTF-8 nucleotide code".to_owned())?;
         compute_wfa_cigar(cfg.scoring(), query, extension, left, global, target, band)
     } else {
-        Ok(compute_ksw_cigar(
+        try_compute_ksw_cigar(
             &target_bytes,
             &query_bytes,
             cfg.scoring(),
@@ -173,7 +177,7 @@ fn align_segment(
                 cfg.zdrop_extension
             },
             band,
-        ))
+        )
     }
 }
 
@@ -430,6 +434,7 @@ pub fn extend_chains(
     target: &[Letter],
     chaining_parameters: &ChainingParameters,
 ) -> Result<Match, String> {
+    let extension_started = std::time::Instant::now();
     let mut m = Match::new(target_block_id, target_block_id as u64);
     let mut extended_ranges: Vec<(i32, i32, i32, i32)> = Vec::new();
     for chain in chains {
@@ -473,6 +478,7 @@ pub fn extend_chains(
             }
         }
     }
+    super::native::record_time(4, extension_started.elapsed());
     if cfg.best_hsp_only {
         if let Some(best) = m.hsps.iter().max_by_key(|hsp| hsp.score).cloned() {
             m.hsps.clear();
@@ -579,7 +585,16 @@ mod tests {
     }
 
     fn dna(s: &[u8]) -> Vec<Letter> {
-        s.iter().map(|&x| x as Letter).collect()
+        // Source Sequence.data stores nucleotide alphabet indices (0..5),
+        // not ASCII. The real KSW matrix is indexed by those numeric codes.
+        s.iter()
+            .map(|base| {
+                crate::basic::value::NUCLEOTIDE_ALPHABET
+                    .iter()
+                    .position(|candidate| candidate == base)
+                    .expect("valid nucleotide fixture") as Letter
+            })
+            .collect()
     }
 
     fn chain(reverse: bool, anchors: &[(i32, i32, i32)]) -> Chain {

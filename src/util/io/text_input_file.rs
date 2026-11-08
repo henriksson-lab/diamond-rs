@@ -5,26 +5,63 @@ use super::{
     StreamEntity, TempFile,
 };
 
+/// Line storage for checked Unicode compatibility or canonical Source bytes.
+pub trait TextLine: Default {
+    fn from_line_bytes(bytes: Vec<u8>) -> IoResult<Self>;
+    fn clear_line(&mut self);
+}
+impl TextLine for String {
+    fn from_line_bytes(bytes: Vec<u8>) -> IoResult<Self> {
+        String::from_utf8(bytes).map_err(|error| IoError::Other(error.to_string()))
+    }
+    fn clear_line(&mut self) {
+        self.clear();
+    }
+}
+impl TextLine for Vec<u8> {
+    fn from_line_bytes(bytes: Vec<u8>) -> IoResult<Self> {
+        Ok(bytes)
+    }
+    fn clear_line(&mut self) {
+        self.clear();
+    }
+}
+
+pub type ByteTextInputFile<S = InputFileStream> = TextInputFile<S, Vec<u8>>;
+
 #[derive(Debug, Clone)]
-pub struct TextInputFile<S: StreamEntity> {
+pub struct TextInputFile<S: StreamEntity, L = String> {
     input: Deserializer<S>,
-    pub line: String,
+    pub line: L,
     pub line_count: usize,
     putback_line: bool,
     eof: bool,
     line_separator: u8,
 }
 
-impl<S: StreamEntity> TextInputFile<S> {
-    pub const DEFAULT_LINE_SEPARATOR: u8 = b'\n';
-
-    /// Generic compatibility constructor. The three C++ constructors are
-    /// represented by `from_file_name`, `from_temp_file`, and
-    /// `from_output_file` below.
+impl<S: StreamEntity> TextInputFile<S, String> {
+    /// Existing Unicode constructor retains checked UTF-8 line conversion.
     pub fn new(input: Deserializer<S>, line_separator: u8) -> Self {
+        Self::new_with_line(input, line_separator)
+    }
+    pub fn with_default_separator(input: Deserializer<S>) -> Self {
+        Self::new(input, Self::DEFAULT_LINE_SEPARATOR)
+    }
+}
+impl<S: StreamEntity> TextInputFile<S, Vec<u8>> {
+    pub fn new_bytes(input: Deserializer<S>, line_separator: u8) -> Self {
+        Self::new_with_line(input, line_separator)
+    }
+    pub fn with_default_separator_bytes(input: Deserializer<S>) -> Self {
+        Self::new_bytes(input, Self::DEFAULT_LINE_SEPARATOR)
+    }
+}
+impl<S: StreamEntity, L: TextLine> TextInputFile<S, L> {
+    pub const DEFAULT_LINE_SEPARATOR: u8 = b'\n';
+    fn new_with_line(input: Deserializer<S>, line_separator: u8) -> Self {
         Self {
             input,
-            line: String::new(),
+            line: L::default(),
             line_count: 0,
             putback_line: false,
             eof: false,
@@ -32,17 +69,12 @@ impl<S: StreamEntity> TextInputFile<S> {
         }
     }
 
-    /// Rust spelling of the C++ constructor's default separator argument.
-    pub fn with_default_separator(input: Deserializer<S>) -> Self {
-        Self::new(input, Self::DEFAULT_LINE_SEPARATOR)
-    }
-
     pub fn rewind(&mut self) -> IoResult<()> {
         self.input.rewind()?;
         self.line_count = 0;
         self.putback_line = false;
         self.eof = false;
-        self.line.clear();
+        self.line.clear_line();
         Ok(())
     }
 
@@ -63,7 +95,7 @@ impl<S: StreamEntity> TextInputFile<S> {
         if line.last() == Some(&b'\r') {
             line.pop();
         }
-        self.line = String::from_utf8(line).map_err(|error| IoError::Other(error.to_string()))?;
+        self.line = L::from_line_bytes(line)?;
         Ok(())
     }
 
@@ -85,12 +117,49 @@ impl<S: StreamEntity> TextInputFile<S> {
 
 impl TextInputFile<InputFileStream> {
     pub fn from_file_name(file_name: &str, line_separator: u8) -> IoResult<Self> {
-        let input = InputFile::new(file_name, 0)?;
+        Self::from_file_path(std::path::Path::new(file_name), line_separator)
+    }
+    pub fn from_file_path(file_name: &std::path::Path, line_separator: u8) -> IoResult<Self> {
+        let input = InputFile::new_path(file_name, 0)?;
         Ok(Self::new(input.into_deserializer(), line_separator))
     }
 
     pub fn from_file_name_default(file_name: &str) -> IoResult<Self> {
-        Self::from_file_name(file_name, Self::DEFAULT_LINE_SEPARATOR)
+        Self::from_file_path_default(std::path::Path::new(file_name))
+    }
+    pub fn from_file_path_default(file_name: &std::path::Path) -> IoResult<Self> {
+        Self::from_file_path(file_name, Self::DEFAULT_LINE_SEPARATOR)
+    }
+
+    pub fn from_file_name_with_buffer_size(file_name: &str, buffer_size: usize) -> IoResult<Self> {
+        Self::from_file_path_with_buffer_size(std::path::Path::new(file_name), buffer_size)
+    }
+    pub fn from_file_path_with_buffer_size(
+        file_name: &std::path::Path,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        let input = InputFile::with_buffer_size_path(file_name, 0, buffer_size)?;
+        Ok(Self::with_default_separator(input.into_deserializer()))
+    }
+
+    pub fn from_source_file_with_buffer_size(
+        file_name: &str,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        Self::from_source_path_with_buffer_size(std::path::Path::new(file_name), buffer_size)
+    }
+    pub fn from_source_path_with_buffer_size(
+        file_name: &std::path::Path,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        let input = InputFile::with_source_profile_path(file_name, 0, buffer_size)?;
+        Ok(Self::with_default_separator(input.into_deserializer()))
+    }
+    pub fn from_source_file_default(file_name: &str) -> IoResult<Self> {
+        Self::from_source_path_default(std::path::Path::new(file_name))
+    }
+    pub fn from_source_path_default(file_name: &std::path::Path) -> IoResult<Self> {
+        Self::from_source_path_with_buffer_size(file_name, super::DEFAULT_FILE_BUFFER_SIZE)
     }
 
     pub fn from_temp_file(tmp_file: &mut TempFile, line_separator: u8) -> IoResult<Self> {
@@ -112,6 +181,72 @@ impl TextInputFile<InputFileStream> {
     }
 }
 
+impl TextInputFile<InputFileStream, Vec<u8>> {
+    pub fn from_file_name_bytes(file_name: &str, line_separator: u8) -> IoResult<Self> {
+        Self::from_file_path_bytes(std::path::Path::new(file_name), line_separator)
+    }
+    pub fn from_file_path_bytes(file_name: &std::path::Path, line_separator: u8) -> IoResult<Self> {
+        let input = InputFile::new_path(file_name, 0)?;
+        Ok(Self::new_bytes(input.into_deserializer(), line_separator))
+    }
+    pub fn from_file_name_bytes_default(file_name: &str) -> IoResult<Self> {
+        Self::from_file_path_bytes_default(std::path::Path::new(file_name))
+    }
+    pub fn from_file_path_bytes_default(file_name: &std::path::Path) -> IoResult<Self> {
+        Self::from_file_path_bytes(file_name, Self::DEFAULT_LINE_SEPARATOR)
+    }
+    pub fn from_file_name_bytes_with_buffer_size(
+        file_name: &str,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        Self::from_file_path_bytes_with_buffer_size(std::path::Path::new(file_name), buffer_size)
+    }
+    pub fn from_file_path_bytes_with_buffer_size(
+        file_name: &std::path::Path,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        let input = InputFile::with_buffer_size_path(file_name, 0, buffer_size)?;
+        Ok(Self::with_default_separator_bytes(
+            input.into_deserializer(),
+        ))
+    }
+    pub fn from_source_file_bytes_with_buffer_size(
+        file_name: &str,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        Self::from_source_path_bytes_with_buffer_size(std::path::Path::new(file_name), buffer_size)
+    }
+    pub fn from_source_path_bytes_with_buffer_size(
+        file_name: &std::path::Path,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        let input = InputFile::with_source_profile_path(file_name, 0, buffer_size)?;
+        Ok(Self::with_default_separator_bytes(
+            input.into_deserializer(),
+        ))
+    }
+    pub fn from_source_file_bytes_default(file_name: &str) -> IoResult<Self> {
+        Self::from_source_path_bytes_default(std::path::Path::new(file_name))
+    }
+    pub fn from_source_path_bytes_default(file_name: &std::path::Path) -> IoResult<Self> {
+        Self::from_source_path_bytes_with_buffer_size(file_name, super::DEFAULT_FILE_BUFFER_SIZE)
+    }
+    pub fn from_temp_file_bytes(tmp_file: &mut TempFile, line_separator: u8) -> IoResult<Self> {
+        let input = InputFile::from_temp_file(tmp_file, 0, Compressor::None)?;
+        Ok(Self::new_bytes(input.into_deserializer(), line_separator))
+    }
+    pub fn from_temp_file_bytes_default(tmp_file: &mut TempFile) -> IoResult<Self> {
+        Self::from_temp_file_bytes(tmp_file, Self::DEFAULT_LINE_SEPARATOR)
+    }
+    pub fn from_output_file_bytes(out_file: &mut OutputFile, line_separator: u8) -> IoResult<Self> {
+        let input = InputFile::from_output_file(out_file, 0)?;
+        Ok(Self::new_bytes(input.into_deserializer(), line_separator))
+    }
+    pub fn from_output_file_bytes_default(out_file: &mut OutputFile) -> IoResult<Self> {
+        Self::from_output_file_bytes(out_file, Self::DEFAULT_LINE_SEPARATOR)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +257,30 @@ mod tests {
             Deserializer::new(VecStream::from_vec(bytes.to_vec())),
             separator,
         )
+    }
+
+    #[test]
+    fn raw_lines_preserve_bytes_putback_counts_and_source_eof_semantics() {
+        let mut input = ByteTextInputFile::new_bytes(
+            Deserializer::new(VecStream::from_vec(b"a\xff\r|b\0tail".to_vec())),
+            b'|',
+        );
+        input.getline().unwrap();
+        assert_eq!(input.line, b"a\xff");
+        assert_eq!(input.line_count, 1);
+        assert!(!input.eof());
+        input.putback_line();
+        assert_eq!(input.line_count, 0);
+        input.getline().unwrap();
+        assert_eq!(input.line, b"a\xff");
+        assert_eq!(input.line_count, 1);
+        input.getline().unwrap();
+        assert_eq!(input.line, b"b\0tail");
+        assert_eq!(input.line_count, 2);
+        assert!(input.eof());
+        input.getline().unwrap();
+        assert!(input.line.is_empty());
+        assert_eq!(input.line_count, 3);
     }
 
     #[test]

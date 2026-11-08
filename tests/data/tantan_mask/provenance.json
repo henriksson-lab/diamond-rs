@@ -1,0 +1,85 @@
+{
+  "source_commit": "1d162b4fefb5e6b4d868c24e6ad551cad2dcf246",
+  "natural_input": "UniParc2026_03 uniparc_active_p1.fasta.gz; six unique complete original records selected by actual1.1Baa makedb bytecomparison",
+  "upstream_part_md5": "efe44cde7125cfcf367c1324ab1a035c",
+  "upstream_part_sha256": "acf3a2f93e84b870abedbdf59db92d8306f9ebff2fd39eafa29cde8243cca84a",
+  "fixture_sha256": "a34132eb8da6b1ebe8aba25ea1753a27c2d664cf3bda11bb339f9acd30c0b718",
+  "profiles": [
+    {
+      "profile": "nonfma",
+      "argv": [
+        "/tmp/diamond-rs-source-oracles-20261107-ugfxkklz/build-baseline/diamond",
+        "makedb",
+        "--in",
+        "/data/henriksson/github/claude/diamond-rs/.tmp/native-post-translation-20261107/scale-data/makedb-current/numerical/six-natural.fasta",
+        "--db",
+        "/data/henriksson/github/claude/diamond-rs/.tmp/native-post-translation-20261107/scale-data/makedb-current/numerical/nonfma/database",
+        "-p1",
+        "--quiet"
+      ],
+      "binary_sha256": "17a237c828ff3aa8216e2427ab72df0a7489cc328211dcb48d8d59bea3a54c12",
+      "status": 0
+    },
+    {
+      "profile": "fma",
+      "argv": [
+        "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+        "makedb",
+        "--in",
+        "/data/henriksson/github/claude/diamond-rs/.tmp/native-post-translation-20261107/scale-data/makedb-current/numerical/six-natural.fasta",
+        "--db",
+        "/data/henriksson/github/claude/diamond-rs/.tmp/native-post-translation-20261107/scale-data/makedb-current/numerical/fma/database",
+        "-p1",
+        "--quiet"
+      ],
+      "binary_sha256": "d8d08608b96706db62e44036fc979f9a658e72f59fc19d8727546daa616c42d8",
+      "status": 0
+    }
+  ],
+  "profile_contract": "Source vector8_avx2.h fmadd: __FMA__ || _MSC_VER selects fused; ordinaryGNU/Clang CMake AVX2 has -mavx2 without -mfma; explicitoriginal build has -march=native. Scalar fused behavior follows observed GNU object. Tests compare exact complete encoded/masked sequence, no threshold/tolerance changes. Original Source algorithm/objects/executables unchanged; separatecwd only. Other architectures need their own Source numerical expectations.",
+  "source_hashes": {
+    "diamond/src/masking/tantan.cpp": "45d120ee4017d38c62d30f31b7a30bae32d5a59ca0ed5105cc6c86a823d3f6ee",
+    "diamond/src/util/simd/vector8_avx2.h": "a2d8c790a771c793beb9b606a0c9ed80ecc94b923e94bf8a3b2bbf78ce1161de"
+  },
+  "diagnostic_artifacts": ".tmp/native-post-translation-20261107/scale-data/makedb-current/numerical",
+  "blosum50_terminal_stop": {
+    "profiles": [
+      {
+        "profile": "nonfma",
+        "status": 0,
+        "masked_positions0": [
+          189,
+          190,
+          191,
+          192,
+          193,
+          194,
+          195,
+          196
+        ],
+        "driver_sha256": "70564d4252e5d745a365ed7af5748979ee0587a10e7fffcde6cc259b34062a14",
+        "probe_sha256": "07a69f3fedf70968126271ecf73620c819a6f4a30184d811c02f2aab0619d725",
+        "scope": "Immutable full Source object relink, newmain calls actualScoreMatrix/Masking; no productionCLI claim (baseline makedb rejects --matrix). All algorithmobjects unchanged."
+      },
+      {
+        "profile": "fma",
+        "status": 0,
+        "masked_positions0": [
+          190,
+          191,
+          192,
+          193,
+          194,
+          195,
+          196
+        ],
+        "driver_sha256": "70564d4252e5d745a365ed7af5748979ee0587a10e7fffcde6cc259b34062a14",
+        "probe_sha256": "58052446d5638adcdd110e9599228378255f8f6080ae982f68561229fb5d0780",
+        "scope": "Immutable full Source object relink, newmain calls actualScoreMatrix/Masking; no productionCLI claim (baseline makedb rejects --matrix). All algorithmobjects unchanged."
+      }
+    ],
+    "source_sequence_sha256": "e8dfa598ce1c7cc776ebfa0e6e982fc2aba817631caf0a3868e8a69a450e2ea1",
+    "constructor": "ScoreMatrix(\"BLOSUM50\",13,2,0,1,1); Masking::mask_bit; config.tantan_minMaskProb=0.9",
+    "full_build_and_capture_provenance": ".tmp/native-post-translation-20261107/scale-data/makedb-current/numerical/blosum50/source-object-profiles.json"
+  }
+}

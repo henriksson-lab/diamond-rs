@@ -1,0 +1,4 @@
+translated_query	single_domain	445	176	1.08e-59	1	234	1	78	78
+translated_query	reordered	445	176	6.89e-56	1	234	302	379	78
+reverse_query	single_domain	445	176	1.08e-59	1137	904	1	78	78
+reverse_query	reordered	445	176	6.89e-56	1137	904	302	379	78

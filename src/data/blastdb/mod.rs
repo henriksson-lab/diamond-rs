@@ -3,6 +3,7 @@ pub mod ber;
 pub mod blastdb;
 pub mod db;
 pub mod pal;
+pub(crate) mod parallel_load;
 pub mod phr;
 pub mod pin;
 pub mod psq;

@@ -1,0 +1,4 @@
+case-088	blastp	full	query.faa	0	1	0	default	1	coverage
+case-093	blastp	full	query.faa	0	1	1	default	1	coverage
+case-098	blastp	full	query.faa	0	0.0000001	0	default	1	coverage
+case-103	blastp	full	query.faa	0	0.0000001	1	default	1	coverage

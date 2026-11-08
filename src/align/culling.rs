@@ -422,12 +422,12 @@ where
     new_hits
 }
 
-pub fn filter_hsp(
+pub fn filter_hsp_bytes(
     hsp: &Hsp,
     source_query_len: u32,
-    query_title: &str,
+    query_title: &[u8],
     subject_len: u32,
-    subject_title: Option<&str>,
+    subject_title: Option<&[u8]>,
     query_seq: &[Letter],
     subject_seq: &[Letter],
     min_id: f64,
@@ -437,7 +437,7 @@ pub fn filter_hsp(
     query_or_target_cover: f64,
     no_self_hits: bool,
 ) -> bool {
-    filter_hsp_with_cluster_threshold(
+    filter_hsp_with_cluster_threshold_bytes(
         hsp,
         source_query_len,
         query_title,
@@ -456,12 +456,12 @@ pub fn filter_hsp(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn filter_hsp_with_cluster_threshold(
+pub fn filter_hsp_with_cluster_threshold_bytes(
     hsp: &Hsp,
     source_query_len: u32,
-    query_title: &str,
+    query_title: &[u8],
     subject_len: u32,
-    subject_title: Option<&str>,
+    subject_title: Option<&[u8]>,
     query_seq: &[Letter],
     subject_seq: &[Letter],
     min_id: f64,
@@ -480,7 +480,14 @@ pub fn filter_hsp_with_cluster_threshold(
         || qcov < query_cover
         || tcov < subject_cover
         || (qcov < query_or_target_cover && tcov < query_or_target_cover)
-        || (no_self_hits && query_seq == subject_seq && Some(query_title) == subject_title)
+        || (no_self_hits
+            && subject_title
+                .is_some_and(|title| c_string_title(query_title) == c_string_title(title))
+            && query_seq.len() == subject_seq.len()
+            && query_seq.iter().zip(subject_seq).all(|(&query, &subject)| {
+                (query & crate::basic::value::LETTER_MASK)
+                    == (subject & crate::basic::value::LETTER_MASK)
+            }))
 }
 
 impl Match {
@@ -495,8 +502,28 @@ impl Match {
         subject_seq: &[Letter],
         config: &HspFilterConfig,
     ) {
+        self.apply_filters_bytes(
+            source_query_len,
+            query_title.as_bytes(),
+            query_seq,
+            subject_len,
+            subject_title.map(str::as_bytes),
+            subject_seq,
+            config,
+        );
+    }
+    pub fn apply_filters_bytes(
+        &mut self,
+        source_query_len: u32,
+        query_title: &[u8],
+        query_seq: &[Letter],
+        subject_len: u32,
+        subject_title: Option<&[u8]>,
+        subject_seq: &[Letter],
+        config: &HspFilterConfig,
+    ) {
         self.hsps.retain(|hsp| {
-            !filter_hsp(
+            !filter_hsp_bytes(
                 hsp,
                 source_query_len,
                 query_title,
@@ -523,13 +550,13 @@ impl Match {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn match_apply_filters(
+pub fn match_apply_filters_bytes(
     target: &mut Match,
     source_query_len: u32,
-    query_title: &str,
+    query_title: &[u8],
     query_seq: &[Letter],
     subject_len: u32,
-    subject_title: Option<&str>,
+    subject_title: Option<&[u8]>,
     subject_seq: &[Letter],
     min_id: f64,
     approx_min_id: f64,
@@ -538,7 +565,7 @@ pub fn match_apply_filters(
     query_or_target_cover: f64,
     no_self_hits: bool,
 ) {
-    target.apply_filters(
+    target.apply_filters_bytes(
         source_query_len,
         query_title,
         query_seq,
@@ -558,13 +585,13 @@ pub fn match_apply_filters(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn apply_filters_matches(
+pub fn apply_filters_matches_bytes(
     matches: &mut [Match],
     source_query_len: u32,
-    query_title: &str,
+    query_title: &[u8],
     query_seq: &[Letter],
     subject_len: u32,
-    subject_title: Option<&str>,
+    subject_title: Option<&[u8]>,
     subject_seq: &[Letter],
     min_id: f64,
     approx_min_id: f64,
@@ -584,7 +611,7 @@ pub fn apply_filters_matches(
     };
     if filters_enabled(&config) {
         for target in matches {
-            target.apply_filters(
+            target.apply_filters_bytes(
                 source_query_len,
                 query_title,
                 query_seq,
@@ -611,7 +638,7 @@ fn filters_enabled(config: &HspFilterConfig) -> bool {
 pub fn apply_filters(
     matches: &mut [Match],
     source_query_len: u32,
-    query_title: &str,
+    query_title: &(impl AsRef<[u8]> + ?Sized),
     query_seq: &[Letter],
     targets: &Block,
     config: &HspFilterConfig,
@@ -623,16 +650,13 @@ pub fn apply_filters(
         let id = target.target_block_id as usize;
         let subject_seq = targets.seqs().get(id);
         let subject_title = if config.no_self_hits {
-            Some(
-                std::str::from_utf8(targets.ids()?.get(id))
-                    .map_err(|error| format!("Invalid UTF-8 target title: {error}"))?,
-            )
+            Some(targets.ids()?.get(id))
         } else {
             None
         };
-        target.apply_filters(
+        target.apply_filters_bytes(
             source_query_len,
-            query_title,
+            query_title.as_ref(),
             query_seq,
             subject_seq.len() as u32,
             subject_title,
@@ -643,8 +667,169 @@ pub fn apply_filters(
     Ok(())
 }
 
+fn c_string_title(title: &[u8]) -> &[u8] {
+    &title[..title
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(title.len())]
+}
+pub fn filter_hsp(
+    hsp: &Hsp,
+    source_query_len: u32,
+    query_title: &str,
+    subject_len: u32,
+    subject_title: Option<&str>,
+    query_seq: &[Letter],
+    subject_seq: &[Letter],
+    min_id: f64,
+    approx_min_id: f64,
+    query_cover: f64,
+    subject_cover: f64,
+    query_or_target_cover: f64,
+    no_self_hits: bool,
+) -> bool {
+    filter_hsp_bytes(
+        hsp,
+        source_query_len,
+        query_title.as_bytes(),
+        subject_len,
+        subject_title.map(str::as_bytes),
+        query_seq,
+        subject_seq,
+        min_id,
+        approx_min_id,
+        query_cover,
+        subject_cover,
+        query_or_target_cover,
+        no_self_hits,
+    )
+}
+
+pub fn filter_hsp_with_cluster_threshold(
+    hsp: &Hsp,
+    source_query_len: u32,
+    query_title: &str,
+    subject_len: u32,
+    subject_title: Option<&str>,
+    query_seq: &[Letter],
+    subject_seq: &[Letter],
+    min_id: f64,
+    approx_min_id: f64,
+    query_cover: f64,
+    subject_cover: f64,
+    query_or_target_cover: f64,
+    no_self_hits: bool,
+    cluster_threshold_passed: bool,
+) -> bool {
+    filter_hsp_with_cluster_threshold_bytes(
+        hsp,
+        source_query_len,
+        query_title.as_bytes(),
+        subject_len,
+        subject_title.map(str::as_bytes),
+        query_seq,
+        subject_seq,
+        min_id,
+        approx_min_id,
+        query_cover,
+        subject_cover,
+        query_or_target_cover,
+        no_self_hits,
+        cluster_threshold_passed,
+    )
+}
+
+pub fn match_apply_filters(
+    target: &mut Match,
+    source_query_len: u32,
+    query_title: &str,
+    query_seq: &[Letter],
+    subject_len: u32,
+    subject_title: Option<&str>,
+    subject_seq: &[Letter],
+    min_id: f64,
+    approx_min_id: f64,
+    query_cover: f64,
+    subject_cover: f64,
+    query_or_target_cover: f64,
+    no_self_hits: bool,
+) {
+    match_apply_filters_bytes(
+        target,
+        source_query_len,
+        query_title.as_bytes(),
+        query_seq,
+        subject_len,
+        subject_title.map(str::as_bytes),
+        subject_seq,
+        min_id,
+        approx_min_id,
+        query_cover,
+        subject_cover,
+        query_or_target_cover,
+        no_self_hits,
+    )
+}
+
+pub fn apply_filters_matches(
+    matches: &mut [Match],
+    source_query_len: u32,
+    query_title: &str,
+    query_seq: &[Letter],
+    subject_len: u32,
+    subject_title: Option<&str>,
+    subject_seq: &[Letter],
+    min_id: f64,
+    approx_min_id: f64,
+    query_cover: f64,
+    subject_cover: f64,
+    query_or_target_cover: f64,
+    no_self_hits: bool,
+) {
+    apply_filters_matches_bytes(
+        matches,
+        source_query_len,
+        query_title.as_bytes(),
+        query_seq,
+        subject_len,
+        subject_title.map(str::as_bytes),
+        subject_seq,
+        min_id,
+        approx_min_id,
+        query_cover,
+        subject_cover,
+        query_or_target_cover,
+        no_self_hits,
+    )
+}
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn no_self_title_filter_compares_source_c_string_bytes() {
+        let hsp = crate::align::hsp::Hsp::new();
+        let sequence: [crate::basic::value::Letter; 3] = [0, 1, 2];
+        let filtered = |query: &[u8], subject: &[u8]| {
+            super::filter_hsp_bytes(
+                &hsp,
+                3,
+                query,
+                3,
+                Some(subject),
+                &sequence,
+                &sequence,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                true,
+            )
+        };
+        assert!(filtered(b"name\xff", b"name\xff"));
+        assert!(filtered(b"name\x80\0query-tail", b"name\x80\0subject-tail"));
+        assert!(!filtered(b"name\xff", b"name\x80"));
+    }
+
     use super::*;
     use crate::basic::value::SequenceType;
     use crate::util::interval::Interval;

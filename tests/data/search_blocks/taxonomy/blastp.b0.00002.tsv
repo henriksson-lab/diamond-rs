@@ -1,0 +1,10 @@
+domain_query	single_domain	1	78	2.88e-59	176	10	Zeta species	Bacteria	Test kingdom	Test phylum	Bacteria; Test kingdom; Test phylum; Zeta species
+domain_query	reordered	1	78	1.83e-55	176	11	Alpha species	Bacteria	Test kingdom	Test phylum	Bacteria; Test kingdom; Test phylum; Alpha species
+domain_query	reordered	309	379	5.65e-53	169	11	Alpha species	Bacteria	Test kingdom	Test phylum	Bacteria; Test kingdom; Test phylum; Alpha species
+domain_query	reordered	159	228	1.71e-50	162	11	Alpha species	Bacteria	Test kingdom	Test phylum	Bacteria; Test kingdom; Test phylum; Alpha species
+domain_query	unmapped	1	78	1.83e-55	176		N/A	N/A	N/A	N/A	N/A
+domain_query	unmapped	309	379	5.65e-53	169		N/A	N/A	N/A	N/A	N/A
+domain_query	unmapped	159	228	1.71e-50	162		N/A	N/A	N/A	N/A	N/A
+domain_query	sp|P00001.1|mixed	1	78	1.83e-55	176	10;11	Zeta species;Alpha species	Bacteria	Test kingdom	Test phylum	Bacteria; Test kingdom; Test phylum; Zeta species<>Bacteria; Test kingdom; Test phylum; Alpha species
+domain_query	sp|P00001.1|mixed	309	379	5.65e-53	169	10;11	Zeta species;Alpha species	Bacteria	Test kingdom	Test phylum	Bacteria; Test kingdom; Test phylum; Zeta species<>Bacteria; Test kingdom; Test phylum; Alpha species
+domain_query	sp|P00001.1|mixed	159	228	1.71e-50	162	10;11	Zeta species;Alpha species	Bacteria	Test kingdom	Test phylum	Bacteria; Test kingdom; Test phylum; Zeta species<>Bacteria; Test kingdom; Test phylum; Alpha species

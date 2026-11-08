@@ -1,10 +1,12 @@
 use crate::basic::reduction::Reduction;
 use crate::basic::shape_config::ShapeConfig;
 use crate::data::block::Block;
-use crate::data::enum_seeds::{enum_seeds_block, enum_seeds_hashed_unfiltered, EnumSeedsCallback};
+use crate::data::enum_seeds::{
+    enum_seeds_block, enum_seeds_hashed_unfiltered_with_min_query_len, EnumSeedsCallback,
+};
 use crate::data::flags::{EnumCfg, SeedEncoding, NO_FILTER};
 use crate::masking::MaskingAlgo;
-use crate::util::data_structures::{HashSet as DiamondHashSet, Identity, Modulo2};
+use crate::util::data_structures::{BitVector, HashSet as DiamondHashSet, Identity, Modulo2};
 use crate::util::math::next_pow2;
 
 pub type Table = DiamondHashSet<Modulo2, Identity>;
@@ -16,7 +18,7 @@ pub const HASH_TABLE_FACTOR: f64 = 1.25;
 
 #[derive(Debug, Clone)]
 pub struct SeedSet {
-    data: Vec<bool>,
+    data: BitVector,
     coverage: f64,
 }
 
@@ -31,13 +33,75 @@ impl SeedSet {
         shapes: &ShapeConfig,
         reduction: &Reduction,
     ) -> Result<Self, String> {
-        if !shapes.get(0).contiguous() {
+        Self::from_block_with_contexts(
+            seqs,
+            max_coverage,
+            skip,
+            seed_cut,
+            soft_masking,
+            shapes,
+            reduction,
+            1,
+            0,
+        )
+    }
+
+    /// Source dense contiguous set with iteration skip and signed global
+    /// minimum length. Contexts belong to source queries (six for blastx).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_block_with_min_query_len(
+        seqs: &mut Block,
+        max_coverage: f64,
+        skip: Option<&BitVector>,
+        seed_cut: f64,
+        soft_masking: MaskingAlgo,
+        shapes: &ShapeConfig,
+        reduction: &Reduction,
+        contexts: usize,
+        min_query_len: crate::basic::value::Loc,
+    ) -> Result<Self, String> {
+        let skip =
+            crate::data::enum_seeds::source_query_skip_vec(skip, contexts, seqs.seqs().len())?;
+        Self::from_block_with_contexts(
+            seqs,
+            max_coverage,
+            skip.as_ref(),
+            seed_cut,
+            soft_masking,
+            shapes,
+            reduction,
+            contexts,
+            min_query_len,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_block_with_contexts(
+        seqs: &mut Block,
+        max_coverage: f64,
+        skip: Option<&Vec<bool>>,
+        seed_cut: f64,
+        soft_masking: MaskingAlgo,
+        shapes: &ShapeConfig,
+        reduction: &Reduction,
+        contexts: usize,
+        min_query_len: crate::basic::value::Loc,
+    ) -> Result<Self, String> {
+        if shapes.count() == 0 || !shapes.get(0).contiguous() {
             return Err("Contiguous seed required.".to_string());
         }
-        let data_size = (1u64 << reduction.bit_size()).pow(shapes.get(0).length as u32) as usize;
+        let bits = (reduction.bit_size() as u32)
+            .checked_mul(shapes.get(0).length as u32)
+            .ok_or_else(|| "Contiguous seed space overflow".to_owned())?;
+        let data_size = 1usize
+            .checked_shl(bits)
+            .ok_or_else(|| "Contiguous seed space exceeds native address space".to_owned())?;
         let max_coverage =
             (max_coverage * (reduction.size() as f64).powi(shapes.get(0).length)) as usize;
-        let mut cb = vec![SeedSetCallback::new(vec![false; data_size], max_coverage)];
+        let mut cb = vec![SeedSetCallback::new(
+            BitVector::with_size(data_size),
+            max_coverage,
+        )];
         let partition = seqs.seqs().partition(1, false, false);
         let cfg = EnumCfg {
             partition: Some(&partition),
@@ -57,8 +121,8 @@ impl SeedSet {
         let ctx = crate::data::enum_seeds::EnumSeedsContext {
             shapes,
             reduction,
-            min_query_len: 0,
-            query_contexts: 1,
+            min_query_len,
+            query_contexts: contexts,
         };
         enum_seeds_block(seqs, &mut cb, &NO_FILTER, &cfg, &ctx)?;
         let cb = cb.pop().unwrap();
@@ -71,7 +135,7 @@ impl SeedSet {
 
     /// Matches C++ `SeedSet::contains(key, shape)`.
     pub fn contains(&self, key: u64, _shape: u64) -> bool {
-        self.data[key as usize]
+        self.data.get(key as usize)
     }
 
     /// Matches C++ `SeedSet::coverage()`.
@@ -94,6 +158,71 @@ impl HashedSeedSet {
         soft_masking: MaskingAlgo,
         shapes: &ShapeConfig,
         reduction: &Reduction,
+    ) -> Result<Self, String> {
+        Self::from_block_with_contexts(seqs, skip, seed_cut, soft_masking, shapes, reduction, 1, 0)
+    }
+
+    /// Source-query skip for iterative protein or six-context translated search.
+    pub fn from_block_with_skip(
+        seqs: &mut Block,
+        skip: Option<&crate::util::data_structures::BitVector>,
+        seed_cut: f64,
+        soft_masking: MaskingAlgo,
+        shapes: &ShapeConfig,
+        reduction: &Reduction,
+        query_contexts: usize,
+    ) -> Result<Self, String> {
+        Self::from_block_with_min_query_len(
+            seqs,
+            skip,
+            seed_cut,
+            soft_masking,
+            shapes,
+            reduction,
+            query_contexts,
+            0,
+        )
+    }
+
+    /// Apply the source GLOBAL minimum-length filter to hashed-set counting
+    /// and filling, including the specialized no-skip enumeration path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_block_with_min_query_len(
+        seqs: &mut Block,
+        skip: Option<&crate::util::data_structures::BitVector>,
+        seed_cut: f64,
+        soft_masking: MaskingAlgo,
+        shapes: &ShapeConfig,
+        reduction: &Reduction,
+        query_contexts: usize,
+        min_query_len: crate::basic::value::Loc,
+    ) -> Result<Self, String> {
+        let skip = crate::data::enum_seeds::source_query_skip_vec(
+            skip,
+            query_contexts,
+            seqs.seqs().len(),
+        )?;
+        Self::from_block_with_contexts(
+            seqs,
+            skip.as_ref(),
+            seed_cut,
+            soft_masking,
+            shapes,
+            reduction,
+            query_contexts,
+            min_query_len,
+        )
+    }
+
+    fn from_block_with_contexts(
+        seqs: &mut Block,
+        skip: Option<&Vec<bool>>,
+        seed_cut: f64,
+        soft_masking: MaskingAlgo,
+        shapes: &ShapeConfig,
+        reduction: &Reduction,
+        query_contexts: usize,
+        min_query_len: crate::basic::value::Loc,
     ) -> Result<Self, String> {
         let shape_count = shapes.count() as usize;
         let initial_capacity = next_pow2(seqs.seqs().letters() as f64 * HASH_TABLE_FACTOR);
@@ -121,21 +250,37 @@ impl HashedSeedSet {
         let ctx = crate::data::enum_seeds::EnumSeedsContext {
             shapes,
             reduction,
-            min_query_len: 0,
-            query_contexts: 1,
+            min_query_len,
+            query_contexts,
         };
+        let template_len = (0..shapes.count())
+            .map(|id| shapes.get(id as usize).length)
+            .max()
+            .unwrap_or(0);
         if skip.is_none() {
-            seqs.soft_mask(soft_masking);
+            if soft_masking != MaskingAlgo::None {
+                seqs.soft_mask(soft_masking);
+            }
             match reduction.bit_size() {
-                4 => enum_seeds_hashed_unfiltered::<_, 4>(
+                4 => enum_seeds_hashed_unfiltered_with_min_query_len::<_, 4>(
                     seqs.seqs(),
                     &mut cb[0],
                     partition[0],
                     partition[1],
                     shapes,
                     reduction,
+                    min_query_len,
+                    query_contexts,
                 ),
-                _ => return Err("Unsupported reduction.".to_string()),
+                _ => {
+                    if soft_masking != MaskingAlgo::None {
+                        seqs.remove_soft_masking(template_len, false);
+                    }
+                    return Err("Unsupported reduction.".to_string());
+                }
+            }
+            if soft_masking != MaskingAlgo::None {
+                seqs.remove_soft_masking(template_len, false);
             }
         } else {
             enum_seeds_block(seqs, &mut cb, &NO_FILTER, &cfg, &ctx)?;
@@ -151,15 +296,22 @@ impl HashedSeedSet {
                 .map(|&size| Table::new(next_pow2(size as f64 * HASH_TABLE_FACTOR))),
         );
         if skip.is_none() {
-            seqs.soft_mask(soft_masking);
-            enum_seeds_hashed_unfiltered::<_, 4>(
+            if soft_masking != MaskingAlgo::None {
+                seqs.soft_mask(soft_masking);
+            }
+            enum_seeds_hashed_unfiltered_with_min_query_len::<_, 4>(
                 seqs.seqs(),
                 &mut cb[0],
                 partition[0],
                 partition[1],
                 shapes,
                 reduction,
+                min_query_len,
+                query_contexts,
             );
+            if soft_masking != MaskingAlgo::None {
+                seqs.remove_soft_masking(template_len, false);
+            }
         } else {
             enum_seeds_block(seqs, &mut cb, &NO_FILTER, &cfg, &ctx)?;
         }
@@ -244,11 +396,11 @@ impl HashedSeedSet {
 struct SeedSetCallback {
     coverage: usize,
     max_coverage: usize,
-    data: Vec<bool>,
+    data: BitVector,
 }
 
 impl SeedSetCallback {
-    fn new(data: Vec<bool>, max_coverage: usize) -> Self {
+    fn new(data: BitVector, max_coverage: usize) -> Self {
         Self {
             coverage: 0,
             max_coverage,
@@ -259,8 +411,8 @@ impl SeedSetCallback {
 
 impl EnumSeedsCallback for SeedSetCallback {
     fn call(&mut self, seed: u64, _pos: usize, _block_id: usize, _shape: i32) -> bool {
-        if !self.data[seed as usize] {
-            self.data[seed as usize] = true;
+        if !self.data.get(seed as usize) {
+            self.data.set(seed as usize);
             self.coverage += 1;
             if self.coverage > self.max_coverage {
                 return false;
@@ -303,8 +455,11 @@ mod tests {
 
     #[test]
     fn test_seed_set_accessors() {
+        let mut data = BitVector::with_size(4);
+        data.set(1);
+        data.set(3);
         let seed_set = SeedSet {
-            data: vec![false, true, false, true],
+            data,
             coverage: 0.5,
         };
         assert!(!seed_set.contains(0, 9));

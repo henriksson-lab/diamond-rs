@@ -1,0 +1,4 @@
+cseqid	mseqid	score
+domain_query	single_domain	441
+domain_query	reordered	441
+domain_query	domain_query	1126

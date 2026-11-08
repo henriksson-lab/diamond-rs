@@ -5,13 +5,12 @@
 //! configuration explicit.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::data::daa::{
-    copy_match_record_raw, finish_daa_from_refs, finish_daa_query_record, init_daa,
-    write_daa_query_record, DaaFile, DaaQueryRecord,
+    copy_match_record_raw, finish_daa_from_refs_bytes, finish_daa_query_record, init_daa,
+    write_daa_query_record_bytes, ByteDaaFile, DaaFile, DaaName,
 };
 
 /// Explicit counterpart of the C++ `config` fields consumed by `merge_daa`.
@@ -19,6 +18,7 @@ use crate::data::daa::{
 pub struct DaaMergeConfig {
     pub input_files: Vec<PathBuf>,
     pub output_file: PathBuf,
+    pub file_buffer_size: usize,
 }
 
 impl DaaMergeConfig {
@@ -31,6 +31,7 @@ impl DaaMergeConfig {
         Self {
             input_files: input_files.into_iter().map(Into::into).collect(),
             output_file: output_file.into(),
+            file_buffer_size: 67_108_864,
         }
     }
 
@@ -52,15 +53,15 @@ impl DaaMergeConfig {
 }
 
 /// Mirrors C++ `build_mapping`.
-pub fn build_mapping(
-    accession_to_oid: &mut HashMap<String, u32>,
-    sequence_ids: &mut Vec<String>,
+pub fn build_mapping<N: DaaName>(
+    accession_to_oid: &mut HashMap<N, u32>,
+    sequence_ids: &mut Vec<N>,
     sequence_lengths: &mut Vec<u32>,
-    file: &DaaFile,
+    file: &DaaFile<N>,
 ) -> HashMap<u32, u32> {
     let mut mapping = HashMap::new();
     for input_oid in 0..file.db_seqs_used() as usize {
-        let name = file.ref_name(input_oid).to_string();
+        let name = file.stored_ref_name(input_oid).clone();
         let next_oid = accession_to_oid.len() as u32;
         let output_oid = *accession_to_oid.entry(name.clone()).or_insert(next_oid);
         mapping.insert(input_oid as u32, output_oid);
@@ -73,19 +74,20 @@ pub fn build_mapping(
 }
 
 /// Mirrors C++ `write_file`, including raw match copying and subject-ID remap.
-pub fn write_file<W: Write>(
-    file: &mut DaaFile,
+pub fn write_file<W: Write, N: DaaName>(
+    file: &mut DaaFile<N>,
     output: &mut W,
     subject_map: &HashMap<u32, u32>,
 ) -> io::Result<i64> {
     let mut output_buffer = Vec::new();
     let mut last_query_number = None;
     while let Some((buffer, query_number)) = file.read_query_buffer()? {
-        let record = DaaQueryRecord::from_buffer(file, &buffer, query_number)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        let size_position = write_daa_query_record(
+        let record =
+            crate::data::daa::DaaQueryRecord::<N>::from_buffer_storage(file, &buffer, query_number)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let size_position = write_daa_query_record_bytes(
             &mut output_buffer,
-            &record.query_name,
+            record.query_name.daa_bytes(),
             record.query_source(),
             record.input_sequence_type(),
         );
@@ -113,7 +115,7 @@ pub fn merge_daa(config: &DaaMergeConfig) -> io::Result<i64> {
     let mut sequence_lengths = Vec::new();
 
     for input_file in &config.input_files {
-        let file = DaaFile::open(input_file)?;
+        let file = ByteDaaFile::open_bytes_with_buffer_size(input_file, config.file_buffer_size)?;
         oid_maps.push(build_mapping(
             &mut accession_to_oid,
             &mut sequence_ids,
@@ -123,19 +125,21 @@ pub fn merge_daa(config: &DaaMergeConfig) -> io::Result<i64> {
         files.push(file);
     }
 
-    let mut output = File::create(&config.output_file)?;
+    let mut output =
+        super::buffered_io::DaaOutput::create(&config.output_file, config.file_buffer_size)?;
     init_daa(&mut output)?;
     let mut query_count = 0;
     for (file, subject_map) in files.iter_mut().zip(&oid_maps) {
         query_count += write_file(file, &mut output, subject_map)?;
     }
-    finish_daa_from_refs(
+    finish_daa_from_refs_bytes(
         &mut output,
         &files[0],
         &sequence_ids,
         &sequence_lengths,
         query_count,
     )?;
+    output.close()?;
     Ok(query_count)
 }
 

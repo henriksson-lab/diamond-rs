@@ -130,6 +130,26 @@ impl<'a> Record<'a> {
         iterator.value_string()
     }
 
+    /// Source strings are arbitrary bytes, including non-UTF-8 TSV fields.
+    pub fn string_bytes(&self, i: usize) -> &'a [u8] {
+        let mut offset = 0usize;
+        for (index, kind) in self.schema.iter().enumerate() {
+            match kind {
+                Type::Int64 => offset += 8,
+                Type::String => {
+                    let length =
+                        i32::from_ne_bytes(self.buf[offset..offset + 4].try_into().unwrap())
+                            as usize;
+                    if index == i {
+                        return &self.buf[offset + 4..offset + 4 + length];
+                    }
+                    offset += 4 + length;
+                }
+            }
+        }
+        panic!("TSV string field is outside the schema")
+    }
+
     pub fn begin(&self) -> RecordIterator<'a> {
         RecordIterator::new(self.schema, self.buf)
     }
@@ -153,8 +173,10 @@ impl<'a> Record<'a> {
                 buf.append_char('\t');
             }
             match field.type_() {
-                Type::Int64 => buf.append_display(field.get::<i64>()),
-                Type::String => buf.append_str(&field.get::<String>()),
+                Type::Int64 => {
+                    buf.append_display(field.get::<i64>());
+                }
+                Type::String => buf.write_raw(self.string_bytes(idx)),
             };
         }
         buf.append_char('\n');

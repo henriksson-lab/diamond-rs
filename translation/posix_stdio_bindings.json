@@ -1,0 +1,92 @@
+{
+  "generator": "translation/generate_posix_stdio_bindings.py",
+  "scope": "Only opaque FILE-pointer variable declarations; no FILE/fpos_t layout, no fdopen, no stream ownership or SDK requirement in package builds.",
+  "profiles": {
+    "gnu": {
+      "input_header": "/usr/include/stdio.h",
+      "sha256": "3740b475b7236024022927f9f3097a4bf6effc46a8e47ef03b1ee1e0b4f3cdfa",
+      "exact_declarations": [
+        "extern FILE *stdout;",
+        "extern FILE *stderr;"
+      ],
+      "const_pointer": false,
+      "cfg": "all(target_os = \"linux\", target_env = \"gnu\")",
+      "clang_AST": {
+        "stdout": {
+          "argv": [
+            "clang",
+            "-x",
+            "c",
+            "-fsyntax-only",
+            "-Xclang",
+            "-ast-dump=json",
+            "-Xclang",
+            "-ast-dump-filter",
+            "-Xclang",
+            "stdout",
+            "-"
+          ],
+          "types": [
+            {
+              "qualType": "FILE *"
+            }
+          ]
+        },
+        "stderr": {
+          "argv": [
+            "clang",
+            "-x",
+            "c",
+            "-fsyntax-only",
+            "-Xclang",
+            "-ast-dump=json",
+            "-Xclang",
+            "-ast-dump-filter",
+            "-Xclang",
+            "stderr",
+            "-"
+          ],
+          "types": [
+            {
+              "qualType": "FILE *"
+            }
+          ]
+        }
+      }
+    },
+    "musl": {
+      "input_header": "/opt/zig/lib/libc/include/generic-musl/stdio.h",
+      "sha256": "917c7faec2c17fb7515cb2db964e4547e8764fb590f3ded9077f3f252472640d",
+      "exact_declarations": [
+        "extern FILE *const stdout;",
+        "extern FILE *const stderr;"
+      ],
+      "const_pointer": true,
+      "cfg": "all(target_os = \"linux\", target_env = \"musl\")"
+    },
+    "darwin": {
+      "input_header": ".tmp/native-post-translation-20261107/stdio-source-plan/posix-console-bindings/apple-Libc-1439.141.1-stdio.h",
+      "sha256": "ed9dcda19675862558681f641ea8ca172feddfefabde41f6006cd908ecb0c05a",
+      "exact_declarations": [
+        "extern FILE *__stdoutp;",
+        "extern FILE *__stderrp;"
+      ],
+      "const_pointer": false,
+      "cfg": "target_vendor = \"apple\""
+    }
+  },
+  "primary_sources": [
+    "https://sourceware.org/git/?p=glibc.git;a=blob;f=libio/stdio.h",
+    "https://git.musl-libc.org/cgit/musl/tree/include/stdio.h",
+    "https://raw.githubusercontent.com/apple-oss-distributions/Libc/Libc-1439.141.1/include/stdio.h"
+  ],
+  "license_scope": "No implementation or struct layout copied. Header inputs retain their upstream license notices; generated declarations describe public pointer ABI only.",
+  "format_command": [
+    "rustfmt",
+    "--edition",
+    "2021",
+    "src/util/io/posix_stdio_bindings.rs"
+  ],
+  "generated_sha256": "6c1d917516453242c55abc79f9c3614aebcb8aa021fad521f8e0fe79a89ee135",
+  "generator_sha256": "7f9a5a67d1ed46fa2711e77359e22c8909f5ff64976662a1540479c702da128d"
+}

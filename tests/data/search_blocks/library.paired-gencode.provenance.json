@@ -1,0 +1,33 @@
+{
+  "source_binary_sha256": "d8d08608b96706db62e44036fc979f9a658e72f59fc19d8727546daa616c42d8",
+  "source_commit": "1d162b4fefb5e6b4d868c24e6ad551cad2dcf246",
+  "args": [
+    "blastx",
+    "-q",
+    "paired-left.fna",
+    "paired-right.fna",
+    "-d",
+    "tests/data/search_output/reference.faa",
+    "-b0.0000001",
+    "-p4",
+    "--masking",
+    "0",
+    "--max-hsps",
+    "0",
+    "--query-gencode",
+    "4",
+    "--min-orf",
+    "1",
+    "-f",
+    "6",
+    "qseqid",
+    "sseqid",
+    "qstart",
+    "qend",
+    "qframe",
+    "full_qseq_mate"
+  ],
+  "inputs": "Left is all three records in search_output/query.fna; right is the same records in reverse order. Records are then round-robin interleaved.",
+  "normalization": "None",
+  "sha256": "2306447320d31e454ed4e822b226bb90f052875c85c57a9192a0bccecb0dc749"
+}

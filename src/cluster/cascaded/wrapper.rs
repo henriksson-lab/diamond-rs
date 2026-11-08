@@ -65,8 +65,8 @@ pub enum WrapperCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CascadedWrapperConfig {
-    pub database: Option<String>,
-    pub parallel_tmpdir: String,
+    pub database: Option<std::path::PathBuf>,
+    pub parallel_tmpdir: std::path::PathBuf,
     pub command: WrapperCommand,
     pub thresholds: ThresholdConfig,
     pub core: CascadedConfig,
@@ -83,7 +83,7 @@ impl Default for CascadedWrapperConfig {
     fn default() -> Self {
         Self {
             database: None,
-            parallel_tmpdir: String::new(),
+            parallel_tmpdir: std::path::PathBuf::new(),
             command: WrapperCommand::Cascaded,
             thresholds: ThresholdConfig {
                 member_cover: None,
@@ -118,22 +118,22 @@ pub struct CentroidSearchConfig {
     pub subject_cover: f64,
     pub query_or_target_cover: f64,
     pub lin_stage1_target: bool,
-    pub iterate: Vec<String>,
+    pub iterate: Vec<Vec<u8>>,
     pub lin_stage1_query: bool,
     pub chunk_size: f64,
     pub lowmem: i32,
     pub approx_min_id: f64,
     pub max_evalue: f64,
-    pub matrix: String,
+    pub matrix: Vec<u8>,
     pub gap_open: i32,
     pub gap_extend: i32,
     pub comp_based_stats: i32,
     pub masking: crate::masking::MaskingMode,
     pub soft_masking: crate::masking::MaskingAlgo,
-    pub motif_masking: String,
+    pub motif_masking: Vec<u8>,
     pub freq_masking: bool,
     pub db_size: u64,
-    pub extension_mode: String,
+    pub extension_mode: Vec<u8>,
     pub hamming_ext: bool,
     pub diag_filter_cov: Option<f64>,
     pub diag_filter_id: Option<f64>,
@@ -152,11 +152,33 @@ pub enum WrapperOutput {
 }
 
 pub trait CascadedWrapperBackend {
+    fn io_errors(&self) -> crate::util::io::IoErrorOwner {
+        Default::default()
+    }
+
+    /// Source's process-wide block budget with an adapter-controlled limit.
+    fn block_size(
+        &self,
+        memory: i64,
+        letters: i64,
+        sensitivity: Sensitivity,
+        linear: bool,
+        threads: i32,
+    ) -> (f64, i32) {
+        block_size(memory, letters, sensitivity, linear, threads)
+    }
+
     type Database;
     type Block;
 
     fn external(&mut self, config: &CascadedWrapperConfig) -> Result<(), String>;
     fn open_database(&mut self, path: &str) -> Result<Self::Database, String>;
+    fn open_database_path(&mut self, path: &std::path::Path) -> Result<Self::Database, String> {
+        self.open_database(
+            path.to_str()
+                .ok_or("Legacy backend requires UTF-8 paths; override open_database_path")?,
+        )
+    }
     fn database_name(&self, database: &Self::Database) -> String;
     fn database_is_blast(&self, database: &Self::Database) -> bool;
     fn database_sequence_count(&self, database: &Self::Database) -> OId;
@@ -198,6 +220,12 @@ pub trait CascadedWrapperBackend {
     fn append_centroids(&mut self, block: &Self::Block, ids: &[SuperBlockId])
         -> Result<(), String>;
     fn close_block(&mut self, block: Self::Block) -> Result<(), String>;
+    /// Source opens its mapping destination after computing the block budget,
+    /// before either clustering branch. Compatibility adapters may already own
+    /// their output externally; the native CLI adapter creates the real owner.
+    fn open_output(&mut self, _simple_header: bool) -> Result<(), String> {
+        Ok(())
+    }
     fn write_output(
         &mut self,
         database: &Self::Database,
@@ -218,6 +246,12 @@ pub struct WrapperState {
 
 impl WrapperState {
     pub fn new(config: &CascadedWrapperConfig) -> Result<Self, String> {
+        Self::new_with_io_owner(config, &Default::default())
+    }
+    pub fn new_with_io_owner(
+        config: &CascadedWrapperConfig,
+        errors: &crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
         let linclust = config.command == WrapperCommand::LinClust;
         let steps = cluster_steps_with_config(
             config
@@ -230,7 +264,9 @@ impl WrapperState {
         let last = steps
             .last()
             .ok_or_else(|| "No cluster steps configured.".to_owned())?;
-        let sensitivity = sensitivity_from_name(last.strip_suffix("_lin").unwrap_or(last))?;
+        let sensitivity = errors.capture(crate::basic::config::sensitivity_from_bytes(
+            last.strip_suffix(b"_lin").unwrap_or(last),
+        ))?;
         Ok(Self {
             linclust,
             sensitivity,
@@ -241,21 +277,7 @@ impl WrapperState {
 }
 
 fn sensitivity_from_name(name: &str) -> Result<Sensitivity, String> {
-    match name {
-        "faster" => Ok(Sensitivity::Faster),
-        "fast" => Ok(Sensitivity::Fast),
-        "default" => Ok(Sensitivity::Default),
-        "linclust-40" => Ok(Sensitivity::Linclust40),
-        "linclust-20" => Ok(Sensitivity::Linclust20),
-        "shapes-6x10" => Ok(Sensitivity::Shapes6x10),
-        "shapes-30x10" => Ok(Sensitivity::Shapes30x10),
-        "mid-sensitive" => Ok(Sensitivity::MidSensitive),
-        "sensitive" => Ok(Sensitivity::Sensitive),
-        "more-sensitive" => Ok(Sensitivity::MoreSensitive),
-        "very-sensitive" => Ok(Sensitivity::VerySensitive),
-        "ultra-sensitive" => Ok(Sensitivity::UltraSensitive),
-        _ => Err(format!("Invalid sensitivity level: {name}")),
-    }
+    crate::basic::config::sensitivity_from_string(name)
 }
 
 fn search_vs_centroids<B: CascadedWrapperBackend>(
@@ -272,7 +294,7 @@ fn search_vs_centroids<B: CascadedWrapperBackend>(
     let letters = backend
         .block_letters(super_block)
         .max(backend.centroid_letters());
-    let (chunk_size, lowmem) = block_size(
+    let (chunk_size, lowmem) = backend.block_size(
         config.memory_limit.min(i64::MAX as u64) as i64,
         letters.min(i64::MAX as u64) as i64,
         state.sensitivity,
@@ -352,7 +374,7 @@ pub fn run<B: CascadedWrapperBackend>(
     config.core.mutual_cover = config.thresholds.mutual_cover;
     config.core.approx_min_id = config.thresholds.approx_min_id.unwrap();
 
-    if !config.parallel_tmpdir.is_empty() {
+    if !config.parallel_tmpdir.as_os_str().is_empty() {
         if config.command == WrapperCommand::LinClust {
             return backend.external(config);
         }
@@ -363,22 +385,25 @@ pub fn run<B: CascadedWrapperBackend>(
     config.core.diag_filter_cov = config.thresholds.diag_filter_cov;
     config.core.diag_filter_id = config.thresholds.diag_filter_id;
 
-    let mut database = backend.open_database(&database_path)?;
+    let mut database = backend.open_database_path(&database_path)?;
     if backend.database_is_blast(&database) {
         return Err("Clustering is not supported for BLAST databases.".to_owned());
     }
     let letters = backend.database_letters(&database);
     let sequence_count = backend.database_sequence_count(&database);
     let memory_limit = config.memory_limit.min(i64::MAX as u64) as i64;
-    let block_letters = (block_size(
-        memory_limit,
-        letters.min(i64::MAX as u64) as i64,
-        Sensitivity::Faster,
-        true,
-        config.threads,
-    )
-    .0 * 1e9) as i64;
+    let block_letters = (backend
+        .block_size(
+            memory_limit,
+            letters.min(i64::MAX as u64) as i64,
+            Sensitivity::Faster,
+            true,
+            config.threads,
+        )
+        .0
+        * 1e9) as i64;
 
+    backend.open_output(config.simple_header)?;
     let linear = config.command == WrapperCommand::LinClust;
     if block_letters as u64 >= letters && sequence_count < SuperBlockId::MAX as OId {
         let centroids = backend.cascaded_database(&mut database, linear, &mut config.core)?;
@@ -389,7 +414,7 @@ pub fn run<B: CascadedWrapperBackend>(
             config.simple_header,
         )?;
     } else {
-        let mut state = WrapperState::new(config)?;
+        let mut state = WrapperState::new_with_io_owner(config, &backend.io_errors())?;
         config.db_size = Some(letters);
         config.core.db_size = letters;
         let traits = get_traits(Sensitivity::Faster);

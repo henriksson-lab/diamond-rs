@@ -24,16 +24,23 @@ pub enum ExtensionMode {
 impl ExtensionMode {
     /// Matches C++ `EnumTraits<Extension::Mode>::from_string(const string&)`.
     pub fn from_string(s: &str) -> Result<Self, String> {
+        Self::from_bytes(s.as_bytes()).map_err(|error| error.to_string())
+    }
+    pub fn from_bytes(s: &[u8]) -> std::io::Result<Self> {
         match s {
-            "banded-fast" => Ok(Self::BandedFast),
-            "banded-slow" => Ok(Self::BandedSlow),
-            "full" => Ok(Self::Full),
-            "none" => Ok(Self::None),
-            "global" => Ok(Self::Global),
-            _ => Err(format!(
-                "Invalid value for string field: {}. Permitted values: banded-fast, banded-slow, full, global, none",
-                s
-            )),
+            b"banded-fast" => Ok(Self::BandedFast),
+            b"banded-slow" => Ok(Self::BandedSlow),
+            b"full" => Ok(Self::Full),
+            b"none" => Ok(Self::None),
+            b"global" => Ok(Self::Global),
+            _ => {
+                let mut message = b"Invalid value for string field: ".to_vec();
+                message.extend_from_slice(s);
+                message.extend_from_slice(
+                    b". Permitted values: banded-fast, banded-slow, full, global, none",
+                );
+                Err(crate::util::io::RawDiagnosticError(message).into_io())
+            }
         }
     }
 }
@@ -68,24 +75,24 @@ pub struct SetupSearchInput {
     pub minimizer_window: Option<i32>,
     pub sketch_size: Option<i32>,
     pub contiguous_seed_mode: bool,
-    pub shape_mask: Vec<String>,
+    pub shape_mask: Vec<Vec<u8>>,
     pub shapes: u32,
     pub lin_stage1_query: bool,
     pub lin_stage1_target: bool,
     pub lin_stage1_combo: bool,
     pub gapped_filter_diag_bit_score: f64,
     pub seed_cut: f64,
-    pub motif_masking: String,
+    pub motif_masking: Vec<u8>,
     pub swipe_all: bool,
     pub freq_masking: bool,
-    pub soft_masking: String,
-    pub ext: String,
+    pub soft_masking: Vec<u8>,
+    pub ext: Vec<u8>,
     pub global_ranking_targets: bool,
     pub linclust_banded_ext: bool,
     pub frame_shift: i32,
     pub anchored_swipe: bool,
-    pub aln_out: String,
-    pub parallel_tmpdir: String,
+    pub aln_out: std::path::PathBuf,
+    pub parallel_tmpdir: std::path::PathBuf,
     pub approx_min_id: f64,
 }
 
@@ -109,17 +116,17 @@ impl Default for SetupSearchInput {
             lin_stage1_combo: false,
             gapped_filter_diag_bit_score: 0.0,
             seed_cut: 0.0,
-            motif_masking: String::new(),
+            motif_masking: Vec::new(),
             swipe_all: false,
             freq_masking: false,
-            soft_masking: String::new(),
-            ext: String::new(),
+            soft_masking: Vec::new(),
+            ext: Vec::new(),
             global_ranking_targets: false,
             linclust_banded_ext: false,
             frame_shift: 0,
             anchored_swipe: false,
-            aln_out: String::new(),
-            parallel_tmpdir: String::new(),
+            aln_out: std::path::PathBuf::new(),
+            parallel_tmpdir: std::path::PathBuf::new(),
             approx_min_id: 0.0,
         }
     }
@@ -668,15 +675,23 @@ pub fn soft_masking_algo(
     swipe_all: bool,
     freq_masking: bool,
 ) -> Result<MaskingAlgo, String> {
+    soft_masking_algo_bytes(traits, motif_masking.as_bytes(), swipe_all, freq_masking)
+}
+pub fn soft_masking_algo_bytes(
+    traits: &SensitivityTraits,
+    motif_masking: &[u8],
+    swipe_all: bool,
+    freq_masking: bool,
+) -> Result<MaskingAlgo, String> {
     if motif_masking.is_empty() {
         Ok(if !swipe_all && !freq_masking && traits.motif_masking {
             MaskingAlgo::Motif
         } else {
             MaskingAlgo::None
         })
-    } else if motif_masking == "0" {
+    } else if motif_masking == b"0" {
         Ok(MaskingAlgo::None)
-    } else if motif_masking == "1" {
+    } else if motif_masking == b"1" {
         if swipe_all {
             Err("Soft masking is not supported for --swipe.".to_string())
         } else {
@@ -692,6 +707,19 @@ pub fn setup_search(
     sens: Sensitivity,
     input: &SetupSearchInput,
     score_matrix: &ScoreMatrix,
+) -> Result<SetupSearchResult, String> {
+    setup_search_with_io_owner(
+        sens,
+        input,
+        score_matrix,
+        &crate::util::io::IoErrorOwner::default(),
+    )
+}
+pub fn setup_search_with_io_owner(
+    sens: Sensitivity,
+    input: &SetupSearchInput,
+    score_matrix: &ScoreMatrix,
+    errors: &crate::util::io::IoErrorOwner,
 ) -> Result<SetupSearchResult, String> {
     let traits = get_traits(sens);
     // C++ `Config::set_option(option, value, sentinel, fallback)` chooses the
@@ -742,15 +770,15 @@ pub fn setup_search(
     } else {
         Reduction::default_reduction()
     };
-    let shape_codes: Vec<String> = if input.contiguous_seed_mode {
+    let shape_codes: Vec<Vec<u8>> = if input.contiguous_seed_mode {
         let contiguous_seed = traits.contiguous_seed.ok_or_else(|| {
             "Contiguous seed mode is not supported for this sensitivity setting.".to_string()
         })?;
-        vec![contiguous_seed.to_string()]
+        vec![contiguous_seed.as_bytes().to_vec()]
     } else if input.shape_mask.is_empty() {
         get_shape_codes(sens)
             .iter()
-            .map(|x| x.to_string())
+            .map(|x| x.as_bytes().to_vec())
             .collect()
     } else {
         input.shape_mask.clone()
@@ -760,7 +788,7 @@ pub fn setup_search(
     // Murphy-10 reduction. Both have a four-bit encoding, so the shape's
     // stored long mask remains valid while subsequent seed encoding uses
     // Murphy-10.
-    let shapes = ShapeConfig::from_codes(&shape_codes, input.shapes, &shape_reduction)?;
+    let shapes = ShapeConfig::from_codes_bytes(&shape_codes, input.shapes, &shape_reduction)?;
     let reduction = Reduction::default_reduction();
     if (input.lin_stage1_target || input.lin_stage1_query || input.lin_stage1_combo)
         && shapes[0].weight < 10
@@ -774,7 +802,7 @@ pub fn setup_search(
         input.seed_cut
     };
     let seed_complexity_cut = seed_cut * std::f64::consts::LN_2 * shapes[0].weight as f64;
-    let mut soft_masking_bits = soft_masking_algo(
+    let mut soft_masking_bits = soft_masking_algo_bytes(
         &traits,
         &input.motif_masking,
         input.swipe_all,
@@ -782,15 +810,15 @@ pub fn setup_search(
     )?
     .bits();
     if !input.soft_masking.is_empty() {
-        soft_masking_bits |= match input.soft_masking.as_str() {
-            "0" | "none" => MaskingAlgo::None.bits(),
-            "tantan" => MaskingAlgo::Tantan.bits(),
-            "seg" => MaskingAlgo::Seg.bits(),
+        soft_masking_bits |= match input.soft_masking.as_slice() {
+            b"0" | b"none" => MaskingAlgo::None.bits(),
+            b"tantan" => MaskingAlgo::Tantan.bits(),
+            b"seg" => MaskingAlgo::Seg.bits(),
             _ => {
-                return Err(format!(
-                    "Invalid value for string field: {}. Permitted values: 0, none, seg, tantan",
-                    input.soft_masking
-                ))
+                let mut message = b"Invalid value for string field: ".to_vec();
+                message.extend_from_slice(&input.soft_masking);
+                message.extend_from_slice(b". Permitted values: 0, none, seg, tantan");
+                return errors.capture(Err(crate::util::io::RawDiagnosticError(message).into_io()));
             }
         };
     }
@@ -806,7 +834,7 @@ pub fn setup_search(
             default_ext_mode(sens)
         }
     } else {
-        let mode = ExtensionMode::from_string(&input.ext)?;
+        let mode = errors.capture(ExtensionMode::from_bytes(&input.ext))?;
         if mode != ExtensionMode::Full {
             if input.global_ranking_targets {
                 return Err("Global ranking only supports full matrix extension.".to_string());
@@ -825,7 +853,7 @@ pub fn setup_search(
             return Err("Anchored swipe does not support full matrix extension.".to_string());
         }
     }
-    if !input.aln_out.is_empty() && input.parallel_tmpdir.is_empty() {
+    if !input.aln_out.as_os_str().is_empty() && input.parallel_tmpdir.as_os_str().is_empty() {
         return Err(
             "Alignment output to file is not supported without --parallel-tmpdir.".to_string(),
         );
@@ -1075,8 +1103,8 @@ mod tests {
             query_bins: Some(2),
             shape_mask: vec!["1111111111".to_string()],
             lin_stage1_query: true,
-            soft_masking: "tantan".to_string(),
-            ext: "full".to_string(),
+            soft_masking: b"tantan".to_vec(),
+            ext: b"full".to_vec(),
             ..SetupSearchInput::default()
         };
         let result = setup_search(Sensitivity::Fast, &input, &score_matrix).unwrap();
@@ -1133,7 +1161,7 @@ mod tests {
     fn test_setup_search_extension_and_output_errors() {
         let score_matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
         let input = SetupSearchInput {
-            ext: "banded-fast".to_string(),
+            ext: b"banded-fast".to_vec(),
             global_ranking_targets: true,
             ..SetupSearchInput::default()
         };
@@ -1145,7 +1173,7 @@ mod tests {
         );
 
         let input = SetupSearchInput {
-            ext: "banded-fast".to_string(),
+            ext: b"banded-fast".to_vec(),
             swipe_all: true,
             ..SetupSearchInput::default()
         };

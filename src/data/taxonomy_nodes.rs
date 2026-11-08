@@ -2,7 +2,7 @@
 //! `diamond/src/data/taxonomy_nodes.{h,cpp}`.
 
 use crate::basic::value::TaxId;
-use crate::data::blastdb::taxdmp::read_nodes_dmp;
+use crate::data::blastdb::taxdmp::read_nodes_dmp_bytes_io_path;
 use crate::util::io::{Deserializer, IoResult, Serializer, StreamEntity};
 use std::collections::BTreeSet;
 use std::io::{self, Write};
@@ -129,14 +129,32 @@ impl Rank {
 
     /// Matches `Rank::Rank(const char*)` with a recoverable Rust error.
     pub fn parse(name: &str) -> Result<Self, String> {
-        Self::predefined(name)
-            .and_then(Self::from_index)
-            .ok_or_else(|| format!("Invalid taxonomic rank: {name}"))
+        Self::parse_bytes(name.as_bytes()).map_err(|error| error.to_string())
     }
-
-    /// Matches `Rank::predefined`; `None` corresponds to C++'s `-1`.
+    pub fn parse_bytes(name: &[u8]) -> io::Result<Self> {
+        if let Some(rank) = Self::predefined_bytes(name).and_then(Self::from_index) {
+            return Ok(rank);
+        }
+        let end = name
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(name.len());
+        let mut message = b"Invalid taxonomic rank: ".to_vec();
+        message.extend_from_slice(&name[..end]);
+        Err(crate::util::io::RawDiagnosticError(message).into_io())
+    }
+    /// Rank(const char*) and predefined both use the C-string prefix.
     pub fn predefined(name: &str) -> Option<usize> {
-        Self::NAMES.iter().position(|&candidate| candidate == name)
+        Self::predefined_bytes(name.as_bytes())
+    }
+    pub fn predefined_bytes(name: &[u8]) -> Option<usize> {
+        let end = name
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(name.len());
+        Self::NAMES
+            .iter()
+            .position(|candidate| candidate.as_bytes() == &name[..end])
     }
 
     pub fn name(self) -> &'static str {
@@ -213,35 +231,61 @@ pub struct TaxonomyNodes {
 }
 
 impl TaxonomyNodes {
-    /// Matches `TaxonomyNodes(const string&)`.
     pub fn from_nodes_dmp(file_name: &str) -> Result<Self, String> {
+        Self::from_nodes_dmp_path(std::path::Path::new(file_name))
+    }
+    pub fn from_nodes_dmp_source(file_name: &str, buffer_size: usize) -> Result<Self, String> {
+        Self::from_nodes_dmp_source_path(std::path::Path::new(file_name), buffer_size)
+    }
+    pub fn from_nodes_dmp_source_io(file_name: &str, buffer_size: usize) -> io::Result<Self> {
+        Self::from_nodes_dmp_source_io_path(std::path::Path::new(file_name), buffer_size)
+    }
+
+    /// Matches `TaxonomyNodes(const string&)`.
+    pub fn from_nodes_dmp_path(file_name: &std::path::Path) -> Result<Self, String> {
+        Self::from_nodes_profile_io(file_name, None).map_err(|error| error.to_string())
+    }
+    pub fn from_nodes_dmp_source_path(
+        file_name: &std::path::Path,
+        buffer_size: usize,
+    ) -> Result<Self, String> {
+        Self::from_nodes_dmp_source_io_path(file_name, buffer_size)
+            .map_err(|error| error.to_string())
+    }
+    /// Source constructor with the actual typed file/open/read error retained.
+    pub fn from_nodes_dmp_source_io_path(
+        file_name: &std::path::Path,
+        buffer_size: usize,
+    ) -> io::Result<Self> {
+        Self::from_nodes_profile_io(file_name, Some(buffer_size))
+    }
+    fn from_nodes_profile_io(
+        file_name: &std::path::Path,
+        source_buffer: Option<usize>,
+    ) -> io::Result<Self> {
         let mut nodes = Self::default();
-        let mut rank_error = None;
-        read_nodes_dmp(file_name, |taxid, parent, rank_name| {
-            if rank_error.is_some() {
-                return;
-            }
+        let callback = |taxid, parent, rank_name: &[u8]| {
             if taxid < 0 {
-                rank_error = Some(format!("Invalid negative taxon id: {taxid}"));
-                return;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid negative taxon id: {taxid}"),
+                ));
             }
-            let rank = match Rank::parse(rank_name) {
-                Ok(rank) => rank,
-                Err(error) => {
-                    rank_error = Some(error);
-                    return;
-                }
-            };
+            let rank = Rank::parse_bytes(rank_name)?;
             let index = taxid as usize;
             nodes.parent.resize(index + 1, 0);
             nodes.parent[index] = parent;
             nodes.rank.resize(index + 1, Rank::None);
             nodes.rank[index] = rank;
-        })
-        .map_err(|error| error.to_string())?;
-        if let Some(error) = rank_error {
-            return Err(error);
-        }
+            Ok(())
+        };
+        if let Some(buffer) = source_buffer {
+            crate::data::blastdb::taxdmp::read_nodes_dmp_bytes_io_with_source_buffer_path(
+                file_name, buffer, callback,
+            )
+        } else {
+            read_nodes_dmp_bytes_io_path(file_name, callback)
+        }?;
         Ok(nodes)
     }
 
@@ -377,6 +421,35 @@ impl TaxonomyNodes {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_rank_parser_retains_raw_diagnostic_and_c_string_prefix() {
+        assert_eq!(
+            super::Rank::parse_bytes(b"species\0ignored").unwrap(),
+            super::Rank::Species
+        );
+        let error = super::Rank::parse_bytes(b"rank\xff").unwrap_err();
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error),
+            Some(b"Invalid taxonomic rank: rank\xff".as_slice())
+        );
+        let path = std::env::temp_dir().join(format!(
+            "diamond-raw-rank-{}-{}.dmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"2\t|\t1\t|\trank\xff\t|\t\nmalformed-next-row\n").unwrap();
+        let error =
+            super::TaxonomyNodes::from_nodes_dmp_source_io(path.to_str().unwrap(), 32).unwrap_err();
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error),
+            Some(b"Invalid taxonomic rank: rank\xff".as_slice())
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
     use super::*;
     use crate::util::io::VecStream;
     use std::io::Write;

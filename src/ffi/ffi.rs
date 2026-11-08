@@ -7,7 +7,19 @@
 
 use std::io::Write;
 
-use crate::run::main::{RunBackend, RunFeatures};
+use crate::run::main::{RunBackend, RunError, RunFeatures};
+
+/// Native execution boundary shared with the CLI and library. This facade
+/// preserves typed errors for its caller and never enters the C++ oracle.
+pub fn execute<B: RunBackend, O: Write, E: Write>(
+    backend: &mut B,
+    args: &[String],
+    features: RunFeatures,
+    out: &mut O,
+    err: &mut E,
+) -> Result<i32, RunError> {
+    crate::run::main::execute(backend, args, features, out, err)
+}
 
 /// Safe Rust counterpart of C++ `diamond_main`.
 pub fn diamond_main<B: RunBackend, O: Write, E: Write, L: Write>(

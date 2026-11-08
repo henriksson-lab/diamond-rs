@@ -1,0 +1,7 @@
+mixed_query	579	0	578	+	mixed	193	0	192	193	193	255	AS:i:347	ZR:i:889	ZE:f:7.85e-128
+mixed_query	579	0	233	+	complex	78	0	77	78	78	255	AS:i:175	ZR:i:444	ZE:f:1.03e-61
+complex_query	234	0	233	-	complex	78	0	77	78	78	255	AS:i:176	ZR:i:446	ZE:f:5.61e-64
+complex_query	234	0	233	-	mixed	193	0	77	78	78	255	AS:i:176	ZR:i:446	ZE:f:2.07e-62
+mutation_query	540	0	539	-	mutation0	180	0	179	180	180	255	AS:i:401	ZR:i:1031	ZE:f:6.44e-150
+mutation_query	540	0	539	-	mutation9	180	0	179	160	180	255	AS:i:342	ZR:i:878	ZE:f:1.39e-126
+motif_query	396	0	395	+	motif	132	0	131	132	132	255	AS:i:305	ZR:i:782	ZE:f:1.61e-113

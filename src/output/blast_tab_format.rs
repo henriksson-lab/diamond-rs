@@ -19,18 +19,21 @@ pub use super::format::{
 
 /// All former process-global inputs used by C++ `TabularFormat`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlastTabConfig {
-    pub output_format: Vec<String>,
+pub struct BlastTabConfig<T = String> {
+    pub output_format: Vec<T>,
     pub json: bool,
     pub frame_shift: i32,
     pub query_translated: bool,
-    pub score_matrix_name: String,
+    /// Source `value_traits` is nucleotide for blastn, while query_translated
+    /// remains false. Keep the alphabet separate from coordinate translation.
+    pub nucleotide_query: bool,
+    pub score_matrix_name: T,
     pub workflow: Workflow,
     /// `None` means the option was absent; `Some([])` requests the workflow
     /// default header, matching C++ `config.output_header.present()/empty()`.
-    pub output_header: Option<Vec<String>>,
+    pub output_header: Option<Vec<T>>,
     pub version: String,
-    pub invocation: String,
+    pub invocation: Vec<u8>,
     pub report_unaligned: i32,
     pub qnum_offset: u64,
     pub snum_offset: u64,
@@ -43,11 +46,12 @@ impl Default for BlastTabConfig {
             json: false,
             frame_shift: 0,
             query_translated: false,
+            nucleotide_query: false,
             score_matrix_name: "BLOSUM62".into(),
             workflow: Workflow::BlastP,
             output_header: None,
             version: env!("CARGO_PKG_VERSION").into(),
-            invocation: String::new(),
+            invocation: Vec::new(),
             report_unaligned: 0,
             qnum_offset: 0,
             snum_offset: 0,
@@ -57,49 +61,91 @@ impl Default for BlastTabConfig {
 
 /// Configured BLAST tabular/JSON formatter.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlastTabFormat {
+pub struct BlastTabFormat<T = String> {
     pub format: TabularFormat,
-    pub config: BlastTabConfig,
+    pub config: BlastTabConfig<T>,
 }
 
-impl BlastTabFormat {
+pub type ByteBlastTabConfig = BlastTabConfig<Vec<u8>>;
+pub type ByteBlastTabFormat = BlastTabFormat<Vec<u8>>;
+
+impl Default for ByteBlastTabConfig {
+    fn default() -> Self {
+        let config = BlastTabConfig::<String>::default();
+        Self {
+            output_format: config
+                .output_format
+                .into_iter()
+                .map(String::into_bytes)
+                .collect(),
+            score_matrix_name: config.score_matrix_name.into_bytes(),
+            output_header: config
+                .output_header
+                .map(|values| values.into_iter().map(String::into_bytes).collect()),
+            json: config.json,
+            frame_shift: config.frame_shift,
+            query_translated: config.query_translated,
+            nucleotide_query: config.nucleotide_query,
+            workflow: config.workflow,
+            version: config.version,
+            invocation: config.invocation,
+            report_unaligned: config.report_unaligned,
+            qnum_offset: config.qnum_offset,
+            snum_offset: config.snum_offset,
+        }
+    }
+}
+impl BlastTabFormat<String> {
     pub fn new(config: BlastTabConfig) -> Result<Self, String> {
+        Self::new_core(config).map_err(|error| error.to_string())
+    }
+}
+impl ByteBlastTabFormat {
+    pub fn new_bytes(config: ByteBlastTabConfig) -> io::Result<Self> {
+        Self::new_core(config)
+    }
+}
+impl<N: AsRef<[u8]>> BlastTabFormat<N> {
+    fn new_core(config: BlastTabConfig<N>) -> io::Result<Self> {
         let fields = config
             .output_format
             .iter()
-            .map(String::as_str)
+            .map(AsRef::as_ref)
             .collect::<Vec<_>>();
-        let format = TabularFormat::new(
+        let format = TabularFormat::new_bytes(
             &fields,
             config.json,
             config.frame_shift,
             config.query_translated,
-            &config.score_matrix_name,
+            config.score_matrix_name.as_ref(),
         )?;
-        // Validate header configuration at construction, as the C++ header
-        // path otherwise defers this error until output starts.
         let header = config
             .output_header
             .as_ref()
-            .map(|values| values.iter().map(String::as_str).collect::<Vec<_>>());
-        TabularFormat::header_format(config.workflow, header.as_deref())?;
+            .map(|values| values.iter().map(AsRef::as_ref).collect::<Vec<_>>());
+        TabularFormat::header_format_bytes(config.workflow, header.as_deref())?;
         Ok(Self { format, config })
     }
 
     pub fn header(&self) -> Result<String, String> {
+        String::from_utf8(self.header_bytes().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())
+    }
+    pub fn header_bytes(&self) -> io::Result<Vec<u8>> {
         let values = self
             .config
             .output_header
             .as_ref()
-            .map(|values| values.iter().map(String::as_str).collect::<Vec<_>>());
-        let header = TabularFormat::header_format(self.config.workflow, values.as_deref())?;
-        print_tabular_header(
+            .map(|values| values.iter().map(AsRef::as_ref).collect::<Vec<_>>());
+        let header = TabularFormat::header_format_bytes(self.config.workflow, values.as_deref())?;
+        super::format::print_tabular_header_bytes(
             &self.format.fields,
             header,
             self.config.json,
             &self.config.version,
             &self.config.invocation,
         )
+        .map_err(io::Error::other)
     }
 
     pub fn footer(&self) -> &'static str {
@@ -121,11 +167,30 @@ impl BlastTabFormat {
         query_quality: &str,
         mate_sequence: Option<&[Letter]>,
     ) -> io::Result<()> {
+        self.write_match_bytes(
+            writer,
+            context,
+            subject_taxids,
+            taxonomy,
+            query_quality.as_bytes(),
+            mate_sequence,
+        )
+    }
+
+    pub fn write_match_bytes<W: Write, T: AsRef<[u8]>>(
+        &self,
+        writer: &mut W,
+        context: &HspContext<T>,
+        subject_taxids: &[TaxId],
+        taxonomy: Option<&TaxonomyTree>,
+        query_quality: &[u8],
+        mate_sequence: Option<&[Letter]>,
+    ) -> io::Result<()> {
         if self.config.json {
-            return super::format::write_tabular_context_row_json(
+            return super::format::write_tabular_context_row_json_bytes(
                 writer,
                 context,
-                context.hit_num != 0 || context.hsp_num != 0,
+                context.hit_num != 0,
                 &self.format.fields,
                 self.config.query_translated,
                 self.config.frame_shift != 0,
@@ -143,17 +208,19 @@ impl BlastTabFormat {
                 writer.write_all(b"\t")?;
             }
             let mut cell = Vec::new();
-            if matches!(
-                field,
-                FieldId::STaxIds
-                    | FieldId::SSciNames
-                    | FieldId::SSKingdoms
-                    | FieldId::SKingdoms
-                    | FieldId::SPhylums
-                    | FieldId::SLineages
-            ) {
+            if field.taxonomy_rank().is_some()
+                || matches!(
+                    field,
+                    FieldId::STaxIds
+                        | FieldId::SSciNames
+                        | FieldId::SSKingdoms
+                        | FieldId::SKingdoms
+                        | FieldId::SPhylums
+                        | FieldId::SLineages
+                )
+            {
                 if let Some(tree) = taxonomy {
-                    super::format::write_tabular_context_row_with_taxonomy(
+                    super::format::write_tabular_context_row_with_taxonomy_bytes(
                         &mut cell,
                         context,
                         std::slice::from_ref(field),
@@ -174,7 +241,7 @@ impl BlastTabFormat {
                 field,
                 FieldId::QQual | FieldId::FullQQual | FieldId::FullQSeqMate
             ) {
-                super::format::write_tabular_context_row_with_query_info(
+                super::format::write_tabular_context_row_with_query_info_bytes(
                     &mut cell,
                     context,
                     std::slice::from_ref(field),
@@ -186,7 +253,7 @@ impl BlastTabFormat {
                     mate_sequence,
                 )?;
             } else {
-                super::format::write_tabular_context_row(
+                super::format::write_tabular_context_row_bytes(
                     &mut cell,
                     context,
                     std::slice::from_ref(field),
@@ -214,30 +281,27 @@ impl BlastTabFormat {
         query_quality: &str,
         unaligned: bool,
     ) -> io::Result<()> {
+        self.write_query_intro_bytes(
+            writer,
+            query_title.as_bytes(),
+            query_len,
+            query_sequence,
+            query_quality.as_bytes(),
+            unaligned,
+        )
+    }
+
+    pub fn write_query_intro_bytes<W: Write>(
+        &self,
+        writer: &mut W,
+        query_title: &[u8],
+        query_len: i32,
+        query_sequence: &[Letter],
+        query_quality: &[u8],
+        unaligned: bool,
+    ) -> io::Result<()> {
         let enabled = unaligned && self.config.report_unaligned == 1;
-        if enabled {
-            // These C++ callbacks intentionally define match output only. The
-            // inherited invalid query-intro handler throws instead of printing
-            // the generic numeric `-1` sentinel.
-            if let Some(field) = self.format.fields.iter().find(|field| {
-                matches!(
-                    field,
-                    FieldId::HspNum
-                        | FieldId::NormalizedBitscore
-                        | FieldId::NormalizedNident
-                        | FieldId::CorrectedBitScore
-                        | FieldId::Reserved1
-                        | FieldId::Reserved2
-                )
-            }) {
-                let key = field.output_field().map_or("reserved", |def| def.key);
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("Invalid output field: {key}"),
-                ));
-            }
-        }
-        super::format::write_tabular_query_intro_with_quality(
+        super::format::write_tabular_query_intro_with_quality_for_type_bytes(
             writer,
             query_title,
             query_len,
@@ -245,6 +309,7 @@ impl BlastTabFormat {
             query_quality,
             &self.format.fields,
             enabled,
+            self.config.query_translated || self.config.nucleotide_query,
         )
     }
 }
@@ -301,6 +366,30 @@ mod tests {
             name: "Proteobacteria".into(),
         });
         tree
+    }
+
+    #[test]
+    fn byte_config_preserves_invocation_and_invalid_field_diagnostic() {
+        let formatter = ByteBlastTabFormat::new_bytes(ByteBlastTabConfig {
+            output_header: Some(vec![b"verbose".to_vec()]),
+            invocation: b"diamond_\xff --view".to_vec(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(formatter
+            .header_bytes()
+            .unwrap()
+            .windows(b"diamond_\xff --view".len())
+            .any(|part| part == b"diamond_\xff --view"));
+        let error = ByteBlastTabFormat::new_bytes(ByteBlastTabConfig {
+            output_format: vec![b"6".to_vec(), b"field_\xff".to_vec()],
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error),
+            Some(b"Invalid output field: field_\xff".as_slice())
+        );
     }
 
     #[test]
@@ -366,7 +455,7 @@ mod tests {
                 .collect(),
             output_header: Some(Vec::new()),
             version: "9.9".into(),
-            invocation: "diamond test".into(),
+            invocation: b"diamond test".to_vec(),
             report_unaligned: 1,
             ..Default::default()
         })

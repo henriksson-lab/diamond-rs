@@ -1,0 +1,11 @@
+@HD	VN:1.5	SO:query
+@PG	PN:DIAMOND	VN:2.1.24	CL:/data/henriksson/github/claude/diamond-rs/diamond/build/diamond blastp -q /data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.faa -d /data/henriksson/github/claude/diamond-rs/.tmp/native-sam-20261107/source.dmnd --masking 0 --comp-based-stats 1 --max-hsps 0 --algo 0 -b 0.0000001 -p1 -f 101 --unal 2 --salltitles --sam-query-len -o /data/henriksson/github/claude/diamond-rs/.tmp/native-sam-20261107/source.sam
+@mm	BlastP
+@CO	BlastP-like alignments
+@CO	Reporting AS: bitScore, ZR: rawScore, ZE: expected, ZI: percent identity, ZL: reference length, ZF: frame, ZS: query start DNA coordinate
+domain_query	0	single_domain	1	255	78M	*	0	0	MKTAYIAKQRQISFVKSHFSRQDILDLWIYHTQGYFPDWQNYTPGPGIRYPLTFGWCFKELDYVYDGQFKKDELEKTR	*	AS:i:176	NM:i:0	ZL:i:78	ZR:i:445	ZE:f:1.27e-59	ZI:i:100	ZF:i:1	ZS:i:1	MD:Z:78	ZQ:i:379
+domain_query	0	reordered	302	255	78M	*	0	0	MKTAYIAKQRQISFVKSHFSRQDILDLWIYHTQGYFPDWQNYTPGPGIRYPLTFGWCFKELDYVYDGQFKKDELEKTR	*	AS:i:176	NM:i:0	ZL:i:379	ZR:i:445	ZE:f:8.09e-56	ZI:i:100	ZF:i:1	ZS:i:1	MD:Z:78	ZQ:i:379
+domain_query	0	reordered	1	255	71M	*	0	0	SWLWSNWPRYMFQAHHGTMDHWGMNQMYDSETVKTFGMKKGINYKPNDPQSLSLWPNHFTTGCGMMCRNWT	*	AS:i:169	NM:i:0	ZL:i:379	ZR:i:428	ZE:f:2.49e-53	ZI:i:100	ZF:i:1	ZS:i:309	MD:Z:71	ZQ:i:379
+domain_query	0	reordered	152	255	70M	*	0	0	MRHWITDLQPNFVKYCEGSIKTLHVPQWYDAFNRCGIMNQEWKYPFHSVDLTCKIWQFNDYHPMGVERLS	*	AS:i:162	NM:i:0	ZL:i:379	ZR:i:411	ZE:f:7.54e-51	ZI:i:100	ZF:i:1	ZS:i:159	MD:Z:70	ZQ:i:379
+domain_query	0	gapped_ref	1	255	28M3D27M2I21M	*	0	0	MKTAYIAKQRQISFVKSHFSRQDILDLWIYHTQGYFPDWQNYTPGPGIRYPLTFGWCFKELDYVYDGQFKKDELEKTR	*	AS:i:157	NM:i:5	ZL:i:79	ZR:i:398	ZE:f:1.36e-52	ZI:i:93	ZF:i:1	ZS:i:1	MD:Z:28^GGH48	ZQ:i:379
+unaligned	4	*	0	255	*	*	0	0	*	*

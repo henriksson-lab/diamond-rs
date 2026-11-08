@@ -1,3 +1,6 @@
+#[path = "support/source_startup.rs"]
+mod source_startup;
+
 use std::fs::File;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -69,6 +72,7 @@ fn native_view_writes_text_and_seekable_daa_to_stdout() {
         String::from_utf8_lossy(&text.stderr)
     );
     assert_eq!(text.stdout, b"query0\tref0\t30\n");
+    assert_eq!(text.stderr, source_startup::age_warning_stderr());
 
     let redirected = File::create(&daa_stdout).unwrap();
     let status = Command::new(env!("CARGO_BIN_EXE_diamond"))
@@ -101,7 +105,8 @@ fn native_view_matches_upstream_help_and_console_verbosity_policy() {
         .output()
         .unwrap();
     assert!(!help.status.success());
-    let help_stdout = String::from_utf8(help.stdout).unwrap();
+    let help_stdout =
+        std::str::from_utf8(source_startup::stdout_body_before_suffix(&help)).unwrap();
     assert!(help_stdout.starts_with("Options:\n--threads"));
     assert!(help_stdout.contains("--outfmt                 output format\n"));
     assert!(help_stdout.contains(
@@ -112,7 +117,7 @@ fn native_view_matches_upstream_help_and_console_verbosity_policy() {
     ));
     assert!(help_stdout
         .ends_with("--forwardonly            only show alignments of forward strand\n\n"));
-    assert!(String::from_utf8(help.stderr)
+    assert!(std::str::from_utf8(&help.stderr)
         .unwrap()
         .ends_with("Error: The view command requires a DAA (option -a) input file.\n"));
 
@@ -131,7 +136,7 @@ fn native_view_matches_upstream_help_and_console_verbosity_policy() {
         .unwrap();
     assert!(stdout_default.status.success());
     assert_eq!(stdout_default.stdout, b"query0\n");
-    assert!(stdout_default.stderr.is_empty());
+    assert_eq!(stdout_default.stderr, source_startup::age_warning_stderr());
 
     let stdout_verbose = Command::new(env!("CARGO_BIN_EXE_diamond"))
         .args(base)
@@ -139,6 +144,7 @@ fn native_view_matches_upstream_help_and_console_verbosity_policy() {
         .output()
         .unwrap();
     assert!(stdout_verbose.status.success());
+    assert_eq!(source_startup::stdout_body(&stdout_verbose), b"query0\n");
     let verbose_stderr = String::from_utf8(stdout_verbose.stderr).unwrap();
     assert!(verbose_stderr.starts_with("diamond v2.1.24.178 "));
     assert!(verbose_stderr.contains("#CPU threads: 1\n"));
@@ -165,7 +171,8 @@ fn native_view_matches_upstream_help_and_console_verbosity_policy() {
         .output()
         .unwrap();
     assert!(file_quiet.status.success());
-    assert!(file_quiet.stderr.is_empty());
+    assert_eq!(source_startup::stdout_body(&file_quiet), b"");
+    assert_eq!(file_quiet.stderr, source_startup::age_warning_stderr());
 
     let file_log = Command::new(env!("CARGO_BIN_EXE_diamond"))
         .args(base)

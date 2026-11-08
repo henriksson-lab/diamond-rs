@@ -119,7 +119,14 @@ impl<T> Vector<T>
 where
     T: Clone + Default + Display + FromStr,
 {
-    pub fn out(&self) -> String {
+    /// Source stream insertion for owned primitive numeric values and custom
+    /// static Display types. The output-only 'static bound permits safe
+    /// primitive downcasts, preserving signed NaNs before text formatting.
+    /// Storage, constructors, and input parsing retain their existing bounds.
+    pub fn out(&self) -> String
+    where
+        T: 'static,
+    {
         let mut out = String::new();
         match alp_ioutil::getFormat() {
             alp_ioutil::Format::MACHINE => {
@@ -127,7 +134,7 @@ where
                     if i != 0 {
                         out.push('\n');
                     }
-                    out.push_str(&self.getVector()[i].to_string());
+                    out.push_str(&alp_ioutil::format_value(&self.getVector()[i]));
                 }
             }
             alp_ioutil::Format::HUMAN | alp_ioutil::Format::FORMAT => {
@@ -136,7 +143,7 @@ where
                     if i != 0 {
                         out.push('\t');
                     }
-                    out.push_str(&self.getVector()[i].to_string());
+                    out.push_str(&alp_ioutil::format_value(&self.getVector()[i]));
                 }
                 out.push_str("\t! vector elements");
             }
@@ -148,13 +155,8 @@ where
     pub fn in_(&mut self, input: &str) {
         match alp_ioutil::getFormat() {
             alp_ioutil::Format::MACHINE => {
-                let mut v = Vec::new();
-                for token in input.split_whitespace() {
-                    match token.parse::<T>() {
-                        Ok(value) => v.push(value),
-                        Err(_) => alp_ioutil::abort_msg("Njn::Vector::in : bad d_vector_p"),
-                    }
-                }
+                // Source does not diagnose extraction failure in MACHINE mode.
+                let (v, _) = alp_ioutil::read_values::<T>(input);
                 if v.len() != self.getM() {
                     self.free2();
                     self.init(v.len());
@@ -167,11 +169,12 @@ where
                 if !alp_ioutil::getLine(input, &mut offset, &mut s, alp_ioutil::getTerminator()) {
                     alp_ioutil::abort_msg("Njn::Vector::in : bad m");
                 }
-                let m: usize = s
-                    .split_whitespace()
-                    .next()
-                    .and_then(|x| x.parse().ok())
+                let mut dimension_offset = 0;
+                let m: usize = alp_ioutil::read_value(&s, &mut dimension_offset)
                     .unwrap_or_else(|| alp_ioutil::abort_msg("Njn::Vector::in : bad m"));
+                // Vector::in reuses its stringstream without clear(), retaining
+                // eofbit if the dimension ended at the final character.
+                let dimension_eof = dimension_offset == s.len();
                 if m != self.getM() {
                     self.free2();
                     self.init(m);
@@ -180,11 +183,11 @@ where
                 if !alp_ioutil::getLine(input, &mut offset, &mut s, alp_ioutil::getTerminator()) {
                     alp_ioutil::abort_msg("Njn::Vector::in : bad d_vector_p [0]");
                 }
-                let mut tokens = s.split_whitespace();
+                let mut value_offset = 0;
                 for i in 0..self.getM() {
-                    self.d_vector_p[i] = tokens
-                        .next()
-                        .and_then(|x| x.parse::<T>().ok())
+                    self.d_vector_p[i] = (!dimension_eof)
+                        .then(|| alp_ioutil::read_value(&s, &mut value_offset))
+                        .flatten()
                         .unwrap_or_else(|| {
                             alp_ioutil::abort_msg(&format!(
                                 "Njn::Vector::in : bad d_vector_p [{}]",
@@ -200,7 +203,7 @@ where
 
 impl<T> fmt::Display for Vector<T>
 where
-    T: Clone + Default + Display + FromStr,
+    T: Clone + Default + Display + FromStr + 'static,
 {
     fn fmt(&self, ostr_: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(ostr_, "{}", self.out())

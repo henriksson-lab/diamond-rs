@@ -25,7 +25,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-flate2 = { version = "1", features = ["zlib-rs"] }
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
 libc = "0.2"
 memmap2 = "0.9"
 nalgebra = "0.32.6"
@@ -43,16 +43,27 @@ mach2 = "0.6"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_System_Console",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_ProcessStatus",
+    "Win32_System_Performance",
     "Win32_System_Threading",
+    "Win32_System_SystemInformation",
 ] }
 
 [features]
 default = []
+# Source WITH_ZSTD command profile; typed low-level Rust codecs stay available.
+zstd = []
 ffi = ["dep:cmake"]
+# Source EXTRA command registry and the native tool backends connected to it.
+extra = []
+# Source EXTRA + WITH_DNA registration and native nucleotide search.
+dna = ["extra"]
+# Source WITH_MCL command and clustering formats.
+mcl = ["extra"]
 # Diagnostic A/B switch for measuring the glibc-specific RSS trim calls.
 # Production builds keep trimming enabled.
 disable-malloc-trim = []

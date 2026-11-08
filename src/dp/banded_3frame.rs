@@ -7,7 +7,7 @@
 
 use crate::align::hsp::Hsp;
 use crate::basic::packed_transcript::EditOperation;
-use crate::basic::translate::{Frame, TranslatedPosition};
+use crate::basic::translate::{Frame, Strand, TranslatedPosition};
 use crate::basic::value::{Letter, LETTER_MASK};
 use crate::dp::smith_waterman::SwResult;
 use crate::dp::swipe::DpTarget;
@@ -37,6 +37,17 @@ pub enum Trace {
 pub struct DpStat {
     pub gross_cells: usize,
     pub net_cells: usize,
+}
+
+/// Source's separate `::dp_stat` accumulator (align.cpp). These three-frame
+/// cells are not the SWIPE counters in basic::statistics::Statistics.
+pub static DP_STAT: std::sync::LazyLock<std::sync::Mutex<DpStat>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(DpStat::default()));
+
+pub(crate) fn merge_dp_stat(worker: &DpStat) {
+    let mut total = DP_STAT.lock().unwrap();
+    total.gross_cells += worker.gross_cells;
+    total.net_cells += worker.net_cells;
 }
 
 #[derive(Debug, Clone)]
@@ -614,7 +625,7 @@ pub fn banded_3frame_swipe_range(
     d_end: i32,
     score_matrix: &ScoreMatrix,
 ) -> ThreeFrameSwResult {
-    let qlen = query.iter().map(|q| q.len()).max().unwrap_or(0);
+    let qlen = query[0].len();
     let slen = subject.len();
     if qlen == 0 || slen == 0 || d_end <= d_begin {
         return ThreeFrameSwResult::default();
@@ -624,23 +635,55 @@ pub fn banded_3frame_swipe_range(
     let gap_extend = score_matrix.gap_extend();
     let frame_shift = score_matrix.frame_shift();
     let neg_inf = i32::MIN / 4;
-    let states = (qlen + 1) * (slen + 1) * 3;
-    let idx = |frame: usize, i: usize, j: usize| -> usize { ((j * (qlen + 1) + i) * 3) + frame };
+    // Source's traceback matrix has one fixed-width diagonal band per
+    // subject column, interleaving the three frames. Slot zero represents
+    // every local-alignment boundary and every cell outside the band.
+    let band = (i64::from(d_end) - i64::from(d_begin)) as usize;
+    // DpTarget::banded_cols excludes subject prefixes and suffixes that
+    // never intersect the query. A distant seed must not allocate storage
+    // for its whole (potentially very long) target prefix.
+    let column_begin = (1 - i64::from(d_end)).clamp(0, slen as i64) as usize;
+    let column_end = (qlen as i64 - i64::from(d_begin)).clamp(0, slen as i64) as usize;
+    if column_begin >= column_end {
+        return ThreeFrameSwResult::default();
+    }
+    let states = band
+        .checked_mul(column_end - column_begin)
+        .and_then(|cells| cells.checked_mul(3))
+        .and_then(|cells| cells.checked_add(1))
+        .expect("Three-frame band storage overflow");
+    let idx = |frame: usize, i: usize, j: usize| -> usize {
+        let diagonal = i as i64 - j as i64;
+        if i == 0
+            || j <= column_begin
+            || j > column_end
+            || diagonal < i64::from(d_begin)
+            || diagonal >= i64::from(d_end)
+        {
+            0
+        } else {
+            1 + ((j - column_begin - 1) * band + (diagonal - i64::from(d_begin)) as usize) * 3
+                + frame
+        }
+    };
 
     let mut h = vec![0i32; states];
-    let mut hgap = vec![neg_inf; states];
-    let mut vgap = vec![neg_inf; states];
+    let mut previous_hgap = vec![neg_inf; band * 3];
+    let mut current_hgap = vec![neg_inf; band * 3];
     let mut trace = vec![Trace::Zero; states];
     let mut best_score = 0i32;
     let mut best_frame = 0usize;
     let mut best_i = 0usize;
     let mut best_j = 0usize;
 
-    for j in 1..=slen {
+    for j in column_begin + 1..=column_end {
+        current_hgap.fill(neg_inf);
+        let mut vgap = [neg_inf; 3];
         let subject_pos = j as i32 - 1;
         let lower = (d_begin + subject_pos).max(0);
         let upper = (d_end + subject_pos - 1).min(qlen as i32 - 1);
         if lower > upper {
+            std::mem::swap(&mut previous_hgap, &mut current_hgap);
             continue;
         }
 
@@ -691,16 +734,22 @@ pub fn banded_3frame_swipe_range(
                     }
                 }
 
+                let diagonal = i as i64 - j as i64;
+                let row = (diagonal - i64::from(d_begin)) as usize;
                 let h_open = h[idx(frame, i, j - 1)] - gap_open;
-                let h_extend = hgap[idx(frame, i, j - 1)] - gap_extend;
+                let h_extend = if row + 1 < band {
+                    previous_hgap[(row + 1) * 3 + frame] - gap_extend
+                } else {
+                    neg_inf
+                };
                 if h_open >= h_extend {
-                    hgap[current] = h_open;
+                    current_hgap[row * 3 + frame] = h_open;
                     if h_open > score {
                         score = h_open;
                         source = Trace::HGapOpen;
                     }
                 } else {
-                    hgap[current] = h_extend;
+                    current_hgap[row * 3 + frame] = h_extend;
                     if h_extend > score {
                         score = h_extend;
                         source = Trace::HGapExtend;
@@ -708,15 +757,15 @@ pub fn banded_3frame_swipe_range(
                 }
 
                 let v_open = h[idx(frame, i - 1, j)] - gap_open;
-                let v_extend = vgap[idx(frame, i - 1, j)] - gap_extend;
+                let v_extend = vgap[frame] - gap_extend;
                 if v_open >= v_extend {
-                    vgap[current] = v_open;
+                    vgap[frame] = v_open;
                     if v_open > score {
                         score = v_open;
                         source = Trace::VGapOpen;
                     }
                 } else {
-                    vgap[current] = v_extend;
+                    vgap[frame] = v_extend;
                     if v_extend > score {
                         score = v_extend;
                         source = Trace::VGapExtend;
@@ -738,10 +787,20 @@ pub fn banded_3frame_swipe_range(
                 }
             }
         }
+        std::mem::swap(&mut previous_hgap, &mut current_hgap);
     }
 
-    traceback_3frame(
-        query, subject, &h, &trace, qlen, best_score, best_frame, best_i, best_j,
+    traceback_3frame_with_index(
+        query,
+        subject,
+        &h,
+        &trace,
+        idx,
+        Some((score_matrix.gap_open(), gap_extend)),
+        best_score,
+        best_frame,
+        best_i,
+        best_j,
     )
 }
 
@@ -756,10 +815,36 @@ pub fn traceback_3frame(
     best_i: usize,
     best_j: usize,
 ) -> ThreeFrameSwResult {
+    traceback_3frame_with_index(
+        query,
+        subject,
+        h,
+        trace,
+        |frame, i, j| ((j * (qlen + 1) + i) * 3) + frame,
+        None,
+        best_score,
+        best_frame,
+        best_i,
+        best_j,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn traceback_3frame_with_index<I: Fn(usize, usize, usize) -> usize>(
+    query: [&[Letter]; 3],
+    subject: &[Letter],
+    h: &[i32],
+    trace: &[Trace],
+    idx: I,
+    gap_scheme: Option<(i32, i32)>,
+    best_score: i32,
+    best_frame: usize,
+    best_i: usize,
+    best_j: usize,
+) -> ThreeFrameSwResult {
     if best_score == 0 {
         return ThreeFrameSwResult::default();
     }
-    let idx = |frame: usize, i: usize, j: usize| -> usize { ((j * (qlen + 1) + i) * 3) + frame };
     let mut frame = best_frame;
     let mut i = best_i;
     let mut j = best_j;
@@ -772,7 +857,47 @@ pub fn traceback_3frame(
     };
 
     while i > 0 && j > 0 && h[idx(frame, i, j)] > 0 {
-        match trace[idx(frame, i, j)] {
+        let current_trace = trace[idx(frame, i, j)];
+        if matches!(
+            current_trace,
+            Trace::HGapOpen | Trace::HGapExtend | Trace::VGapOpen | Trace::VGapExtend
+        ) {
+            if let Some((open, extend)) = gap_scheme {
+                // Source traceback walks H scores at increasing gap length,
+                // checking horizontal before vertical at each length. A gap
+                // state's predecessor need not have been the best H state,
+                // so following best-cell trace flags alone loses affine gaps.
+                let score = h[idx(frame, i, j)];
+                let mut found = false;
+                for length in 1..=i.max(j) {
+                    let penalty = open + extend * length as i32;
+                    if length <= j && score + penalty == h[idx(frame, i, j - length)] {
+                        j -= length;
+                        ops.push((EditOperation::Deletion, length as i32));
+                        sw.gap_openings += 1;
+                        sw.gaps += length as i32;
+                        sw.length += length as i32;
+                        found = true;
+                        break;
+                    }
+                    if length <= i && score + penalty == h[idx(frame, i - length, j)] {
+                        i -= length;
+                        ops.push((EditOperation::Insertion, length as i32));
+                        sw.gap_openings += 1;
+                        sw.gaps += length as i32;
+                        sw.length += length as i32;
+                        found = true;
+                        break;
+                    }
+                }
+                assert!(
+                    found,
+                    "Three-frame affine-gap traceback predecessor is absent"
+                );
+                continue;
+            }
+        }
+        match current_trace {
             Trace::Diag => {
                 let q = query[frame][i - 1] & LETTER_MASK;
                 let s = subject[j - 1] & LETTER_MASK;
@@ -906,6 +1031,30 @@ fn banded_3frame_swipe_targets_with_limit(
     dna_len: i32,
     score_limit: Option<i32>,
 ) -> Vec<Hsp> {
+    banded_3frame_swipe_targets_with_controls(
+        query,
+        targets,
+        score_only,
+        score_matrix,
+        stat,
+        overflow,
+        dna_len,
+        score_limit,
+        1.0,
+    )
+}
+
+fn banded_3frame_swipe_targets_with_controls(
+    query: [&[Letter]; 3],
+    targets: &[DpTarget],
+    score_only: bool,
+    score_matrix: &ScoreMatrix,
+    stat: &mut DpStat,
+    overflow: &mut Vec<DpTarget>,
+    dna_len: i32,
+    score_limit: Option<i32>,
+    transcript_len_estimate: f64,
+) -> Vec<Hsp> {
     // `None` denotes the i32 overflow retry. Do not dispatch saturated lanes
     // back into the narrow SIMD kernel.
     if score_only && score_limit.is_some() {
@@ -923,12 +1072,10 @@ fn banded_3frame_swipe_targets_with_limit(
     }
     let mut out = Vec::new();
     for target in targets {
-        let band = target.band().max(0) as usize;
-        stat.gross_cells += band * target.cols.max(0) as usize * 3;
         if target.seq.is_empty() || target.d_end <= target.d_begin {
             continue;
         }
-        let result = banded_3frame_swipe_range(
+        let mut result = banded_3frame_swipe_range(
             query,
             &target.seq,
             target.d_begin,
@@ -939,17 +1086,49 @@ fn banded_3frame_swipe_targets_with_limit(
             overflow.push(target.clone());
             continue;
         }
-        if result.sw.score <= 0 {
-            continue;
+        if result.sw.score == 0 && !score_only {
+            // Source traceback always uses scalar i32 lanes. A zero best
+            // score leaves max_col=0 and selects the first valid zero cell
+            // in the first computed column, then emits an empty transcript.
+            let i0 = target.left_i1() + 1 - target.band();
+            let query_pos = i0.max(0);
+            let subject_pos = target.left_i1() - (target.d_end - 1);
+            if query_pos >= query[0].len() as i32
+                || subject_pos < 0
+                || subject_pos >= target.seq.len() as i32
+            {
+                // No computed first-column cell: Source's traceback may
+                // read unwritten storage or fail its scan. Preserve bounded
+                // native handling outside that valid traceback domain.
+                continue;
+            }
+            result.sw.query_begin = query_pos + 1;
+            result.sw.query_end = query_pos + 1;
+            result.sw.subject_begin = subject_pos + 1;
+            result.sw.subject_end = subject_pos + 1;
+            result.frame_begin = 0;
+            result.frame_end = 0;
         }
-        stat.net_cells += result.sw.length.max(0) as usize;
-        out.push(traceback_to_hsp(
+        if score_only {
+            let band = target.band();
+            let i1 = target.left_i1();
+            score_only_coordinates(
+                &mut result,
+                query[0].len() as i32,
+                band,
+                i1 + 1 - band,
+                i1,
+                target,
+            );
+        }
+        out.push(traceback_to_hsp_with_estimate(
             result,
             query,
             target,
             score_only,
             score_matrix,
             dna_len,
+            transcript_len_estimate,
         ));
     }
     out
@@ -964,7 +1143,7 @@ fn banded_3frame_score_only_simd(
     query: [&[Letter]; 3],
     targets: &[DpTarget],
     score_matrix: &ScoreMatrix,
-    stat: &mut DpStat,
+    _stat: &mut DpStat,
     overflow: &mut Vec<DpTarget>,
     dna_len: i32,
     score_limit: Option<i32>,
@@ -982,8 +1161,6 @@ fn banded_3frame_score_only_simd(
     for batch in targets.chunks(lanes) {
         let scores = score_batch_simd(query, batch, score_matrix, &mut scratch)?;
         for (lane, target) in batch.iter().enumerate() {
-            let band = target.band().max(0) as usize;
-            stat.gross_cells += band * target.cols.max(0) as usize * 3;
             let lane_score = scores.lanes[lane];
             if scores.overflow_mask & (1 << lane) != 0
                 || score_limit.is_some_and(|limit| lane_score.score >= limit)
@@ -991,28 +1168,24 @@ fn banded_3frame_score_only_simd(
                 overflow.push(target.clone());
                 continue;
             }
-            if lane_score.score <= 0 {
-                continue;
-            }
-
-            // The score-only C++ specialization does not retain traceback.
-            // Preserve its inexpensive coordinate estimate: the end point is
-            // exact, while the beginning follows the end-point diagonal.
-            let diagonal = lane_score.query_end - lane_score.subject_end;
-            let query_begin = diagonal.max(0);
-            let subject_begin = (-diagonal).max(0);
-            let result = ThreeFrameSwResult {
+            let mut result = ThreeFrameSwResult {
                 sw: SwResult {
                     score: lane_score.score,
-                    query_begin,
-                    query_end: lane_score.query_end,
-                    subject_begin,
                     subject_end: lane_score.subject_end,
                     ..Default::default()
                 },
-                frame_begin: lane_score.frame_end,
-                frame_end: lane_score.frame_end,
+                ..Default::default()
             };
+            let band = batch.iter().map(DpTarget::band).max().unwrap_or(0);
+            let i1 = batch.iter().map(DpTarget::left_i1).min().unwrap_or(0);
+            score_only_coordinates(
+                &mut result,
+                query[0].len() as i32,
+                band,
+                i1 + 1 - band,
+                i1,
+                target,
+            );
             out.push(traceback_to_hsp(
                 result,
                 query,
@@ -1075,7 +1248,7 @@ fn banded_3frame_swipe_target_range_with_limit(
     _parallel: bool,
     score_only_limit: i32,
 ) -> Vec<Hsp> {
-    targets.sort_by_key(|target| (target.left_i1(), target.band(), target.cols));
+    crate::dp::swipe::sort(targets, 24, 400);
     let mut overflow16 = Vec::new();
     let mut overflow32 = Vec::new();
     let dna_len = (query[0].len() * 3) as i32;
@@ -1115,6 +1288,197 @@ fn banded_3frame_swipe_target_range_with_limit(
     out
 }
 
+/// Source score-only traceback estimates query coverage from the shared band
+/// and best column; it deliberately has neither a trace nor subject bounds.
+fn score_only_coordinates(
+    result: &mut ThreeFrameSwResult,
+    query_len: i32,
+    band: i32,
+    i0: i32,
+    i1: i32,
+    target: &DpTarget,
+) {
+    let j0 = i1 - (target.d_end - 1);
+    // best=zero and max_col=0 are Source's initial state; a zero score
+    // never updates that column, irrespective of the target's first offset.
+    let max_col = if result.sw.score == 0 {
+        0
+    } else {
+        result.sw.subject_end - 1 - j0
+    };
+    let end = (i0 + max_col + band / 2).min(query_len);
+    result.sw = SwResult {
+        score: result.sw.score,
+        query_begin: (end - (j0 + max_col)).max(0),
+        query_end: end,
+        ..Default::default()
+    };
+    result.frame_begin = 0;
+    result.frame_end = 0;
+}
+
+/// Source strand-aware dispatcher with the actual untranslated DNA length.
+/// The target-parallel path schedules bounded chunks on the caller's pool,
+/// then merges real cell statistics and retries saturated i16 lanes in i32.
+#[allow(clippy::too_many_arguments)]
+pub fn banded_3frame_swipe_strand(
+    query: [&[Letter]; 3],
+    strand: Strand,
+    dna_len: i32,
+    targets: &mut [DpTarget],
+    score_matrix: &ScoreMatrix,
+    stat: &mut DpStat,
+    score_only: bool,
+    parallel: bool,
+) -> Vec<Hsp> {
+    banded_3frame_swipe_strand_with_controls(
+        query,
+        strand,
+        dna_len,
+        targets,
+        score_matrix,
+        stat,
+        score_only,
+        parallel,
+        256,
+        1.0,
+    )
+}
+
+pub fn banded_3frame_swipe_strand_with_controls(
+    query: [&[Letter]; 3],
+    strand: Strand,
+    dna_len: i32,
+    targets: &mut [DpTarget],
+    score_matrix: &ScoreMatrix,
+    stat: &mut DpStat,
+    score_only: bool,
+    parallel: bool,
+    swipe_chunk_size: u32,
+    transcript_len_estimate: f64,
+) -> Vec<Hsp> {
+    banded_3frame_swipe_strand_with_controls_and_bins(
+        query,
+        strand,
+        dna_len,
+        targets,
+        score_matrix,
+        stat,
+        score_only,
+        parallel,
+        swipe_chunk_size,
+        transcript_len_estimate,
+        24,
+        400,
+    )
+}
+
+/// Source DpTarget ordering uses configured band and column bins before
+/// left-i1; keep the old entrypoint as a default-profile wrapper.
+pub fn banded_3frame_swipe_strand_with_controls_and_bins(
+    query: [&[Letter]; 3],
+    strand: Strand,
+    dna_len: i32,
+    targets: &mut [DpTarget],
+    score_matrix: &ScoreMatrix,
+    stat: &mut DpStat,
+    score_only: bool,
+    parallel: bool,
+    swipe_chunk_size: u32,
+    transcript_len_estimate: f64,
+    band_bin: i32,
+    col_bin: i32,
+) -> Vec<Hsp> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    crate::dp::swipe::sort(targets, band_bin, col_bin);
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let run = |targets: &[DpTarget]| {
+        let mut stat = DpStat::default();
+        let mut overflow = Vec::new();
+        let hsps = banded_3frame_swipe_targets_with_controls(
+            query,
+            targets,
+            score_only,
+            score_matrix,
+            &mut stat,
+            &mut overflow,
+            dna_len,
+            score_only.then_some(i16::MAX as i32),
+            transcript_len_estimate,
+        );
+        (hsps, stat, overflow)
+    };
+    let batches = if parallel {
+        // Source fetch_add(0) never advances a nonempty worker cursor.
+        // Fail at that actual liveness boundary instead of hanging.
+        assert!(
+            swipe_chunk_size != 0,
+            "Source zero swipe chunk cannot make progress."
+        );
+        let next = AtomicUsize::new(0);
+        let targets: &[DpTarget] = targets;
+        (0..rayon::current_num_threads())
+            .into_par_iter()
+            .map(|_| {
+                let mut output = Vec::new();
+                let mut worker_stat = DpStat::default();
+                let mut overflow = Vec::new();
+                loop {
+                    let begin = next.fetch_add(swipe_chunk_size as usize, Ordering::Relaxed);
+                    if begin >= targets.len() {
+                        break;
+                    }
+                    let end = begin
+                        .saturating_add(swipe_chunk_size as usize)
+                        .min(targets.len());
+                    let (mut hsps, cells, mut failed) = run(&targets[begin..end]);
+                    output.append(&mut hsps);
+                    overflow.append(&mut failed);
+                    worker_stat.gross_cells += cells.gross_cells;
+                    worker_stat.net_cells += cells.net_cells;
+                }
+                (output, worker_stat, overflow)
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![run(targets)]
+    };
+    let mut out = Vec::new();
+    let mut overflow16 = Vec::new();
+    for (mut hsps, cells, mut overflow) in batches {
+        stat.gross_cells += cells.gross_cells;
+        stat.net_cells += cells.net_cells;
+        out.append(&mut hsps);
+        overflow16.append(&mut overflow);
+    }
+    // Source joins every narrow worker before its single serial i32 retry.
+    let mut overflow32 = Vec::new();
+    out.extend(banded_3frame_swipe_targets_with_controls(
+        query,
+        &overflow16,
+        score_only,
+        score_matrix,
+        stat,
+        &mut overflow32,
+        dna_len,
+        None,
+        transcript_len_estimate,
+    ));
+    if strand == Strand::Reverse {
+        for hsp in &mut out {
+            hsp.frame += 3;
+            hsp.query_source_range = Interval::new(
+                dna_len - hsp.query_source_range.end,
+                dna_len - hsp.query_source_range.begin,
+            );
+        }
+    }
+    out
+}
+
 fn traceback_to_hsp(
     result: ThreeFrameSwResult,
     query: [&[Letter]; 3],
@@ -1123,13 +1487,37 @@ fn traceback_to_hsp(
     score_matrix: &ScoreMatrix,
     dna_len: i32,
 ) -> Hsp {
+    traceback_to_hsp_with_estimate(
+        result,
+        query,
+        target,
+        score_only,
+        score_matrix,
+        dna_len,
+        1.0,
+    )
+}
+
+fn traceback_to_hsp_with_estimate(
+    result: ThreeFrameSwResult,
+    query: [&[Letter]; 3],
+    target: &DpTarget,
+    score_only: bool,
+    score_matrix: &ScoreMatrix,
+    dna_len: i32,
+    transcript_len_estimate: f64,
+) -> Hsp {
     let mut hsp = Hsp::new();
+    if !score_only {
+        hsp.transcript
+            .reserve((result.sw.score as f64 * transcript_len_estimate) as usize);
+    }
     hsp.backtraced = !score_only;
     hsp.score = result.sw.score;
     hsp.bit_score = score_matrix.bitscore(result.sw.score as f64);
     hsp.evalue = score_matrix.evalue(
         result.sw.score,
-        result.sw.query_end.max(1) as u32,
+        query[0].len() as u32,
         target.seq.len() as u32,
     );
     hsp.frame = result.frame_begin as i32;
@@ -1140,11 +1528,17 @@ fn traceback_to_hsp(
     hsp.gaps = result.sw.gaps;
     hsp.query_range = Interval::new(result.sw.query_begin, result.sw.query_end);
     hsp.subject_range = Interval::new(result.sw.subject_begin, result.sw.subject_end);
-    hsp.query_source_range = TranslatedPosition::absolute_interval(
-        TranslatedPosition::new(hsp.query_range.begin, Frame::from_index(hsp.frame)),
-        TranslatedPosition::new(hsp.query_range.end, Frame::from_index(hsp.frame)),
+    hsp.set_end(
+        result.sw.query_end,
+        result.sw.subject_end,
+        Frame::from_index(result.frame_end as i32),
         dna_len,
-        true,
+    );
+    hsp.set_begin(
+        result.sw.query_begin,
+        result.sw.subject_begin,
+        Frame::from_index(result.frame_begin as i32),
+        dna_len,
     );
     hsp.subject_source_range = hsp.subject_range;
     hsp.target_seq = target.seq.clone();
@@ -1294,7 +1688,8 @@ mod tests {
         assert_eq!(out[0].positives, q0.len() as i32);
         assert!(out[0].transcript.data().last().unwrap().is_terminator());
         assert!(overflow.is_empty());
-        assert!(stat.gross_cells > 0);
+        // Source's DP_STAT increments are commented out in the real kernel.
+        assert_eq!(stat, DpStat::default());
     }
 
     #[test]

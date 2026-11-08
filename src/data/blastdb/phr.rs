@@ -10,18 +10,48 @@ use super::volume::BlastVolume;
 use crate::basic::value::TaxId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SeqId {
+pub struct SeqId<N = String> {
     pub type_: String,
-    pub value: String,
+    pub value: N,
     pub version: Option<i64>,
-    pub chain: Option<String>,
+    pub chain: Option<N>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct BlastDefLine {
-    pub title: String,
-    pub seqids: Vec<SeqId>,
+pub struct BlastDefLine<N = String> {
+    pub title: N,
+    pub seqids: Vec<SeqId<N>>,
     pub taxid: Option<TaxId>,
+}
+
+pub type ByteSeqId = SeqId<Vec<u8>>;
+pub type ByteBlastDefLine = BlastDefLine<Vec<u8>>;
+impl ByteSeqId {
+    pub fn try_into_string(self) -> Result<SeqId, String> {
+        Ok(SeqId {
+            type_: self.type_,
+            value: String::from_utf8(self.value).map_err(|error| error.to_string())?,
+            version: self.version,
+            chain: self
+                .chain
+                .map(String::from_utf8)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+        })
+    }
+}
+impl ByteBlastDefLine {
+    pub fn try_into_string(self) -> Result<BlastDefLine, String> {
+        Ok(BlastDefLine {
+            title: String::from_utf8(self.title).map_err(|error| error.to_string())?,
+            seqids: self
+                .seqids
+                .into_iter()
+                .map(ByteSeqId::try_into_string)
+                .collect::<Result<_, _>>()?,
+            taxid: self.taxid,
+        })
+    }
 }
 
 pub fn tag_name_from_number(num: u32) -> String {
@@ -51,13 +81,13 @@ pub fn tag_name_from_number(num: u32) -> String {
     .to_string()
 }
 
-fn decode_seqid_into(node: &Node, seqid: &mut SeqId) {
+fn decode_seqid_into_bytes(node: &Node, seqid: &mut ByteSeqId) {
     for n4 in &node.children {
         match n4.tag.tag_number {
             1 => {
                 for n5 in &n4.children {
                     if n5.tag.tag_number == 26 {
-                        seqid.value = String::from_utf8_lossy(&n5.value).into_owned();
+                        seqid.value = n5.value.clone();
                     }
                 }
             }
@@ -73,18 +103,18 @@ fn decode_seqid_into(node: &Node, seqid: &mut SeqId) {
     }
 }
 
-fn decode_seqid(node: &Node) -> SeqId {
-    let mut seqid = SeqId::default();
+fn decode_seqid_bytes(node: &Node) -> ByteSeqId {
+    let mut seqid = ByteSeqId::default();
     for n1 in &node.children {
         if n1.tag.tag_number == 16 {
             for n2 in &n1.children {
                 match n2.tag.tag_number {
                     0 | 1 | 4 | 5 | 7 | 9 | 12 | 15 | 16 => {
                         seqid.type_ = tag_name_from_number(n2.tag.tag_number);
-                        decode_seqid_into(n2, &mut seqid);
+                        decode_seqid_into_bytes(n2, &mut seqid);
                         for n3 in &n2.children {
                             if n3.tag.tag_number == 16 {
-                                decode_seqid_into(n3, &mut seqid);
+                                decode_seqid_into_bytes(n3, &mut seqid);
                             }
                         }
                     }
@@ -97,19 +127,14 @@ fn decode_seqid(node: &Node) -> SeqId {
                                         0 => {
                                             for n5 in &n4.children {
                                                 if n5.tag.tag_number == 26 {
-                                                    seqid.value =
-                                                        String::from_utf8_lossy(&n5.value)
-                                                            .into_owned();
+                                                    seqid.value = n5.value.clone();
                                                 }
                                             }
                                         }
                                         3 => {
                                             for n5 in &n4.children {
                                                 if n5.tag.tag_number == 26 {
-                                                    seqid.chain = Some(
-                                                        String::from_utf8_lossy(&n5.value)
-                                                            .into_owned(),
-                                                    );
+                                                    seqid.chain = Some(n5.value.clone());
                                                 }
                                             }
                                         }
@@ -127,20 +152,20 @@ fn decode_seqid(node: &Node) -> SeqId {
     seqid
 }
 
-fn decode_defline(node: &Node, full_titles: bool, taxids: bool) -> BlastDefLine {
-    let mut defline = BlastDefLine::default();
+fn decode_defline_bytes(node: &Node, full_titles: bool, taxids: bool) -> ByteBlastDefLine {
+    let mut defline = ByteBlastDefLine::default();
     for n1 in &node.children {
         match n1.tag.tag_number {
             0 => {
                 if full_titles {
                     for n2 in &n1.children {
                         if n2.tag.tag_number == 26 {
-                            defline.title = String::from_utf8_lossy(&n2.value).into_owned();
+                            defline.title = n2.value.clone();
                         }
                     }
                 }
             }
-            1 => defline.seqids.push(decode_seqid(n1)),
+            1 => defline.seqids.push(decode_seqid_bytes(n1)),
             2 => {
                 if taxids {
                     for n2 in &n1.children {
@@ -156,19 +181,19 @@ fn decode_defline(node: &Node, full_titles: bool, taxids: bool) -> BlastDefLine 
     defline
 }
 
-pub fn decode_deflines(
+pub fn decode_deflines_bytes(
     header_data: &[u8],
     all: bool,
     full_titles: bool,
     taxids: bool,
-) -> Result<Vec<BlastDefLine>, String> {
+) -> Result<Vec<ByteBlastDefLine>, String> {
     let mut out = Vec::new();
     let nodes = decode(header_data).map_err(|e| e.to_string())?;
     if nodes.is_empty() {
         return Ok(out);
     }
     for node in &nodes[0].children {
-        out.push(decode_defline(node, full_titles, taxids));
+        out.push(decode_defline_bytes(node, full_titles, taxids));
         if !all && !taxids {
             break;
         }
@@ -177,13 +202,13 @@ pub fn decode_deflines(
 }
 
 impl BlastVolume {
-    pub fn deflines(
+    pub fn deflines_bytes(
         &mut self,
         oid: u32,
         all: bool,
         full_titles: bool,
         taxids: bool,
-    ) -> Result<Vec<BlastDefLine>, String> {
+    ) -> Result<Vec<ByteBlastDefLine>, String> {
         if oid >= self.index.num_oids {
             return Err("OID exceeds number of sequences in volume".to_string());
         }
@@ -194,25 +219,30 @@ impl BlastVolume {
         }
         let header_length = next_header_offset - header_offset;
         if oid != self.hdr_ptr {
-            self.phr_mapping
-                .seek(header_offset as i64, std::io::SeekFrom::Start(0))
-                .map_err(|e| e.to_string())?;
+            self.io_errors.capture(
+                self.phr_mapping
+                    .seek(header_offset as i64, std::io::SeekFrom::Start(0))
+                    .map_err(std::io::Error::other),
+            )?;
         }
         self.hdr_ptr = oid + 1;
-        let data = self
-            .phr_mapping
-            .read(header_length)
-            .map_err(|e| e.to_string())?;
-        decode_deflines(data, all, full_titles, taxids)
+        let data = self.io_errors.capture(
+            self.phr_mapping
+                .read(header_length)
+                .map_err(std::io::Error::other),
+        )?;
+        decode_deflines_bytes(data, all, full_titles, taxids)
     }
 
     pub fn raw_deflines(&mut self, count: u32) -> Result<Vec<u8>, String> {
         let len = (self.index.header_index[(self.hdr_ptr + count) as usize]
             - self.index.header_index[self.hdr_ptr as usize]) as usize;
         let mut data = vec![0u8; len];
-        self.phr_mapping
-            .read_exact(&mut data)
-            .map_err(|e| e.to_string())?;
+        self.io_errors.capture(
+            self.phr_mapping
+                .read_exact(&mut data)
+                .map_err(std::io::Error::other),
+        )?;
         self.hdr_ptr += count;
         Ok(data)
     }
@@ -226,43 +256,94 @@ pub fn id_len(header_index: &[u32], oid: usize) -> usize {
     (header_index[oid + 1] - header_index[oid]) as usize
 }
 
-pub fn format_seqid(id: &SeqId) -> String {
-    if id.value.is_empty() {
-        return "N/A".to_string();
+pub fn format_seqid_bytes<N: AsRef<[u8]>>(id: &SeqId<N>) -> Vec<u8> {
+    if id.value.as_ref().is_empty() {
+        return b"N/A".to_vec();
     }
-    let mut output = id.value.clone();
+    let mut output = id.value.as_ref().to_vec();
     if let Some(version) = id.version {
-        output.push('.');
-        output.push_str(&version.to_string());
+        output.push(b'.');
+        output.extend_from_slice(version.to_string().as_bytes());
     }
     if let Some(chain) = &id.chain {
-        if !chain.is_empty() {
-            output.push('_');
-            output.push_str(chain);
+        if !chain.as_ref().is_empty() {
+            output.push(b'_');
+            output.extend_from_slice(chain.as_ref());
         }
     }
     output
 }
-
-pub fn build_title(deflines: &[BlastDefLine], delimiter: &str, all: bool) -> String {
-    let mut output = String::new();
-    for (index, defline) in deflines.iter().enumerate() {
+pub fn build_title_bytes<N: AsRef<[u8]>>(
+    deflines: &[BlastDefLine<N>],
+    delimiter: &[u8],
+    all: bool,
+) -> Vec<u8> {
+    let mut output = Vec::new();
+    let delimiter = &delimiter[..delimiter
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(delimiter.len())];
+    for (index, line) in deflines.iter().enumerate() {
         if index != 0 {
             if !all {
                 break;
             }
-            output.push_str(delimiter);
+            output.extend_from_slice(delimiter);
         }
-        output.push_str(&format_seqid(
-            defline.seqids.first().unwrap_or(&SeqId::default()),
-        ));
-        output.push(' ');
-        output.push_str(&defline.title);
+        if let Some(id) = line.seqids.first() {
+            output.extend_from_slice(&format_seqid_bytes(id));
+        } else {
+            output.extend_from_slice(b"N/A");
+        }
+        output.push(b' ');
+        output.extend_from_slice(line.title.as_ref());
     }
     if output.is_empty() {
-        output = "N/A".to_string();
+        output.extend_from_slice(b"N/A");
     }
     output
+}
+pub fn format_seqid(id: &SeqId) -> String {
+    String::from_utf8(format_seqid_bytes(id)).expect("String SeqId must render UTF-8")
+}
+pub fn build_title(deflines: &[BlastDefLine], delimiter: &str, all: bool) -> String {
+    String::from_utf8(build_title_bytes(deflines, delimiter.as_bytes(), all))
+        .expect("String deflines must render UTF-8")
+}
+pub fn decode_deflines(
+    data: &[u8],
+    all: bool,
+    full_titles: bool,
+    taxids: bool,
+) -> Result<Vec<BlastDefLine>, String> {
+    decode_deflines_bytes(data, all, full_titles, taxids)?
+        .into_iter()
+        .map(ByteBlastDefLine::try_into_string)
+        .collect()
+}
+impl BlastVolume {
+    pub fn deflines(
+        &mut self,
+        oid: u32,
+        all: bool,
+        full_titles: bool,
+        taxids: bool,
+    ) -> Result<Vec<BlastDefLine>, String> {
+        self.deflines_bytes(oid, all, full_titles, taxids)?
+            .into_iter()
+            .map(ByteBlastDefLine::try_into_string)
+            .collect()
+    }
+}
+#[cfg(test)]
+fn decode_seqid(node: &Node) -> SeqId {
+    decode_seqid_bytes(node).try_into_string().unwrap()
+}
+#[cfg(test)]
+fn decode_defline(node: &Node, full_titles: bool, taxids: bool) -> BlastDefLine {
+    decode_defline_bytes(node, full_titles, taxids)
+        .try_into_string()
+        .unwrap()
 }
 
 #[cfg(test)]
@@ -280,6 +361,29 @@ mod tests {
             value: value.to_vec(),
             children,
         }
+    }
+
+    #[test]
+    fn raw_pdb_chain_and_c_string_delimiter_preserve_source_domains() {
+        let molecule = node(0, &[], vec![node(26, b"P\xff\0ID", vec![])]);
+        let chain = node(3, &[], vec![node(26, b"\x80", vec![])]);
+        let pdb = node(14, &[], vec![node(16, &[], vec![molecule, chain])]);
+        let input = node(1, &[], vec![node(16, &[], vec![pdb])]);
+        let id = decode_seqid_bytes(&input);
+        assert_eq!(format_seqid_bytes(&id), b"P\xff\0ID_\x80");
+        assert!(id.clone().try_into_string().is_err());
+        let lines = vec![
+            ByteBlastDefLine {
+                title: b"T\xfe\0tail".to_vec(),
+                seqids: vec![id],
+                taxid: None
+            };
+            2
+        ];
+        assert_eq!(
+            build_title_bytes(&lines, b"|\0ignored", true),
+            b"P\xff\0ID_\x80 T\xfe\0tail|P\xff\0ID_\x80 T\xfe\0tail"
+        );
     }
 
     #[test]

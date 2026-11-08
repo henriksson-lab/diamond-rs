@@ -4,6 +4,7 @@ use std::fs::File as StdFile;
 #[cfg(unix)]
 use std::io::Seek;
 use std::io::SeekFrom;
+use std::path::{Path, PathBuf};
 
 use super::{
     Compressor, Deserializer, FilePrimitive, FileSource, InputStreamBuffer, IoError, IoResult,
@@ -33,18 +34,21 @@ pub enum InputFileStream {
     Memory(VecStream),
 }
 
-fn make_decompressor(
+fn make_decompressor_with_buffer_size(
     compressor: Compressor,
     buffer: InputStreamBuffer<FileSource>,
+    buffer_size: usize,
 ) -> IoResult<InputFileStream> {
     match compressor {
-        Compressor::Zlib => Ok(InputFileStream::Zlib(InputStreamBuffer::new(
+        Compressor::Zlib => Ok(InputFileStream::Zlib(InputStreamBuffer::with_buffer_size(
             ZlibSource::new(buffer)?,
             0,
+            buffer_size,
         ))),
-        Compressor::Zstd => Ok(InputFileStream::Zstd(InputStreamBuffer::new(
+        Compressor::Zstd => Ok(InputFileStream::Zstd(InputStreamBuffer::with_buffer_size(
             ZstdSource::new(buffer)?,
             0,
+            buffer_size,
         ))),
         Compressor::None => Err(IoError::Other(String::new())),
     }
@@ -86,8 +90,13 @@ impl StreamEntity for InputFileStream {
         dispatch_stream!(self, stream => stream.close())
     }
 
+    fn file_path(&self) -> &Path {
+        dispatch_stream!(self, stream => stream.file_path())
+    }
     fn file_name(&self) -> &str {
-        dispatch_stream!(self, stream => stream.file_name())
+        self.file_path()
+            .to_str()
+            .expect("Non-UTF8 OS path; use file_path")
     }
 
     fn file(&mut self) -> IoResult<&mut StdFile> {
@@ -114,28 +123,102 @@ impl StreamEntity for InputFileStream {
 #[derive(Debug)]
 pub struct InputFile {
     pub(crate) deserializer: Deserializer<InputFileStream>,
-    pub file_name: String,
+    pub file_name: PathBuf,
     pub unlinked: bool,
     pub temp_file: bool,
 }
 
+impl std::io::Read for InputFile {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.read_raw(bytes).map_err(std::io::Error::other)
+    }
+}
+
 impl InputFile {
+    pub fn file_path(&self) -> &Path {
+        &self.file_name
+    }
+    #[cfg(unix)]
+    pub fn file_name_bytes(&self) -> &[u8] {
+        use std::os::unix::ffi::OsStrExt;
+        self.file_name.as_os_str().as_bytes()
+    }
+    pub fn try_file_name(&self) -> IoResult<&str> {
+        self.file_name
+            .to_str()
+            .ok_or_else(|| IoError::Other("OS path is not UTF-8; use file_path".into()))
+    }
     pub const BUFFERED: i32 = 1;
     pub const NO_AUTODETECT: i32 = 2;
 
     /// C++ `InputFile(const string&, int)`.
     pub fn new(file_name: &str, flags: i32) -> IoResult<Self> {
-        let mut buffer = InputStreamBuffer::new(FileSource::new(file_name)?, flags);
+        Self::new_path(Path::new(file_name), flags)
+    }
+    pub fn new_path(file_name: &Path, flags: i32) -> IoResult<Self> {
+        Self::with_buffer_size_path(file_name, flags, super::DEFAULT_FILE_BUFFER_SIZE)
+    }
+
+    /// Explicit replacement for Source's process-global file buffer setting.
+    pub fn with_buffer_size(file_name: &str, flags: i32, buffer_size: usize) -> IoResult<Self> {
+        Self::with_buffer_size_path(Path::new(file_name), flags, buffer_size)
+    }
+    pub fn with_buffer_size_path(
+        file_name: &Path,
+        flags: i32,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        Self::with_codec_profile(file_name, flags, buffer_size, true, false)
+    }
+
+    /// Source command build profile, preserving the same stream owner/type.
+    pub fn with_source_profile(file_name: &str, flags: i32, buffer_size: usize) -> IoResult<Self> {
+        Self::with_source_profile_path(Path::new(file_name), flags, buffer_size)
+    }
+    pub fn with_source_profile_path(
+        file_name: &Path,
+        flags: i32,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        Self::with_codec_profile(file_name, flags, buffer_size, cfg!(feature = "zstd"), true)
+    }
+    pub fn source_new(file_name: &str, flags: i32) -> IoResult<Self> {
+        Self::source_new_path(Path::new(file_name), flags)
+    }
+    pub fn source_new_path(file_name: &Path, flags: i32) -> IoResult<Self> {
+        Self::with_source_profile_path(file_name, flags, super::DEFAULT_FILE_BUFFER_SIZE)
+    }
+    fn with_codec_profile(
+        file_name: &Path,
+        flags: i32,
+        buffer_size: usize,
+        allow_zstd: bool,
+        source_profile: bool,
+    ) -> IoResult<Self> {
+        let source = FileSource::new_path(file_name)?;
+        if buffer_size == 0 && !source_profile {
+            // Source's zero-capacity regular-file compressor peek fails
+            // without setting EOF (fread(..., 0) performs no read).
+            return Err(IoError::Other("Invalid peek".into()));
+        }
+        Vec::<u8>::new().try_reserve_exact(buffer_size).map_err(|_| IoError::Other(
+            "Failed to allocate sufficient memory. Please refer to the online wiki for instructions on memory usage.".into()
+        ))?;
+        let mut buffer = InputStreamBuffer::with_source_buffer_size(source, flags, buffer_size);
         let mut compressor = None;
 
-        if !file_name.is_empty() && file_name != "-" {
+        if !file_name.as_os_str().is_empty() && file_name.as_os_str() != std::ffi::OsStr::new("-") {
             #[cfg(not(windows))]
             {
-                let metadata = std::fs::metadata(file_name).map_err(|_| {
-                    IoError::Other(format!("Error calling stat on file {file_name}"))
-                })?;
+                let metadata = std::fs::metadata(super::source_c_path(file_name).as_ref())
+                    .map_err(|_| {
+                        IoError::path_message(b"Error calling stat on file ", file_name)
+                    })?;
                 if metadata.is_file() && flags & Self::NO_AUTODETECT == 0 {
                     buffer.fetch()?;
+                    if buffer.data().len() < 4 && !buffer.eof()? {
+                        return Err(IoError::Other("Invalid peek".into()));
+                    }
                     if buffer.data().len() >= 4 {
                         let detected = detect_compressor(buffer.data());
                         if detected != Compressor::None {
@@ -147,6 +230,9 @@ impl InputFile {
             #[cfg(windows)]
             if flags & Self::NO_AUTODETECT == 0 {
                 buffer.fetch()?;
+                if buffer.data().len() < 4 && !buffer.eof()? {
+                    return Err(IoError::Other("Invalid peek".into()));
+                }
                 if buffer.data().len() >= 4 {
                     let detected = detect_compressor(buffer.data());
                     if detected != Compressor::None {
@@ -157,13 +243,20 @@ impl InputFile {
         }
 
         let stream = match compressor {
-            Some(compressor) => make_decompressor(compressor, buffer)?,
+            Some(compressor) => {
+                if compressor == Compressor::Zstd && !allow_zstd {
+                    return Err(IoError::Other(
+                        "Executable was not compiled with ZStd support.".into(),
+                    ));
+                }
+                make_decompressor_with_buffer_size(compressor, buffer, buffer_size)?
+            }
             None => InputFileStream::File(buffer),
         };
 
         Ok(Self {
             deserializer: Deserializer::new(stream),
-            file_name: file_name.to_string(),
+            file_name: file_name.to_path_buf(),
             unlinked: false,
             temp_file: false,
         })
@@ -181,10 +274,10 @@ impl InputFile {
             let mut file = data.try_clone_file()?;
             file.seek(SeekFrom::Start(0))
                 .map_err(|_| IoError::Other("Error calling fseek.".to_string()))?;
-            FileSource::from_file(&data.name, file)
+            FileSource::try_from_file_path(&data.name, file)?
         };
         #[cfg(not(unix))]
-        let source = FileSource::new(&data.name)?;
+        let source = FileSource::new_path(&data.name)?;
 
         Self::from_source(source, data.name.clone(), data.unlinked, flags, compressor)
     }
@@ -195,50 +288,102 @@ impl InputFile {
         flags: i32,
         compressor: Compressor,
     ) -> IoResult<Self> {
-        let file_name = tmp_file.file_name();
-        let file = tmp_file
-            .file()?
-            .try_clone()
-            .map_err(|_| IoError::FileOpen(file_name.clone()))?;
+        Self::from_temp_file_with_buffer_size(
+            tmp_file,
+            flags,
+            compressor,
+            super::DEFAULT_FILE_BUFFER_SIZE,
+        )
+    }
+    pub fn from_temp_file_with_buffer_size(
+        tmp_file: &mut TempFile,
+        flags: i32,
+        compressor: Compressor,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        let file_name = tmp_file.file_path().to_path_buf();
+        #[cfg(any(unix, windows))]
+        let shared = tmp_file.shared_stdio()?;
         tmp_file.rewind()?;
-        Self::from_source(
-            FileSource::from_file(&file_name, file),
+        #[cfg(any(unix, windows))]
+        let source = if let Some(shared) = shared {
+            FileSource::from_shared_path(&file_name, shared)
+        } else {
+            FileSource::try_from_file_path(&file_name, tmp_file.clone_file()?)?
+        };
+        #[cfg(not(any(unix, windows)))]
+        let source = FileSource::from_file_path(&file_name, tmp_file.clone_file()?);
+        Self::from_source_with_buffer_size(
+            source,
             file_name,
             tmp_file.unlinked(),
             flags,
             compressor,
+            buffer_size,
         )
     }
 
     /// C++ `InputFile(OutputFile&, int)`.
     pub fn from_output_file(out_file: &mut OutputFile, flags: i32) -> IoResult<Self> {
-        let file_name = out_file.file_name();
-        let file = out_file
-            .file()?
-            .try_clone()
-            .map_err(|_| IoError::FileOpen(file_name.clone()))?;
+        Self::from_output_file_with_buffer_size(out_file, flags, super::DEFAULT_FILE_BUFFER_SIZE)
+    }
+
+    pub fn from_output_file_with_buffer_size(
+        out_file: &mut OutputFile,
+        flags: i32,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        let file_name = out_file.file_path().to_path_buf();
+        #[cfg(any(unix, windows))]
+        let shared = out_file.shared_stdio()?;
         out_file.rewind()?;
-        Self::from_source(
-            FileSource::from_file(&file_name, file),
+        #[cfg(any(unix, windows))]
+        let source = if let Some(shared) = shared {
+            FileSource::from_shared_path(&file_name, shared)
+        } else {
+            FileSource::try_from_file_path(&file_name, out_file.clone_file()?)?
+        };
+        #[cfg(not(any(unix, windows)))]
+        let source = FileSource::from_file_path(&file_name, out_file.clone_file()?);
+        Self::from_source_with_buffer_size(
+            source,
             file_name,
             false,
             flags,
             Compressor::None,
+            buffer_size,
         )
     }
 
     fn from_source(
         source: FileSource,
-        file_name: String,
+        file_name: PathBuf,
         unlinked: bool,
         flags: i32,
         compressor: Compressor,
     ) -> IoResult<Self> {
-        let buffer = InputStreamBuffer::new(source, flags);
+        Self::from_source_with_buffer_size(
+            source,
+            file_name,
+            unlinked,
+            flags,
+            compressor,
+            super::DEFAULT_FILE_BUFFER_SIZE,
+        )
+    }
+    fn from_source_with_buffer_size(
+        source: FileSource,
+        file_name: PathBuf,
+        unlinked: bool,
+        flags: i32,
+        compressor: Compressor,
+        buffer_size: usize,
+    ) -> IoResult<Self> {
+        let buffer = InputStreamBuffer::with_source_buffer_size(source, flags, buffer_size);
         let stream = if compressor == Compressor::None {
             InputFileStream::File(buffer)
         } else {
-            make_decompressor(compressor, buffer)?
+            make_decompressor_with_buffer_size(compressor, buffer, buffer_size)?
         };
         Ok(Self {
             deserializer: Deserializer::new(stream),
@@ -250,11 +395,13 @@ impl InputFile {
 
     pub fn close_and_delete(&mut self) -> IoResult<()> {
         self.close()?;
-        if !self.unlinked && std::fs::remove_file(&self.file_name).is_err() {
-            eprintln!(
-                "Warning: Failed to delete temporary file {}",
-                self.file_name
-            );
+        if !self.unlinked
+            && std::fs::remove_file(super::source_c_path(&self.file_name).as_ref()).is_err()
+        {
+            let mut bytes = b"Warning: Failed to delete temporary file ".to_vec();
+            bytes.extend_from_slice(&super::path_diagnostic_bytes(&self.file_name)?);
+            bytes.push(b'\n');
+            let _ = std::io::Write::write_all(&mut super::console::stderr(), &bytes);
         }
         Ok(())
     }
@@ -274,6 +421,11 @@ impl InputFile {
 
     pub(crate) fn into_deserializer(self) -> Deserializer<InputFileStream> {
         self.deserializer
+    }
+
+    /// Codec-backed inputs remain non-seekable even with prefetched data.
+    pub fn seekable(&self) -> bool {
+        self.deserializer.seekable()
     }
 
     pub fn rewind(&mut self) -> IoResult<()> {
@@ -345,6 +497,10 @@ impl InputFile {
         self.deserializer.read_to(dst, delimiter)
     }
 
+    pub fn peek_bytes(&mut self, count: usize) -> IoResult<Vec<u8>> {
+        self.deserializer.peek_bytes(count)
+    }
+
     pub fn peek(&mut self, count: usize) -> IoResult<String> {
         self.deserializer.peek(count)
     }
@@ -360,6 +516,65 @@ impl InputFile {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn os_paths_preserve_non_utf8_through_codecs_errors_and_temp_handoff() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let root = std::env::temp_dir().join(format!(
+            "diamond-raw-path-{}-{}",
+            std::process::id(),
+            crate::util::test_path_component()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let dir = root.join(std::ffi::OsString::from_vec(b"directory\xff".to_vec()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join(std::ffi::OsString::from_vec(b"file\x80.gz".to_vec()));
+        let mut output =
+            super::OutputFile::with_source_profile_path(&path, super::Compressor::Zlib, "wb", 32)
+                .unwrap();
+        assert_eq!(output.file_path(), path);
+        assert!(output.try_file_name().is_err());
+        output.write_raw(b"actual raw path").unwrap();
+        output.close().unwrap();
+        let mut input = super::InputFile::with_source_profile_path(&path, 0, 32).unwrap();
+        assert_eq!(input.file_name_bytes(), path.as_os_str().as_bytes());
+        let mut bytes = [0; 15];
+        assert_eq!(input.read_raw(&mut bytes).unwrap(), 15);
+        assert_eq!(&bytes, b"actual raw path");
+        input.close().unwrap();
+        let missing = dir.join(std::ffi::OsString::from_vec(b"missing\xfe".to_vec()));
+        let error = super::InputFile::new_path(&missing, 0).unwrap_err();
+        let saved = crate::util::io::file_open_error::find(&error).unwrap();
+        assert_eq!(saved.path, missing);
+        let mut expected = b"Error opening file ".to_vec();
+        expected.extend_from_slice(missing.as_os_str().as_bytes());
+        assert_eq!(saved.try_message_bytes().unwrap(), expected);
+        let data = crate::util::io::TempFileData::init_in(true, &dir, false).unwrap();
+        assert_eq!(data.name.parent(), Some(dir.as_path()));
+        assert!(data.unlinked);
+        assert!(!data.name.exists());
+        let mut temp = crate::util::io::TempFile::from_temp_file_data(&data).unwrap();
+        temp.write_raw(b"abc").unwrap();
+        let mut alias = super::InputFile::from_temp_file_with_buffer_size(
+            &mut temp,
+            0,
+            super::Compressor::None,
+            32,
+        )
+        .unwrap();
+        assert_eq!(alias.file_path(), data.name);
+        let mut bytes = [0; 3];
+        alias.read_raw(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"abc");
+        alias.close().unwrap();
+        drop(alias);
+        drop(temp);
+        drop(data);
+        drop(input);
+        drop(output);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use std::io::Write;
 

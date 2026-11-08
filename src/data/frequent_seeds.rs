@@ -147,7 +147,7 @@ impl FrequentSeeds {
                 query_seqs.data_mut_at(pos)[0] |= crate::basic::value::SEED_MASK;
             }
         }
-        Ok(FrequentSeedsBuildStats {
+        let stats = FrequentSeedsBuildStats {
             ref_mean: ref_sd.mean(),
             ref_sd: ref_sd.sd(),
             query_mean: query_sd.mean(),
@@ -155,7 +155,14 @@ impl FrequentSeeds {
             ref_max_n,
             query_max_n,
             masked_positions,
-        })
+        };
+        let f = crate::output::format::format_default_float;
+        let message = format!("Seed frequency mean (reference) = {}, SD = {}\nSeed frequency mean (query) = {}, SD = {}\nSeed frequency cap query: {}, reference: {}\nMasked positions = {}\n", f(stats.ref_mean),f(stats.ref_sd),f(stats.query_mean),f(stats.query_sd),stats.query_max_n,stats.ref_max_n,stats.masked_positions);
+        let _ = crate::util::log_stream::log_stream()
+            .lock()
+            .unwrap()
+            .write(message);
+        Ok(stats)
     }
 
     /// Matches C++ `FrequentSeeds::build(sid, range, query_seed_hits, ref_seed_hits, query_seqs, freq_sd)`.

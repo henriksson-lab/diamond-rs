@@ -12,3 +12,5 @@ pub mod legacy;
 pub mod output;
 pub mod target;
 pub mod ungapped;
+
+pub(crate) mod native;

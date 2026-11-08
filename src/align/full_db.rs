@@ -22,6 +22,16 @@ pub fn full_db_align(
     cfg: &GappedScoreConfig,
     score_matrix: &ScoreMatrix,
 ) -> Vec<Target> {
+    assert!(
+        cfg.query_contexts > 0
+            && cfg.query_contexts <= query_seq.len()
+            && cfg.query_contexts <= crate::basic::consts::MAX_CONTEXT as usize,
+        "full database alignment query-context count mismatch"
+    );
+    assert!(
+        !cfg.comp_based_stats_hauser || cfg.query_contexts <= query_cbs.len(),
+        "full database alignment CBS context count mismatch"
+    );
     let swipe_statistics = Arc::new(Mutex::new(Statistics::new()));
     let ref_seqs = target_block.seqs();
     let mut hsps = Vec::new();
@@ -41,10 +51,18 @@ pub fn full_db_align(
         params.flags = flags | Flags::FULL_MATRIX;
         params.target_max_len = ref_seqs.max_len(0, ref_seqs.len() as BlockId);
         params.v = hsp_values;
+        params.band_bin = cfg.band_bin;
+        params.col_bin = cfg.col_bin;
         params.cutoff_score_8bit = cfg.cutoff_score_8bit;
         params.max_swipe_dp = cfg.max_swipe_dp;
+        params.swipe_task_size = cfg.swipe_task_size;
+        params.threads_align = cfg.threads_align;
+        params.target_parallel_verbosity = cfg.target_parallel_verbosity;
+        params.error_sink = cfg.swipe_error.clone();
+        params.transcript_len_estimate = cfg.transcript_len_estimate;
         params.approx_backtrace = cfg.approx_backtrace;
         params.max_evalue = cfg.max_evalue;
+        params.min_bit_score = cfg.min_bit_score;
         params.query_cover = cfg.query_cover;
         params.subject_cover = cfg.subject_cover;
         params.query_or_target_cover = cfg.query_or_target_cover;

@@ -16,9 +16,21 @@ impl<S: StreamEntity> Serializer<S> {
     /// C++ `Serializer::Serializer(StreamEntity*)`, including initial buffer
     /// acquisition through `reset_buffer()`.
     pub fn new(buffer: S) -> Self {
+        Self::with_buffer_size(buffer, DEFAULT_FILE_BUFFER_SIZE)
+    }
+
+    /// Explicit size of the source serializer's writable buffer.
+    pub fn with_buffer_size(buffer: S, buffer_size: usize) -> Self {
+        assert!(buffer_size != 0, "serializer buffer size must be nonzero");
+        Self::with_source_buffer_size(buffer, buffer_size)
+    }
+
+    /// Zero-sized Source staging is valid until a nonempty write. Source's
+    /// serializer loops forever there; report that nonprogress boundary safely.
+    pub fn with_source_buffer_size(buffer: S, buffer_size: usize) -> Self {
         Self {
             buffer,
-            pending: vec![0; DEFAULT_FILE_BUFFER_SIZE],
+            pending: vec![0; buffer_size],
             pending_pos: 0,
         }
     }
@@ -82,6 +94,11 @@ impl<S: StreamEntity> Serializer<S> {
     }
 
     pub fn write_raw(&mut self, ptr: &[u8]) -> IoResult<()> {
+        if self.pending.is_empty() && !ptr.is_empty() {
+            return Err(super::IoError::Other(
+                "Source zero-capacity output cannot make progress.".into(),
+            ));
+        }
         let mut offset = 0;
         while offset < ptr.len() {
             if self.pending.is_empty() || self.pending_pos == self.pending.len() {
@@ -131,13 +148,28 @@ impl<S: StreamEntity> Serializer<S> {
         self.buffer.close()
     }
 
+    pub fn file_path(&self) -> &std::path::Path {
+        self.buffer.file_path()
+    }
     pub fn file_name(&self) -> String {
-        self.buffer.file_name().to_string()
+        self.file_path()
+            .to_str()
+            .expect("Non-UTF8 OS path; use file_path")
+            .to_owned()
     }
 
     /// Matches C++ `file()` without an implicit serializer flush.
     pub fn file(&mut self) -> IoResult<&mut File> {
         self.buffer.file()
+    }
+
+    #[cfg(any(unix, windows))]
+    pub(crate) fn shared_stdio(&mut self) -> IoResult<Option<super::cstdio_file::SharedCstdio>> {
+        self.buffer.shared_stdio()
+    }
+
+    pub fn clone_file(&mut self) -> IoResult<File> {
+        self.buffer.clone_file()
     }
 
     pub fn consume(&mut self, ptr: &[u8]) -> IoResult<()> {
@@ -157,9 +189,6 @@ impl<S: StreamEntity> Serializer<S> {
     }
 
     pub fn reset_buffer(&mut self) {
-        if self.pending.is_empty() {
-            self.pending = vec![0; DEFAULT_FILE_BUFFER_SIZE];
-        }
         self.pending_pos = 0;
     }
 

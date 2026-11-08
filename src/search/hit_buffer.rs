@@ -8,7 +8,7 @@ use super::hit::Hit;
 use crate::basic::seed::SeedOffset;
 use crate::basic::value::BlockId;
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -61,9 +61,23 @@ pub struct HitBuffer {
     stream_last_key: Vec<Option<(u32, SeedOffset)>>,
     error: Option<String>,
     allocated: bool,
+    no_unlink: bool,
+    loader_workers: usize,
 }
 
 impl HitBuffer {
+    pub(crate) fn set_load_threads(&mut self, load_threads: i32, threads: usize) {
+        self.loader_workers = if threads > 1 {
+            (threads - 1).min(load_threads.max(1) as usize).max(1)
+        } else {
+            1
+        };
+    }
+    /// Preserve real spill files for Source's --no-unlink debugging mode.
+    pub(crate) fn set_no_unlink(&mut self, no_unlink: bool) {
+        self.no_unlink = no_unlink;
+    }
+
     /// Compatibility constructor for the historical in-memory Rust API.
     pub fn new(num_bins: usize) -> Self {
         Self::with_key_partition((1..=num_bins as u32).collect())
@@ -113,12 +127,9 @@ impl HitBuffer {
         let mut temp_files = Vec::new();
         let mut temp_writers = (0..n).map(|_| None).collect::<Vec<_>>();
         if mode == HitBufferMode::Disk {
-            let dir = if tmpdir.as_ref().as_os_str().is_empty() {
-                std::env::temp_dir()
-            } else {
-                tmpdir.as_ref().to_path_buf()
-            };
-            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            // Source TempFile uses the configured directory directly. Empty
+            // means cwd; it does not consult TMPDIR or create a missing path.
+            let dir = tmpdir.as_ref().to_path_buf();
             let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
             for bin in 0..n {
                 let path = dir.join(format!(
@@ -158,6 +169,11 @@ impl HitBuffer {
             stream_last_key: vec![None; n],
             error: None,
             allocated: false,
+            no_unlink: false,
+            loader_workers: std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .saturating_sub(1)
+                .clamp(1, 16),
         })
     }
 
@@ -347,6 +363,7 @@ impl HitBuffer {
                 let long_subject_offsets = self.long_subject_offsets;
                 let max_query = self.max_query;
                 let max_target = self.max_target;
+                let loader_workers = self.loader_workers;
                 let mut reuse = if self.spare_hits.capacity() >= self.pending_hits.capacity() {
                     std::mem::take(&mut self.spare_hits)
                 } else {
@@ -363,6 +380,7 @@ impl HitBuffer {
                             max_query,
                             max_target,
                             reuse,
+                            loader_workers,
                         )
                     }) {
                     Ok(worker) => self.load_worker = Some(worker),
@@ -379,6 +397,13 @@ impl HitBuffer {
     /// vectors instead of materializing a flat `Hit` array which the caller
     /// would immediately copy and regroup.
     pub(crate) fn load_grouped(&mut self) -> bool {
+        self.load_grouped_with_limit(u64::MAX)
+    }
+
+    /// Grouped counterpart of Source HitBuffer::load(max_size). Its loop
+    /// currently retrieves exactly one bin even when the budget is zero;
+    /// retain this behavior instead of inventing cross-bin coalescing.
+    pub(crate) fn load_grouped_with_limit(&mut self, _max_size: u64) -> bool {
         if self.pending || self.load_worker.is_some() || self.grouped_load_worker.is_some() {
             self.error = Some("HitBuffer::load_grouped(): previous load still in progress".into());
             return false;
@@ -405,6 +430,7 @@ impl HitBuffer {
         let max_query = self.max_query;
         let max_target = self.max_target;
         let reuse = std::mem::take(&mut self.spare_grouped_hits);
+        let loader_workers = self.loader_workers;
         match thread::Builder::new()
             .name("diamond-rs-grouped-hit-loader".to_string())
             .spawn(move || {
@@ -417,6 +443,7 @@ impl HitBuffer {
                     begin,
                     end,
                     reuse,
+                    loader_workers,
                 )
             }) {
             Ok(worker) => self.grouped_load_worker = Some(worker),
@@ -647,44 +674,76 @@ impl HitBuffer {
         max_query: u32,
         max_target: u64,
         mut hits: Vec<Hit>,
+        workers: usize,
     ) -> Result<(Vec<Hit>, u64), String> {
-        let disk_size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
         hits.clear();
-        if expected_count == 0 {
-            return Ok((hits, disk_size));
-        }
         hits.reserve(expected_count.saturating_sub(hits.capacity()));
-        let mut file = File::open(path).map_err(|e| e.to_string())?;
-        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        loop {
-            let mut size_bytes = [0u8; std::mem::size_of::<usize>()];
-            let n = file.read(&mut size_bytes).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            if n != size_bytes.len() {
-                return Err("HitBuffer::load_bin(): truncated packet size".to_string());
-            }
-            let len = usize::from_ne_bytes(size_bytes);
-            let expected = read_u32_from(&mut file)? as usize;
-            let mut payload = vec![0; len];
-            file.read_exact(&mut payload).map_err(|_| {
-                "HitBuffer::load_bin(): truncated packet / possibly corrupted temporary file"
-                    .to_string()
-            })?;
-            Self::decode_packet(
-                &payload,
-                expected,
-                long_subject_offsets,
-                max_query,
-                max_target,
-                &mut hits,
-            )?;
-        }
+        let disk_size = Self::decode_file_packets(
+            &path,
+            expected_count,
+            long_subject_offsets,
+            max_query,
+            max_target,
+            workers,
+            |packet| {
+                hits.extend(packet);
+                Ok(())
+            },
+        )?;
         if hits.len() != expected_count {
             return Err("Mismatching hit count / possibly corrupted temporary file".to_string());
         }
         Ok((hits, disk_size))
+    }
+
+    fn decode_file_packets<E>(
+        path: &Path,
+        expected_count: usize,
+        long_subject_offsets: bool,
+        max_query: u32,
+        max_target: u64,
+        workers: usize,
+        consume: E,
+    ) -> Result<u64, String>
+    where
+        E: FnMut(Vec<Hit>) -> Result<(), String> + Send,
+    {
+        let disk_size = fs::metadata(path).map_err(|error| error.to_string())?.len();
+        if expected_count == 0 {
+            return Ok(disk_size);
+        }
+        let mut file = File::open(path).map_err(|error| error.to_string())?;
+        crate::util::parallel::ordered_pipeline::run(
+            workers,
+            || {
+                let mut size = [0u8; std::mem::size_of::<usize>()];
+                let n = file.read(&mut size).map_err(|error| error.to_string())?;
+                if n == 0 {
+                    return Ok(None);
+                }
+                if n != size.len() {
+                    return Err("HitBuffer::load_bin(): truncated packet size".into());
+                }
+                let count = read_u32_from(&mut file)? as usize;
+                let mut payload = vec![0; usize::from_ne_bytes(size)];
+                file.read_exact(&mut payload).map_err(|_| "HitBuffer::load_bin(): truncated packet / possibly corrupted temporary file".to_string())?;
+                Ok(Some((payload, count)))
+            },
+            |(payload, count): (Vec<u8>, usize)| {
+                let mut packet = Vec::with_capacity(count);
+                Self::decode_packet(
+                    &payload,
+                    count,
+                    long_subject_offsets,
+                    max_query,
+                    max_target,
+                    &mut packet,
+                )?;
+                Ok(packet)
+            },
+            consume,
+        )?;
+        Ok(disk_size)
     }
 
     fn decode_packet(
@@ -745,76 +804,40 @@ impl HitBuffer {
         begin: u32,
         end: u32,
         mut hits: Vec<Vec<CompactHit>>,
+        workers: usize,
     ) -> Result<(Vec<Vec<CompactHit>>, u64), String> {
-        let disk_size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
         let query_count = end.saturating_sub(begin) as usize;
         hits.resize_with(query_count, Vec::new);
         hits.truncate(query_count);
         for query_hits in &mut hits {
             query_hits.clear();
         }
-        if expected_count == 0 {
-            return Ok((hits, disk_size));
-        }
-
-        let mut file = File::open(path).map_err(|e| e.to_string())?;
         let mut decoded = 0usize;
-        loop {
-            let mut size_bytes = [0u8; std::mem::size_of::<usize>()];
-            let n = file.read(&mut size_bytes).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            if n != size_bytes.len() {
-                return Err("HitBuffer::load_grouped_bin(): truncated packet size".to_string());
-            }
-            let len = usize::from_ne_bytes(size_bytes);
-            let packet_count = read_u32_from(&mut file)? as usize;
-            let mut payload = vec![0; len];
-            file.read_exact(&mut payload).map_err(|_| {
-                "HitBuffer::load_grouped_bin(): truncated packet / possibly corrupted temporary file"
-                    .to_string()
-            })?;
-            let mut pos = 0usize;
-            if take_u16(&payload, &mut pos)? != 0 {
-                return Err("HitBuffer::load_grouped_bin(): invalid packet header".to_string());
-            }
-            let packet_begin = decoded;
-            while pos < payload.len() {
-                let query = take_u32(&payload, &mut pos)?;
-                if query >= max_query || query < begin || query >= end {
-                    return Err("HitBuffer::load_grouped_bin(): invalid query id / possibly corrupted temporary file".to_string());
-                }
-                let seed_offset = take_u32(&payload, &mut pos)?;
-                let query_hits = &mut hits[(query - begin) as usize];
-                loop {
-                    let score = take_u16(&payload, &mut pos)?;
-                    if score == 0 {
-                        break;
+        let disk_size = Self::decode_file_packets(
+            &path,
+            expected_count,
+            long_subject_offsets,
+            max_query,
+            max_target,
+            workers,
+            |packet| {
+                for hit in packet {
+                    if hit.query < begin || hit.query >= end {
+                        return Err("HitBuffer::load_grouped_bin(): invalid query id / possibly corrupted temporary file".into());
                     }
-                    let subject = if long_subject_offsets {
-                        take_u40(&payload, &mut pos)?
-                    } else {
-                        take_u32(&payload, &mut pos)? as u64
-                    };
-                    if subject >= max_target {
-                        return Err("HitBuffer::load_grouped_bin(): invalid subject location / possibly corrupted temporary file".to_string());
+                    if decoded >= expected_count {
+                        return Err("HitBuffer::load_grouped_bin(): buffer overflow / possibly corrupted temporary file".into());
                     }
-                    if decoded - packet_begin >= packet_count || decoded >= expected_count {
-                        return Err("HitBuffer::load_grouped_bin(): buffer overflow / possibly corrupted temporary file".to_string());
-                    }
-                    query_hits.push(CompactHit {
-                        subject,
-                        seed_offset,
-                        score,
+                    hits[(hit.query - begin) as usize].push(CompactHit {
+                        subject: hit.subject,
+                        seed_offset: hit.seed_offset,
+                        score: hit.score,
                     });
                     decoded += 1;
                 }
-            }
-            if decoded - packet_begin != packet_count {
-                return Err("Mismatching hit count / possibly corrupted temporary file".to_string());
-            }
-        }
+                Ok(())
+            },
+        )?;
         if decoded != expected_count {
             return Err("Mismatching hit count / possibly corrupted temporary file".to_string());
         }
@@ -826,8 +849,10 @@ impl Drop for HitBuffer {
     fn drop(&mut self) {
         let _ = self.finish_load_worker();
         let _ = self.finish_grouped_load_worker();
-        for path in &self.temp_files {
-            let _ = fs::remove_file(path);
+        if !self.no_unlink {
+            for path in &self.temp_files {
+                let _ = fs::remove_file(path);
+            }
         }
     }
 }

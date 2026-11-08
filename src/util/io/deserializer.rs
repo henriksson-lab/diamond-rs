@@ -23,6 +23,11 @@ impl<S: StreamEntity> Deserializer<S> {
         }
     }
 
+    /// Capability of the actual stream owner, including codec wrappers.
+    pub fn seekable(&self) -> bool {
+        self.buffer.seekable()
+    }
+
     pub fn rewind(&mut self) -> IoResult<()> {
         self.lookahead = None;
         self.buffer.rewind()
@@ -224,8 +229,12 @@ impl<S: StreamEntity> Deserializer<S> {
     }
 
     pub fn peek(&mut self, n: usize) -> IoResult<String> {
+        String::from_utf8(self.peek_bytes(n)?).map_err(|e| IoError::Other(e.to_string()))
+    }
+
+    pub fn peek_bytes(&mut self, n: usize) -> IoResult<Vec<u8>> {
         if n == 0 {
-            return Ok(String::new());
+            return Ok(Vec::new());
         }
         if self.lookahead.is_none() && self.buffer.data().is_empty() {
             match self.buffer.fetch() {
@@ -238,7 +247,7 @@ impl<S: StreamEntity> Deserializer<S> {
         if available.len() < n && !self.buffer.eof()? {
             return Err(IoError::Other("Invalid peek".to_string()));
         }
-        String::from_utf8(available).map_err(|e| IoError::Other(e.to_string()))
+        Ok(available)
     }
 
     pub fn file_size(&mut self) -> IoResult<i64> {
@@ -276,7 +285,7 @@ impl<S: StreamEntity> Deserializer<S> {
 
     /// Compatibility for Rust callers that wrap a seekable `StreamEntity`
     /// directly rather than the C++-equivalent `InputStreamBuffer`.
-    fn peek_via_seek(&mut self, n: usize) -> IoResult<String> {
+    fn peek_via_seek(&mut self, n: usize) -> IoResult<Vec<u8>> {
         let pos = self.buffer.tell()?;
         let mut out = Vec::with_capacity(n);
         if let Some(byte) = self.lookahead {
@@ -291,7 +300,7 @@ impl<S: StreamEntity> Deserializer<S> {
         if out.len() < n && !eof {
             return Err(IoError::Other("Invalid peek".to_string()));
         }
-        String::from_utf8(out).map_err(|e| IoError::Other(e.to_string()))
+        Ok(out)
     }
 }
 
@@ -305,6 +314,15 @@ mod tests {
             VecStream::from_vec(bytes.to_vec()),
             0,
         ))
+    }
+
+    #[test]
+    fn raw_peek_preserves_non_utf8_and_does_not_consume() {
+        let mut input = buffered(&[0xff, b'>']);
+        assert_eq!(input.peek_bytes(1).unwrap(), [0xff]);
+        assert!(input.peek(1).is_err());
+        assert_eq!(input.read_one().unwrap(), Some(0xff));
+        assert_eq!(input.peek_bytes(1).unwrap(), [b'>']);
     }
 
     #[test]

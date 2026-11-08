@@ -1,0 +1,10 @@
+translated_query	translated_query <alpha>& description	single_domain	single_domain control	single_domain	single_domain control	0	1	0
+translated_query	translated_query <alpha>& description	reordered	reordered three disjoint domains	reordered	reordered three disjoint domains	0	0	0
+translated_query	translated_query <alpha>& description	reordered	reordered three disjoint domains	reordered	reordered three disjoint domains	0	0	1
+translated_query	translated_query <alpha>& description	reordered	reordered three disjoint domains	reordered	reordered three disjoint domains	0	0	2
+translated_query	translated_query <alpha>& description	gapped_ref	gapped_ref indel <subject>& title	gapped_ref;alternate	gapped_ref indel <subject>& title<>alternate second title	0	2	0
+reverse_query	reverse_query	single_domain	single_domain control	single_domain	single_domain control	1	1	0
+reverse_query	reverse_query	reordered	reordered three disjoint domains	reordered	reordered three disjoint domains	1	0	0
+reverse_query	reverse_query	reordered	reordered three disjoint domains	reordered	reordered three disjoint domains	1	0	1
+reverse_query	reverse_query	reordered	reordered three disjoint domains	reordered	reordered three disjoint domains	1	0	2
+reverse_query	reverse_query	gapped_ref	gapped_ref indel <subject>& title	gapped_ref;alternate	gapped_ref indel <subject>& title<>alternate second title	1	2	0

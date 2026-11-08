@@ -84,21 +84,40 @@ impl Table {
         line: &str,
         record_id: Option<RecordId>,
     ) -> Result<(), String> {
+        self.push_back_raw_line(line.as_bytes(), record_id)
+    }
+
+    /// Byte-preserving Source CharTokenizer path. A trailing delimiter does
+    /// not create a final token: `a\t` lacks the second schema field.
+    pub fn push_back_raw_line(
+        &mut self,
+        line: &[u8],
+        record_id: Option<RecordId>,
+    ) -> Result<(), String> {
         let mut field = 0usize;
         self.limits.push(*self.limits.last().unwrap());
         if let Some(record_id) = record_id {
             field += 1;
             self.push_i64(record_id);
         }
-        for token in line.split('\t') {
+        let mut begin = 0;
+        while begin < line.len() {
             if field >= self.schema.len() {
                 break;
             }
+            let end = line[begin..]
+                .iter()
+                .position(|&byte| byte == b'\t')
+                .map_or(line.len(), |length| begin + length);
+            let token = &line[begin..end];
             match self.schema[field] {
-                Type::String => self.push_str(token),
-                Type::Int64 => self.push_i64(convert_string_i64(token)?),
+                Type::String => self.push_bytes(token),
+                Type::Int64 => self.push_i64(convert_string_i64(
+                    std::str::from_utf8(token).map_err(|error| error.to_string())?,
+                )?),
             }
             field += 1;
+            begin = end.saturating_add(1);
         }
         if field < self.schema.len() {
             return Err("Missing fields in input line".to_string());
@@ -201,9 +220,13 @@ impl Table {
     }
 
     pub(super) fn push_str(&mut self, s: &str) {
-        self.push_i32(s.len() as i32);
-        self.data.extend_from_slice(s.as_bytes());
-        *self.limits.last_mut().unwrap() += s.len() as i64;
+        self.push_bytes(s.as_bytes());
+    }
+
+    pub(super) fn push_bytes(&mut self, bytes: &[u8]) {
+        self.push_i32(bytes.len() as i32);
+        self.data.extend_from_slice(bytes);
+        *self.limits.last_mut().unwrap() += bytes.len() as i64;
     }
 
     pub(super) fn push_i32(&mut self, x: i32) {

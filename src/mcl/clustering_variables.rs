@@ -5,12 +5,35 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::LazyLock;
 
-type Getter = fn(&HspContext, bool) -> f64;
+#[derive(Debug, Clone, Copy)]
+enum Getter {
+    QueryLength,
+    SubjectLength,
+    QueryStart,
+    QueryEnd,
+    SubjectStart,
+    SubjectEnd,
+    Evalue,
+    BitScore,
+    RawScore,
+    Length,
+    PercentIdenticalMatches,
+    NumberIdenticalMatches,
+    NumberMismatches,
+    NumberPositiveMatches,
+    NumberGapOpenings,
+    NumberGaps,
+    PercentagePositiveMatches,
+    QueryFrame,
+    QueryCoveragePerHsp,
+    SubjectCoveragePerHsp,
+    NormalizedBitScoreGlobal,
+}
 
 /// One numeric HSP property available to MCL expressions.
 ///
-/// The C++ implementation uses one subclass per property. A function pointer
-/// retains the same immutable polymorphic registry without heap allocation.
+/// The C++ implementation uses one subclass per property. An immutable property
+/// tag selects the shared numeric getter for either String or byte titles.
 #[derive(Debug, Clone, Copy)]
 pub struct Variable {
     name: &'static str,
@@ -42,8 +65,34 @@ impl Variable {
     ///
     /// `query_translated` replaces the alignment-mode process global used by
     /// C++ `HspContext::blast_query_frame()`.
-    pub fn get(&self, context: &HspContext, query_translated: bool) -> f64 {
-        (self.getter)(context, query_translated)
+    pub fn get<T>(&self, context: &HspContext<T>, query_translated: bool) -> f64 {
+        match self.getter {
+            Getter::QueryLength => query_length(context, query_translated),
+            Getter::SubjectLength => subject_length(context, query_translated),
+            Getter::QueryStart => query_start(context, query_translated),
+            Getter::QueryEnd => query_end(context, query_translated),
+            Getter::SubjectStart => subject_start(context, query_translated),
+            Getter::SubjectEnd => subject_end(context, query_translated),
+            Getter::Evalue => evalue(context, query_translated),
+            Getter::BitScore => bit_score(context, query_translated),
+            Getter::RawScore => raw_score(context, query_translated),
+            Getter::Length => length(context, query_translated),
+            Getter::PercentIdenticalMatches => percent_identical_matches(context, query_translated),
+            Getter::NumberIdenticalMatches => number_identical_matches(context, query_translated),
+            Getter::NumberMismatches => number_mismatches(context, query_translated),
+            Getter::NumberPositiveMatches => number_positive_matches(context, query_translated),
+            Getter::NumberGapOpenings => number_gap_openings(context, query_translated),
+            Getter::NumberGaps => number_gaps(context, query_translated),
+            Getter::PercentagePositiveMatches => {
+                percentage_positive_matches(context, query_translated)
+            }
+            Getter::QueryFrame => query_frame(context, query_translated),
+            Getter::QueryCoveragePerHsp => query_coverage_per_hsp(context, query_translated),
+            Getter::SubjectCoveragePerHsp => subject_coverage_per_hsp(context, query_translated),
+            Getter::NormalizedBitScoreGlobal => {
+                normalized_bit_score_global(context, query_translated)
+            }
+        }
     }
 }
 
@@ -116,171 +165,211 @@ impl VariableRegistry {
 static VARIABLE_REGISTRY: LazyLock<StaticVariableRegistry> =
     LazyLock::new(StaticVariableRegistry::new);
 
-fn query_length(r: &HspContext, _: bool) -> f64 {
+fn query_length<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.query_source_len as f64
 }
 
-fn subject_length(r: &HspContext, _: bool) -> f64 {
+fn subject_length<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.subject_len as f64
 }
 
-fn query_start(r: &HspContext, _: bool) -> f64 {
+fn query_start<T>(r: &HspContext<T>, _: bool) -> f64 {
     (r.oriented_query_range().begin + 1) as f64
 }
 
-fn query_end(r: &HspContext, _: bool) -> f64 {
+fn query_end<T>(r: &HspContext<T>, _: bool) -> f64 {
     (r.oriented_query_range().end + 1) as f64
 }
 
-fn subject_start(r: &HspContext, _: bool) -> f64 {
+fn subject_start<T>(r: &HspContext<T>, _: bool) -> f64 {
     (r.subject_range().begin + 1) as f64
 }
 
-fn subject_end(r: &HspContext, _: bool) -> f64 {
+fn subject_end<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.subject_range().end as f64
 }
 
-fn evalue(r: &HspContext, _: bool) -> f64 {
+fn evalue<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.evalue()
 }
 
-fn bit_score(r: &HspContext, _: bool) -> f64 {
+fn bit_score<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.bit_score()
 }
 
-fn raw_score(r: &HspContext, _: bool) -> f64 {
+fn raw_score<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.score() as f64
 }
 
-fn length(r: &HspContext, _: bool) -> f64 {
+fn length<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.length() as f64
 }
 
-fn percent_identical_matches(r: &HspContext, _: bool) -> f64 {
+fn percent_identical_matches<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.identities() as f64 * 100.0 / r.length() as f64
 }
 
-fn number_identical_matches(r: &HspContext, _: bool) -> f64 {
+fn number_identical_matches<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.identities() as f64
 }
 
-fn number_mismatches(r: &HspContext, _: bool) -> f64 {
+fn number_mismatches<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.mismatches() as f64
 }
 
-fn number_positive_matches(r: &HspContext, _: bool) -> f64 {
+fn number_positive_matches<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.positives() as f64
 }
 
-fn number_gap_openings(r: &HspContext, _: bool) -> f64 {
+fn number_gap_openings<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.gap_openings() as f64
 }
 
-fn number_gaps(r: &HspContext, _: bool) -> f64 {
+fn number_gaps<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.gaps() as f64
 }
 
-fn percentage_positive_matches(r: &HspContext, _: bool) -> f64 {
+fn percentage_positive_matches<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.positives() as f64 * 100.0 / r.length() as f64
 }
 
-fn query_frame(r: &HspContext, query_translated: bool) -> f64 {
+fn query_frame<T>(r: &HspContext<T>, query_translated: bool) -> f64 {
     r.blast_query_frame(query_translated) as f64
 }
 
-fn query_coverage_per_hsp(r: &HspContext, _: bool) -> f64 {
+fn query_coverage_per_hsp<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.query_source_range().length() as f64 * 100.0 / r.query_source_len as f64
 }
 
-fn subject_coverage_per_hsp(r: &HspContext, _: bool) -> f64 {
+fn subject_coverage_per_hsp<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.subject_range().length() as f64 * 100.0 / r.subject_len as f64
 }
 
-fn normalized_bit_score_global(r: &HspContext, _: bool) -> f64 {
+fn normalized_bit_score_global<T>(r: &HspContext<T>, _: bool) -> f64 {
     r.bit_score() / r.query_self_aln_score.max(r.target_self_aln_score) * 100.0
 }
 
 const VARIABLES: [Variable; 21] = [
-    Variable::new("qlen", HspValues::NONE, OutputFlags::NONE, query_length),
-    Variable::new("slen", HspValues::NONE, OutputFlags::NONE, subject_length),
+    Variable::new(
+        "qlen",
+        HspValues::NONE,
+        OutputFlags::NONE,
+        Getter::QueryLength,
+    ),
+    Variable::new(
+        "slen",
+        HspValues::NONE,
+        OutputFlags::NONE,
+        Getter::SubjectLength,
+    ),
     Variable::new(
         "qstart",
         HspValues::QUERY_START,
         OutputFlags::NONE,
-        query_start,
+        Getter::QueryStart,
     ),
-    Variable::new("qend", HspValues::QUERY_END, OutputFlags::NONE, query_end),
+    Variable::new(
+        "qend",
+        HspValues::QUERY_END,
+        OutputFlags::NONE,
+        Getter::QueryEnd,
+    ),
     Variable::new(
         "sstart",
         HspValues::TARGET_START,
         OutputFlags::NONE,
-        subject_start,
+        Getter::SubjectStart,
     ),
     Variable::new(
         "send",
         HspValues::TARGET_END,
         OutputFlags::NONE,
-        subject_end,
+        Getter::SubjectEnd,
     ),
-    Variable::new("evalue", HspValues::NONE, OutputFlags::NONE, evalue),
-    Variable::new("bitscore", HspValues::NONE, OutputFlags::NONE, bit_score),
-    Variable::new("score", HspValues::NONE, OutputFlags::NONE, raw_score),
-    Variable::new("length", HspValues::LENGTH, OutputFlags::NONE, length),
+    Variable::new("evalue", HspValues::NONE, OutputFlags::NONE, Getter::Evalue),
+    Variable::new(
+        "bitscore",
+        HspValues::NONE,
+        OutputFlags::NONE,
+        Getter::BitScore,
+    ),
+    Variable::new(
+        "score",
+        HspValues::NONE,
+        OutputFlags::NONE,
+        Getter::RawScore,
+    ),
+    Variable::new(
+        "length",
+        HspValues::LENGTH,
+        OutputFlags::NONE,
+        Getter::Length,
+    ),
     Variable::new(
         "pident",
         HspValues(HspValues::LENGTH.0 | HspValues::IDENT.0),
         OutputFlags::NONE,
-        percent_identical_matches,
+        Getter::PercentIdenticalMatches,
     ),
     Variable::new(
         "nident",
         HspValues::IDENT,
         OutputFlags::NONE,
-        number_identical_matches,
+        Getter::NumberIdenticalMatches,
     ),
     Variable::new(
         "mismatch",
         HspValues::MISMATCHES,
         OutputFlags::NONE,
-        number_mismatches,
+        Getter::NumberMismatches,
     ),
     Variable::new(
         "positive",
         HspValues::TRANSCRIPT,
         OutputFlags::NONE,
-        number_positive_matches,
+        Getter::NumberPositiveMatches,
     ),
     Variable::new(
         "gapopen",
         HspValues::GAP_OPENINGS,
         OutputFlags::NONE,
-        number_gap_openings,
+        Getter::NumberGapOpenings,
     ),
-    Variable::new("gaps", HspValues::GAPS, OutputFlags::NONE, number_gaps),
+    Variable::new(
+        "gaps",
+        HspValues::GAPS,
+        OutputFlags::NONE,
+        Getter::NumberGaps,
+    ),
     Variable::new(
         "ppos",
         HspValues::TRANSCRIPT,
         OutputFlags::NONE,
-        percentage_positive_matches,
+        Getter::PercentagePositiveMatches,
     ),
-    Variable::new("qframe", HspValues::NONE, OutputFlags::NONE, query_frame),
+    Variable::new(
+        "qframe",
+        HspValues::NONE,
+        OutputFlags::NONE,
+        Getter::QueryFrame,
+    ),
     Variable::new(
         "qcovhsp",
         HspValues::QUERY_COORDS,
         OutputFlags::NONE,
-        query_coverage_per_hsp,
+        Getter::QueryCoveragePerHsp,
     ),
     Variable::new(
         "scovhsp",
         HspValues::TARGET_COORDS,
         OutputFlags::NONE,
-        subject_coverage_per_hsp,
+        Getter::SubjectCoveragePerHsp,
     ),
     Variable::new(
         "normalized_bitscore_global",
         HspValues::NONE,
         OutputFlags::SELF_ALN_SCORES,
-        normalized_bit_score_global,
+        Getter::NormalizedBitScoreGlobal,
     ),
 ];
 

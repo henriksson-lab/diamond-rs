@@ -1,0 +1,4 @@
+domain_query	single_domain	427	169	5.32e-57	1	78	1	78	78
+domain_query	reordered	421	166	2.24e-52	1	78	302	379	78
+domain_query	reordered	396	157	9.75e-49	309	379	1	71	71
+domain_query	reordered	394	156	1.90e-48	159	228	152	221	70

@@ -16,7 +16,7 @@ pub struct EdgeData {
 impl EdgeData {
     pub const SIZE: usize = 32;
 
-    pub fn from_context(r: &HspContext) -> Self {
+    pub fn from_context<T>(r: &HspContext<T>) -> Self {
         EdgeData {
             query: r.query_oid,
             target: r.subject_oid,
@@ -42,13 +42,13 @@ pub struct Edge;
 
 impl Edge {
     /// Matches C++ `Output::Format::Edge::print_match`.
-    pub fn print_match<W: Write>(&self, writer: &mut W, r: &HspContext) -> io::Result<()> {
+    pub fn print_match<W: Write, T>(&self, writer: &mut W, r: &HspContext<T>) -> io::Result<()> {
         EdgeData::from_context(r).write(writer)
     }
 }
 
 /// Matches C++ `Output::Format::Edge::print_match(r)`.
-pub fn print_match<W: Write>(writer: &mut W, r: &HspContext) -> io::Result<()> {
+pub fn print_match<W: Write, T>(writer: &mut W, r: &HspContext<T>) -> io::Result<()> {
     Edge.print_match(writer, r)
 }
 
@@ -124,3 +124,5 @@ mod tests {
         assert_eq!(compatibility, buf);
     }
 }
+
+pub use print_match as print_match_bytes;

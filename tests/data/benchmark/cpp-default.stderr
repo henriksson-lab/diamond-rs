@@ -1,0 +1,16 @@
+diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen
+Documentation, support and updates available at http://www.diamondsearch.org
+Please cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)
+
+[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.
+Matrix adjust (openblas):			0.1036 ms
+Anchored Swipe (int16_t):	232.021 ps/Cell
+Anchored Swipe2 (int16_t):	283.328 ps/Cell
+SWIPE (int8_t):			89.4623 ps/Cell
+SWIPE (int16_t):		192.905 ps/Cell
+SWIPE (int8_t, Stats):		184.264 ps/Cell
+SWIPE (int8_t, MatrixAdjust):	181.438 ps/Cell
+SWIPE (int8_t, CBS):		188.219 ps/Cell
+SWIPE (int8_t, TB):		181.215 ps/Cell
+Diagonal scores:		13.3282 ps/Cell
+Error: TargetIterator: No matrix provided for adjusted matrix.

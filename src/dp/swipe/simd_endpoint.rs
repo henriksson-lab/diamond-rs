@@ -206,6 +206,30 @@ pub fn endpoint_full_batch_avx2_i8(
     matrix_scale: i32,
     scratch: &mut EndpointScratch,
 ) -> Option<EndpointBatch> {
+    endpoint_full_batch_avx2_i8_with_row_counter(
+        query,
+        targets,
+        matrix,
+        cbs,
+        semi_global,
+        matrix_scale,
+        true,
+        scratch,
+    )
+}
+
+/// `full_swipe.h` also uses DummyRowCounter for NONE requests: no query
+/// length limit, but the best subject column is still retained.
+pub(super) fn endpoint_full_batch_avx2_i8_with_row_counter(
+    query: &[Letter],
+    targets: &[TraceTarget<'_>],
+    matrix: &ScoreMatrix,
+    cbs: &[i8],
+    semi_global: bool,
+    matrix_scale: i32,
+    track_query: bool,
+    scratch: &mut EndpointScratch,
+) -> Option<EndpointBatch> {
     if targets.is_empty() || targets.len() > 32 || (!cbs.is_empty() && cbs.len() < query.len()) {
         return None;
     }
@@ -215,7 +239,7 @@ pub fn endpoint_full_batch_avx2_i8(
         u8::MAX as usize
     };
     assert!(
-        query.len() <= max_rows,
+        !track_query || query.len() <= max_rows,
         "Query length exceeds row counter maximum."
     );
     assert!(matrix_scale == 1, "Matrix scale != 1.0 not supported.");
@@ -228,30 +252,70 @@ pub fn endpoint_full_batch_avx2_i8(
         // SAFETY: AVX2 was detected and fixed arrays cover all lanes.
         Some(unsafe {
             match (semi_global, !cbs.is_empty(), standard) {
-                (true, true, true) => {
-                    full_i8_impl::<true, true, true>(query, targets, matrix, cbs, scratch)
-                }
-                (true, true, false) => {
-                    full_i8_impl::<true, true, false>(query, targets, matrix, cbs, scratch)
-                }
-                (true, false, true) => {
-                    full_i8_impl::<true, false, true>(query, targets, matrix, cbs, scratch)
-                }
-                (true, false, false) => {
-                    full_i8_impl::<true, false, false>(query, targets, matrix, cbs, scratch)
-                }
-                (false, true, true) => {
-                    full_i8_impl::<false, true, true>(query, targets, matrix, cbs, scratch)
-                }
-                (false, true, false) => {
-                    full_i8_impl::<false, true, false>(query, targets, matrix, cbs, scratch)
-                }
-                (false, false, true) => {
-                    full_i8_impl::<false, false, true>(query, targets, matrix, cbs, scratch)
-                }
-                (false, false, false) => {
-                    full_i8_impl::<false, false, false>(query, targets, matrix, cbs, scratch)
-                }
+                (true, true, true) => full_i8_impl::<true, true, true>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (true, true, false) => full_i8_impl::<true, true, false>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (true, false, true) => full_i8_impl::<true, false, true>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (true, false, false) => full_i8_impl::<true, false, false>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (false, true, true) => full_i8_impl::<false, true, true>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (false, true, false) => full_i8_impl::<false, true, false>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (false, false, true) => full_i8_impl::<false, false, true>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (false, false, false) => full_i8_impl::<false, false, false>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
             }
         })
     }
@@ -264,6 +328,7 @@ pub fn endpoint_full_batch_avx2_i8(
             cbs,
             semi_global,
             matrix_scale,
+            track_query,
             scratch,
         );
         None
@@ -279,6 +344,30 @@ pub fn endpoint_full_batch_avx2_i16(
     matrix_scale: i32,
     scratch: &mut EndpointScratch,
 ) -> Option<EndpointBatch> {
+    endpoint_full_batch_avx2_i16_with_row_counter(
+        query,
+        targets,
+        matrix,
+        cbs,
+        semi_global,
+        matrix_scale,
+        true,
+        scratch,
+    )
+}
+
+/// `full_swipe.h` also uses DummyRowCounter for NONE requests: no query
+/// length limit, but the best subject column is still retained.
+pub(super) fn endpoint_full_batch_avx2_i16_with_row_counter(
+    query: &[Letter],
+    targets: &[TraceTarget<'_>],
+    matrix: &ScoreMatrix,
+    cbs: &[i8],
+    semi_global: bool,
+    matrix_scale: i32,
+    track_query: bool,
+    scratch: &mut EndpointScratch,
+) -> Option<EndpointBatch> {
     if targets.is_empty() || targets.len() > 16 || (!cbs.is_empty() && cbs.len() < query.len()) {
         return None;
     }
@@ -288,7 +377,7 @@ pub fn endpoint_full_batch_avx2_i16(
         u16::MAX as usize
     };
     assert!(
-        query.len() <= max_rows,
+        !track_query || query.len() <= max_rows,
         "Query length exceeds row counter maximum."
     );
     assert!(matrix_scale == 1, "Matrix scale != 1.0 not supported.");
@@ -301,30 +390,70 @@ pub fn endpoint_full_batch_avx2_i16(
         // SAFETY: AVX2 was detected and fixed arrays cover all lanes.
         Some(unsafe {
             match (semi_global, !cbs.is_empty(), standard) {
-                (true, true, true) => {
-                    full_i16_impl::<true, true, true>(query, targets, matrix, cbs, scratch)
-                }
-                (true, true, false) => {
-                    full_i16_impl::<true, true, false>(query, targets, matrix, cbs, scratch)
-                }
-                (true, false, true) => {
-                    full_i16_impl::<true, false, true>(query, targets, matrix, cbs, scratch)
-                }
-                (true, false, false) => {
-                    full_i16_impl::<true, false, false>(query, targets, matrix, cbs, scratch)
-                }
-                (false, true, true) => {
-                    full_i16_impl::<false, true, true>(query, targets, matrix, cbs, scratch)
-                }
-                (false, true, false) => {
-                    full_i16_impl::<false, true, false>(query, targets, matrix, cbs, scratch)
-                }
-                (false, false, true) => {
-                    full_i16_impl::<false, false, true>(query, targets, matrix, cbs, scratch)
-                }
-                (false, false, false) => {
-                    full_i16_impl::<false, false, false>(query, targets, matrix, cbs, scratch)
-                }
+                (true, true, true) => full_i16_impl::<true, true, true>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (true, true, false) => full_i16_impl::<true, true, false>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (true, false, true) => full_i16_impl::<true, false, true>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (true, false, false) => full_i16_impl::<true, false, false>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (false, true, true) => full_i16_impl::<false, true, true>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (false, true, false) => full_i16_impl::<false, true, false>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (false, false, true) => full_i16_impl::<false, false, true>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
+                (false, false, false) => full_i16_impl::<false, false, false>(
+                    query,
+                    targets,
+                    matrix,
+                    cbs,
+                    track_query,
+                    scratch,
+                ),
             }
         })
     }
@@ -337,6 +466,7 @@ pub fn endpoint_full_batch_avx2_i16(
             cbs,
             semi_global,
             matrix_scale,
+            track_query,
             scratch,
         );
         None
@@ -466,6 +596,7 @@ unsafe fn full_i8_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool, const STAND
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
     cbs: &[i8],
+    track_query: bool,
     scratch: &mut EndpointScratch,
 ) -> EndpointBatch {
     const LANES: usize = 32;
@@ -568,7 +699,7 @@ unsafe fn full_i8_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool, const STAND
     for lane in 0..targets.len() {
         out.endpoints[lane] = Endpoint {
             score: scores_decode_i8(best[lane], delta),
-            query_end: best_query_end[lane],
+            query_end: if track_query { best_query_end[lane] } else { 1 },
             subject_end: best_subject_end[lane],
         };
         if best[lane] == i8::MAX {
@@ -586,6 +717,7 @@ unsafe fn full_i16_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool, const STAN
     targets: &[TraceTarget<'_>],
     matrix: &ScoreMatrix,
     cbs: &[i8],
+    track_query: bool,
     scratch: &mut EndpointScratch,
 ) -> EndpointBatch {
     const LANES: usize = 16;
@@ -695,7 +827,7 @@ unsafe fn full_i16_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool, const STAN
     for lane in 0..targets.len() {
         out.endpoints[lane] = Endpoint {
             score: best[lane] as i32 - delta as i32,
-            query_end: best_query_end[lane],
+            query_end: if track_query { best_query_end[lane] } else { 1 },
             subject_end: best_subject_end[lane],
         };
         if best[lane] == i16::MAX {

@@ -1,0 +1,10 @@
+translated_query	single_domain	single_domain;single_alias	single_domain first description	single_domain first description<>single_alias alternate description	176
+translated_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main main <alpha>& title >preAlias early title	sp|R001|main main <alpha>& title >preAlias early title<>tr|A001|alt second <beta>& title<>lastAlias third title	176
+translated_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main main <alpha>& title >preAlias early title	sp|R001|main main <alpha>& title >preAlias early title<>tr|A001|alt second <beta>& title<>lastAlias third title	169
+translated_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main main <alpha>& title >preAlias early title	sp|R001|main main <alpha>& title >preAlias early title<>tr|A001|alt second <beta>& title<>lastAlias third title	162
+translated_query	gapped_refraw	gapped_refraw;gapped_alt;lastGap	gapped_refraw raw separator two	gapped_refraw raw separator two<>gapped_alt second title<>lastGap final title	157
+reverse_query	single_domain	single_domain;single_alias	single_domain first description	single_domain first description<>single_alias alternate description	176
+reverse_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main main <alpha>& title >preAlias early title	sp|R001|main main <alpha>& title >preAlias early title<>tr|A001|alt second <beta>& title<>lastAlias third title	176
+reverse_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main main <alpha>& title >preAlias early title	sp|R001|main main <alpha>& title >preAlias early title<>tr|A001|alt second <beta>& title<>lastAlias third title	169
+reverse_query	sp|R001|main	sp|R001|main;tr|A001|alt;lastAlias	sp|R001|main main <alpha>& title >preAlias early title	sp|R001|main main <alpha>& title >preAlias early title<>tr|A001|alt second <beta>& title<>lastAlias third title	162
+reverse_query	gapped_refraw	gapped_refraw;gapped_alt;lastGap	gapped_refraw raw separator two	gapped_refraw raw separator two<>gapped_alt second title<>lastGap final title	157

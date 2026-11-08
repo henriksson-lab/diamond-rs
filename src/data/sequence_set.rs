@@ -222,9 +222,14 @@ pub type LetterStringSet = StringSetBase<Letter, { DELIMITER_LETTER as i64 }, 1>
 pub fn max_id_len(ids: &StringSet) -> usize {
     let mut max_len = 0usize;
     for i in 0..ids.size() as usize {
-        let id = std::str::from_utf8(ids.get(i)).unwrap_or("");
+        let id = crate::util::sequence::c_string_bytes(ids.get(i));
         let len = id
-            .find(|c| crate::util::sequence::ID_DELIMITERS.contains(c))
+            .iter()
+            .position(|byte| {
+                crate::util::sequence::ID_DELIMITERS
+                    .as_bytes()
+                    .contains(byte)
+            })
             .unwrap_or(id.len());
         max_len = max_len.max(len);
     }
@@ -627,7 +632,18 @@ impl SequenceSet {
             self.seq_length(i)
         } else {
             let j = i - i % query_contexts;
-            self.seq_length(j) + self.seq_length(j + 1) + self.seq_length(j + 2) + 2
+            // Source applies this GLOBAL context grouping to targets too.
+            // Missing forward-frame lengths are an upstream out-of-bounds
+            // access. Define that incomplete group as length zero so a positive
+            // min-query-len safely rejects it; threshold zero stays unchanged.
+            if j + 2 >= self.len() {
+                return 0;
+            }
+            let length = i64::from(self.seq_length(j))
+                + i64::from(self.seq_length(j + 1))
+                + i64::from(self.seq_length(j + 2))
+                + 2;
+            length.min(i64::from(Loc::MAX)) as Loc
         }
     }
 
@@ -1021,6 +1037,8 @@ mod tests {
         assert_eq!(ids.local_position(259), (0, 3));
         assert_eq!(ids.local_position(262), (1, 0));
         assert_eq!(max_id_len(&ids), 5);
+        ids.push_back(b"raw\xfflong\0ignored-title-tail");
+        assert_eq!(max_id_len(&ids), 8);
     }
 
     #[test]

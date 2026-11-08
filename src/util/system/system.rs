@@ -15,6 +15,43 @@ pub const DEFAULT_LINE_DELIMITER: &str = "\r\n";
 #[cfg(not(windows))]
 pub const DEFAULT_LINE_DELIMITER: &str = "\n";
 
+/// Host processor hint used by Source's `std::thread::hardware_concurrency`.
+/// This intentionally follows the C++ library's OS query rather than Rust's
+/// quota-aware `available_parallelism` or the size of an existing Rayon pool.
+pub fn hardware_concurrency() -> u32 {
+    #[cfg(unix)]
+    {
+        // libc++ uses this on Apple/POSIX. On glibc it calls __get_nprocs,
+        // the same implementation selected directly by libstdc++.
+        let count = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        if count < 0 {
+            0
+        } else {
+            count as u32
+        }
+    }
+    #[cfg(all(windows, target_env = "gnu"))]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+        let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+        // libstdc++'s Windows implementation queries this processor group.
+        unsafe { GetSystemInfo(&mut info) };
+        info.dwNumberOfProcessors
+    }
+    #[cfg(all(windows, not(target_env = "gnu")))]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetActiveProcessorCount, ALL_PROCESSOR_GROUPS,
+        };
+        // libc++ and current MSVC count active processors across all groups.
+        unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
     Red,
@@ -44,9 +81,10 @@ pub fn set_color(color: Color, err: bool) {
     {
         let sequence = color_escape_sequence(color);
         if err {
-            eprint!("{sequence}");
+            crate::util::log_stream::flush_tied_stdout();
+            crate::util::io::console::stderr_fmt(format_args!("{sequence}"));
         } else {
-            print!("{sequence}");
+            crate::util::io::console::stdout_fmt(format_args!("{sequence}"));
         }
     }
 }
@@ -68,9 +106,10 @@ pub fn reset_color(err: bool) {
     #[cfg(not(windows))]
     {
         if err {
-            eprint!("{}", reset_color_escape_sequence());
+            crate::util::log_stream::flush_tied_stdout();
+            crate::util::io::console::stderr_fmt(format_args!("{}", reset_color_escape_sequence()));
         } else {
-            print!("{}", reset_color_escape_sequence());
+            crate::util::io::console::stdout_fmt(format_args!("{}", reset_color_escape_sequence()));
         }
     }
 }
@@ -234,6 +273,10 @@ fn parse_linux_cache_size(value: &str) -> Option<usize> {
 }
 
 pub fn mkdir(dir: &str) -> Result<(), String> {
+    mkdir_path(std::path::Path::new(dir)).map_err(|error| error.to_string())
+}
+
+pub fn mkdir_path(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     let result = {
         use std::os::unix::fs::DirBuilderExt;
@@ -246,7 +289,9 @@ pub fn mkdir(dir: &str) -> Result<(), String> {
     match result {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(_) => Err(format!("could not create temporary directory {dir}")),
+        Err(_) => Err(std::io::Error::other(
+            crate::util::io::IoError::path_message(b"could not create temporary directory ", dir),
+        )),
     }
 }
 

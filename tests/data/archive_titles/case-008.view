@@ -1,0 +1,10 @@
+translated_query	single_domain	single_domain	single_domain	single_domain	176
+translated_query	sp|R001|main	sp|R001|main	sp|R001|main	sp|R001|main	176
+translated_query	sp|R001|main	sp|R001|main	sp|R001|main	sp|R001|main	169
+translated_query	sp|R001|main	sp|R001|main	sp|R001|main	sp|R001|main	162
+translated_query	gapped_refraw	gapped_refraw	gapped_refraw	gapped_refraw	157
+reverse_query	single_domain	single_domain	single_domain	single_domain	176
+reverse_query	sp|R001|main	sp|R001|main	sp|R001|main	sp|R001|main	176
+reverse_query	sp|R001|main	sp|R001|main	sp|R001|main	sp|R001|main	169
+reverse_query	sp|R001|main	sp|R001|main	sp|R001|main	sp|R001|main	162
+reverse_query	gapped_refraw	gapped_refraw	gapped_refraw	gapped_refraw	157

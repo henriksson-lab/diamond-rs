@@ -7,21 +7,22 @@
 
 use std::collections::BTreeSet;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::basic::value::{Letter, AMINO_ACID_ALPHABET, MASK_LETTER, NUCLEOTIDE_ALPHABET};
-use crate::data::fasta::FastaRecord;
+use crate::data::fasta::{ByteFastaRecord, FastaRecord};
 use crate::masking::tantan::TantanMasker;
 use crate::stats::matrices::BLOSUM62;
-use crate::util::sequence::seqid;
+use crate::util::sequence::seqid_bytes;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolsConfig {
-    pub database: Option<String>,
-    pub query_file: Option<String>,
-    pub seq_no: Vec<String>,
-    pub output_file: Option<String>,
-    pub oid_list: Option<String>,
+    pub database: Option<PathBuf>,
+    pub query_file: Option<PathBuf>,
+    pub seq_no: Vec<Vec<u8>>,
+    pub output_file: Option<PathBuf>,
+    pub oid_list: Option<PathBuf>,
     pub reverse: bool,
     pub hardmasked: bool,
     pub chunk_size: f64,
@@ -96,7 +97,51 @@ pub trait ToolsBackend {
         path: &str,
         sequence_type: ToolSequenceType,
     ) -> Result<Vec<FastaRecord>, String>;
+    /// Canonical Source byte records; provided bridges preserve existing String backends.
+    fn database_sequences_bytes(&mut self, database: &str) -> Result<Vec<ByteFastaRecord>, String> {
+        self.database_sequences(database)
+            .map(|records| records.into_iter().map(Into::into).collect())
+    }
+    fn read_sequences_bytes(
+        &mut self,
+        path: &str,
+        sequence_type: ToolSequenceType,
+    ) -> Result<Vec<ByteFastaRecord>, String> {
+        self.read_sequences(path, sequence_type)
+            .map(|records| records.into_iter().map(Into::into).collect())
+    }
+    fn database_sequences_path_bytes(
+        &mut self,
+        database: &Path,
+    ) -> Result<Vec<ByteFastaRecord>, String> {
+        self.database_sequences_bytes(
+            database
+                .to_str()
+                .ok_or("Path is not UTF-8; implement database_sequences_path_bytes")?,
+        )
+    }
+    fn read_sequences_path_bytes(
+        &mut self,
+        path: &Path,
+        sequence_type: ToolSequenceType,
+    ) -> Result<Vec<ByteFastaRecord>, String> {
+        self.read_sequences_bytes(
+            path.to_str()
+                .ok_or("Path is not UTF-8; implement read_sequences_path_bytes")?,
+            sequence_type,
+        )
+    }
     fn random_index(&mut self, sequence_count: usize) -> usize;
+    fn mask_sequence(&mut self, sequence: &mut [Letter], probability: f32) -> Result<(), String> {
+        TantanMasker::new(&BLOSUM62, probability).mask_hard(sequence);
+        Ok(())
+    }
+    /// Source initializes its score matrix before opening pairwise input,
+    /// including with zero worker threads. Native backends must preserve any
+    /// constructor error at that point rather than delaying it until a pair.
+    fn prepare_pairwise(&mut self, _settings: PairwiseSettings) -> Result<(), String> {
+        Ok(())
+    }
     fn pairwise_alignment(
         &mut self,
         reference: &[Letter],
@@ -105,7 +150,7 @@ pub trait ToolsBackend {
     ) -> Result<Vec<PairwiseColumn>, String>;
 }
 
-fn required<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str, String> {
+fn required<'a>(value: &'a Option<PathBuf>, name: &str) -> Result<&'a Path, String> {
     value
         .as_deref()
         .ok_or_else(|| format!("Missing required parameter: {name}"))
@@ -116,19 +161,9 @@ fn first_seq_no(config: &ToolsConfig) -> Result<usize, String> {
         .seq_no
         .first()
         .ok_or_else(|| "Missing required parameter: seq-no".to_owned())?;
-    // C atoi: leading whitespace and a sign are accepted; parsing stops at
-    // the first non-digit and invalid input yields zero.
-    let value = value.trim_start();
-    let (negative, digits) = match value.as_bytes().first() {
-        Some(b'-') => (true, &value[1..]),
-        Some(b'+') => (false, &value[1..]),
-        _ => (false, value),
-    };
-    let digits = &digits[..digits
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(digits.len())];
-    let parsed = digits.parse::<i64>().unwrap_or(0);
-    Ok(if negative { -parsed } else { parsed } as usize)
+    let mut value = value.clone();
+    value.push(0);
+    Ok(unsafe { libc::atoi(value.as_ptr().cast()) } as usize)
 }
 
 fn sequence_text(sequence: &[Letter], alphabet: &[u8]) -> String {
@@ -171,7 +206,7 @@ pub fn random_seqs<B: ToolsBackend, W: Write, S: Write>(
     out: &mut W,
     status: &mut S,
 ) -> Result<(), String> {
-    let records = backend.database_sequences(required(&config.database, "database")?)?;
+    let records = backend.database_sequences_path_bytes(required(&config.database, "database")?)?;
     writeln!(status, "Sequences = {}", records.len()).map_err(|error| error.to_string())?;
     let count = first_seq_no(config)?;
     if count > records.len() {
@@ -213,12 +248,35 @@ pub fn run_masker_records<W: Write, E: Write>(
     elapsed_seconds: f64,
     min_mask_prob: f32,
 ) -> Result<MaskerSummary, String> {
+    let summary = mask_records(records, out, min_mask_prob)?;
+    write_masker_summary(err, summary, elapsed_seconds)?;
+    Ok(summary)
+}
+
+fn mask_records<W: Write, N: AsRef<[u8]>>(
+    records: &[FastaRecord<N>],
+    out: &mut W,
+    min_mask_prob: f32,
+) -> Result<MaskerSummary, String> {
     let masker = TantanMasker::new(&BLOSUM62, min_mask_prob);
+    mask_records_with(records, out, |sequence| {
+        masker.mask_hard(sequence);
+        Ok(())
+    })
+}
+fn mask_records_with<W: Write, N: AsRef<[u8]>>(
+    records: &[FastaRecord<N>],
+    out: &mut W,
+    mut mask: impl FnMut(&mut [Letter]) -> Result<(), String>,
+) -> Result<MaskerSummary, String> {
     let mut summary = MaskerSummary::default();
     for record in records {
-        writeln!(out, ">{}", record.id).map_err(|error| error.to_string())?;
+        out.write_all(b">").map_err(|error| error.to_string())?;
+        out.write_all(record.id.as_ref())
+            .map_err(|error| error.to_string())?;
+        writeln!(out).map_err(|error| error.to_string())?;
         let mut sequence = record.sequence.clone();
-        masker.mask_hard(&mut sequence);
+        mask(&mut sequence)?;
         writeln!(out, "{}", sequence_text(&sequence, AMINO_ACID_ALPHABET))
             .map_err(|error| error.to_string())?;
         let masked = sequence
@@ -229,13 +287,21 @@ pub fn run_masker_records<W: Write, E: Write>(
         summary.masked_sequences += usize::from(masked > 0);
         summary.total_sequences += 1;
     }
+    Ok(summary)
+}
+
+fn write_masker_summary<E: Write>(
+    err: &mut E,
+    summary: MaskerSummary,
+    elapsed_seconds: f64,
+) -> Result<(), String> {
     writeln!(
         err,
         "#Sequences: {}/{}, #Letters: {}, t={}",
         summary.masked_sequences, summary.total_sequences, summary.masked_letters, elapsed_seconds
     )
     .map_err(|error| error.to_string())?;
-    Ok(summary)
+    Ok(())
 }
 
 pub fn run_masker<B: ToolsBackend, W: Write, E: Write>(
@@ -245,17 +311,17 @@ pub fn run_masker<B: ToolsBackend, W: Write, E: Write>(
     err: &mut E,
 ) -> Result<MaskerSummary, String> {
     let started = Instant::now();
-    let records = backend.read_sequences(
+    let records = backend.read_sequences_path_bytes(
         required(&config.query_file, "query")?,
         ToolSequenceType::AminoAcid,
     )?;
-    run_masker_records(
-        records.as_slice(),
-        out,
-        err,
-        started.elapsed().as_secs_f64(),
-        config.tantan_min_mask_prob,
-    )
+    let summary = mask_records_with(records.as_slice(), out, |sequence| {
+        backend.mask_sequence(sequence, config.tantan_min_mask_prob)
+    })?;
+    // Source reports elapsed whole milliseconds after masking and writing,
+    // rather than timing only the input read before entering the masker.
+    write_masker_summary(err, summary, started.elapsed().as_millis() as f64 / 1000.0)?;
+    Ok(summary)
 }
 
 pub fn fastq2fasta<B: ToolsBackend, W: Write>(
@@ -263,13 +329,16 @@ pub fn fastq2fasta<B: ToolsBackend, W: Write>(
     config: &ToolsConfig,
     out: &mut W,
 ) -> Result<(), String> {
-    let records = backend.read_sequences(
+    let records = backend.read_sequences_path_bytes(
         required(&config.query_file, "query")?,
         ToolSequenceType::Nucleotide,
     )?;
     let max = first_seq_no(config)?;
     for record in records.iter().take(max) {
-        writeln!(out, ">{}", record.id).map_err(|error| error.to_string())?;
+        out.write_all(b">").map_err(|error| error.to_string())?;
+        out.write_all(record.id.as_ref())
+            .map_err(|error| error.to_string())?;
+        writeln!(out).map_err(|error| error.to_string())?;
         writeln!(
             out,
             "{}",
@@ -309,11 +378,19 @@ pub fn pairwise_worker<B: ToolsBackend, W: Write>(
     records: &[FastaRecord],
     out: &mut W,
 ) -> Result<(), String> {
+    pairwise_worker_raw(backend, records, out)
+}
+
+fn pairwise_worker_raw<B: ToolsBackend, W: Write, N: AsRef<[u8]>>(
+    backend: &mut B,
+    records: &[FastaRecord<N>],
+    out: &mut W,
+) -> Result<(), String> {
     for pair in records.chunks_exact(2) {
         let reference = &pair[0];
         let query = &pair[1];
-        let reference_id = seqid(&reference.id);
-        let query_id = seqid(&query.id);
+        let reference_id = seqid_bytes(reference.id.as_ref());
+        let query_id = seqid_bytes(query.id.as_ref());
         let columns = backend.pairwise_alignment(
             &reference.sequence,
             &query.sequence,
@@ -321,20 +398,30 @@ pub fn pairwise_worker<B: ToolsBackend, W: Write>(
         )?;
         let mut buffer = Vec::new();
         for column in columns {
-            match column.operation {
-                PairwiseOperation::Substitution => writeln!(
-                    buffer,
-                    "{reference_id}\t{query_id}\t{}\t{}\t{}",
-                    column.subject_pos, column.query_pos, column.query_char
-                ),
-                PairwiseOperation::Deletion => writeln!(
-                    buffer,
-                    "{reference_id}\t{query_id}\t{}\t-1\t-",
-                    column.subject_pos
-                ),
-                PairwiseOperation::Other => Ok(()),
+            if matches!(
+                column.operation,
+                PairwiseOperation::Substitution | PairwiseOperation::Deletion
+            ) {
+                buffer
+                    .write_all(&reference_id)
+                    .map_err(|error| error.to_string())?;
+                buffer.write_all(b"\t").map_err(|error| error.to_string())?;
+                buffer
+                    .write_all(&query_id)
+                    .map_err(|error| error.to_string())?;
+                match column.operation {
+                    PairwiseOperation::Substitution => writeln!(
+                        buffer,
+                        "\t{}\t{}\t{}",
+                        column.subject_pos, column.query_pos, column.query_char
+                    ),
+                    PairwiseOperation::Deletion => {
+                        writeln!(buffer, "\t{}\t-1\t-", column.subject_pos)
+                    }
+                    PairwiseOperation::Other => unreachable!(),
+                }
+                .map_err(|error| error.to_string())?;
             }
-            .map_err(|error| error.to_string())?;
         }
         out.write_all(&buffer).map_err(|error| error.to_string())?;
     }
@@ -346,17 +433,18 @@ pub fn pairwise<B: ToolsBackend, W: Write>(
     config: &ToolsConfig,
     out: &mut W,
 ) -> Result<(), String> {
-    if config.threads <= 0 {
-        return Ok(());
-    }
-    let records = backend.read_sequences(
+    backend.prepare_pairwise(PairwiseSettings::default())?;
+    let records = backend.read_sequences_path_bytes(
         required(&config.query_file, "query")?,
         ToolSequenceType::Nucleotide,
     )?;
+    if config.threads <= 0 {
+        return Ok(());
+    }
     // C++ workers share the input stream and serialize complete per-pair
     // buffers. Sequential ownership preserves those record boundaries; only
     // the unspecified cross-thread ordering is made deterministic.
-    pairwise_worker(backend, &records, out)
+    pairwise_worker_raw(backend, &records, out)
 }
 
 pub fn reverse<B: ToolsBackend, W: Write>(
@@ -364,12 +452,15 @@ pub fn reverse<B: ToolsBackend, W: Write>(
     config: &ToolsConfig,
     out: &mut W,
 ) -> Result<(), String> {
-    let records = backend.read_sequences(
+    let records = backend.read_sequences_path_bytes(
         required(&config.query_file, "query")?,
         ToolSequenceType::AminoAcid,
     )?;
     for record in records {
-        writeln!(out, ">\\{}", record.id).map_err(|error| error.to_string())?;
+        out.write_all(b">\\").map_err(|error| error.to_string())?;
+        out.write_all(&record.id)
+            .map_err(|error| error.to_string())?;
+        writeln!(out).map_err(|error| error.to_string())?;
         writeln!(
             out,
             "{}",
@@ -390,7 +481,7 @@ mod tests {
         input: Vec<FastaRecord>,
         random: Vec<usize>,
         alignments: Vec<Vec<PairwiseColumn>>,
-        got_get_seq: Option<String>,
+        got_get_seq: Option<PathBuf>,
         sequence_types: Vec<ToolSequenceType>,
     }
 
@@ -424,8 +515,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn byte_backend_reaches_tool_headers_without_checked_string_reads() {
+        struct RawBackend;
+        impl ToolsBackend for RawBackend {
+            fn get_seq(&mut self, _: &ToolsConfig) -> Result<(), String> {
+                Ok(())
+            }
+            fn database_sequences(&mut self, _: &str) -> Result<Vec<FastaRecord>, String> {
+                Err("String reader must not be called".into())
+            }
+            fn read_sequences(
+                &mut self,
+                _: &str,
+                _: ToolSequenceType,
+            ) -> Result<Vec<FastaRecord>, String> {
+                Err("String reader must not be called".into())
+            }
+            fn read_sequences_bytes(
+                &mut self,
+                _: &str,
+                _: ToolSequenceType,
+            ) -> Result<Vec<ByteFastaRecord>, String> {
+                Ok(vec![ByteFastaRecord {
+                    id: b"raw\xff\0tail".to_vec(),
+                    sequence: vec![0, 1],
+                    quality: None,
+                }])
+            }
+            fn random_index(&mut self, _: usize) -> usize {
+                0
+            }
+            fn pairwise_alignment(
+                &mut self,
+                _: &[Letter],
+                _: &[Letter],
+                _: PairwiseSettings,
+            ) -> Result<Vec<PairwiseColumn>, String> {
+                Ok(vec![])
+            }
+        }
+        let config = ToolsConfig {
+            query_file: Some("unused".into()),
+            seq_no: vec!["1".into()],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        fastq2fasta(&mut RawBackend, &config, &mut out).unwrap();
+        assert_eq!(out, b">raw\xff\0tail\nAC\n");
+        out.clear();
+        reverse(&mut RawBackend, &config, &mut out).unwrap();
+        assert_eq!(out, b">\\raw\xff\0tail\nRA\n");
+    }
+
     fn record(id: &str, sequence: &[Letter]) -> FastaRecord {
         FastaRecord {
+            quality: None,
             id: id.to_owned(),
             sequence: sequence.to_vec(),
         }
@@ -444,7 +589,7 @@ mod tests {
             ..Default::default()
         };
         get_seq(&mut backend, &config).unwrap();
-        assert_eq!(backend.got_get_seq.as_deref(), Some("db.dmnd"));
+        assert_eq!(backend.got_get_seq.as_deref(), Some(Path::new("db.dmnd")));
         let mut out = Vec::new();
         let mut status = Vec::new();
         random_seqs(&mut backend, &config, &mut out, &mut status).unwrap();

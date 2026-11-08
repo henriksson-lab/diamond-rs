@@ -1,16 +1,18 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
 use crate::util::data_structures::{DoubleArray, FlatIndex};
 use crate::util::hash::murmur_hash_u64;
-use crate::util::io::{IoError, IoResult, TempFileData};
+use crate::util::io::{
+    Compressor, InputFile, IoError, IoErrorOwner, IoResult, TempFile, TempFileData,
+};
 
 pub mod greedy_vertex_cover;
+pub mod source_sort;
 
 pub use greedy_vertex_cover::{
     greedy_vertex_cover, make_cluster_cc, make_cluster_gvc, neighbor_count, neighbor_count2,
@@ -851,6 +853,118 @@ pub trait HashJoinRecord: Copy {
     fn value(&self) -> Self::Value;
 }
 
+/// Controls shared by Source's recursive radix/hash seed join.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HashJoinConfig {
+    pub split_size: usize,
+    pub split_key_len: u32,
+    pub radix_bits: u32,
+    pub ht_factor: f64,
+    pub swap: bool,
+    pub radix_cluster_buffered: bool,
+}
+impl Default for HashJoinConfig {
+    fn default() -> Self {
+        Self {
+            split_size: JOIN_SPLIT_SIZE,
+            split_key_len: JOIN_SPLIT_KEY_LEN,
+            radix_bits: 8,
+            ht_factor: JOIN_HT_FACTOR,
+            swap: HASH_JOIN_SWAP,
+            radix_cluster_buffered: false,
+        }
+    }
+}
+
+// Build group headers once, then scatter in input order, as Source does after
+// replacing each key with its table slot. Values may have a packed wire size
+// (PackedLoc is five bytes), which is independent of Rust's size_of::<Value>().
+fn scatter_join<V: HashJoinValue>(
+    table: &mut [RelPtr],
+    r: impl Iterator<Item = (usize, V)>,
+    s: impl Iterator<Item = (usize, V)>,
+    dst_r: &mut DoubleArray,
+    dst_s: &mut DoubleArray,
+) {
+    let mut encoded = Vec::new();
+    let mut rows_r = r.peekable();
+    let mut rows_s = s.peekable();
+    let width = rows_r
+        .peek()
+        .or_else(|| rows_s.peek())
+        .map(|(_, v)| {
+            v.write_ne_bytes(&mut encoded);
+            encoded.len()
+        })
+        .unwrap_or(0);
+    let mut data_r = Vec::new();
+    let mut data_s = Vec::new();
+    for ptr in table.iter_mut() {
+        if ptr.s == 0 {
+            continue;
+        }
+        let nr = ptr.r as usize;
+        let ns = ptr.s as usize;
+        data_r.extend_from_slice(&ptr.r.to_ne_bytes());
+        data_s.extend_from_slice(&ptr.s.to_ne_bytes());
+        ptr.r =
+            u32::try_from(data_r.len()).expect("Source join output exceeds unsigned byte offsets");
+        ptr.s =
+            u32::try_from(data_s.len()).expect("Source join output exceeds unsigned byte offsets");
+        data_r.resize(
+            data_r
+                .len()
+                .checked_add(nr.checked_mul(width).expect("join size overflow"))
+                .expect("join size overflow"),
+            0,
+        );
+        data_s.resize(
+            data_s
+                .len()
+                .checked_add(ns.checked_mul(width).expect("join size overflow"))
+                .expect("join size overflow"),
+            0,
+        );
+    }
+    for (slot, value) in rows_r {
+        if table[slot].s == 0 {
+            continue;
+        }
+        encoded.clear();
+        value.write_ne_bytes(&mut encoded);
+        assert_eq!(
+            encoded.len(),
+            width,
+            "HashJoinValue must have a fixed encoded width"
+        );
+        let offset = table[slot].r as usize;
+        data_r[offset..offset + width].copy_from_slice(&encoded);
+        table[slot].r = table[slot]
+            .r
+            .checked_add(width as u32)
+            .expect("join offset overflow");
+    }
+    for (slot, value) in rows_s {
+        encoded.clear();
+        value.write_ne_bytes(&mut encoded);
+        assert_eq!(
+            encoded.len(),
+            width,
+            "HashJoinValue must have a fixed encoded width"
+        );
+        let offset = table[slot].s as usize;
+        data_s[offset..offset + width].copy_from_slice(&encoded);
+        table[slot].s = table[slot]
+            .s
+            .checked_add(width as u32)
+            .expect("join offset overflow");
+    }
+    let nr = data_r.len();
+    let ns = data_s.len();
+    *dst_r = DoubleArray::from_bytes(data_r, nr);
+    *dst_s = DoubleArray::from_bytes(data_s, ns);
+}
+
 pub fn hash_table_join<T>(
     r: Relation<'_, T>,
     s: Relation<'_, T>,
@@ -863,11 +977,32 @@ pub fn hash_table_join<T>(
     <T::Key as TryFrom<usize>>::Error: std::fmt::Debug,
     <T::Key as TryInto<usize>>::Error: std::fmt::Debug,
 {
+    hash_table_join_with_config(r, s, shift, dst_r, dst_s, &HashJoinConfig::default())
+        .expect("hash table join failed");
+}
+
+fn hash_table_join_with_config<T>(
+    r: Relation<'_, T>,
+    s: Relation<'_, T>,
+    shift: u32,
+    dst_r: &mut DoubleArray,
+    dst_s: &mut DoubleArray,
+    config: &HashJoinConfig,
+) -> Result<(), String>
+where
+    T: HashJoinRecord,
+    T::Key: RadixKey,
+    <T::Key as TryFrom<usize>>::Error: std::fmt::Debug,
+    <T::Key as TryInto<usize>>::Error: std::fmt::Debug,
+{
     if r.n == 0 || s.n == 0 {
-        return;
+        return Ok(());
     }
-    let n = next_pow2_usize((r.n as f64 * JOIN_HT_FACTOR).ceil() as usize);
-    let key = ExtractBits::new(T::Key::try_from(n).unwrap(), shift);
+    let n = join_table_size(r.n, config.ht_factor)?;
+    let key = ExtractBits::new(
+        T::Key::try_from(n).map_err(|_| "Source join table exceeds seed key width".to_string())?,
+        shift,
+    );
     let mut table = vec![(T::Key::from(0), RelPtr::default()); n];
     let mut r_slots = Vec::with_capacity(r.n);
     for item in r.data {
@@ -887,7 +1022,9 @@ pub fn hash_table_join<T>(
             }
             p += 1;
             if p == n {
-                assert!(!wrapped, "Hash table overflow.");
+                if wrapped {
+                    return Err("Hash table overflow.".into());
+                }
                 p = 0;
                 wrapped = true;
             }
@@ -909,32 +1046,25 @@ pub fn hash_table_join<T>(
             }
             p += 1;
             if p == n {
-                assert!(!wrapped, "Hash table overflow.");
+                if wrapped {
+                    return Err("Hash table overflow.".into());
+                }
                 p = 0;
                 wrapped = true;
             }
         }
     }
-    let mut data_r = Vec::new();
-    let mut data_s = Vec::new();
-    for (p, (_, ptr)) in table.iter().enumerate().filter(|(_, (_, ptr))| ptr.s != 0) {
-        data_r.extend_from_slice(&ptr.r.to_ne_bytes());
-        data_s.extend_from_slice(&ptr.s.to_ne_bytes());
-        for (slot, item) in r_slots.iter().zip(r.data.iter()) {
-            if *slot == p {
-                item.value().write_ne_bytes(&mut data_r);
-            }
-        }
-        for (slot, value) in &s_hits {
-            if *slot == p {
-                value.write_ne_bytes(&mut data_s);
-            }
-        }
-    }
-    let size_r = data_r.len();
-    let size_s = data_s.len();
-    *dst_r = DoubleArray::from_bytes(data_r, size_r);
-    *dst_s = DoubleArray::from_bytes(data_s, size_s);
+    let mut pointers: Vec<_> = table.into_iter().map(|(_, ptr)| ptr).collect();
+    scatter_join(
+        &mut pointers,
+        r_slots
+            .into_iter()
+            .zip(r.data.iter().map(|item| item.value())),
+        s_hits.into_iter(),
+        dst_r,
+        dst_s,
+    );
+    Ok(())
 }
 
 pub fn table_join<T>(
@@ -965,26 +1095,15 @@ pub fn table_join<T>(
             s_hits.push((p, item.value()));
         }
     }
-    let mut data_r = Vec::new();
-    let mut data_s = Vec::new();
-    for (p, ptr) in table.iter().enumerate().filter(|(_, ptr)| ptr.s != 0) {
-        data_r.extend_from_slice(&ptr.r.to_ne_bytes());
-        data_s.extend_from_slice(&ptr.s.to_ne_bytes());
-        for item in r.data {
-            if key.get(item.key()).try_into().unwrap() == p {
-                item.value().write_ne_bytes(&mut data_r);
-            }
-        }
-        for (slot, value) in &s_hits {
-            if *slot == p {
-                value.write_ne_bytes(&mut data_s);
-            }
-        }
-    }
-    let size_r = data_r.len();
-    let size_s = data_s.len();
-    *dst_r = DoubleArray::from_bytes(data_r, size_r);
-    *dst_s = DoubleArray::from_bytes(data_s, size_s);
+    scatter_join(
+        &mut table,
+        r.data
+            .iter()
+            .map(|item| (key.get(item.key()).try_into().unwrap(), item.value())),
+        s_hits.into_iter(),
+        dst_r,
+        dst_s,
+    );
 }
 
 pub fn hash_join_into<T>(
@@ -1000,30 +1119,168 @@ pub fn hash_join_into<T>(
     <T::Key as TryFrom<usize>>::Error: std::fmt::Debug,
     <T::Key as TryInto<usize>>::Error: std::fmt::Debug,
 {
+    let config = HashJoinConfig::default();
+    hash_join_configured_into(r, s, out_r, out_s, total_bits, shift, &config)
+        .expect("hash join failed");
+}
+
+fn hash_join_configured_into<T>(
+    r: Relation<'_, T>,
+    s: Relation<'_, T>,
+    out_r: &mut DoubleArray,
+    out_s: &mut DoubleArray,
+    total_bits: u32,
+    shift: u32,
+    config: &HashJoinConfig,
+) -> Result<(), String>
+where
+    T: HashJoinRecord,
+    T::Key: RadixKey,
+    <T::Key as TryFrom<usize>>::Error: std::fmt::Debug,
+    <T::Key as TryInto<usize>>::Error: std::fmt::Debug,
+{
     if r.n == 0 || s.n == 0 {
-        return;
+        return Ok(());
     }
-    let key_bits = total_bits - shift;
-    let mut tmp_r = DoubleArray::new();
-    let mut tmp_s = DoubleArray::new();
-    if r.n < JOIN_SPLIT_SIZE || key_bits < JOIN_SPLIT_KEY_LEN {
-        if next_pow2_usize((r.n as f64 * JOIN_HT_FACTOR).ceil() as usize) < (1usize << key_bits) {
-            hash_table_join(r, s, shift, &mut tmp_r, &mut tmp_s);
+    if hash_join_leaf(r.data, s.data, out_r, out_s, total_bits, shift, config)? {
+        return Ok(());
+    }
+    // The public relation is immutable. Source mutates its caller's seed arrays;
+    // these two owned arenas preserve that API while reusing both at every depth.
+    let mut r = r.data.to_vec();
+    let mut s = s.data.to_vec();
+    let mut scratch_r = r.clone();
+    let mut scratch_s = s.clone();
+    hash_join_recursive(
+        &mut r,
+        &mut s,
+        &mut scratch_r,
+        &mut scratch_s,
+        out_r,
+        out_s,
+        total_bits,
+        shift,
+        config,
+    )?;
+    Ok(())
+}
+
+fn hash_join_leaf<T>(
+    r: &[T],
+    s: &[T],
+    out_r: &mut DoubleArray,
+    out_s: &mut DoubleArray,
+    total_bits: u32,
+    shift: u32,
+    config: &HashJoinConfig,
+) -> Result<bool, String>
+where
+    T: HashJoinRecord,
+    T::Key: RadixKey,
+    <T::Key as TryFrom<usize>>::Error: std::fmt::Debug,
+    <T::Key as TryInto<usize>>::Error: std::fmt::Debug,
+{
+    let key_bits = total_bits
+        .checked_sub(shift)
+        .ok_or_else(|| "Source join shift exceeds key width".to_string())?;
+    if r.len() < config.split_size || key_bits < config.split_key_len {
+        let mut tmp_r = DoubleArray::new();
+        let mut tmp_s = DoubleArray::new();
+        let table_size = join_table_size(r.len(), config.ht_factor)?;
+        let rr = Relation::new(r, r.len());
+        let ss = Relation::new(s, s.len());
+        if (table_size as u128) < (1u128 << key_bits) {
+            hash_table_join_with_config(rr, ss, shift, &mut tmp_r, &mut tmp_s, config)?;
         } else {
-            table_join(r, s, total_bits, shift, &mut tmp_r, &mut tmp_s);
+            table_join(rr, ss, total_bits, shift, &mut tmp_r, &mut tmp_s);
         }
         out_r.append(&tmp_r);
         out_s.append(&tmp_s);
-    } else {
-        table_join(r, s, total_bits, shift, &mut tmp_r, &mut tmp_s);
-        out_r.append(&tmp_r);
-        out_s.append(&tmp_s);
+        return Ok(true);
     }
+    Ok(false)
+}
+
+fn hash_join_recursive<T>(
+    r: &mut [T],
+    s: &mut [T],
+    scratch_r: &mut [T],
+    scratch_s: &mut [T],
+    out_r: &mut DoubleArray,
+    out_s: &mut DoubleArray,
+    total_bits: u32,
+    shift: u32,
+    config: &HashJoinConfig,
+) -> Result<(), String>
+where
+    T: HashJoinRecord,
+    T::Key: RadixKey,
+    <T::Key as TryFrom<usize>>::Error: std::fmt::Debug,
+    <T::Key as TryInto<usize>>::Error: std::fmt::Debug,
+{
+    if r.is_empty() || s.is_empty() {
+        return Ok(());
+    }
+    if hash_join_leaf(r, s, out_r, out_s, total_bits, shift, config)? {
+        return Ok(());
+    }
+    let key_bits = total_bits
+        .checked_sub(shift)
+        .ok_or_else(|| "Source join shift exceeds key width".to_string())?;
+    if config.radix_bits == 0 || config.radix_bits > key_bits {
+        return Err(
+            "Source radix join requires a positive radix width within the remaining key bits"
+                .into(),
+        );
+    }
+    let clusters = 1usize
+        .checked_shl(config.radix_bits)
+        .ok_or_else(|| "Source radix width exceeds address width".to_string())?;
+    let mut hr = vec![0; clusters];
+    let mut hs = vec![0; clusters];
+    radix_cluster(
+        Relation::new(r, r.len()),
+        shift,
+        scratch_r,
+        &mut hr,
+        |item: &T| item.key(),
+        config.radix_bits,
+        config.radix_cluster_buffered,
+    );
+    radix_cluster(
+        Relation::new(s, s.len()),
+        shift,
+        scratch_s,
+        &mut hs,
+        |item: &T| item.key(),
+        config.radix_bits,
+        config.radix_cluster_buffered,
+    );
+    let mut rb = 0;
+    let mut sb = 0;
+    for cluster in 0..clusters {
+        let re = hr[cluster];
+        let se = hs[cluster];
+        hash_join_recursive(
+            &mut scratch_r[rb..re],
+            &mut scratch_s[sb..se],
+            &mut r[rb..re],
+            &mut s[sb..se],
+            out_r,
+            out_s,
+            total_bits,
+            shift + config.radix_bits,
+            config,
+        )?;
+        rb = re;
+        sb = se;
+    }
+    Ok(())
 }
 
 pub fn hash_join<'a, T>(
-    mut r: Relation<'a, T>,
-    mut s: Relation<'a, T>,
+    r: Relation<'a, T>,
+    s: Relation<'a, T>,
     total_bits: u32,
 ) -> (DoubleArray, DoubleArray)
 where
@@ -1032,26 +1289,59 @@ where
     <T::Key as TryFrom<usize>>::Error: std::fmt::Debug,
     <T::Key as TryInto<usize>>::Error: std::fmt::Debug,
 {
-    let swap = HASH_JOIN_SWAP && r.n > s.n;
+    hash_join_with_config(r, s, total_bits, &HashJoinConfig::default())
+}
+
+pub fn hash_join_with_config<'a, T>(
+    r: Relation<'a, T>,
+    s: Relation<'a, T>,
+    total_bits: u32,
+    config: &HashJoinConfig,
+) -> (DoubleArray, DoubleArray)
+where
+    T: HashJoinRecord,
+    T::Key: RadixKey,
+    <T::Key as TryFrom<usize>>::Error: std::fmt::Debug,
+    <T::Key as TryInto<usize>>::Error: std::fmt::Debug,
+{
+    try_hash_join_with_config(r, s, total_bits, config).expect("hash join failed")
+}
+
+pub fn try_hash_join_with_config<'a, T>(
+    mut r: Relation<'a, T>,
+    mut s: Relation<'a, T>,
+    total_bits: u32,
+    config: &HashJoinConfig,
+) -> Result<(DoubleArray, DoubleArray), String>
+where
+    T: HashJoinRecord,
+    T::Key: RadixKey,
+    <T::Key as TryFrom<usize>>::Error: std::fmt::Debug,
+    <T::Key as TryInto<usize>>::Error: std::fmt::Debug,
+{
+    let swap = config.swap && r.n > s.n;
     if swap {
         std::mem::swap(&mut r, &mut s);
     }
     let mut out_r = DoubleArray::new();
     let mut out_s = DoubleArray::new();
-    hash_join_into(r, s, &mut out_r, &mut out_s, total_bits, 0);
+    hash_join_configured_into(r, s, &mut out_r, &mut out_s, total_bits, 0, config)?;
     if swap {
-        (out_s, out_r)
+        Ok((out_s, out_r))
     } else {
-        (out_r, out_s)
+        Ok((out_r, out_s))
     }
 }
 
-fn next_pow2_usize(x: usize) -> usize {
-    if x <= 1 {
-        1
-    } else {
-        x.next_power_of_two()
+fn join_table_size(rows: usize, factor: f64) -> Result<usize, String> {
+    let size = (rows as f64 * factor).ceil();
+    if !size.is_finite() || size < 0.0 || size >= usize::MAX as f64 {
+        return Err("Source hash join table size is outside defined conversion bounds".into());
     }
+    (size as usize)
+        .max(1)
+        .checked_next_power_of_two()
+        .ok_or_else(|| "Source hash join table size overflows address width".into())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1148,6 +1438,10 @@ pub fn radix_cluster<T, Key, GetKey>(
                 buf[r].clear();
             }
         }
+        // Source deletes partial eight-record buffers here without flushing:
+        // its subsequent join can read uninitialized gaps. Keep a defined,
+        // complete scatter for those inputs; literal parity applies only when
+        // every bucket size is divisible by eight.
         for r in 0..clusters {
             let begin = hst[r];
             out[begin..begin + buf[r].len()].copy_from_slice(&buf[r]);
@@ -1327,27 +1621,62 @@ where
     I: IntoIterator<Item = T>,
     F: FnMut(T),
 {
-    let mut d: Vec<_> = begin.into_iter().map(|i| i.into_iter()).collect();
-    let mut q: Vec<Option<T>> = d.iter_mut().map(|i| i.next()).collect();
-    loop {
-        let mut idx: Option<usize> = None;
-        for i in 0..q.len() {
-            if q[i].is_none() {
-                continue;
+    // Upstream's Entry comparison is `!(value < other.value)`: equal heads
+    // rise on insertion. Preserve the pinned standard-library heap's push
+    // and adjust operations explicitly rather than adding a stream-index tie
+    // breaker, which changes clustered realignment output across blocks.
+    let mut streams: Vec<_> = begin.into_iter().map(IntoIterator::into_iter).collect();
+    let mut heap = Vec::new();
+    fn push<T: Ord>(heap: &mut Vec<(T, usize)>, value: (T, usize)) {
+        heap.push(value);
+        let mut hole = heap.len() - 1;
+        while hole > 0 {
+            let parent = (hole - 1) / 2;
+            if heap[parent].0 < heap[hole].0 {
+                break;
             }
-            if let Some(j) = idx {
-                if q[i].as_ref().unwrap() < q[j].as_ref().unwrap() {
-                    idx = Some(i);
-                }
-            } else {
-                idx = Some(i);
-            }
+            heap.swap(parent, hole);
+            hole = parent;
         }
-        let Some(i) = idx else {
-            break;
-        };
-        f(q[i].take().unwrap());
-        q[i] = d[i].next();
+    }
+    fn pop<T: Ord>(heap: &mut Vec<(T, usize)>) -> Option<(T, usize)> {
+        let last = heap.pop()?;
+        if heap.is_empty() {
+            return Some(last);
+        }
+        let out = std::mem::replace(&mut heap[0], last);
+        let mut hole = 0;
+        while 2 * hole + 1 < heap.len() {
+            let left = 2 * hole + 1;
+            let right = left + 1;
+            let child = if right < heap.len() && heap[right].0 < heap[left].0 {
+                right
+            } else {
+                left
+            };
+            heap.swap(hole, child);
+            hole = child;
+        }
+        while hole > 0 {
+            let parent = (hole - 1) / 2;
+            if heap[parent].0 < heap[hole].0 {
+                break;
+            }
+            heap.swap(parent, hole);
+            hole = parent;
+        }
+        Some(out)
+    }
+    for (index, stream) in streams.iter_mut().enumerate() {
+        if let Some(value) = stream.next() {
+            push(&mut heap, (value, index));
+        }
+    }
+    while let Some((value, index)) = pop(&mut heap) {
+        f(value);
+        if let Some(value) = streams[index].next() {
+            push(&mut heap, (value, index));
+        }
     }
 }
 
@@ -1356,7 +1685,29 @@ pub fn alloc_size<T>(_x: &T) -> usize {
 }
 
 pub fn alloc_size_string_u32_pair(x: &(String, u32)) -> usize {
-    4 + std::mem::size_of::<String>() + x.0.len()
+    4 + source_string_object_size() + x.0.len()
+}
+
+// Spill thresholds use C++ object sizes, not Rust's String/tuple layouts.
+// The pinned GNU ABI has pointer + size + 16-byte SSO storage; Apple's
+// libc++ string has three machine words. MSVC has the same object size as
+// the GNU layout on the supported 32/64-bit targets.
+const fn source_string_object_size() -> usize {
+    if cfg!(target_vendor = "apple") {
+        3 * std::mem::size_of::<usize>()
+    } else {
+        16 + 2 * std::mem::size_of::<usize>()
+    }
+}
+
+const fn source_string_pair_size<T>() -> usize {
+    let alignment = if std::mem::align_of::<T>() > std::mem::align_of::<usize>() {
+        std::mem::align_of::<T>()
+    } else {
+        std::mem::align_of::<usize>()
+    };
+    let size = source_string_object_size() + std::mem::size_of::<T>();
+    size.div_ceil(alignment) * alignment
 }
 
 /// On-disk representation used by DIAMOND's `ExternalSorter`.
@@ -1411,10 +1762,7 @@ external_sort_integer!(i32, u32, i64, u64, usize);
 
 impl ExternalSortField for String {
     fn external_alloc_size(&self) -> usize {
-        // Upstream `alloc_size(pair<string, uint32_t>)` accounts for the
-        // string allocation plus its fixed-width companion.  At field level,
-        // account for the string object's resident storage and payload.
-        std::mem::size_of::<String>() + self.len()
+        source_string_object_size()
     }
 
     fn write_external<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
@@ -1438,6 +1786,37 @@ impl ExternalSortField for String {
                     return String::from_utf8(bytes).map(Some).map_err(|error| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, error)
                     });
+                }
+                _ => bytes.push(byte[0]),
+            }
+        }
+    }
+}
+
+impl ExternalSortField for Vec<u8> {
+    fn external_alloc_size(&self) -> usize {
+        source_string_object_size()
+    }
+
+    fn write_external<W: Write>(&self, out: &mut W) -> std::io::Result<()> {
+        out.write_all(self)?;
+        out.write_all(&[0])
+    }
+
+    fn read_external<R: Read>(input: &mut R, eof_allowed: bool) -> std::io::Result<Option<Self>> {
+        let mut bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match input.read(&mut byte)? {
+                0 if bytes.is_empty() && eof_allowed => return Ok(None),
+                0 => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "unterminated string in external-sort run",
+                    ));
+                }
+                _ if byte[0] == 0 => {
+                    return Ok(Some(bytes));
                 }
                 _ => bytes.push(byte[0]),
             }
@@ -1499,25 +1878,51 @@ macro_rules! external_sort_pair {
 // `makedb`.  Upstream's generic `alloc_size` counts only sizeof(Type) for
 // them, even for the string pairs; reproduce that threshold exactly rather
 // than silently choosing a different spill boundary.
-external_sort_pair!(String, u64, |_: &(String, u64)| std::mem::size_of::<(
-    String,
+external_sort_pair!(String, u64, |_: &(String, u64)| source_string_pair_size::<
     u64,
-)>());
-external_sort_pair!(String, i32, |_: &(String, i32)| std::mem::size_of::<(
-    String,
+>());
+external_sort_pair!(String, i32, |_: &(String, i32)| source_string_pair_size::<
     i32,
-)>());
+>());
+external_sort_pair!(
+    Vec<u8>,
+    u64,
+    |_: &(Vec<u8>, u64)| source_string_pair_size::<u64>()
+);
+external_sort_pair!(
+    Vec<u8>,
+    i32,
+    |_: &(Vec<u8>, i32)| source_string_pair_size::<i32>()
+);
 external_sort_pair!(u64, i32, |_: &(u64, i32)| std::mem::size_of::<(u64, i32,)>(
 ));
 
 // This otherwise-unused specialization mirrors the sole pair overload in
 // external_sort.h and keeps the translated primitive generally testable.
 external_sort_pair!(String, u32, |value: &(String, u32)| {
-    4 + std::mem::size_of::<String>() + value.0.len()
+    alloc_size_string_u32_pair(value)
 });
 
 pub fn external_sorter_default_cmp<Type: Ord>(a: &Type, b: &Type) -> bool {
     a < b
+}
+
+/// Explicit equivalents of Source config.no_unlink/file_buffer_size.
+#[derive(Debug, Clone)]
+pub struct ExternalSortIoOptions {
+    pub no_unlink: bool,
+    pub file_buffer_size: usize,
+    /// Shared transport across Source's retained String-returning adapters.
+    pub errors: IoErrorOwner,
+}
+impl Default for ExternalSortIoOptions {
+    fn default() -> Self {
+        Self {
+            no_unlink: false,
+            file_buffer_size: 1 << 20,
+            errors: IoErrorOwner::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1527,6 +1932,7 @@ pub struct ExternalSorter<Type, Cmp = fn(&Type, &Type) -> bool> {
     size: usize,
     bucket_size: usize,
     temp_dir: PathBuf,
+    io_options: ExternalSortIoOptions,
     files: Vec<ExternalSortRun>,
     buf: Vec<Type>,
     queue: Vec<ExternalSortEntry<Type>>,
@@ -1534,14 +1940,37 @@ pub struct ExternalSorter<Type, Cmp = fn(&Type, &Type) -> bool> {
 
 #[derive(Debug)]
 struct ExternalSortRun {
+    #[cfg(test)]
     path: PathBuf,
-    input: Option<BufReader<File>>,
+    input: Option<InputFile>,
+    preserve_on_drop: bool,
+    #[cfg(all(test, unix))]
+    writer_identity: (u64, u64),
 }
 
 impl Drop for ExternalSortRun {
     fn drop(&mut self) {
-        self.input = None;
-        let _ = std::fs::remove_file(&self.path);
+        if let Some(mut input) = self.input.take() {
+            // Source explicitly closes/deletes consumed runs. For abandoned
+            // raw-pointer runs it leaks ownership; Rust closes its descriptor
+            // safely, retaining named --no-unlink artifacts for diagnosis.
+            if self.preserve_on_drop {
+                let _ = input.close();
+            } else {
+                let _ = input.close_and_delete();
+            }
+        }
+    }
+}
+
+struct ExternalSortWriter<'a>(&'a mut TempFile);
+impl Write for ExternalSortWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write_raw(bytes).map_err(std::io::Error::other)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush().map_err(std::io::Error::other)
     }
 }
 
@@ -1560,6 +1989,27 @@ where
     }
 }
 
+impl<Type: ExternalSortValue + Ord + Sync> ExternalSorter<Type, fn(&Type, &Type) -> bool> {
+    pub fn in_directory(directory: impl AsRef<Path>) -> Self {
+        Self::with_bucket_size_in(
+            external_sorter_default_cmp::<Type>,
+            Self::BUCKET_SIZE,
+            directory,
+        )
+    }
+    pub fn in_directory_with_io(
+        directory: impl AsRef<Path>,
+        io_options: ExternalSortIoOptions,
+    ) -> Self {
+        Self::with_bucket_size_in_and_io(
+            external_sorter_default_cmp::<Type>,
+            Self::BUCKET_SIZE,
+            directory,
+            io_options,
+        )
+    }
+}
+
 impl<Type, Cmp> ExternalSorter<Type, Cmp>
 where
     Type: ExternalSortValue + Sync,
@@ -1568,20 +2018,35 @@ where
     pub const BUCKET_SIZE: usize = 2 * 1024 * 1024 * 1024;
 
     pub fn new(cmp: Cmp) -> Self {
-        Self::with_bucket_size_in(cmp, Self::BUCKET_SIZE, std::env::temp_dir())
+        Self::with_bucket_size_in(cmp, Self::BUCKET_SIZE, std::path::PathBuf::new())
     }
 
     pub fn with_bucket_size(cmp: Cmp, bucket_size: usize) -> Self {
-        Self::with_bucket_size_in(cmp, bucket_size, std::env::temp_dir())
+        Self::with_bucket_size_in(cmp, bucket_size, std::path::PathBuf::new())
     }
 
     pub fn with_bucket_size_in(cmp: Cmp, bucket_size: usize, temp_dir: impl AsRef<Path>) -> Self {
+        Self::with_bucket_size_in_and_io(
+            cmp,
+            bucket_size,
+            temp_dir,
+            ExternalSortIoOptions::default(),
+        )
+    }
+
+    pub fn with_bucket_size_in_and_io(
+        cmp: Cmp,
+        bucket_size: usize,
+        temp_dir: impl AsRef<Path>,
+        io_options: ExternalSortIoOptions,
+    ) -> Self {
         Self {
             cmp,
             count: 0,
             size: 0,
             bucket_size,
             temp_dir: temp_dir.as_ref().to_path_buf(),
+            io_options,
             files: Vec::new(),
             buf: Vec::new(),
             queue: Vec::new(),
@@ -1593,6 +2058,11 @@ where
     }
 
     pub fn try_push(&mut self, x: Type) -> IoResult<()> {
+        self.try_push_impl(x)
+            .map_err(|error| self.remember_error(error))
+    }
+
+    fn try_push_impl(&mut self, x: Type) -> IoResult<()> {
         self.count += 1;
         self.size += x.external_alloc_size();
         self.buf.push(x);
@@ -1607,6 +2077,11 @@ where
     }
 
     pub fn try_init_read(&mut self) -> IoResult<()> {
+        self.try_init_read_impl()
+            .map_err(|error| self.remember_error(error))
+    }
+
+    fn try_init_read_impl(&mut self) -> IoResult<()> {
         self.flush()?;
         self.queue.clear();
         for i in 0..self.files.len() {
@@ -1630,6 +2105,11 @@ where
     }
 
     pub fn try_increment(&mut self) -> IoResult<()> {
+        self.try_increment_impl()
+            .map_err(|error| self.remember_error(error))
+    }
+
+    fn try_increment_impl(&mut self) -> IoResult<()> {
         let Some(entry) = self.heap_pop() else {
             return Ok(());
         };
@@ -1650,8 +2130,33 @@ where
         self.files.len()
     }
 
-    fn io_error(context: &str, error: std::io::Error) -> IoError {
-        IoError::Other(format!("{context}: {error}"))
+    pub fn temporary_directory(&self) -> &Path {
+        &self.temp_dir
+    }
+
+    pub fn io_options(&self) -> ExternalSortIoOptions {
+        self.io_options.clone()
+    }
+
+    fn remember_error(&self, error: IoError) -> IoError {
+        let _ = self
+            .io_options
+            .errors
+            .capture::<()>(Err(std::io::Error::other(error.clone())));
+        error
+    }
+
+    fn io_error(error: std::io::Error) -> IoError {
+        if let Some(inner) = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<IoError>())
+        {
+            inner.clone()
+        } else if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            IoError::EndOfStream
+        } else {
+            IoError::Other(error.to_string())
+        }
     }
 
     fn get_entry(&mut self, bucket: usize) -> IoResult<Option<Type>> {
@@ -1659,24 +2164,23 @@ where
             .input
             .as_mut()
             .expect("external-sort run read after exhaustion");
-        match Type::read_external(input)
-            .map_err(|error| Self::io_error("error reading external-sort run", error))?
-        {
-            Some(value) => Ok(Some(value)),
-            None => {
+        match Type::read_external(input).map_err(Self::io_error) {
+            Ok(Some(value)) => Ok(Some(value)),
+            Ok(None) | Err(IoError::EndOfStream) => {
+                self.files[bucket]
+                    .input
+                    .as_mut()
+                    .unwrap()
+                    .close_and_delete()?;
                 self.files[bucket].input = None;
-                std::fs::remove_file(&self.files[bucket].path).map_err(|error| {
-                    Self::io_error("error deleting consumed external-sort run", error)
-                })?;
                 Ok(None)
             }
+            Err(error) => Err(error),
         }
     }
 
     fn flush(&mut self) -> IoResult<()> {
-        if self.buf.is_empty() {
-            return Ok(());
-        }
+        // Source flush creates a real TempFile even for an empty final run.
         // C++ materializes one uint32_t per buffered value and sorts that
         // index with ips4o::parallel. Keep both the 4-byte ownership and the
         // parallel unstable-sort boundary: usize would add roughly 256 MiB at
@@ -1685,43 +2189,68 @@ where
             IoError::Other("external-sort run exceeds the uint32 index range".to_owned())
         })?;
         let mut idx: Vec<u32> = (0..count).collect();
+        let data = &self.buf;
+        let compare = &self.cmp;
         idx.par_sort_unstable_by(|&x, &y| {
             let x = x as usize;
             let y = y as usize;
-            if (self.cmp)(&self.buf[x], &self.buf[y]) {
+            if compare(&data[x], &data[y]) {
                 Ordering::Less
-            } else if (self.cmp)(&self.buf[y], &self.buf[x]) {
+            } else if compare(&data[y], &data[x]) {
                 Ordering::Greater
             } else {
                 Ordering::Equal
             }
         });
 
-        let data = TempFileData::init_in(false, &self.temp_dir, true)?;
-        let path = PathBuf::from(&data.name);
-        drop(data);
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .map_err(|error| Self::io_error("error opening external-sort run", error))?;
+        let data = TempFileData::init_in(true, &self.temp_dir, self.io_options.no_unlink)?;
+        let mut output = TempFile::from_temp_file_data_with_buffer_size(
+            &data,
+            self.io_options.file_buffer_size,
+        )?;
+        let path = output.file_path().to_path_buf();
+        #[cfg(all(test, unix))]
+        let writer_identity = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = output.file()?.metadata().map_err(Self::io_error)?;
+            (metadata.dev(), metadata.ino())
+        };
         let write_result = (|| -> std::io::Result<()> {
-            let mut out = BufWriter::with_capacity(1 << 20, file);
+            let mut writer = ExternalSortWriter(&mut output);
             for i in idx {
-                self.buf[i as usize].write_external(&mut out)?;
+                self.buf[i as usize].write_external(&mut writer)?;
             }
-            out.flush()
+            writer.flush()
         })();
         if let Err(error) = write_result {
-            let _ = std::fs::remove_file(&path);
-            return Err(Self::io_error("error writing external-sort run", error));
+            let _ = output.close();
+            if !data.unlinked && !self.io_options.no_unlink {
+                let _ = std::fs::remove_file(&path);
+            }
+            return Err(Self::io_error(error));
         }
-        let input = File::open(&path)
-            .map(BufReader::new)
-            .map_err(|error| Self::io_error("error reopening external-sort run", error))?;
+        let input = match InputFile::from_temp_file_with_buffer_size(
+            &mut output,
+            InputFile::BUFFERED,
+            Compressor::None,
+            self.io_options.file_buffer_size,
+        ) {
+            Ok(input) => input,
+            Err(error) => {
+                let _ = output.close();
+                if !data.unlinked && !self.io_options.no_unlink {
+                    let _ = std::fs::remove_file(&path);
+                }
+                return Err(error);
+            }
+        };
         self.files.push(ExternalSortRun {
+            #[cfg(test)]
             path,
             input: Some(input),
+            preserve_on_drop: self.io_options.no_unlink,
+            #[cfg(all(test, unix))]
+            writer_identity,
         });
         self.buf.clear();
         self.size = 0;
@@ -2217,6 +2746,43 @@ mod tests {
     }
 
     #[test]
+    fn merge_equal_heads_matches_pinned_upstream_heap() {
+        #[derive(Eq)]
+        struct Record(i32, usize);
+        impl PartialEq for Record {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+        }
+        impl Ord for Record {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.0.cmp(&other.0)
+            }
+        }
+        impl PartialOrd for Record {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        let files = [[0, 0, 2], [0, 1, 2], [0, 0, 1], [0, 1, 1], [0, 0, 2]]
+            .into_iter()
+            .enumerate()
+            .map(|(stream, keys)| {
+                keys.into_iter()
+                    .enumerate()
+                    .map(move |(position, key)| Record(key, 10 * stream + position))
+            });
+        let mut ids = Vec::new();
+        merge_sorted_files(files, |record: Record| ids.push(record.1));
+        // Snapshot of upstream's Entry comparator with the pinned Linux
+        // standard library; equal keys alone cannot establish this behavior.
+        assert_eq!(
+            ids,
+            [40, 41, 30, 20, 21, 0, 1, 10, 11, 22, 31, 32, 12, 2, 42]
+        );
+    }
+
+    #[test]
     fn test_external_sorter() {
         let mut s = ExternalSorter::default();
         for value in [5, 1, 4, 1, 3, 2] {
@@ -2246,7 +2812,7 @@ mod tests {
         let p = ("abc".to_string(), 7u32);
         assert_eq!(
             alloc_size_string_u32_pair(&p),
-            4 + std::mem::size_of::<String>() + 3
+            4 + source_string_object_size() + 3
         );
         assert_eq!(alloc_size(&7u32), std::mem::size_of::<u32>());
     }
@@ -2281,7 +2847,24 @@ mod tests {
         assert_eq!(sorter.run_count(), expected.len());
         assert!(sorter.buf.is_empty());
         let paths: Vec<_> = sorter.files.iter().map(|run| run.path.clone()).collect();
+        #[cfg(unix)]
+        assert!(paths.iter().all(|path| !path.exists()));
+        #[cfg(not(unix))]
         assert!(paths.iter().all(|path| path.is_file()));
+        #[cfg(unix)]
+        for run in &mut sorter.files {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = run
+                .input
+                .as_mut()
+                .unwrap()
+                .file()
+                .unwrap()
+                .metadata()
+                .unwrap();
+            assert_eq!(metadata.nlink(), 0);
+            assert_eq!((metadata.dev(), metadata.ino()), run.writer_identity);
+        }
 
         sorter.try_init_read().unwrap();
         let mut actual = Vec::new();
@@ -2332,12 +2915,12 @@ mod tests {
         let accession_oid = ("long-accession".to_string(), 1u64);
         assert_eq!(
             ExternalSortValue::external_alloc_size(&accession_oid),
-            std::mem::size_of::<(String, u64)>()
+            source_string_pair_size::<u64>()
         );
         let legacy_specialization = ("long-accession".to_string(), 1u32);
         assert_eq!(
             ExternalSortValue::external_alloc_size(&legacy_specialization),
-            4 + std::mem::size_of::<String>() + legacy_specialization.0.len()
+            4 + source_string_object_size() + legacy_specialization.0.len()
         );
     }
 
@@ -2351,9 +2934,102 @@ mod tests {
         sorter.try_push(1).unwrap();
         assert_eq!(sorter.run_count(), 1);
         let path = sorter.files[0].path.clone();
+        #[cfg(unix)]
+        assert!(!path.exists());
+        #[cfg(not(unix))]
         assert!(path.is_file());
         drop(sorter);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn external_sorter_no_unlink_preserves_abandoned_but_deletes_consumed_runs() {
+        let directory = std::env::temp_dir().join(format!(
+            "diamond-sort-linked-{}-{}",
+            std::process::id(),
+            crate::util::test_path_component()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let options = ExternalSortIoOptions {
+            no_unlink: true,
+            file_buffer_size: 4096,
+            ..Default::default()
+        };
+        let mut sorter = ExternalSorter::with_bucket_size_in_and_io(
+            external_sorter_default_cmp::<i32>,
+            1,
+            &directory,
+            options.clone(),
+        );
+        sorter.try_push(7).unwrap();
+        let path = sorter.files[0].path.clone();
+        assert!(path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let run = &mut sorter.files[0];
+            let metadata = run
+                .input
+                .as_mut()
+                .unwrap()
+                .file()
+                .unwrap()
+                .metadata()
+                .unwrap();
+            assert_eq!(metadata.nlink(), 1);
+            assert_eq!((metadata.dev(), metadata.ino()), run.writer_identity);
+        }
+        sorter.try_init_read().unwrap();
+        assert_eq!(sorter.current(), Some(&7));
+        sorter.try_increment().unwrap();
+        assert!(
+            !path.exists(),
+            "Source EOF close_and_delete also deletes named no-unlink runs"
+        );
+        drop(sorter);
+        let mut abandoned = ExternalSorter::with_bucket_size_in_and_io(
+            external_sorter_default_cmp::<i32>,
+            1,
+            &directory,
+            options,
+        );
+        abandoned.try_push(9).unwrap();
+        let path = abandoned.files[0].path.clone();
+        drop(abandoned);
+        assert!(
+            path.is_file(),
+            "no-unlink preserves the named diagnostic artifact on early drop"
+        );
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn external_sorter_empty_init_read_has_real_temp_constructor_and_typed_error() {
+        let directory = std::env::temp_dir().join(format!(
+            "diamond-sort-missing-{}-{}",
+            std::process::id(),
+            crate::util::test_path_component()
+        ));
+        let options = ExternalSortIoOptions::default();
+        let errors = options.errors.clone();
+        let mut sorter = ExternalSorter::with_bucket_size_in_and_io(
+            external_sorter_default_cmp::<i32>,
+            ExternalSorter::<i32>::BUCKET_SIZE,
+            &directory,
+            options,
+        );
+        let error = sorter.try_init_read().unwrap_err();
+        #[cfg(unix)]
+        assert!(matches!(&error, IoError::TemporaryFileOpenDetails(_)));
+        #[cfg(windows)]
+        assert!(matches!(&error, IoError::FileOpenDetails(_)));
+        let restored = errors.finish::<()>(Err(error.to_string())).unwrap_err();
+        #[cfg(unix)]
+        assert!(crate::util::io::temp_file::find_temp_open(&restored).is_some());
+        #[cfg(windows)]
+        assert!(crate::util::io::file_open_error::find(&restored).is_some());
+        assert!(!directory.exists());
     }
 
     #[test]

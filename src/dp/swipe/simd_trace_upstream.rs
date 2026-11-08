@@ -406,6 +406,20 @@ unsafe fn trace_i8_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool, const STAN
     if band == 0 {
         return (vec![SwResult::default(); targets.len()], 0);
     }
+    // Full-matrix callers supply the complete diagonal range. Upstream's
+    // full_swipe counter measures query rows, whereas its banded counter
+    // measures offsets from the moving diagonal. Counting padded band rows
+    // in a full matrix wraps narrow counters even for short queries.
+    let full_matrix = targets.iter().all(|target| {
+        target.d_begin == -(target.subject.len() as i32 - 1) && target.d_end == query.len() as i32
+    });
+    let counter_rows = if full_matrix { query.len() } else { band };
+    if counter_rows > u8::MAX as usize {
+        return (
+            vec![SwResult::default(); targets.len()],
+            u32::MAX >> (32 - targets.len()),
+        );
+    }
     let i1 = targets
         .iter()
         .map(|target| (target.d_end - 1).max(0))
@@ -531,7 +545,12 @@ unsafe fn trace_i8_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool, const STAN
         let query_end = (i1 + column as i32).min(query.len() as i32 - 1) + 1;
         let mut vertical = zero;
         let mut col_best = zero;
-        let mut row_counter = arch::_mm256_set1_epi8((query_begin - moving_i0) as i8);
+        let counter_begin = if full_matrix {
+            query_begin
+        } else {
+            query_begin - moving_i0
+        };
+        let mut row_counter = arch::_mm256_set1_epi8(counter_begin as i8);
         let mut row_max = zero;
         let mut row = (query_begin - moving_i0) as usize;
         let row_end = (query_end - moving_i0) as usize;
@@ -614,7 +633,12 @@ unsafe fn trace_i8_impl<const SEMI_GLOBAL: bool, const HAS_CBS: bool, const STAN
             if column_scores[lane] > best[lane] {
                 best[lane] = column_scores[lane];
                 best_col[lane] = column;
-                best_row[lane] = column_rows[lane] as u8 as usize;
+                let counter_row = column_rows[lane] as u8 as usize;
+                best_row[lane] = if full_matrix {
+                    (counter_row as i32 - moving_i0) as usize
+                } else {
+                    counter_row
+                };
             }
         }
     }
@@ -767,6 +791,20 @@ unsafe fn trace_i16_impl<
     if band == 0 {
         return (vec![SwResult::default(); targets.len()], 0);
     }
+    // Full-matrix callers supply the complete diagonal range. Upstream's
+    // full_swipe counter measures query rows, whereas its banded counter
+    // measures offsets from the moving diagonal. Counting padded band rows
+    // in a full matrix wraps narrow counters even for short queries.
+    let full_matrix = targets.iter().all(|target| {
+        target.d_begin == -(target.subject.len() as i32 - 1) && target.d_end == query.len() as i32
+    });
+    let counter_rows = if full_matrix { query.len() } else { band };
+    if counter_rows > u16::MAX as usize {
+        return (
+            vec![SwResult::default(); targets.len()],
+            u32::MAX >> (32 - targets.len()),
+        );
+    }
     let i1 = targets
         .iter()
         .map(|target| (target.d_end - 1).max(0))
@@ -886,7 +924,12 @@ unsafe fn trace_i16_impl<
         let query_end = (i1 + column as i32).min(query.len() as i32 - 1) + 1;
         let mut vertical = zero;
         let mut col_best = zero;
-        let mut row_counter = arch::_mm256_set1_epi16((query_begin - moving_i0) as i16);
+        let counter_begin = if full_matrix {
+            query_begin
+        } else {
+            query_begin - moving_i0
+        };
+        let mut row_counter = arch::_mm256_set1_epi16(counter_begin as i16);
         let mut row_max = zero;
         let mut row = (query_begin - moving_i0) as usize;
         let row_end = (query_end - moving_i0) as usize;
@@ -968,7 +1011,12 @@ unsafe fn trace_i16_impl<
             if column_scores[lane] > best[lane] {
                 best[lane] = column_scores[lane];
                 best_col[lane] = column;
-                best_row[lane] = column_rows[lane] as u16 as usize;
+                let counter_row = column_rows[lane] as u16 as usize;
+                best_row[lane] = if full_matrix {
+                    (counter_row as i32 - moving_i0) as usize
+                } else {
+                    counter_row
+                };
             }
         }
     }
@@ -1276,6 +1324,77 @@ fn finish_i8<const SEMI_GLOBAL: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_matrix_traceback_uses_query_rows_with_long_target_padding() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query: Vec<Letter> = (0..24).map(|index| (index % 20) as Letter).collect();
+        let mut subjects = [vec![23; 700], vec![23; 900]];
+        for (subject, begin) in subjects.iter_mut().zip([5, 300]) {
+            subject[begin..begin + query.len()].copy_from_slice(&query);
+        }
+        let targets: Vec<_> = subjects
+            .iter()
+            .map(|subject| TraceTarget {
+                subject,
+                d_begin: -(subject.len() as i32 - 1),
+                d_end: query.len() as i32,
+                matrix: None,
+                matrix_scale: 1,
+            })
+            .collect();
+        for cbs in [vec![], vec![-1; query.len()]] {
+            for (results, overflow) in unsafe {
+                [
+                    trace_i8(&query, &targets, &matrix, &cbs, false),
+                    trace_i16(&query, &targets, &matrix, &cbs, false),
+                ]
+            } {
+                assert_eq!(overflow, 0);
+                for (result, begin) in results.iter().zip([5, 300]) {
+                    let expected_score: i32 = query
+                        .iter()
+                        .map(|&letter| matrix.score(letter, letter))
+                        .sum::<i32>()
+                        - if cbs.is_empty() {
+                            0
+                        } else {
+                            query.len() as i32
+                        };
+                    assert_eq!(result.score, expected_score);
+                    assert_eq!((result.query_begin, result.query_end), (0, 24));
+                    assert_eq!(
+                        (result.subject_begin, result.subject_end),
+                        (begin, begin + 24)
+                    );
+                    assert_eq!(result.operations, [(EditOperation::Match, 24)]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_matrix_byte_traceback_promotes_a_query_exceeding_counter_range() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query = vec![0; 256];
+        let subject = [0];
+        let target = TraceTarget {
+            subject: &subject,
+            d_begin: 0,
+            d_end: 256,
+            matrix: None,
+            matrix_scale: 1,
+        };
+        let (results, overflow) = unsafe { trace_i8(&query, &[target], &matrix, &[], false) };
+        assert_eq!(overflow, 1);
+        assert_eq!(results[0].score, 0);
+    }
 
     #[test]
     fn bmi2_trace_packings_match_portable() {

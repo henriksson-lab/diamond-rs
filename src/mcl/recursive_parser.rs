@@ -9,24 +9,38 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
-    message: String,
+    message: crate::util::io::RawDiagnosticError,
 }
 
 impl ParseError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: crate::util::io::RawDiagnosticError(message.into().into_bytes()),
         }
     }
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        fmt::Display::fmt(&self.message, f)
     }
 }
 
-impl std::error::Error for ParseError {}
+impl std::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.message)
+    }
+}
+impl ParseError {
+    pub fn from_bytes(message: Vec<u8>) -> Self {
+        Self {
+            message: crate::util::io::RawDiagnosticError(message),
+        }
+    }
+    pub fn into_io(self) -> std::io::Error {
+        std::io::Error::other(self)
+    }
+}
 
 impl From<UnknownVariableError> for ParseError {
     fn from(value: UnknownVariableError) -> Self {
@@ -34,8 +48,8 @@ impl From<UnknownVariableError> for ParseError {
     }
 }
 
-pub struct RecursiveParser<'a> {
-    context: Option<&'a HspContext>,
+pub struct RecursiveParser<'a, T = String> {
+    context: Option<&'a HspContext<T>>,
     expression: &'a [u8],
     position: usize,
     variables: Vec<&'static Variable>,
@@ -43,18 +57,54 @@ pub struct RecursiveParser<'a> {
 }
 
 impl<'a> RecursiveParser<'a> {
-    pub fn new(context: Option<&'a HspContext>, expression: &'a str) -> Self {
-        Self::new_with_mode(context, expression, false)
+    pub fn clean_expression(expression: &str) -> String {
+        String::from_utf8(Self::clean_expression_bytes(expression.as_bytes()))
+            .expect("ASCII whitespace removal preserves UTF-8")
     }
-
+    pub fn clean_expression_bytes(expression: &[u8]) -> Vec<u8> {
+        expression
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect()
+    }
+    pub fn new_bytes(context: Option<&'a HspContext>, expression: &'a [u8]) -> Self {
+        Self::new_with_context_mode_bytes(context, expression, false)
+    }
+    pub fn new(context: Option<&'a HspContext>, expression: &'a str) -> Self {
+        Self::new_with_context_mode(context, expression, false)
+    }
     pub fn new_with_mode(
         context: Option<&'a HspContext>,
         expression: &'a str,
+        translated: bool,
+    ) -> Self {
+        Self::new_with_context_mode(context, expression, translated)
+    }
+}
+
+impl<'a, T> RecursiveParser<'a, T> {
+    pub fn new_with_context(context: Option<&'a HspContext<T>>, expression: &'a str) -> Self {
+        Self::new_with_context_mode(context, expression, false)
+    }
+
+    pub fn new_with_context_mode(
+        context: Option<&'a HspContext<T>>,
+        expression: &'a str,
         query_translated: bool,
     ) -> Self {
+        Self::new_with_context_mode_bytes(context, expression.as_bytes(), query_translated)
+    }
+    pub fn new_with_context_mode_bytes(
+        context: Option<&'a HspContext<T>>,
+        expression: &'a [u8],
+        query_translated: bool,
+    ) -> Self {
+        // Source parser receives c_str(), not the full stored std::string.
+        let expression = crate::util::sequence::c_string_bytes(expression);
         Self {
             context,
-            expression: expression.as_bytes(),
+            expression,
             position: 0,
             variables: Vec::new(),
             query_translated,
@@ -73,18 +123,14 @@ impl<'a> RecursiveParser<'a> {
         Ok(value)
     }
 
-    fn consume(&mut self, expected: u8) -> Result<(), ParseError> {
-        let actual = self.get()?;
-        if actual == expected {
-            Ok(())
-        } else {
-            Err(ParseError::new(format!(
-                "Expected '{}' at byte {}, found '{}'",
-                expected as char,
-                self.position - 1,
-                actual as char
-            )))
+    fn consume(&mut self, _expected: u8) -> Result<(), ParseError> {
+        // Source grammar simply advances over these separator positions.
+        // Retain a bounds error only at its genuine out-of-allocation edge.
+        if self.position >= self.expression.len() {
+            return Err(ParseError::new("Unexpected end of clustering expression"));
         }
+        self.position += 1;
+        Ok(())
     }
 
     fn starts_with(&self, text: &[u8]) -> bool {
@@ -106,10 +152,9 @@ impl<'a> RecursiveParser<'a> {
                 return Ok(operation);
             }
         }
-        let tail = String::from_utf8_lossy(&self.expression[self.position..]);
-        Err(ParseError::new(format!(
-            "Error while evaluating the expression {tail} Unknown relation"
-        )))
+        // The Source constructs a runtime_error here but never throws it.
+        // Its fallback predicate is false and leaves the cursor untouched.
+        Ok(|_, _| false)
     }
 
     fn variable_name(&mut self) -> Result<&'a str, ParseError> {
@@ -117,28 +162,22 @@ impl<'a> RecursiveParser<'a> {
         while matches!(self.peek(0), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_')) {
             self.position += 1;
         }
-        if self.position == start {
-            return Err(ParseError::new(format!(
-                "Expected a factor at byte {}",
-                self.position
-            )));
-        }
-        std::str::from_utf8(&self.expression[start..self.position])
-            .map_err(|_| ParseError::new("Clustering expression is not ASCII"))
+        // The variable lexer admits ASCII letters/underscore only, including
+        // an empty key for an unrecognized leading byte (Source registry error).
+        Ok(std::str::from_utf8(&self.expression[start..self.position])
+            .expect("ASCII variable lexer"))
     }
 
     fn integer(&mut self) -> Result<u32, ParseError> {
         let first = self.get()?;
-        if !first.is_ascii_digit() {
-            return Err(ParseError::new("Expected decimal digit"));
-        }
-        let mut result = u32::from(first - b'0');
+        // Source integer() consumes the first byte unconditionally. This
+        // also governs the fractional substring following a decimal point.
+        let mut result = (i32::from(first as libc::c_char) - i32::from(b'0')) as u32;
         while let Some(digit @ b'0'..=b'9') = self.peek(0) {
             self.position += 1;
             result = result
-                .checked_mul(10)
-                .and_then(|value| value.checked_add(u32::from(digit - b'0')))
-                .ok_or_else(|| ParseError::new("Integer overflow in clustering expression"))?;
+                .wrapping_mul(10)
+                .wrapping_add(u32::from(digit - b'0'));
         }
         Ok(result)
     }
@@ -175,7 +214,9 @@ impl<'a> RecursiveParser<'a> {
                 self.consume(b',')?;
                 let second = self.expression()?;
                 self.consume(b')')?;
-                Ok(first.max(second))
+                // std::max returns its first operand on an unordered or
+                // equal comparison; f64::max instead discards a NaN.
+                Ok(if first < second { second } else { first })
             }
             _ if self.starts_with(b"min(") => {
                 self.position += 4;
@@ -183,7 +224,7 @@ impl<'a> RecursiveParser<'a> {
                 self.consume(b',')?;
                 let second = self.expression()?;
                 self.consume(b')')?;
-                Ok(first.min(second))
+                Ok(if second < first { second } else { first })
             }
             _ if self.starts_with(b"exp(") => {
                 self.position += 4;
@@ -216,7 +257,7 @@ impl<'a> RecursiveParser<'a> {
                     Ok(4.0)
                 }
             }
-            None => Err(ParseError::new("Unexpected end of clustering expression")),
+            None => Err(ParseError::new("Unknown variable: ")),
         }
     }
 
@@ -251,13 +292,14 @@ impl<'a> RecursiveParser<'a> {
     pub fn variables(&self) -> &[&'static Variable] {
         &self.variables
     }
+}
 
-    pub fn clean_expression(expression: &str) -> String {
-        expression
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect()
-    }
+/// Actual Source syntax-only evaluation (the caller chooses the run phase).
+pub fn evaluate_bytes(expression: &[u8]) -> std::io::Result<f64> {
+    let cleaned = RecursiveParser::clean_expression_bytes(expression);
+    RecursiveParser::new_bytes(None, &cleaned)
+        .evaluate()
+        .map_err(ParseError::into_io)
 }
 
 #[cfg(test)]
@@ -286,6 +328,23 @@ mod tests {
             100.0,
             80.0,
         )
+    }
+
+    #[test]
+    fn byte_expression_preserves_source_lexer_and_separator_behavior() {
+        assert_eq!(evaluate_bytes(b" max(1;2] ").unwrap(), 2.0);
+        assert_eq!(evaluate_bytes(b"1\0+invalid").unwrap(), 1.0);
+        assert_eq!(evaluate_bytes(b"4294967296").unwrap(), 0.0);
+        assert_eq!(evaluate_bytes(b"1.a").unwrap(), 50.0);
+        let error = evaluate_bytes(b"\xff").unwrap_err();
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error).unwrap(),
+            b"Unknown variable: "
+        );
+        assert_eq!(
+            evaluate_bytes(b"I(1!2)").unwrap_err().to_string(),
+            "Unknown variable: "
+        );
     }
 
     #[test]

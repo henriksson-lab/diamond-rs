@@ -1,0 +1,43 @@
+{
+  "upstream_commit": "1d162b4fefb5e6b4d868c24e6ad551cad2dcf246",
+  "upstream_version": "DIAMOND 2.1.24 build 178",
+  "immutable_oracle_sha256": "d8d08608b96706db62e44036fc979f9a658e72f59fc19d8727546daa616c42d8",
+  "benchmark_cpp_sha256": "1b479e903c857b92c101492ba2e91a7a5beea4ea8f55a7e88d9ea2cb580234fb",
+  "qualification": "Instrumented source copy; loop counts reduced to one and unreported kernel scores printed. This is not the unmodified oracle. Existing source-build objects are reused, with only AVX2 benchmark object replaced.",
+  "probe_copy_sha256": "b059b2ec279f622a17b837c89a6253aaab583e0917a0b2a1a72b8c0b6988415c",
+  "architecture": "AVX2",
+  "counts": "one iteration per phase, copied C++ benchmark body",
+  "anchored_score": 80,
+  "anchored_pipeline_hsps": 0,
+  "swipe_phases": [
+    {
+      "count": 32,
+      "first_score": 124
+    },
+    {
+      "count": 32,
+      "first_score": 124
+    },
+    {
+      "count": 32,
+      "first_score": 124
+    },
+    {
+      "count": 32,
+      "first_score": 124
+    },
+    {
+      "count": 32,
+      "first_score": 124
+    },
+    {
+      "count": 32,
+      "first_score": 124
+    }
+  ],
+  "diagonal_endpoints": [
+    16,
+    11
+  ],
+  "terminal_error": "TargetIterator: No matrix provided for adjusted matrix."
+}

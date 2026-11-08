@@ -58,6 +58,8 @@ pub struct WrapperConfig {
 pub struct AnchoredSwipeConfig<'a> {
     pub query: &'a [Letter],
     pub query_cbs: Option<&'a [i8]>,
+    pub band_bin: i32,
+    pub col_bin: i32,
     pub score_hint: i32,
     pub sensitivity: Sensitivity,
     pub recompute_adjusted: bool,
@@ -70,8 +72,11 @@ pub struct AnchoredSwipeConfig<'a> {
     pub statistics: Option<Arc<Mutex<Statistics>>>,
     /// Explicit replacement for C++'s process-global `config.swipe_task_size`.
     pub swipe_task_size: i64,
+    pub transcript_len_estimate: f64,
     /// Scale used by the composition-adjusted recomputation matrix.
     pub cbs_matrix_scale: i32,
+    pub matrix_adjust_tolerance: f64,
+    pub matrix_adjust_max_iterations: i32,
 }
 
 impl<'a> AnchoredSwipeConfig<'a> {
@@ -79,6 +84,8 @@ impl<'a> AnchoredSwipeConfig<'a> {
         Self {
             query,
             query_cbs: None,
+            band_bin: 24,
+            col_bin: 400,
             score_hint: 0,
             sensitivity: Sensitivity::Default,
             recompute_adjusted: false,
@@ -90,7 +97,10 @@ impl<'a> AnchoredSwipeConfig<'a> {
             score_matrix,
             statistics: None,
             swipe_task_size: DEFAULT_SWIPE_TASK_SIZE,
+            transcript_len_estimate: 1.0,
             cbs_matrix_scale: 1,
+            matrix_adjust_tolerance: 1e-8,
+            matrix_adjust_max_iterations: 2000,
         }
     }
 }
@@ -444,8 +454,8 @@ pub fn anchored_swipe(targets: &mut Targets, cfg: &AnchoredSwipeConfig<'_>) -> V
                             joint_probs,
                             background_freqs: cfg.score_matrix.background_freqs(),
                             freq_ratios: Some(freq_ratios),
-                            tolerance: 1.0e-5,
-                            max_iterations: 17,
+                            tolerance: cfg.matrix_adjust_tolerance,
+                            max_iterations: cfg.matrix_adjust_max_iterations,
                         },
                     )
                     .expect("BLOSUM composition adjustment inputs are complete");
@@ -491,8 +501,11 @@ pub fn anchored_swipe(targets: &mut Targets, cfg: &AnchoredSwipeConfig<'_>) -> V
     inc(cfg, StatValue::TimeAnchoredSwipe, micros(total));
     if cfg.recompute_adjusted {
         let mut params = Params::new(cfg.query, cfg.score_matrix);
+        params.band_bin = cfg.band_bin;
+        params.col_bin = cfg.col_bin;
         params.v = swipe::HspValues::COORDS;
         params.cbs_matrix_scale = cfg.cbs_matrix_scale.max(1);
+        params.transcript_len_estimate = cfg.transcript_len_estimate;
         params.statistics = cfg.statistics.clone();
         out.extend(swipe::swipe(&recompute, &mut params));
     }
@@ -554,7 +567,9 @@ mod tests {
         let adjusted = Arc::new(TargetMatrix::new(scores, -5, 20));
         let mut targets = vec![Target::new(vec![0], 0, 1, 0, 1, 0, false).with_matrix(adjusted, 1)];
         smith_waterman(&[0], &mut targets, &score_matrix);
-        assert_eq!(targets[0].score, 21);
+        // The initial masked target column consumes the -1 profile padding
+        // before the adjusted A/A score of 20; the stored score adds one.
+        assert_eq!(targets[0].score, 20);
     }
 
     #[test]

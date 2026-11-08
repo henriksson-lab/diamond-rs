@@ -104,10 +104,15 @@ impl<'a> BlockWrapper<'a> {
         Err("Operation not supported".to_owned())
     }
 
-    pub fn seqid(&self, oid: OId, _all: bool, _full_titles: bool) -> Result<String, String> {
-        Ok(std::str::from_utf8(self.block.ids()?.get(oid as usize))
-            .unwrap_or("")
-            .to_owned())
+    pub fn seqid(&self, oid: OId, all: bool, full_titles: bool) -> Result<String, String> {
+        String::from_utf8(self.seqid_bytes(oid, all, full_titles)?.to_vec())
+            .map_err(|error| error.to_string())
+    }
+    /// Source returns std::string from a const-char title pointer here.
+    pub fn seqid_bytes(&self, oid: OId, _all: bool, _full_titles: bool) -> Result<&[u8], String> {
+        Ok(crate::util::sequence::c_string_bytes(
+            self.block.ids()?.get(oid as usize),
+        ))
     }
 
     pub fn id_len(
@@ -129,10 +134,19 @@ impl<'a> BlockWrapper<'a> {
         *pos += 1;
     }
 
-    pub fn read_id_data(&self, oid: i64, _all: bool, _full_titles: bool) -> Result<String, String> {
-        Ok(std::str::from_utf8(self.block.ids()?.get(oid as usize))
-            .unwrap_or("")
-            .to_owned())
+    pub fn read_id_data(&self, oid: i64, all: bool, full_titles: bool) -> Result<String, String> {
+        String::from_utf8(self.read_id_data_bytes(oid, all, full_titles)?.to_vec())
+            .map_err(|error| error.to_string())
+    }
+    /// Source copies the full StringSet row (then appends the caller's NUL),
+    /// unlike seqid's C-string constructor. The borrowed view needs no cache.
+    pub fn read_id_data_bytes(
+        &self,
+        oid: i64,
+        _all: bool,
+        _full_titles: bool,
+    ) -> Result<&[u8], String> {
+        Ok(self.block.ids()?.get(oid as usize))
     }
 
     pub fn skip_id_data(&mut self) {}

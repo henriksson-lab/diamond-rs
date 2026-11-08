@@ -1,8 +1,22 @@
 use std::fmt::Display;
+#[cfg(not(windows))]
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
+
+/// std::cerr is tied to std::cout in Source. Flush cout's actual standard
+/// FILE before console diagnostics, retaining earlier Rust host output too.
+/// A failed flush sets Source's stream failbit; it does not suppress stderr.
+pub fn flush_tied_stdout() {
+    crate::util::io::console::flush_tied_stdout();
+}
+
+/// Process-console diagnostics use the same transport as Source's cerr.
+/// Arbitrary writers supplied to the generic run backend remain untouched.
+pub fn write_source_error_line(args: std::fmt::Arguments<'_>) {
+    crate::util::io::console::stderr_line(args);
+}
 
 pub static MESSAGE_STREAM: LazyLock<Mutex<MessageStream>> =
     LazyLock::new(|| Mutex::new(MessageStream::new(true, false)));
@@ -31,15 +45,19 @@ impl MessageStream {
     pub fn write<T: Display>(&mut self, x: T) -> io::Result<&mut Self> {
         let s = x.to_string();
         if self.to_cout {
-            eprint!("{s}");
-            io::stderr().flush()?;
+            crate::util::io::console::stderr().write_all(s.as_bytes())?;
         }
         if self.to_file {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("diamond.log")?;
-            f.write_all(s.as_bytes())?;
+            #[cfg(windows)]
+            crate::util::io::console::append_log(s.as_bytes());
+            #[cfg(not(windows))]
+            {
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("diamond.log")?;
+                f.write_all(s.as_bytes())?;
+            }
         }
         Ok(self)
     }
@@ -48,9 +66,33 @@ impl MessageStream {
         self.write('\n')
     }
 
+    /// Source inserts std::string bytes into its message streams unchanged.
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<&mut Self> {
+        if self.to_cout {
+            crate::util::io::console::stderr().write_all(bytes)?;
+        }
+        if self.to_file {
+            #[cfg(windows)]
+            crate::util::io::console::append_log(bytes);
+            #[cfg(not(windows))]
+            {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("diamond.log")?;
+                file.write_all(bytes)?;
+            }
+        }
+        Ok(self)
+    }
+
     pub fn flush(&mut self) -> io::Result<&mut Self> {
         if self.to_cout {
-            io::stderr().flush()?;
+            crate::util::io::console::stderr().flush()?;
+        }
+        #[cfg(windows)]
+        if self.to_file {
+            crate::util::io::console::append_log(&[]);
         }
         Ok(self)
     }
@@ -206,13 +248,18 @@ impl Drop for TaskTimer {
 }
 
 pub fn exit_with_error<E: Display>(e: E) -> ! {
-    eprintln!("Error: {e}");
+    write_source_error_line(format_args!("Error: {e}"));
     if let Ok(mut stream) = LOG_STREAM.lock() {
         let _ = stream
             .write("Error: ")
             .and_then(|s| s.write(e))
             .and_then(|s| s.endl());
     }
+    #[cfg(windows)]
+    unsafe {
+        libc::exit(1)
+    }
+    #[cfg(not(windows))]
     std::process::exit(1);
 }
 

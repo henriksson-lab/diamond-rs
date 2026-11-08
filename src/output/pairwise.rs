@@ -130,9 +130,9 @@ pub fn write_pairwise<W: Write>(
 }
 
 /// Matches C++ `PairwiseFormat::print_match(const HspContext&)`.
-pub fn print_match_context<W: Write>(
+pub fn print_match_context_bytes<W: Write, T: AsRef<[u8]>>(
     writer: &mut W,
-    r: &HspContext,
+    r: &HspContext<T>,
     score_matrix: &ScoreMatrix,
     query_translated: bool,
     blastn_command: bool,
@@ -156,8 +156,11 @@ pub fn print_match_context<W: Write>(
     // titles with a space. A naive `replace('\x01', ' ')` only handles the
     // `\x01` case, so multi-seqid headers with `" >"` separators would
     // print verbatim instead of joined-by-space.
-    let target_title = crate::output::format::print_title(&r.target_title, true, true, " ", false);
-    writeln!(writer, ">{}", target_title)?;
+    let target_title =
+        crate::output::format::print_title_bytes(r.target_title.as_ref(), true, true, b" ", false);
+    writer.write_all(b">")?;
+    writer.write_all(&target_title)?;
+    writeln!(writer)?;
     writeln!(writer, "Length={}", r.subject_len)?;
     writeln!(writer)?;
     write!(
@@ -231,7 +234,7 @@ pub fn print_match_context<W: Write>(
             if !qi.good() {
                 break;
             }
-            write_ascii_char(writer, qi.query_char())?;
+            write_ascii_char(writer, qi.try_query_char()?)?;
             qi.advance();
         }
         write!(
@@ -255,7 +258,7 @@ pub fn print_match_context<W: Write>(
             }
             write_ascii_char(
                 writer,
-                mi.midline_char(score_matrix.score(mi.query(), mi.subject())),
+                mi.midline_char(score_matrix.score(mi.try_query()?, mi.try_subject()?)),
             )?;
             mi.advance();
         }
@@ -271,7 +274,7 @@ pub fn print_match_context<W: Write>(
             if !si.good() {
                 break;
             }
-            write_ascii_char(writer, si.subject_char())?;
+            write_ascii_char(writer, si.try_subject_char()?)?;
             si.advance();
         }
         writeln!(writer, " {}", si.subject_pos())?;
@@ -309,13 +312,15 @@ pub fn write_query_header<W: Write>(
 }
 
 /// Matches C++ `PairwiseFormat::print_query_intro()`.
-pub fn print_query_intro<W: Write>(
+pub fn print_query_intro_bytes<W: Write>(
     writer: &mut W,
-    query_title: &str,
+    query_title: &[u8],
     query_len: i32,
     unaligned: bool,
 ) -> io::Result<()> {
-    writeln!(writer, "Query= {}", query_title)?;
+    writer.write_all(b"Query= ")?;
+    writer.write_all(crate::util::sequence::c_string_bytes(query_title))?;
+    writeln!(writer)?;
     writeln!(writer)?;
     writeln!(writer, "Length={}", query_len)?;
     writeln!(writer)?;
@@ -445,4 +450,24 @@ mod tests {
         print_footer(&mut buf).unwrap();
         assert!(buf.is_empty());
     }
+}
+
+// String compatibility entry points share the raw renderer.
+pub fn print_match_context<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    score_matrix: &ScoreMatrix,
+    query_translated: bool,
+    blastn_command: bool,
+) -> io::Result<()> {
+    print_match_context_bytes(writer, r, score_matrix, query_translated, blastn_command)
+}
+
+pub fn print_query_intro<W: Write>(
+    writer: &mut W,
+    query_title: &str,
+    query_len: i32,
+    unaligned: bool,
+) -> io::Result<()> {
+    print_query_intro_bytes(writer, query_title.as_bytes(), query_len, unaligned)
 }

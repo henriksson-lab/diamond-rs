@@ -1,0 +1,187 @@
+[
+  {
+    "flags": [
+      "--soft-masking",
+      "1"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd",
+      "-p1",
+      "--soft-masking",
+      "1",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 1\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: /data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: /data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd (type: Diamond database, sequences: 7, letters: 1033)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file...  [0s]\nLoading query sequences...  [0s]\nMasking queries...  [0.011s]\nError: Invalid value for string field: 1. Permitted values: 0, none, seg, tantan\n"
+  },
+  {
+    "flags": [
+      "--soft-masking",
+      "SEG"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd",
+      "-p1",
+      "--soft-masking",
+      "SEG",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 1\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: /data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: /data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd (type: Diamond database, sequences: 7, letters: 1033)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file...  [0s]\nLoading query sequences...  [0s]\nMasking queries...  [0.012s]\nError: Invalid value for string field: SEG. Permitted values: 0, none, seg, tantan\n"
+  },
+  {
+    "flags": [
+      "--soft-masking",
+      "motif"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd",
+      "-p1",
+      "--soft-masking",
+      "motif",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 1\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: /data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: /data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd (type: Diamond database, sequences: 7, letters: 1033)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file...  [0s]\nLoading query sequences...  [0s]\nMasking queries...  [0.012s]\nError: Invalid value for string field: motif. Permitted values: 0, none, seg, tantan\n"
+  },
+  {
+    "flags": [
+      "--soft-masking"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd",
+      "-p1",
+      "--soft-masking",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid parameter count for option '--soft-masking'\n"
+  },
+  {
+    "flags": [
+      "--soft-masking",
+      "seg",
+      "tantan"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd",
+      "-p1",
+      "--soft-masking",
+      "seg",
+      "tantan",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid parameter count for option '--soft-masking'\n"
+  },
+  {
+    "flags": [
+      "--soft-masking=seg"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd",
+      "-p1",
+      "--soft-masking=seg",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid option: soft-masking=seg\n"
+  },
+  {
+    "flags": [
+      "--approx-id"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd",
+      "-p1",
+      "--approx-id",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid parameter count for option '--approx-id'\n"
+  },
+  {
+    "flags": [
+      "--approx-id",
+      "75",
+      "90"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd",
+      "-p1",
+      "--approx-id",
+      "75",
+      "90",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid parameter count for option '--approx-id'\n"
+  },
+  {
+    "flags": [
+      "--approx-id=75"
+    ],
+    "args": [
+      "/data/henriksson/github/claude/diamond-rs/diamond/build/diamond",
+      "blastp",
+      "-q",
+      "/data/henriksson/github/claude/diamond-rs/tests/data/search_controls/query.faa",
+      "-d",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/reference.dmnd",
+      "-p1",
+      "--approx-id=75",
+      "-o",
+      "/data/henriksson/github/claude/diamond-rs/.tmp/native-search-controls-20261107/error"
+    ],
+    "status": 1,
+    "stderr": "Error: Invalid option: approx-id=75\n"
+  }
+]

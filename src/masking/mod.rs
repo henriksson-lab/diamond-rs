@@ -267,7 +267,7 @@ impl Default for MaskingConfig {
 
 /// Precomputed masking state corresponding to C++ `Masking`.
 pub struct Masking {
-    tantan: tantan::TantanMasker,
+    tantan: std::sync::Arc<tantan::TantanMasker>,
     blast_seg: blast_seg::SegParameters,
     config: MaskingConfig,
 }
@@ -277,10 +277,10 @@ impl Masking {
     /// configuration explicit.
     pub fn new(score_matrix: &ScoreMatrix, config: MaskingConfig) -> Self {
         Self {
-            tantan: tantan::TantanMasker::from_score_matrix(
+            tantan: std::sync::Arc::new(tantan::TantanMasker::from_score_matrix(
                 score_matrix,
                 config.tantan_min_mask_prob,
-            ),
+            )),
             blast_seg: blast_seg::SegParameters::new_aa(),
             config,
         }
@@ -309,7 +309,10 @@ impl Masking {
             }
         }
         if algo_bits & MaskingAlgo::Seg.bits() != 0 {
-            let encoded: Vec<u8> = seq.iter().map(|&letter| letter as u8).collect();
+            let encoded: Vec<u8> = seq
+                .iter()
+                .map(|&letter| (letter & LETTER_MASK) as u8)
+                .collect();
             let ranges = blast_seg::seq_buffer_seg(&encoded, 0, Some(&self.blast_seg));
             for (begin, end) in ranges {
                 if let Some(masking_table) = table.as_deref_mut() {
@@ -336,6 +339,14 @@ impl Masking {
 
     pub fn mask_bit(&self, seq: &mut [Letter]) {
         self.tantan.mask_bit(seq);
+    }
+
+    pub fn tantan(&self) -> &tantan::TantanMasker {
+        &self.tantan
+    }
+
+    pub fn tantan_shared(&self) -> std::sync::Arc<tantan::TantanMasker> {
+        self.tantan.clone()
     }
 
     pub fn bit_to_hard_mask(&self, seq: &mut [Letter], count: &mut usize) {

@@ -1,0 +1,3 @@
+domain_query	single_domain	100	18446744073709551568	domain_query	single_domain control	single_domain	single_domain control	20.6	100	0.0	1.000000
+domain_query	domain_query	100	18446744073709551566	domain_query	domain_query	domain_query	domain_query	100	100	0.0	1.000000
+domain_query	reordered	100	18446744073709551567	domain_query	reordered three disjoint domains	reordered	reordered three disjoint domains	20.6	20.6	0.0	0.205805

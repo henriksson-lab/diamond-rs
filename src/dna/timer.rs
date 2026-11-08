@@ -69,23 +69,33 @@ impl TotalTime {
     pub fn print(&self) {
         eprintln!(
             "Chaining: {} seconds",
-            self.timer.chaining.as_nanos() as f64 / 1_000_000_000.0
+            crate::output::format::format_default_float(
+                self.timer.chaining.as_nanos() as f64 / 1_000_000_000.0
+            )
         );
         eprintln!(
             "Extension-Time: {} seconds",
-            self.timer.extension.as_nanos() as f64 / 1_000_000_000.0
+            crate::output::format::format_default_float(
+                self.timer.extension.as_nanos() as f64 / 1_000_000_000.0
+            )
         );
         eprintln!(
             "seed-lookup: {} seconds",
-            self.timer.next.as_nanos() as f64 / 1_000_000_000.0
+            crate::output::format::format_default_float(
+                self.timer.next.as_nanos() as f64 / 1_000_000_000.0
+            )
         );
         eprintln!(
             "build Hsp from cigar (part of extension): {} seconds",
-            self.timer.postprocessing_time.as_nanos() as f64 / 1_000_000_000.0
+            crate::output::format::format_default_float(
+                self.timer.postprocessing_time.as_nanos() as f64 / 1_000_000_000.0
+            )
         );
         eprintln!(
             "ungapped: {} seconds",
-            self.timer.preprocessing_time.as_nanos() as f64 / 1_000_000_000.0
+            crate::output::format::format_default_float(
+                self.timer.preprocessing_time.as_nanos() as f64 / 1_000_000_000.0
+            )
         );
     }
 }

@@ -133,9 +133,11 @@ impl Target {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GappedScoreConfig {
     pub padding: i32,
+    pub band_bin: i32,
+    pub col_bin: i32,
     pub narrow_band_cov: f64,
     pub narrow_band_factor: f64,
     pub min_band_overlap: f64,
@@ -143,6 +145,16 @@ pub struct GappedScoreConfig {
     pub query_contexts: usize,
     pub cutoff_score_8bit: i32,
     pub max_swipe_dp: i64,
+    pub swipe_task_size: i64,
+    pub threads_align: u32,
+    pub target_parallel_verbosity: u32,
+    pub log_query: bool,
+    pub swipe_error: Option<crate::dp::swipe::SwipeError>,
+    pub transcript_len_estimate: f64,
+    pub tantan_min_mask_prob: f64,
+    pub cbs_window: i32,
+    /// Shared command-level masking kernel, matching Source's global Masking.
+    pub tantan_masker: Option<Arc<crate::masking::tantan::TantanMasker>>,
     pub approx_backtrace: bool,
     pub max_hsps: u32,
     pub inner_culling_overlap: f64,
@@ -155,6 +167,8 @@ pub struct GappedScoreConfig {
     pub query_or_target_cover: f64,
     pub approx_min_id: f64,
     pub cbs_matrix_scale: i32,
+    pub matrix_adjust_tolerance: f64,
+    pub matrix_adjust_max_iterations: i32,
     pub min_id: f64,
     pub no_self_hits: bool,
     pub max_target_seqs: i64,
@@ -167,6 +181,9 @@ pub struct GappedScoreConfig {
     pub ranking_score_drop_factor: f64,
     pub ranking_cutoff_bitscore: f64,
     pub cluster_threshold_present: bool,
+    pub clustering_filter: Option<Arc<crate::mcl::clustering_format::ClusteringFilter>>,
+    pub clustering_query_self_score: Option<f64>,
+    pub clustering_target_self_scores: Option<Arc<[f64]>>,
     pub add_self_aln: bool,
     pub self_: bool,
     pub current_ref_block: BlockId,
@@ -182,12 +199,27 @@ pub struct GappedScoreConfig {
     pub ungapped_window: usize,
 }
 
+impl GappedScoreConfig {
+    pub fn check_swipe_error(&self) -> std::io::Result<()> {
+        if let Some(error) = self
+            .swipe_error
+            .as_ref()
+            .and_then(crate::dp::swipe::SwipeError::take)
+        {
+            return Err(std::io::Error::other(error));
+        }
+        Ok(())
+    }
+}
+
 impl Default for GappedScoreConfig {
     fn default() -> Self {
         Self {
             padding: 0,
+            band_bin: 24,
+            col_bin: 400,
             narrow_band_cov: 0.0,
-            narrow_band_factor: 1.0,
+            narrow_band_factor: 0.0,
             min_band_overlap: 0.0,
             anchored_swipe: false,
             query_contexts: 1,
@@ -198,6 +230,15 @@ impl Default for GappedScoreConfig {
             // score; speed-only.
             cutoff_score_8bit: 240,
             max_swipe_dp: 1_000_000,
+            swipe_task_size: 100_000_000,
+            threads_align: 0,
+            target_parallel_verbosity: u32::MAX,
+            log_query: false,
+            swipe_error: None,
+            transcript_len_estimate: 1.0,
+            tantan_min_mask_prob: 0.9,
+            cbs_window: 40,
+            tantan_masker: None,
             approx_backtrace: false,
             max_hsps: 1,
             inner_culling_overlap: 50.0,
@@ -210,6 +251,8 @@ impl Default for GappedScoreConfig {
             query_or_target_cover: 0.0,
             approx_min_id: 0.0,
             cbs_matrix_scale: 1,
+            matrix_adjust_tolerance: 1e-8,
+            matrix_adjust_max_iterations: 2000,
             min_id: 0.0,
             no_self_hits: false,
             max_target_seqs: 25,
@@ -227,6 +270,9 @@ impl Default for GappedScoreConfig {
             ranking_score_drop_factor: 0.95,
             ranking_cutoff_bitscore: 25.0,
             cluster_threshold_present: false,
+            clustering_filter: None,
+            clustering_query_self_score: None,
+            clustering_target_self_scores: None,
             add_self_aln: false,
             self_: false,
             current_ref_block: 0,
@@ -273,7 +319,7 @@ pub fn ranking_chunk_size(
     if cfg.toppercent.is_some() {
         return MIN_CHUNK_SIZE * block_mult;
     }
-    let multiple = ((max_target_seqs + 31) / 32) * 32;
+    let multiple = crate::util::misc::make_multiple(max_target_seqs, 32);
     let size = MIN_CHUNK_SIZE.max(multiple.min(MAX_CHUNK_SIZE)) * block_mult;
     cfg.target_hard_cap.map_or(size, |cap| size.min(cap))
 }
@@ -354,10 +400,10 @@ pub fn lazy_masking(target_block_ids: &[BlockId], targets: &mut Block, algo: Mas
     n
 }
 
-/// Matches C++ `extend_chunk`.
-pub fn extend_chunk<F1, F2>(
+/// Matches C++ `extend_chunk_bytes`.
+pub fn extend_chunk_bytes<F1, F2>(
     query_seq: &[&[Letter]],
-    query_id: Option<&str>,
+    query_id: Option<&[u8]>,
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; TRUE_AA as usize],
@@ -382,6 +428,12 @@ where
     F1: Fn(i32, i32) -> i32 + Copy,
     F2: Fn(i32, i32) -> i32 + Copy,
 {
+    let mut diagnostic_timer =
+        crate::util::log_stream::TaskTimer::new(if flags.any(Flags::PARALLEL) {
+            cfg.target_parallel_verbosity
+        } else {
+            u32::MAX
+        });
     const GAPPED_FILTER_MIN_QLEN: i32 = 85;
     let n = seed_hits.data_size() as i64;
     stat.inc(StatValue::TargetHits2, n);
@@ -401,6 +453,7 @@ where
         } else {
             Some(query_cbs_refs.as_slice())
         };
+        diagnostic_timer.go(Some("Computing gapped filter"));
         let (filtered_hits, filtered_ids) = gapped_filter_seed_hits(
             query_seq,
             query_cbs_arg,
@@ -427,6 +480,7 @@ where
 
     stat.inc(StatValue::TargetHits3, seed_hits.data_size() as i64);
 
+    diagnostic_timer.go(Some("Computing chaining"));
     let mut targets = ungapped_stage_seed_hits(
         query_seq,
         query_cbs,
@@ -439,7 +493,8 @@ where
         ungapped_cfg,
         score_matrix,
     );
-    let aligned = align_work_targets(
+    diagnostic_timer.finish();
+    let aligned = align_work_targets_bytes(
         &mut targets,
         query_seq,
         query_id,
@@ -468,20 +523,174 @@ impl TargetBlockAccess<'_> {
         }
     }
 
-    fn lazy_masking(&mut self, target_block_ids: &[BlockId], algo: MaskingAlgo) -> usize {
-        match self {
-            TargetBlockAccess::Shared(_) => {
-                panic!("lazy target masking requires a mutable target block")
-            }
-            TargetBlockAccess::Mutable(block) => lazy_masking(target_block_ids, block, algo),
+    fn lazy_masking(
+        &mut self,
+        target_block_ids: &[BlockId],
+        algo: MaskingAlgo,
+        matrix: &ScoreMatrix,
+        probability: f64,
+        supplied_tantan: Option<&crate::masking::tantan::TantanMasker>,
+    ) -> usize {
+        let Self::Mutable(block) = self else {
+            panic!("lazy target masking requires a mutable target block");
+        };
+        if algo == MaskingAlgo::None {
+            return 0;
         }
+        let fallback_tantan =
+            (algo == MaskingAlgo::Tantan && supplied_tantan.is_none()).then(|| {
+                crate::masking::tantan::TantanMasker::from_score_matrix(matrix, probability as f32)
+            });
+        let tantan = if algo == MaskingAlgo::Tantan {
+            supplied_tantan.or(fallback_tantan.as_ref())
+        } else {
+            None
+        };
+        let mut sequence = Vec::new();
+        let mut masked = 0;
+        for &id in target_block_ids {
+            if block.fetch_seq_if_unmasked(id as usize, &mut sequence) {
+                crate::masking::remove_bit_mask(&mut sequence);
+                if let Some(masker) = &tantan {
+                    masker.mask_hard(&mut sequence);
+                } else {
+                    mask_sequence(&mut sequence, algo);
+                }
+                block.write_masked_seq(id as usize, &sequence);
+                masked += 1;
+            }
+        }
+        masked
     }
+
+    fn mask_all_for_swipe(
+        &mut self,
+        algo: MaskingAlgo,
+        matrix: &ScoreMatrix,
+        probability: f64,
+        supplied_tantan: Option<&crate::masking::tantan::TantanMasker>,
+    ) -> usize {
+        if algo == MaskingAlgo::None {
+            return 0;
+        }
+        let Self::Mutable(block) = self else {
+            panic!("lazy target masking requires a mutable target block");
+        };
+        let fallback_tantan =
+            (algo == MaskingAlgo::Tantan && supplied_tantan.is_none()).then(|| {
+                crate::masking::tantan::TantanMasker::from_score_matrix(matrix, probability as f32)
+            });
+        let tantan = if algo == MaskingAlgo::Tantan {
+            supplied_tantan.or(fallback_tantan.as_ref())
+        } else {
+            None
+        };
+        let mut sequence = Vec::new();
+        let mut masked = 0;
+        // There are no seed-hit target IDs in exhaustive mode. Every loaded
+        // reference must be prepared before the first full-matrix pass.
+        for id in 0..block.seqs().len() {
+            if block.fetch_seq_if_unmasked(id, &mut sequence) {
+                crate::masking::remove_bit_mask(&mut sequence);
+                if let Some(masker) = tantan.as_ref() {
+                    masker.mask_hard(&mut sequence);
+                } else {
+                    mask_sequence(&mut sequence, algo);
+                }
+                block.write_masked_seq(id, &sequence);
+                masked += 1;
+            }
+        }
+        masked
+    }
+}
+
+/// Exhaustive extension for an already prepared query and reference block.
+///
+/// This is the source `full_db_align` score pass followed by its ordinary
+/// filter-aware culling and final full-matrix alignment. It needs no synthetic
+/// seed hit and visits every configured query context against every target.
+/// Callers prepare hard masking/CBS as for ordinary extension; mutable
+/// `extend_mut` also supports lazy target preparation for exhaustive mode.
+#[allow(clippy::too_many_arguments)]
+pub fn extend_full_db(
+    query_id: BlockId,
+    query_seq: &[&[Letter]],
+    query_title: &(impl AsRef<[u8]> + ?Sized),
+    source_query_len: i32,
+    query_cbs: &[Vec<i8>],
+    target_block: &Block,
+    stat: &mut Statistics,
+    flags: Flags,
+    cfg: &GappedScoreConfig,
+    score_matrix: &ScoreMatrix,
+    output_hsp_values: HspValues,
+) -> Vec<Match> {
+    let first_round_culling = !have_filters(cfg) || cfg.toppercent.is_some();
+    let flags = flags | Flags::FULL_MATRIX;
+    let mut aligned_targets = full_db_align(
+        query_seq,
+        query_cbs,
+        flags,
+        HspValues::NONE,
+        stat,
+        target_block,
+        cfg,
+        score_matrix,
+    );
+    // With identity/coverage filters, retain the score-sorted candidate list:
+    // a high-scoring rejected target must not hide a lower-scoring valid hit.
+    culling_targets(
+        &mut aligned_targets,
+        !first_round_culling,
+        cfg.max_target_seqs,
+        cfg.toppercent,
+        |score| score_matrix.bitscore(score as f64),
+    );
+    stat.inc(StatValue::TargetHits5, aligned_targets.len() as i64);
+    let mut matches = super::gapped_final::align_targets_final_with_block(
+        &mut aligned_targets,
+        0,
+        query_seq,
+        query_title,
+        query_cbs,
+        source_query_len,
+        0.0,
+        flags,
+        // Source declares COORDS independently of the actual NONE-valued
+        // exhaustive pass. gapped_final intentionally copies those initialized
+        // DummyRowCounter HSPs for this coordinate-only fast path. The SWIPE
+        // seed list is empty, so max_target_seqs >= seed-list size is true.
+        if cfg.anchored_swipe
+            || (cfg.sensitivity <= Sensitivity::Shapes30x10
+                && output_hsp_values.only(HspValues::COORDS)
+                && cfg.toppercent.is_none())
+        {
+            HspValues::COORDS
+        } else {
+            HspValues::NONE
+        },
+        first_round_culling,
+        ExtensionMode::Full,
+        stat,
+        cfg,
+        score_matrix,
+        output_hsp_values,
+        Some(target_block),
+    );
+    if add_self_aln(cfg) && !matches.iter().any(|m| m.target_block_id == query_id) {
+        matches.push(Match::self_match(query_id, query_seq[0]));
+    }
+    culling_matches(&mut matches, cfg.max_target_seqs, cfg.toppercent, |score| {
+        score_matrix.bitscore(score as f64)
+    });
+    matches
 }
 
 fn extend_seed_hit_list_with_block<F1, F2>(
     query_id: BlockId,
     query_seq: &[&[Letter]],
-    query_title: &str,
+    query_title: &(impl AsRef<[u8]> + ?Sized),
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; TRUE_AA as usize],
@@ -505,22 +714,24 @@ where
     F1: Fn(i32, i32) -> i32 + Copy,
     F2: Fn(i32, i32) -> i32 + Copy,
 {
+    if cfg.log_query || (flags.any(Flags::PARALLEL) && !cfg.swipe_all) {
+        if let Ok(mut stream) = crate::util::log_stream::log_stream().lock() {
+            let _ = stream.write_bytes(b"Query=");
+            let _ = stream.write_bytes(query_title.as_ref());
+            let _ = stream.write(format!(" Hits={}\n", seed_hit_list.seed_hits.data_size()));
+        }
+    }
     const UNIFIED_TARGET_LEN: u32 = 50;
     let query_len = if cfg.query_translated {
         query_seq.iter().map(|query| query.len()).max().unwrap_or(0) as u32
     } else {
         query_seq.first().map_or(0, |query| query.len()) as u32
     };
-    let self_aln_score = if target_block.block().has_self_aln() {
-        target_block.block().self_aln_score(query_id as i64)
-    } else {
-        0.0
-    };
     let target_count = seed_hit_list.target_block_ids.len();
 
     if mode == ExtensionMode::None {
         seed_hit_list.target_scores.sort();
-        return seed_only_matches(
+        let mut matches = seed_only_matches(
             seed_hit_list,
             source_query_len as u32,
             Some(target_block.block().seqs()),
@@ -530,55 +741,57 @@ where
             cfg.toppercent,
             |score| score_matrix.bitscore(score as f64),
         );
+        if !cfg.query_translated {
+            // Hsp::set_begin/end encode translated source positions. Source's
+            // seed-only helper obtains align_mode globally; this adapter has
+            // the explicit mode and must retain protein residue coordinates.
+            for target in &mut matches {
+                for hsp in &mut target.hsps {
+                    hsp.query_source_range = hsp.query_range;
+                }
+            }
+        }
+        return matches;
+    }
+
+    if cfg.swipe_all {
+        if cfg.lazy_masking {
+            let masked = target_block.mask_all_for_swipe(
+                cfg.target_masking,
+                score_matrix,
+                cfg.tantan_min_mask_prob,
+                cfg.tantan_masker.as_deref(),
+            );
+            stat.inc(StatValue::MaskedLazy, masked as i64);
+        }
+        return extend_full_db(
+            query_id,
+            query_seq,
+            query_title,
+            source_query_len,
+            query_cbs,
+            target_block.block(),
+            stat,
+            flags,
+            cfg,
+            score_matrix,
+            output_hsp_values,
+        );
     }
 
     if target_count == 0 {
-        let mut matches = if cfg.swipe_all {
-            let mut aligned_targets = full_db_align(
-                query_seq,
-                query_cbs,
-                flags,
-                HspValues::NONE,
-                stat,
-                target_block.block(),
-                cfg,
-                score_matrix,
-            );
-            culling_targets(
-                &mut aligned_targets,
-                false,
-                cfg.max_target_seqs,
-                cfg.toppercent,
-                |score| score_matrix.bitscore(score as f64),
-            );
-            align_targets_final(
-                &mut aligned_targets,
-                0,
-                query_seq,
-                query_title,
-                query_cbs,
-                source_query_len,
-                self_aln_score,
-                flags,
-                HspValues::NONE,
-                false,
-                mode,
-                stat,
-                cfg,
-                score_matrix,
-                output_hsp_values,
-            )
-        } else {
-            Vec::new()
-        };
-        if add_self_aln(cfg) && !matches.iter().any(|m| m.target_block_id == query_id) {
-            matches.push(Match::self_match(query_id, &query_seq[0]));
+        let mut matches = Vec::new();
+        if add_self_aln(cfg) {
+            matches.push(Match::self_match(query_id, query_seq[0]));
         }
-        culling_matches(&mut matches, cfg.max_target_seqs, cfg.toppercent, |score| {
-            score_matrix.bitscore(score as f64)
-        });
         return matches;
     }
+
+    let self_aln_score = if target_block.block().has_self_aln() {
+        target_block.block().self_aln_score(query_id as i64)
+    } else {
+        0.0
+    };
 
     let chunk_size = ranking_chunk_size(
         target_count as i64,
@@ -652,14 +865,19 @@ where
                 &seed_hit_list.target_block_ids
             };
             if cfg.lazy_masking && cfg.global_ranking_targets == 0 {
-                let masked =
-                    target_block.lazy_masking(current_target_block_ids, cfg.target_masking);
+                let masked = target_block.lazy_masking(
+                    current_target_block_ids,
+                    cfg.target_masking,
+                    score_matrix,
+                    cfg.tantan_min_mask_prob,
+                    cfg.tantan_masker.as_deref(),
+                );
                 stat.inc(StatValue::MaskedLazy, masked as i64);
             }
 
-            let v = extend_chunk(
+            let v = extend_chunk_bytes(
                 query_seq,
-                Some(query_title),
+                Some(query_title.as_ref()),
                 source_query_len,
                 query_cbs,
                 query_comp,
@@ -721,19 +939,6 @@ where
             }
         }
 
-        if cfg.swipe_all {
-            aligned_targets = full_db_align(
-                query_seq,
-                query_cbs,
-                flags,
-                HspValues::NONE,
-                stat,
-                target_block.block(),
-                cfg,
-                score_matrix,
-            );
-        }
-
         culling_targets(
             &mut aligned_targets,
             !first_round_culling,
@@ -743,7 +948,7 @@ where
         );
         stat.inc(StatValue::TargetHits5, aligned_targets.len() as i64);
 
-        let mut round_matches = align_targets_final(
+        let mut round_matches = super::gapped_final::align_targets_final_with_block(
             &mut aligned_targets,
             matches.len() as i64,
             query_seq,
@@ -759,6 +964,7 @@ where
             cfg,
             score_matrix,
             output_hsp_values,
+            Some(target_block.block()),
         );
         matches.append(&mut round_matches);
 
@@ -785,7 +991,7 @@ where
 pub fn extend_seed_hit_list<F1, F2>(
     query_id: BlockId,
     query_seq: &[&[Letter]],
-    query_title: &str,
+    query_title: &(impl AsRef<[u8]> + ?Sized),
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; TRUE_AA as usize],
@@ -838,7 +1044,7 @@ where
 pub fn extend_seed_hit_list_mut<F1, F2>(
     query_id: BlockId,
     query_seq: &[&[Letter]],
-    query_title: &str,
+    query_title: &(impl AsRef<[u8]> + ?Sized),
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; TRUE_AA as usize],
@@ -892,7 +1098,7 @@ fn extend_with_block<F1, F2, G>(
     query_id: BlockId,
     hits: &mut [Hit],
     query_seq: &[&[Letter]],
-    query_title: &str,
+    query_title: &(impl AsRef<[u8]> + ?Sized),
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; TRUE_AA as usize],
@@ -917,7 +1123,16 @@ where
     F2: Fn(i32, i32) -> i32 + Copy,
     G: FnOnce(BlockId, &SeedHitList) -> Vec<Match>,
 {
+    let mut diagnostic_timer = crate::util::log_stream::TaskTimer::with_msg(
+        "Loading seed hits",
+        if flags.any(Flags::PARALLEL) {
+            cfg.target_parallel_verbosity
+        } else {
+            u32::MAX
+        },
+    );
     let mut list = load_hits(hits, target_block.block().seqs(), cfg.query_contexts as u32);
+    diagnostic_timer.finish();
     stat.inc(StatValue::TargetHits0, list.target_block_ids.len() as i64);
 
     let target_count = list.target_block_ids.len() as i64;
@@ -987,7 +1202,7 @@ pub fn extend<F1, F2, G>(
     query_id: BlockId,
     hits: &mut [Hit],
     query_seq: &[&[Letter]],
-    query_title: &str,
+    query_title: &(impl AsRef<[u8]> + ?Sized),
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; TRUE_AA as usize],
@@ -1043,7 +1258,7 @@ pub fn extend_mut<F1, F2, G>(
     query_id: BlockId,
     hits: &mut [Hit],
     query_seq: &[&[Letter]],
-    query_title: &str,
+    query_title: &(impl AsRef<[u8]> + ?Sized),
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; TRUE_AA as usize],
@@ -1197,7 +1412,7 @@ pub fn add_dp_targets(
                 DpAnchor::default(),
             );
             if let Some(matrix) = matrix.clone() {
-                dp = dp.with_matrix(matrix, 1);
+                dp = dp.with_matrix(matrix, cfg.cbs_matrix_scale);
             }
             dp_targets[frame][b].push_back(dp);
             continue;
@@ -1274,7 +1489,7 @@ pub fn add_dp_targets(
                         },
                     );
                     if let Some(matrix) = matrix.clone() {
-                        dp = dp.with_matrix(matrix, 1);
+                        dp = dp.with_matrix(matrix, cfg.cbs_matrix_scale);
                     }
                     dp_targets[frame][bin].push_back(dp);
                 }
@@ -1319,17 +1534,17 @@ pub fn add_dp_targets(
             },
         );
         if let Some(matrix) = matrix.clone() {
-            dp = dp.with_matrix(matrix, 1);
+            dp = dp.with_matrix(matrix, cfg.cbs_matrix_scale);
         }
         dp_targets[frame][bin].push_back(dp);
     }
 }
 
 /// Matches C++ `align(vector<WorkTarget>&, const Sequence*, ...)` in `gapped_score.cpp`.
-pub fn align_work_targets(
+pub fn align_work_targets_bytes(
     targets: &mut Vec<crate::align::ungapped::WorkTarget>,
     query_seq: &[&[Letter]],
-    query_id: Option<&str>,
+    query_id: Option<&[u8]>,
     query_cbs: &[Vec<i8>],
     source_query_len: i32,
     mut flags: Flags,
@@ -1410,7 +1625,14 @@ pub fn align_work_targets(
         };
         let hsps = if cfg.anchored_swipe {
             let mut acfg = AnchoredSwipeConfig::new(&query_seq[frame], score_matrix);
+            acfg.cbs_matrix_scale = cfg.cbs_matrix_scale;
+            acfg.matrix_adjust_tolerance = cfg.matrix_adjust_tolerance;
+            acfg.matrix_adjust_max_iterations = cfg.matrix_adjust_max_iterations;
+            acfg.band_bin = cfg.band_bin;
+            acfg.col_bin = cfg.col_bin;
             acfg.query_cbs = cbs;
+            acfg.swipe_task_size = cfg.swipe_task_size;
+            acfg.transcript_len_estimate = cfg.transcript_len_estimate;
             acfg.recompute_adjusted = cfg.comp_based_stats_matrix_adjust;
             acfg.sensitivity = cfg.sensitivity;
             acfg.query_cover = cfg.query_cover;
@@ -1421,17 +1643,25 @@ pub fn align_work_targets(
             anchored_swipe(&mut dp_targets[frame], &acfg)
         } else {
             let mut params = Params::new(&query_seq[frame], score_matrix);
-            params.query_id = query_id;
+            params.query_id_bytes = query_id;
             params.frame = frame as i32;
             params.query_source_len = source_query_len;
             params.query_translated = cfg.query_translated;
             params.composition_bias = cbs;
+            params.band_bin = cfg.band_bin;
+            params.col_bin = cfg.col_bin;
             params.flags = flags;
             params.v = hsp_values;
             params.cutoff_score_8bit = cfg.cutoff_score_8bit;
             params.max_swipe_dp = cfg.max_swipe_dp;
+            params.swipe_task_size = cfg.swipe_task_size;
+            params.threads_align = cfg.threads_align;
+            params.target_parallel_verbosity = cfg.target_parallel_verbosity;
+            params.error_sink = cfg.swipe_error.clone();
+            params.transcript_len_estimate = cfg.transcript_len_estimate;
             params.approx_backtrace = cfg.approx_backtrace;
             params.max_evalue = cfg.max_evalue;
+            params.min_bit_score = cfg.min_bit_score;
             params.query_cover = cfg.query_cover;
             params.subject_cover = cfg.subject_cover;
             params.query_or_target_cover = cfg.query_or_target_cover;
@@ -1725,6 +1955,85 @@ pub fn apply_filters_matches(
     );
 }
 
+pub fn extend_chunk<F1, F2>(
+    query_seq: &[&[Letter]],
+    query_id: Option<&str>,
+    source_query_len: i32,
+    query_cbs: &[Vec<i8>],
+    query_comp: &[f64; TRUE_AA as usize],
+    seed_hits: &FlatArray<SeedHit>,
+    target_block_ids: &[BlockId],
+    target_block: &Block,
+    stat: &mut Statistics,
+    flags: Flags,
+    hsp_values: HspValues,
+    mode: ExtensionMode,
+    cfg: &GappedScoreConfig,
+    ungapped_cfg: &UngappedStageConfig,
+    score_matrix: &ScoreMatrix,
+    cutoff_gapped1_new: F1,
+    cutoff_gapped2_new: F2,
+    gap_open: i32,
+    gap_extend: i32,
+    gapped_filter_diag_score: i32,
+    gapped_filter_window: i32,
+) -> Vec<Target>
+where
+    F1: Fn(i32, i32) -> i32 + Copy,
+    F2: Fn(i32, i32) -> i32 + Copy,
+{
+    extend_chunk_bytes(
+        query_seq,
+        query_id.map(str::as_bytes),
+        source_query_len,
+        query_cbs,
+        query_comp,
+        seed_hits,
+        target_block_ids,
+        target_block,
+        stat,
+        flags,
+        hsp_values,
+        mode,
+        cfg,
+        ungapped_cfg,
+        score_matrix,
+        cutoff_gapped1_new,
+        cutoff_gapped2_new,
+        gap_open,
+        gap_extend,
+        gapped_filter_diag_score,
+        gapped_filter_window,
+    )
+}
+
+pub fn align_work_targets(
+    targets: &mut Vec<crate::align::ungapped::WorkTarget>,
+    query_seq: &[&[Letter]],
+    query_id: Option<&str>,
+    query_cbs: &[Vec<i8>],
+    source_query_len: i32,
+    flags: Flags,
+    hsp_values: HspValues,
+    mode: ExtensionMode,
+    stat: &mut Statistics,
+    cfg: &GappedScoreConfig,
+    score_matrix: &ScoreMatrix,
+) -> Vec<Target> {
+    align_work_targets_bytes(
+        targets,
+        query_seq,
+        query_id.map(str::as_bytes),
+        query_cbs,
+        source_query_len,
+        flags,
+        hsp_values,
+        mode,
+        stat,
+        cfg,
+        score_matrix,
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2,8 +2,7 @@
 //!
 //! Translation of `diamond/src/data/index.cpp`.
 
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::basic::reduction::Reduction;
@@ -11,8 +10,7 @@ use crate::basic::shape_config::ShapeConfig;
 use crate::basic::value::SequenceType;
 use crate::config::Sensitivity;
 use crate::data::block::Block;
-use crate::data::dmnd::ReferenceHeader;
-use crate::data::dmnd_reader::for_each_dmnd_record;
+use crate::data::dmnd::{DatabaseOpenOptions, SourceDatabaseFile};
 use crate::data::seed_set::{HashedSeedSet, Table, SEED_INDEX_MAGIC_NUMBER, SEED_INDEX_VERSION};
 use crate::search::sensitivity::{get_shape_codes, get_traits, soft_masking_algo};
 
@@ -22,37 +20,40 @@ pub const MAX_INDEX_LETTERS: u64 = 100_000_000;
 
 #[derive(Debug, Clone)]
 pub struct MakeIndexConfig {
-    pub database: String,
+    pub database: PathBuf,
     pub sensitivity: Sensitivity,
-    pub shape_mask: Vec<String>,
+    pub shape_mask: Vec<Vec<u8>>,
     pub shapes: u32,
-    /// Zero selects the platform's available parallelism, matching the CLI's
+    /// Zero selects Source's hardware concurrency, matching the CLI's
     /// upstream default.
     pub threads: usize,
+    pub file_buffer_size: usize,
 }
 
 impl MakeIndexConfig {
-    pub fn new(database: impl Into<String>, sensitivity: Sensitivity) -> Self {
+    pub fn new(database: impl Into<PathBuf>, sensitivity: Sensitivity) -> Self {
         Self {
             database: database.into(),
             sensitivity,
             shape_mask: Vec::new(),
             shapes: 0,
             threads: 0,
+            file_buffer_size: 67_108_864,
         }
     }
 }
 
-/// Resolve the database exactly like C++ `auto_append_extension_if_exists`:
-/// retain an existing path, otherwise append (rather than replace) `.dmnd`.
-fn resolve_database_path(database: &str) -> PathBuf {
-    let path = Path::new(database);
-    if path.exists() {
-        return path.to_path_buf();
+/// Match DatabaseFile's actual filename fallback: append only when the
+/// suffixed file exists, retaining an absent caller path for its open error.
+fn resolve_database_path(database: &Path) -> PathBuf {
+    let mut suffixed = database.as_os_str().to_owned();
+    suffixed.push(".dmnd");
+    let suffixed = PathBuf::from(suffixed);
+    if !database.as_os_str().as_encoded_bytes().ends_with(b".dmnd") && suffixed.exists() {
+        suffixed
+    } else {
+        database.to_owned()
     }
-    let mut appended = path.as_os_str().to_owned();
-    appended.push(".dmnd");
-    PathBuf::from(appended)
 }
 
 /// Serialize the on-disk format emitted by C++ `makeindex`.
@@ -80,7 +81,7 @@ pub fn write_seed_index<W: Write>(
 /// This is the Rust counterpart of the single C++ `makeindex()` function in
 /// `data/index.cpp`; configuration that was global in C++ is explicit here.
 pub fn make_index(config: &MakeIndexConfig) -> io::Result<PathBuf> {
-    if config.database.is_empty() {
+    if config.database.as_os_str().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Missing parameter: database file (--db/-d).",
@@ -88,11 +89,14 @@ pub fn make_index(config: &MakeIndexConfig) -> io::Result<PathBuf> {
     }
 
     let database_path = resolve_database_path(&config.database);
-    let mut header_file = File::open(&database_path)?;
-    let header = ReferenceHeader::read_from(&mut header_file)?;
-    header
-        .validate()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut database = SourceDatabaseFile::open(
+        &database_path,
+        DatabaseOpenOptions {
+            file_buffer_size: Some(config.file_buffer_size),
+            ..Default::default()
+        },
+    )?;
+    let header = &database.ref_header;
     if header.letters > MAX_INDEX_LETTERS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -101,44 +105,38 @@ pub fn make_index(config: &MakeIndexConfig) -> io::Result<PathBuf> {
     }
 
     let reduction = Reduction::default_reduction();
-    let shape_codes: Vec<String> = if config.shape_mask.is_empty() {
+    let shape_codes: Vec<Vec<u8>> = if config.shape_mask.is_empty() {
         get_shape_codes(config.sensitivity)
             .iter()
-            .map(|s| (*s).to_string())
+            .map(|s| s.as_bytes().to_vec())
             .collect()
     } else {
         config.shape_mask.clone()
     };
-    let shapes = ShapeConfig::from_codes(&shape_codes, config.shapes, &reduction)
+    let shapes = ShapeConfig::from_codes_bytes(&shape_codes, config.shapes, &reduction)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     let mut block = Block::new();
-    for_each_dmnd_record(&database_path, |oid, id, sequence| {
-        // DMND stores encoded letters as raw bytes. `Letter` is `i8`, so this
-        // is a same-size, alignment-one borrowed view valid for the callback.
-        let sequence =
-            unsafe { std::slice::from_raw_parts(sequence.as_ptr().cast::<i8>(), sequence.len()) };
+    database.visit_sequences(MAX_INDEX_LETTERS, |oid, sequence| {
         block
-            .push_back(
-                sequence,
-                Some(id),
-                None,
-                oid as u64,
-                SequenceType::AminoAcid,
-                0,
-                false,
-            )
+            .push_back(sequence, None, None, oid, SequenceType::AminoAcid, 0, false)
             .map(|_| ())
             .map_err(io::Error::other)
     })?;
+
+    // Source makeindex -> DatabaseFile::load_seqs -> load_twopass clears
+    // persisted DMND SEG annotations before HashedSeedSet applies the selected
+    // sensitivity's soft masking (sequence_file.cpp:267). Raw indexed readers
+    // intentionally retain those bytes; this is the concrete loader boundary.
+    for sequence_id in 0..block.seqs().len() {
+        crate::masking::remove_bit_mask(block.seqs_mut().get_mut(sequence_id));
+    }
 
     let traits = get_traits(config.sensitivity);
     let soft_masking = soft_masking_algo(&traits, "", false, false)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let threads = if config.threads == 0 {
-        std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1)
+        crate::util::system::hardware_concurrency() as usize
     } else {
         config.threads
     };
@@ -149,9 +147,27 @@ pub fn make_index(config: &MakeIndexConfig) -> io::Result<PathBuf> {
     let mut output_name = database_path.as_os_str().to_owned();
     output_name.push(".seed_idx");
     let output_path = PathBuf::from(output_name);
-    let mut output = BufWriter::new(File::create(&output_path)?);
-    write_seed_index(&mut output, &index, shapes.count() as usize)?;
-    output.flush()?;
+    let mut output = crate::util::io::OutputFile::with_source_profile_path(
+        &output_path,
+        crate::util::io::Compressor::None,
+        "wb",
+        config.file_buffer_size,
+    )
+    .map_err(io::Error::other)?;
+    struct SourceWriter<'a>(&'a mut crate::util::io::OutputFile);
+    impl Write for SourceWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .write_raw(bytes)
+                .map(|_| bytes.len())
+                .map_err(io::Error::other)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    write_seed_index(SourceWriter(&mut output), &index, shapes.count() as usize)?;
+    output.close().map_err(io::Error::other)?;
     Ok(output_path)
 }
 

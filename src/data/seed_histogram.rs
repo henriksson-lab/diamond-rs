@@ -138,6 +138,58 @@ impl SeedHistogram {
         )
     }
 
+    /// Histogram over unaligned SOURCE queries without compacting contexts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_block_with_skip<Filter>(
+        seqs: &mut Block,
+        serial: bool,
+        filter: &Filter,
+        enum_cfg: &EnumCfg<'_>,
+        seedp_bits: i32,
+        threads: u32,
+        shapes: &ShapeConfig,
+        reduction: &Reduction,
+        min_query_len: Loc,
+        query_contexts: usize,
+        skip: Option<&crate::util::data_structures::BitVector>,
+    ) -> Result<Self, String>
+    where
+        Filter: EnumSeedsFilter,
+    {
+        let skip = crate::data::enum_seeds::source_query_skip_vec(
+            skip,
+            query_contexts,
+            seqs.seqs().len(),
+        )?;
+        let cfg = EnumCfg {
+            partition: enum_cfg.partition,
+            shape_begin: enum_cfg.shape_begin,
+            shape_end: enum_cfg.shape_end,
+            code: enum_cfg.code,
+            skip: skip.as_ref().or(enum_cfg.skip),
+            filter_masked_seeds: enum_cfg.filter_masked_seeds,
+            mask_seeds: enum_cfg.mask_seeds,
+            seed_cut: enum_cfg.seed_cut,
+            soft_masking: enum_cfg.soft_masking,
+            minimizer_window: enum_cfg.minimizer_window,
+            filter_low_complexity_seeds: enum_cfg.filter_low_complexity_seeds,
+            mask_low_complexity_seeds: enum_cfg.mask_low_complexity_seeds,
+            sketch_size: enum_cfg.sketch_size,
+        };
+        Self::from_block(
+            seqs,
+            serial,
+            filter,
+            &cfg,
+            seedp_bits,
+            threads,
+            shapes,
+            reduction,
+            min_query_len,
+            query_contexts,
+        )
+    }
+
     /// The C++ templated constructor with every non-block dependency grouped
     /// explicitly. `from_block` is retained as a source-compatible wrapper.
     pub fn from_block_with_config<Filter>(

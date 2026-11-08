@@ -1,0 +1,49 @@
+{
+  "oracle": "DIAMOND 2.1.24 build 178",
+  "source_commit": "1d162b4fefb5e6b4d868c24e6ad551cad2dcf246",
+  "immutable_before": {
+    "diamond/build/CMakeFiles/diamond.dir/src/lib/tantan/LambdaCalculator.cc.o": "2c85f6fc7952073f71423672284e8087712d6c25f7574e0c977e58c878cee4ca",
+    "diamond/src/lib/tantan/LambdaCalculator.cc": "db14e5eed27fa30fe6d7867b960791cd6d2fcfe1b2fa5a5eabeb48a138e047ab",
+    "diamond/src/lib/tantan/LambdaCalculator.hh": "ad146090d88605686004bcd879afc0f69d6bcf112632cfcd26210a37af89cc0a",
+    "diamond/build/diamond": "d8d08608b96706db62e44036fc979f9a658e72f59fc19d8727546daa616c42d8"
+  },
+  "immutable_after": {
+    "diamond/build/CMakeFiles/diamond.dir/src/lib/tantan/LambdaCalculator.cc.o": "2c85f6fc7952073f71423672284e8087712d6c25f7574e0c977e58c878cee4ca",
+    "diamond/src/lib/tantan/LambdaCalculator.cc": "db14e5eed27fa30fe6d7867b960791cd6d2fcfe1b2fa5a5eabeb48a138e047ab",
+    "diamond/src/lib/tantan/LambdaCalculator.hh": "ad146090d88605686004bcd879afc0f69d6bcf112632cfcd26210a37af89cc0a",
+    "diamond/build/diamond": "d8d08608b96706db62e44036fc979f9a658e72f59fc19d8727546daa616c42d8"
+  },
+  "source_matrices": {
+    "diamond/src/stats/matrices/blosum45.h": "d08ddd03823734fd6cefd6dc754c13e604de24b7513432f5667612cf2949d52c",
+    "diamond/src/stats/matrices/blosum50.h": "9f1559c14251c1f3dbaa55ea42bfe2325c2d4e117391d94f1d89a6462f64d340",
+    "diamond/src/stats/matrices/blosum62.h": "df1682b3047586b0fb9ebe7b4810dc89b7ec5d8edebef004df172a7288f3280c",
+    "diamond/src/stats/matrices/blosum80.h": "ec07d2a00fc5b52849350a0bd0ff9860640fbb72a90cf8e8b6178e74c9aba0c2",
+    "diamond/src/stats/matrices/blosum90.h": "c3de49d7105b008e9111151d2f5152b4493b66a859e6351e13f707919241e385",
+    "diamond/src/stats/matrices/pam30.h": "13d8aacf850382334af7d8c0160c0938a2f53b7b09f882c6cf24aa52af5a1cf8",
+    "diamond/src/stats/matrices/pam70.h": "42f09acd7ef243775d3c36b39f50b34b0aed2f1fc24cf8b3872f2937c7f133e0",
+    "diamond/src/stats/matrices/pam250.h": "3c96ca3fbfbb69dc0adbce3956a0f0aec04a8e8d5f472caf4a5ad2ef5af77a6b"
+  },
+  "compile_args": [
+    "c++",
+    "-std=c++17",
+    "-O0",
+    "-I",
+    "/data/henriksson/github/claude/diamond-rs/diamond/src/lib/tantan",
+    "/data/henriksson/github/claude/diamond-rs/.tmp/native-lambda-20261107/driver.cc",
+    "/data/henriksson/github/claude/diamond-rs/diamond/build/CMakeFiles/diamond.dir/src/lib/tantan/LambdaCalculator.cc.o",
+    "-o",
+    "/data/henriksson/github/claude/diamond-rs/.tmp/native-lambda-20261107/driver"
+  ],
+  "driver_sha256": "5146f2c93a1197896d9ccb9b7023de0bf9e84e441107498e0a6325fbbe52e007",
+  "driver_source_sha256": "5088c55e417ebb32e0852b2dcbb49f760a59a06809967b8b7c92a5af8a9cef79",
+  "compiler": "c++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0\nCopyright (C) 2021 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+  "calculation_seconds": 3.113732523052022,
+  "cases": 36,
+  "formatter_cases": 19,
+  "files": {
+    "states.tsv": "180566b9d6cf44b6f5f170ac7d9a9d5ece0865c1f8028b097364746c4a607a9e",
+    "rounding.tsv": "12b02bbc1e4e5bfaa9b17a8fa7ae0e0057e97f4ba162a5ff5d41850984ffeab6",
+    "matrices.tsv": "6e226056462af4c1afa548fc413de8b5c1923f0b99a546c7f2cc530d293797b8"
+  },
+  "note": "Only the new standalone driver was compiled. The unchanged original object was linked; no upstream source, object or executable was rebuilt. Formatting probes reproduce the source helper snprintf(%g)/atof body using the same host libc; full vectors call the original compiled implementation."
+}

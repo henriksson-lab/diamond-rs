@@ -391,10 +391,37 @@ pub fn targets() -> Targets {
     std::array::from_fn(|_| TargetVec::default())
 }
 
+/// Shared failure channel for one query's DP calls and cloned reverse passes.
+/// Equality compares channel identity, not its transient failure contents.
+#[derive(Clone, Debug, Default)]
+pub struct SwipeError(Arc<Mutex<Option<String>>>);
+
+impl PartialEq for SwipeError {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl SwipeError {
+    pub fn record(&self, error: String) {
+        let mut slot = self.0.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    }
+
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().unwrap().take()
+    }
+}
+
 #[derive(Clone)]
 pub struct Params<'a> {
     pub query: &'a [Letter],
+    /// Legacy checked UTF-8 diagnostic label. Byte callers use query_id_bytes.
     pub query_id: Option<&'a str>,
+    /// Source diagnostic label, retained as bytes without a duplicate String.
+    pub query_id_bytes: Option<&'a [u8]>,
     pub frame: i32,
     pub query_source_len: i32,
     /// Whether query coordinates are amino-acid positions translated from a
@@ -413,8 +440,15 @@ pub struct Params<'a> {
     pub col_bin: i32,
     pub cutoff_score_8bit: i32,
     pub max_swipe_dp: i64,
+    pub swipe_task_size: i64,
+    pub threads_align: u32,
+    pub target_parallel_verbosity: u32,
+    pub error_sink: Option<SwipeError>,
+    pub transcript_len_estimate: f64,
     pub approx_backtrace: bool,
     pub max_evalue: f64,
+    /// A nonzero bit-score threshold overrides the E-value cutoff.
+    pub min_bit_score: f64,
     pub query_cover: f64,
     pub subject_cover: f64,
     pub query_or_target_cover: f64,
@@ -430,6 +464,7 @@ impl<'a> Params<'a> {
         Params {
             query,
             query_id: None,
+            query_id_bytes: None,
             frame: 0,
             query_source_len: query.len() as i32,
             query_translated: false,
@@ -440,12 +475,18 @@ impl<'a> Params<'a> {
             swipe_bin: 0,
             v: HspValues::COORDS,
             score_matrix,
-            band_bin: 16,
-            col_bin: 16,
+            band_bin: 24,
+            col_bin: 400,
             cutoff_score_8bit: i8::MAX as i32,
             max_swipe_dp: 1_000_000,
+            swipe_task_size: DEFAULT_SWIPE_TASK_SIZE,
+            threads_align: 0,
+            target_parallel_verbosity: u32::MAX,
+            error_sink: None,
+            transcript_len_estimate: 1.0,
             approx_backtrace: false,
             max_evalue: f64::MAX,
+            min_bit_score: 0.0,
             query_cover: 0.0,
             subject_cover: 0.0,
             query_or_target_cover: 0.0,
@@ -584,7 +625,10 @@ fn score_only_hsp(
     let evalue = p
         .score_matrix
         .evalue(score, p.query.len() as u32, target.true_target_len as u32);
-    if evalue > p.max_evalue {
+    if !p
+        .score_matrix
+        .report_cutoff(score, evalue, p.min_bit_score, p.max_evalue)
+    {
         return None;
     }
     let mut hsp = Hsp::new();
@@ -597,8 +641,10 @@ fn score_only_hsp(
     );
     hsp.evalue = evalue;
     hsp.frame = p.frame;
-    hsp.d_begin = d_begin;
-    hsp.d_end = d_end;
+    if !p.flags.any(Flags::FULL_MATRIX) {
+        hsp.d_begin = d_begin;
+        hsp.d_end = d_end;
+    }
     hsp.swipe_target = target.target_idx as i32;
     hsp.swipe_bin = p.swipe_bin;
     Some(hsp)
@@ -623,10 +669,16 @@ fn traceback_hsp(
     let evalue = p
         .score_matrix
         .evalue(score, p.query.len() as u32, target.true_target_len as u32);
-    if evalue > p.max_evalue {
+    if !p
+        .score_matrix
+        .report_cutoff(score, evalue, p.min_bit_score, p.max_evalue)
+    {
         return None;
     }
     let mut hsp = Hsp::new();
+    // Source reserves from the unscaled DP score before constructing edits.
+    hsp.transcript
+        .reserve((sw.score as f64 * p.transcript_len_estimate) as usize);
     hsp.backtraced = true;
     hsp.score = score;
     hsp.bit_score = p.score_matrix.bitscore(score as f64);
@@ -673,6 +725,13 @@ fn traceback_hsp(
         hsp.d_begin = -target.d_end + qlen - tlen + 1;
         hsp.d_end = -target.d_begin + qlen - tlen + 1;
     }
+    if p.flags.any(Flags::FULL_MATRIX) {
+        // full_swipe.h leaves these constructor defaults untouched. Giving
+        // a full-matrix alternative the synthetic full diagonal range makes
+        // it outrank an equal-scoring banded HSP during inner culling.
+        hsp.d_begin = 0;
+        hsp.d_end = 0;
+    }
     hsp.query_source_range = TranslatedPosition::absolute_interval(
         TranslatedPosition::new(hsp.query_range.begin, Frame::from_index(p.frame)),
         TranslatedPosition::new(hsp.query_range.end, Frame::from_index(p.frame)),
@@ -689,8 +748,13 @@ fn traceback_hsp(
     for (op, len) in sw.operations {
         match op {
             EditOperation::Match => {
-                hsp.transcript
-                    .push_with_count(EditOperation::Match, len as u32);
+                // Hsp::push_match uses the count overload with 1u for each
+                // diagonal cell. It does not coalesce adjacent matches.
+                // DAA stores these bytes verbatim, so run compression would
+                // preserve the alignment while changing the archive.
+                for _ in 0..len {
+                    hsp.transcript.push_with_count(EditOperation::Match, 1);
+                }
                 hsp.positives += len;
                 qi += len as usize;
                 sj += len as usize;
@@ -716,8 +780,13 @@ fn traceback_hsp(
                 }
             }
             EditOperation::Insertion => {
+                let begin = hsp.transcript.raw_length();
                 hsp.transcript
                     .push_with_count(EditOperation::Insertion, len as u32);
+                // C++ emits each gap while walking backwards and reverses
+                // the complete transcript afterwards. For gaps >63 cells,
+                // the short remainder therefore precedes the full chunks.
+                hsp.transcript.reverse_from(begin);
                 qi += len as usize;
             }
             EditOperation::Deletion => {
@@ -761,7 +830,10 @@ fn endpoint_hsp(
     let evalue = p
         .score_matrix
         .evalue(score, p.query.len() as u32, target.true_target_len as u32);
-    if evalue > p.max_evalue {
+    if !p
+        .score_matrix
+        .report_cutoff(score, evalue, p.min_bit_score, p.max_evalue)
+    {
         return None;
     }
     let mut hsp = Hsp::new();
@@ -793,6 +865,13 @@ fn endpoint_hsp(
         let mut subject = target.seq.to_vec();
         subject.reverse();
         hsp.approx_id = hsp.approx_id_percent(&query, &subject);
+    }
+    if p.flags.any(Flags::FULL_MATRIX) {
+        // full_swipe.h leaves these constructor defaults untouched. Giving
+        // a full-matrix alternative the synthetic full diagonal range makes
+        // it outrank an equal-scoring banded HSP during inner culling.
+        hsp.d_begin = 0;
+        hsp.d_end = 0;
     }
     hsp.query_source_range = TranslatedPosition::absolute_interval(
         TranslatedPosition::new(hsp.query_range.begin, Frame::from_index(p.frame)),
@@ -834,8 +913,206 @@ pub fn dispatch_swipe(
     p: &Params<'_>,
 ) -> Vec<Hsp> {
     DISPATCH_SCRATCH.with(|scratch| {
-        dispatch_swipe_with_scratch(subject_begin, overflow, p, &mut scratch.borrow_mut())
+        let mut scratch = scratch.borrow_mut();
+        let mut out = dispatch_swipe_with_scratch(subject_begin, overflow, p, &mut scratch);
+        if p.flags.any(Flags::FULL_MATRIX) {
+            full_matrix_output_order(subject_begin, &mut out, overflow, p);
+        }
+        out
     })
+}
+
+/// `AsyncTargetBuffer` refills a lane as soon as its subject ends or its score
+/// saturates. Batched kernels compute the same alignments independently; replay
+/// those completion events to retain the upstream output and promotion order.
+fn full_matrix_output_order(
+    targets: &[DpTarget],
+    out: &mut [Hsp],
+    overflow: &mut TargetVec,
+    p: &Params<'_>,
+) {
+    use std::cmp::Reverse;
+    use std::collections::{BinaryHeap, HashMap, HashSet};
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let avx2 = false;
+    let score_bin = p.swipe_bin.max(0) as usize % SCORE_BINS;
+    let channels = if avx2 {
+        [32, 16, 8][score_bin]
+    } else if cfg!(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm"
+    )) {
+        [16, 8, 4][score_bin]
+    } else {
+        1
+    };
+    let overflow_ids: HashSet<_> = overflow.as_slice().iter().map(|t| t.target_idx).collect();
+    let mut durations = Vec::with_capacity(targets.len());
+    for target in targets {
+        let mut duration = target.seq.len().max(1);
+        if overflow_ids.contains(&target.target_idx) && score_bin < 2 {
+            duration = full_matrix_saturation_column(target, p, score_bin);
+        }
+        durations.push(duration);
+    }
+    let mut active = BinaryHeap::new();
+    let mut next = 0;
+    for lane in 0..channels.min(targets.len()) {
+        active.push(Reverse((durations[next], lane, next)));
+        next += 1;
+    }
+    let mut order = HashMap::new();
+    while let Some(Reverse((time, lane, index))) = active.pop() {
+        order.insert(targets[index].target_idx, order.len());
+        if next < targets.len() {
+            active.push(Reverse((time + durations[next], lane, next)));
+            next += 1;
+        }
+    }
+    out.sort_by_key(|hsp| order.get(&(hsp.swipe_target as i64)).copied());
+    overflow
+        .as_mut_slice()
+        .sort_by_key(|target| order.get(&target.target_idx).copied());
+}
+
+/// Reproduce the saturating full-matrix recurrence only for promoted targets.
+/// Row counters do not affect scores, so score-only searches can locate their
+/// first saturation column even when the query exceeds a byte row counter.
+fn full_matrix_saturation_column(target: &DpTarget, p: &Params<'_>, score_bin: usize) -> usize {
+    let limit = if score_bin == 0 { 255 } else { 65535 };
+    let (sub_min, sub_max) = if score_bin == 0 {
+        (-128, 127)
+    } else {
+        (-32768, 32767)
+    };
+    let scale = target.matrix_scale();
+    let open = (p.score_matrix.gap_open() + p.score_matrix.gap_extend()) * scale;
+    let extend = p.score_matrix.gap_extend() * scale;
+    let mut scores = vec![0i32; p.query.len() + 1];
+    let mut horizontal = vec![0i32; p.query.len() + 1];
+    for column in 0..target.seq.len() {
+        let sl = target.seq[if p.reverse_targets {
+            target.seq.len() - column - 1
+        } else {
+            column
+        }];
+        let mut diagonal = 0;
+        let mut vertical = 0;
+        for (row, &ql) in p.query.iter().enumerate() {
+            let previous = scores[row + 1];
+            let substitution = if let Some(matrix) = target.matrix.as_deref() {
+                i32::from(
+                    matrix.scores[(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize],
+                )
+            } else {
+                p.score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK)
+            };
+            let bias = p.composition_bias.map_or(0, |bias| i32::from(bias[row]));
+            let substitution = (substitution + bias).clamp(sub_min, sub_max);
+            let score = (diagonal + substitution)
+                .clamp(0, limit)
+                .max(horizontal[row + 1])
+                .max(vertical);
+            if score == limit {
+                return column + 1;
+            }
+            scores[row + 1] = score;
+            horizontal[row + 1] = (horizontal[row + 1] - extend).max(score - open).max(0);
+            vertical = (vertical - extend).max(score - open).max(0);
+            diagonal = previous;
+        }
+    }
+    target.seq.len().max(1)
+}
+
+/// Full-matrix NONE requests retain a subject endpoint even though Source's
+/// DummyRowCounter supplies query row zero. This scalar fallback uses the same
+/// signed saturated score encoding as the byte/word vector kernels.
+fn full_score_endpoint(
+    target: &DpTarget,
+    p: &Params<'_>,
+    score_bin: usize,
+    scratch: &mut ScoreScratch,
+) -> SwResult {
+    assert!(
+        p.cbs_matrix_scale == 1,
+        "Matrix scale != 1.0 not supported."
+    );
+    let (low, high) = match score_bin {
+        0 => (i8::MIN as i32, i8::MAX as i32),
+        1 => (i16::MIN as i32, i16::MAX as i32),
+        _ => (i32::MIN, i32::MAX),
+    };
+    let zero = if score_bin < 2 && !p.flags.any(Flags::SEMI_GLOBAL) {
+        low
+    } else {
+        0
+    };
+    let open = p.score_matrix.gap_open() + p.score_matrix.gap_extend();
+    let extend = p.score_matrix.gap_extend();
+    scratch.prev_h.resize(p.query.len() + 1, zero);
+    scratch.prev_e.resize(p.query.len() + 1, zero);
+    scratch.prev_h.fill(zero);
+    scratch.prev_e.fill(zero);
+    let mut best = zero;
+    let mut subject_end = 0;
+    for column in 0..target.seq.len() {
+        let sl = target.seq[if p.reverse_targets {
+            target.seq.len() - column - 1
+        } else {
+            column
+        }];
+        let mut diagonal = zero;
+        let mut vertical = zero;
+        let mut column_best = zero;
+        for (row, &ql) in p.query.iter().enumerate() {
+            let previous = scratch.prev_h[row + 1];
+            let substitution = target.matrix.as_deref().map_or_else(
+                || p.score_matrix.score(ql & LETTER_MASK, sl & LETTER_MASK),
+                |matrix| {
+                    i32::from(
+                        matrix.scores
+                            [(sl & LETTER_MASK) as usize * 32 + (ql & LETTER_MASK) as usize],
+                    )
+                },
+            );
+            let bias = p.composition_bias.map_or(0, |bias| i32::from(bias[row]));
+            let substitution = substitution.saturating_add(bias).clamp(low, high);
+            let score = diagonal
+                .saturating_add(substitution)
+                .clamp(low, high)
+                .max(scratch.prev_e[row + 1])
+                .max(vertical);
+            scratch.prev_h[row + 1] = score;
+            scratch.prev_e[row + 1] = scratch.prev_e[row + 1]
+                .saturating_sub(extend)
+                .clamp(low, high)
+                .max(score.saturating_sub(open).clamp(low, high));
+            vertical = vertical
+                .saturating_sub(extend)
+                .clamp(low, high)
+                .max(score.saturating_sub(open).clamp(low, high));
+            diagonal = previous;
+            column_best = column_best.max(score);
+        }
+        if column_best > best {
+            best = column_best;
+            subject_end = column as i32 + 1;
+        }
+        if score_bin < 2 && best == high {
+            break;
+        }
+    }
+    SwResult {
+        score: best - zero,
+        query_end: 1,
+        subject_end,
+        ..Default::default()
+    }
 }
 
 fn dispatch_swipe_with_scratch(
@@ -854,6 +1131,7 @@ fn dispatch_swipe_with_scratch(
     // gap vectors. Keep them in the same byte -> word -> i32 promotion cascade
     // as upstream, including batches which mix adjusted and ordinary lanes.
     if p.v == HspValues::NONE
+        && !p.flags.any(Flags::FULL_MATRIX)
         && !p.reverse_targets
         && subject_begin.iter().any(DpTarget::adjusted_matrix)
     {
@@ -1000,6 +1278,7 @@ fn dispatch_swipe_with_scratch(
     // the next score-width bin. Keep that flow instead of paying for i16 on
     // every low-scoring target.
     if p.v == HspValues::NONE
+        && !p.flags.any(Flags::FULL_MATRIX)
         && !p.reverse_targets
         && (simd_score8::available() || simd_score8_portable::available())
         && p.swipe_bin >= 0
@@ -1101,6 +1380,14 @@ fn dispatch_swipe_with_scratch(
                         1,
                         &mut scratch.score,
                     );
+                    if p.flags.any(Flags::FULL_MATRIX)
+                        && p.swipe_bin >= 0
+                        && p.swipe_bin as usize % SCORE_BINS < 2
+                        && score >= [255, 65535][p.swipe_bin as usize % SCORE_BINS]
+                    {
+                        overflow.push_back(target.clone());
+                        continue;
+                    }
                     if let Some(hsp) = score_only_hsp(target, score, d_begin, d_end, p) {
                         out.push(hsp);
                     }
@@ -1128,6 +1415,7 @@ fn dispatch_swipe_with_scratch(
     // banded targets into AVX2 lanes, retaining the scalar i32 calculation for
     // saturation and every unsupported semantic combination.
     if p.v == HspValues::NONE
+        && !p.flags.any(Flags::FULL_MATRIX)
         && !p.reverse_targets
         && subject_begin
             .iter()
@@ -1268,6 +1556,14 @@ fn dispatch_swipe_with_scratch(
                 } else {
                     batch.scores[lane]
                 };
+                if p.flags.any(Flags::FULL_MATRIX)
+                    && p.swipe_bin >= 0
+                    && p.swipe_bin as usize % SCORE_BINS == 0
+                    && score >= 255
+                {
+                    overflow.push_back(target.clone());
+                    continue;
+                }
                 if let Some(hsp) = score_only_hsp(target, score, d_begin, d_end, p) {
                     out.push(hsp);
                 }
@@ -1281,8 +1577,11 @@ fn dispatch_swipe_with_scratch(
     // Upstream's COORDS-only high bins are deliberately *not* traceback
     // configurations: VectorRowCounter records the best end cell and the
     // reversed pass recovers the begin cell. Keep that path trace-free here.
-    if p.v.only(HspValues::COORDS) && p.swipe_bin >= SCORE_BINS as i32 && !p.approx_backtrace {
-        let score_bin = p.swipe_bin as usize % SCORE_BINS;
+    let full_dummy_rows = p.v == HspValues::NONE && p.flags.any(Flags::FULL_MATRIX);
+    if full_dummy_rows
+        || (p.v.only(HspValues::COORDS) && p.swipe_bin >= SCORE_BINS as i32 && !p.approx_backtrace)
+    {
+        let score_bin = p.swipe_bin.max(0) as usize % SCORE_BINS;
         let lane_width = match score_bin {
             0 => 32,
             1 => 16,
@@ -1337,22 +1636,24 @@ fn dispatch_swipe_with_scratch(
             }
 
             let batch = match (score_bin, p.flags.any(Flags::FULL_MATRIX)) {
-                (0, true) => simd_endpoint::endpoint_full_batch_avx2_i8(
+                (0, true) => simd_endpoint::endpoint_full_batch_avx2_i8_with_row_counter(
                     p.query,
                     &score_targets[..lane_count],
                     p.score_matrix,
                     bias,
                     p.flags.any(Flags::SEMI_GLOBAL),
                     p.cbs_matrix_scale,
+                    !full_dummy_rows,
                     &mut scratch.endpoint,
                 ),
-                (1, true) => simd_endpoint::endpoint_full_batch_avx2_i16(
+                (1, true) => simd_endpoint::endpoint_full_batch_avx2_i16_with_row_counter(
                     p.query,
                     &score_targets[..lane_count],
                     p.score_matrix,
                     bias,
                     p.flags.any(Flags::SEMI_GLOBAL),
                     p.cbs_matrix_scale,
+                    !full_dummy_rows,
                     &mut scratch.endpoint,
                 ),
                 (0, false) => simd_endpoint::endpoint_batch_avx2_i8(
@@ -1371,6 +1672,7 @@ fn dispatch_swipe_with_scratch(
                     p.flags.any(Flags::SEMI_GLOBAL),
                     &mut scratch.endpoint,
                 ),
+                _ if full_dummy_rows => None,
                 _ => simd_endpoint::endpoint_batch_i32(
                     p.query,
                     &score_targets[..lane_count],
@@ -1411,17 +1713,33 @@ fn dispatch_swipe_with_scratch(
             // do not force an ordinary lane in the same batch to scalar.
             for (lane, &target) in lane_targets[..lane_count].iter().enumerate() {
                 let score_target = score_targets[lane];
-                let sw = banded_sw_cbs_endpoint(
-                    p.query,
-                    score_target.subject,
-                    score_target.d_begin,
-                    score_target.d_end,
-                    p.score_matrix,
-                    bias,
-                    target.matrix.as_deref(),
-                    target.matrix_scale(),
-                    &mut scratch.score,
-                );
+                let sw = if full_dummy_rows {
+                    full_score_endpoint(target, p, score_bin, &mut scratch.score)
+                } else {
+                    banded_sw_cbs_endpoint(
+                        p.query,
+                        score_target.subject,
+                        score_target.d_begin,
+                        score_target.d_end,
+                        p.score_matrix,
+                        bias,
+                        target.matrix.as_deref(),
+                        target.matrix_scale(),
+                        &mut scratch.score,
+                    )
+                };
+                if full_dummy_rows
+                    && score_bin < 2
+                    && sw.score
+                        >= if p.flags.any(Flags::SEMI_GLOBAL) {
+                            [127, 32767][score_bin]
+                        } else {
+                            [255, 65535][score_bin]
+                        }
+                {
+                    overflow.push_back(target.clone());
+                    continue;
+                }
                 if let Some(hsp) =
                     endpoint_hsp(target, score_target.d_begin, score_target.d_end, sw, p)
                 {
@@ -1647,12 +1965,32 @@ fn dispatch_swipe_with_scratch(
 pub fn swipe_threads(
     begin: &[DpTarget],
     overflow: &mut TargetVec,
-    _round: i32,
+    round: i32,
     bin: usize,
     p: &Params<'_>,
 ) -> Vec<Hsp> {
+    match swipe_threads_with_config(begin, overflow, round, bin, p) {
+        Ok(output) => output,
+        Err(error) => {
+            if let Some(sink) = &p.error_sink {
+                sink.record(error);
+                Vec::new()
+            } else {
+                panic!("{error}");
+            }
+        }
+    }
+}
+
+pub fn swipe_threads_with_config(
+    begin: &[DpTarget],
+    overflow: &mut TargetVec,
+    _round: i32,
+    bin: usize,
+    p: &Params<'_>,
+) -> Result<Vec<Hsp>, String> {
     if begin.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // C++ queues target ranges of roughly `swipe_task_size` cells into the
@@ -1677,6 +2015,58 @@ pub fn swipe_threads(
     } else {
         1
     };
+    if p.flags.any(Flags::PARALLEL) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut timer = crate::util::log_stream::TaskTimer::with_msg(
+            "Banded swipe (run)",
+            p.target_parallel_verbosity,
+        );
+        let workers = if p.threads_align == 0 {
+            rayon::current_num_threads()
+        } else {
+            p.threads_align as usize
+        };
+        let next = AtomicUsize::new(0);
+        let monitor = crate::output::live_sink::current_monitor();
+        let work = || {
+            (0..workers)
+                .into_par_iter()
+                .map(|_| {
+                    let _progress_scope = crate::output::live_sink::enter(monitor.clone());
+                    let mut output = Vec::new();
+                    let mut local_overflow = TargetVec::default();
+                    loop {
+                        let first = next.fetch_add(channels, Ordering::Relaxed);
+                        if first >= begin.len() {
+                            break;
+                        }
+                        output.extend(dispatch_swipe(
+                            &begin[first..(first + channels).min(begin.len())],
+                            &mut local_overflow,
+                            p,
+                        ));
+                    }
+                    (output, local_overflow)
+                })
+                .collect::<Vec<_>>()
+        };
+        let results = if workers == rayon::current_num_threads() {
+            work()
+        } else {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .map_err(|error| format!("Error creating alignment threads: {error}"))?
+                .install(work)
+        };
+        timer.go(Some("Banded swipe (merge)"));
+        let mut output = Vec::new();
+        for (mut local_output, local_overflow) in results {
+            output.append(&mut local_output);
+            overflow.push_back_vec(&local_overflow);
+        }
+        return Ok(output);
+    }
     let mut ranges = Vec::new();
     let mut task_begin = 0usize;
     let mut task_cells = 0i64;
@@ -1690,7 +2080,7 @@ pub fn swipe_threads(
                 .sum::<i64>(),
         );
         i = end;
-        if task_cells >= DEFAULT_SWIPE_TASK_SIZE {
+        if task_cells >= p.swipe_task_size {
             ranges.push(task_begin..i);
             task_begin = i;
             task_cells = 0;
@@ -1701,7 +2091,7 @@ pub fn swipe_threads(
     // the threshold. This matters for the many small per-query SWIPE calls.
     if ranges.is_empty() || rayon::current_num_threads() == 1 {
         p.inc_stat(StatValue::SwipeTasksTotal, 1);
-        return dispatch_swipe(begin, overflow, p);
+        return Ok(dispatch_swipe(begin, overflow, p));
     }
     if task_begin < begin.len() {
         ranges.push(task_begin..begin.len());
@@ -1709,9 +2099,17 @@ pub fn swipe_threads(
     p.inc_stat(StatValue::SwipeTasksTotal, ranges.len() as i64);
     p.inc_stat(StatValue::SwipeTasksAsync, ranges.len() as i64);
 
+    let monitor = crate::output::live_sink::current_monitor();
+    if let Some(monitor) = &monitor {
+        monitor.enqueue_dp(ranges.len());
+    }
     let results: Vec<(Vec<Hsp>, TargetVec)> = ranges
         .into_par_iter()
         .map(|range| {
+            if let Some(monitor) = &monitor {
+                monitor.start_dp();
+            }
+            let _progress_scope = crate::output::live_sink::enter(monitor.clone());
             let mut local_overflow = TargetVec::default();
             let output = dispatch_swipe(&begin[range], &mut local_overflow, p);
             (output, local_overflow)
@@ -1722,7 +2120,7 @@ pub fn swipe_threads(
         output.append(&mut local_output);
         overflow.push_back_vec(&local_overflow);
     }
-    output
+    Ok(output)
 }
 
 pub fn swipe_bin(
@@ -1775,7 +2173,7 @@ pub fn recompute_reversed(hsps: &mut [Hsp], p: &mut Params<'_>) -> Vec<Hsp> {
     let qlen = p.query.len() as i32;
 
     for hsp in hsps.iter() {
-        let qcov = hsp.query_cover(p.query_source_len);
+        let qcov = hsp.query_cover_percent(p.query_source_len as u32);
         let tcov = hsp.subject_cover(hsp.target_seq.len() as i32);
         let qcov_filter = if p.query_or_target_cover > 0.0 {
             p.query_or_target_cover
@@ -2427,6 +2825,120 @@ mod tests {
         assert_eq!(mismatch_est(10, 7, 0, HspValues::MISMATCHES), 7);
         assert_eq!(mismatch_est(10, 7, 4, HspValues::MISMATCHES), 4);
         assert_eq!(mismatch_est(10, 7, 4, HspValues::COORDS), 0);
+    }
+
+    #[test]
+    fn full_matrix_none_retains_dummy_query_row_and_true_subject_endpoint() {
+        let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        // NONE uses DummyRowCounter, so the byte score tier must accept a
+        // query longer than its real row counter. Trailing X residues leave
+        // the best subject column before the end of the actual target.
+        let query = vec![0; 300];
+        let subject = vec![0, 0, 0, 0, 23, 23, 23, 23];
+        let target = DpTarget::full(subject, 8, 0, CarryOver::default());
+        let mut params = Params::new(&query, &matrix);
+        params.flags = Flags::FULL_MATRIX;
+        params.v = HspValues::NONE;
+        params.swipe_bin = 0;
+        params.max_evalue = f64::MAX;
+        let scalar = full_score_endpoint(&target, &params, 0, &mut ScoreScratch::default());
+        assert_eq!(
+            (scalar.score, scalar.query_end, scalar.subject_end),
+            (16, 1, 4)
+        );
+        let mut overflow = TargetVec::default();
+        let output = dispatch_swipe(&[target], &mut overflow, &params);
+        assert!(overflow.empty());
+        assert_eq!(output.len(), 1);
+        let hsp = &output[0];
+        assert_eq!(hsp.score, 16);
+        assert_eq!((hsp.query_range.begin, hsp.query_range.end), (0, 1));
+        assert_eq!(
+            (hsp.query_source_range.begin, hsp.query_source_range.end),
+            (0, 1)
+        );
+        assert_eq!((hsp.subject_range.begin, hsp.subject_range.end), (0, 4));
+        assert_eq!(
+            (hsp.subject_source_range.begin, hsp.subject_source_range.end),
+            (0, 4)
+        );
+        assert_eq!((hsp.length, hsp.identities), (0, 0));
+    }
+
+    #[test]
+    fn full_matrix_hsps_keep_the_upstream_default_diagonal_culling_key() {
+        let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query = vec![0; 4];
+        let subject = vec![0; 8];
+        let target = DpTarget::full(subject.clone(), 8, 0, CarryOver::default());
+        let mut params = Params::new(&query, &matrix);
+        params.flags = Flags::FULL_MATRIX;
+        params.v = HspValues::TRANSCRIPT;
+        let result = SwResult {
+            score: 16,
+            query_begin: 0,
+            query_end: 4,
+            subject_begin: 0,
+            subject_end: 4,
+            length: 4,
+            identities: 4,
+            operations: vec![(EditOperation::Match, 4)],
+            ..Default::default()
+        };
+        let traced = traceback_hsp(&target, &subject, -7, 4, result.clone(), &params).unwrap();
+        let endpoint = endpoint_hsp(&target, -7, 4, result, &params).unwrap();
+        let scored = score_only_hsp(&target, 16, -7, 4, &params).unwrap();
+        for hsp in [&traced, &endpoint, &scored] {
+            assert_eq!((hsp.d_begin, hsp.d_end), (0, 0));
+        }
+        let mut primary = traced.clone();
+        primary.d_begin = -5;
+        primary.d_end = 3;
+        let mut hsps = vec![traced, primary];
+        crate::align::culling::inner_hsp_culling(&mut hsps, 0, 50.0);
+        assert_eq!(hsps.len(), 1);
+        assert_eq!(hsps[0].d_begin, -5);
+    }
+
+    #[test]
+    fn traceback_preserves_upstream_wire_operations_and_long_gap_chunk_order() {
+        let sm = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 0).unwrap();
+        let query = vec![0; 135];
+        let subject = vec![0; 8];
+        let target = DpTarget::new(
+            subject.clone(),
+            8,
+            -1,
+            136,
+            0,
+            135,
+            CarryOver::default(),
+            Anchor::default(),
+        );
+        let mut params = Params::new(&query, &sm);
+        params.v = HspValues::TRANSCRIPT;
+        let result = SwResult {
+            score: 40,
+            query_begin: 0,
+            query_end: 135,
+            subject_begin: 0,
+            subject_end: 8,
+            length: 135,
+            identities: 8,
+            mismatches: 0,
+            gap_openings: 1,
+            gaps: 127,
+            operations: vec![
+                (EditOperation::Match, 4),
+                (EditOperation::Insertion, 127),
+                (EditOperation::Match, 4),
+            ],
+        };
+        let hsp = traceback_hsp(&target, &subject, -1, 136, result, &params).unwrap();
+        let bytes: Vec<_> = hsp.transcript.data().iter().map(|op| op.code).collect();
+        // C++ Hsp::push_match appends count 1 without merging. Backward
+        // traceback emits gap chunks 63/63/1 before reversing the transcript.
+        assert_eq!(bytes, [1, 1, 1, 1, 0x41, 0x7f, 0x7f, 1, 1, 1, 1, 0]);
     }
 
     #[test]

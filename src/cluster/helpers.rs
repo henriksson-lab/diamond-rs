@@ -17,37 +17,122 @@ pub trait ClusterHelperDatabase {
     fn sequence_count(&self) -> usize;
     fn accession_to_oid(&self, accession: &str) -> Result<Vec<OId>, String>;
     fn accession(&self, oid: OId) -> Result<&str, String>;
+    fn accession_to_oid_bytes(&self, accession: &[u8]) -> Result<Vec<OId>, String> {
+        self.accession_to_oid(std::str::from_utf8(accession).map_err(|error| error.to_string())?)
+    }
+    fn accession_bytes(&self, oid: OId) -> Result<&[u8], String> {
+        Ok(self.accession(oid)?.as_bytes())
+    }
 }
 
-fn first_oid<D: ClusterHelperDatabase>(db: &D, accession: &str) -> Result<OId, String> {
-    db.accession_to_oid(accession)?
-        .first()
-        .copied()
-        .ok_or_else(|| format!("Accession not found in database: {accession}"))
+fn first_oid<D: ClusterHelperDatabase>(
+    db: &D,
+    accession: &[u8],
+    errors: Option<&crate::util::io::IoErrorOwner>,
+) -> Result<OId, String> {
+    if let Some(oid) = db.accession_to_oid_bytes(accession)?.first().copied() {
+        return Ok(oid);
+    }
+    let mut message = b"Accession not found in database: ".to_vec();
+    message.extend_from_slice(accession);
+    let error = crate::util::io::RawDiagnosticError(message).into_io();
+    if let Some(errors) = errors {
+        errors.capture(Err(error))
+    } else {
+        Err(error.to_string())
+    }
 }
 
-fn cluster_lines(
+fn open_cluster_lines(
     path: &Path,
     simple_header: bool,
     missing_header: &str,
-) -> Result<Vec<(String, String)>, String> {
-    let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    let mut lines = text.lines();
-    if simple_header && lines.next() != Some(HEADER_LINE) {
-        return Err(missing_header.to_owned());
+    buffer_size: usize,
+    source_profile: bool,
+    errors: Option<&crate::util::io::IoErrorOwner>,
+) -> Result<
+    (
+        i64,
+        crate::util::io::text_input_file::ByteTextInputFile<crate::util::io::InputFileStream>,
+    ),
+    String,
+> {
+    // Both Source read overloads count the decoded lines before opening the
+    // parser, including before checking the optional header.
+    let count = if source_profile {
+        if let Some(errors) = errors {
+            errors.capture(
+                crate::util::tsv::tsv::count_lines_with_source_buffer_path_io(path, buffer_size),
+            )?
+        } else {
+            crate::util::tsv::tsv::count_lines_with_source_buffer_path_io(path, buffer_size)
+                .map_err(|error| error.to_string())?
+        }
+    } else {
+        crate::util::tsv::tsv::count_lines_with_buffer_path(path, buffer_size)?
+    };
+    let input = if source_profile {
+        crate::util::io::text_input_file::ByteTextInputFile::from_source_path_bytes_with_buffer_size(path, buffer_size)
+    } else {
+        crate::util::io::text_input_file::ByteTextInputFile::from_file_path_bytes_with_buffer_size(path, buffer_size)
     }
-    let mut pairs = Vec::new();
-    for line in lines {
-        let mut fields = line.split('\t');
-        let centroid = fields
-            .next()
-            .ok_or_else(|| "Invalid clustering record.".to_owned())?;
+    .map_err(std::io::Error::other);
+    let mut input = if let Some(errors) = errors {
+        errors.capture(input)?
+    } else {
+        input.map_err(|error| error.to_string())?
+    };
+    if simple_header {
+        let read = input.getline().map_err(std::io::Error::other);
+        if let Some(errors) = errors {
+            errors.capture(read)?;
+        } else {
+            read.map_err(|error| error.to_string())?;
+        }
+        if input.line != HEADER_LINE.as_bytes() {
+            return Err(missing_header.to_owned());
+        }
+    }
+    Ok((count, input))
+}
+
+fn visit_cluster_lines(
+    input: &mut crate::util::io::text_input_file::ByteTextInputFile<
+        crate::util::io::InputFileStream,
+    >,
+    errors: Option<&crate::util::io::IoErrorOwner>,
+    mut visit: impl FnMut(&[u8], &[u8]) -> Result<(), String>,
+) -> Result<usize, String> {
+    let mut mappings = 0usize;
+    loop {
+        let loaded = input.getline().map_err(std::io::Error::other);
+        if let Some(errors) = errors {
+            errors.capture(loaded)?;
+        } else {
+            loaded.map_err(|error| error.to_string())?;
+        }
+        if input.eof() && input.line.is_empty() {
+            break;
+        }
+        // This is Source's older C-string Tokenizer, not TSV CharTokenizer:
+        // a delimiter at the end supplies an empty second token.
+        let line = crate::util::sequence::c_string_bytes(&input.line);
+        let mut fields = line.splitn(3, |&byte| byte == b'\t');
+        let centroid = fields.next().unwrap_or(&[]);
         let member = fields
             .next()
-            .ok_or_else(|| "Invalid clustering record.".to_owned())?;
-        pairs.push((centroid.to_owned(), member.to_owned()));
+            .ok_or_else(|| "Tokenizer Exception".to_owned())?;
+        visit(centroid, member)?;
+        mappings += 1;
+        if mappings % 1_000_000 == 0 {
+            crate::util::log_stream::log_stream()
+                .lock()
+                .map_err(|_| "Log stream lock poisoned".to_owned())?
+                .write(format!("#Entries: {mappings}\n"))
+                .map_err(|error| error.to_string())?;
+        }
     }
-    Ok(pairs)
+    Ok(mappings)
 }
 
 /// `read(..., CentroidSorted)` overload.
@@ -61,17 +146,83 @@ where
     <Int as TryFrom<OId>>::Error: std::fmt::Debug,
     D: ClusterHelperDatabase,
 {
-    let records = cluster_lines(
+    read_centroid_sorted_profile(file_name, db, simple_header, 8192, false, None)
+}
+
+pub fn read_centroid_sorted_with_source_buffer<Int, D>(
+    file_name: &Path,
+    db: &D,
+    simple_header: bool,
+    buffer_size: usize,
+) -> Result<(FlatArray<Int>, Vec<Int>), String>
+where
+    Int: Copy + Ord + std::hash::Hash + TryFrom<OId>,
+    <Int as TryFrom<OId>>::Error: std::fmt::Debug,
+    D: ClusterHelperDatabase,
+{
+    read_centroid_sorted_profile(file_name, db, simple_header, buffer_size, true, None)
+}
+
+pub fn read_centroid_sorted_with_source_buffer_owned<Int, D>(
+    file_name: &Path,
+    db: &D,
+    simple_header: bool,
+    buffer_size: usize,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<(FlatArray<Int>, Vec<Int>), String>
+where
+    Int: Copy + Ord + std::hash::Hash + TryFrom<OId>,
+    <Int as TryFrom<OId>>::Error: std::fmt::Debug,
+    D: ClusterHelperDatabase,
+{
+    read_centroid_sorted_profile(
+        file_name,
+        db,
+        simple_header,
+        buffer_size,
+        true,
+        Some(errors),
+    )
+}
+
+fn read_centroid_sorted_profile<Int, D>(
+    file_name: &Path,
+    db: &D,
+    simple_header: bool,
+    buffer_size: usize,
+    source_profile: bool,
+    errors: Option<&crate::util::io::IoErrorOwner>,
+) -> Result<(FlatArray<Int>, Vec<Int>), String>
+where
+    Int: Copy + Ord + std::hash::Hash + TryFrom<OId>,
+    <Int as TryFrom<OId>>::Error: std::fmt::Debug,
+    D: ClusterHelperDatabase,
+{
+    let (count, mut input) = open_cluster_lines(
         file_name,
         simple_header,
         "Clusters file is missing header line.",
+        buffer_size,
+        source_profile,
+        errors,
     )?;
-    let mut pairs = Vec::with_capacity(records.len());
-    for (centroid, member) in records {
+    let mut pairs = Vec::new();
+    pairs
+        .try_reserve(usize::try_from(count).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    visit_cluster_lines(&mut input, errors, |centroid, member| {
         pairs.push((
-            Int::try_from(first_oid(db, &centroid)?).map_err(|error| format!("{error:?}"))?,
-            Int::try_from(first_oid(db, &member)?).map_err(|error| format!("{error:?}"))?,
+            Int::try_from(first_oid(db, centroid, errors)?)
+                .map_err(|error| format!("{error:?}"))?,
+            Int::try_from(first_oid(db, member, errors)?).map_err(|error| format!("{error:?}"))?,
         ));
+        Ok(())
+    })?;
+    let closed = input.into_inner().close().map_err(std::io::Error::other);
+    if let Some(errors) = errors {
+        errors.capture(closed)?;
+    } else {
+        closed.map_err(|error| error.to_string())?;
     }
     Ok(make_flat_array(&mut pairs))
 }
@@ -87,19 +238,96 @@ where
     <Int as TryFrom<OId>>::Error: std::fmt::Debug,
     D: ClusterHelperDatabase,
 {
-    let records = cluster_lines(
+    read_mapping_with_buffer(file_name, db, simple_header, 8192)
+}
+
+pub fn read_mapping_with_buffer<Int, D>(
+    file_name: &Path,
+    db: &D,
+    simple_header: bool,
+    buffer_size: usize,
+) -> Result<Vec<Int>, String>
+where
+    Int: Copy + Default + TryFrom<OId>,
+    <Int as TryFrom<OId>>::Error: std::fmt::Debug,
+    D: ClusterHelperDatabase,
+{
+    read_mapping_profile(file_name, db, simple_header, buffer_size, false, None)
+}
+
+pub fn read_mapping_with_source_buffer<Int, D>(
+    file_name: &Path,
+    db: &D,
+    simple_header: bool,
+    buffer_size: usize,
+) -> Result<Vec<Int>, String>
+where
+    Int: Copy + Default + TryFrom<OId>,
+    <Int as TryFrom<OId>>::Error: std::fmt::Debug,
+    D: ClusterHelperDatabase,
+{
+    read_mapping_profile(file_name, db, simple_header, buffer_size, true, None)
+}
+
+pub fn read_mapping_with_source_buffer_owned<Int, D>(
+    file_name: &Path,
+    db: &D,
+    simple_header: bool,
+    buffer_size: usize,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<Vec<Int>, String>
+where
+    Int: Copy + Default + TryFrom<OId>,
+    <Int as TryFrom<OId>>::Error: std::fmt::Debug,
+    D: ClusterHelperDatabase,
+{
+    read_mapping_profile(
+        file_name,
+        db,
+        simple_header,
+        buffer_size,
+        true,
+        Some(errors),
+    )
+}
+
+fn read_mapping_profile<Int, D>(
+    file_name: &Path,
+    db: &D,
+    simple_header: bool,
+    buffer_size: usize,
+    source_profile: bool,
+    errors: Option<&crate::util::io::IoErrorOwner>,
+) -> Result<Vec<Int>, String>
+where
+    Int: Copy + Default + TryFrom<OId>,
+    <Int as TryFrom<OId>>::Error: std::fmt::Debug,
+    D: ClusterHelperDatabase,
+{
+    let (_, mut input) = open_cluster_lines(
         file_name,
         simple_header,
         "Clustering input file is missing header line.",
+        buffer_size,
+        source_profile,
+        errors,
     )?;
     let mut mapping = vec![Int::default(); db.sequence_count()];
-    let mut mappings = 0usize;
-    for (centroid, member) in records {
-        let centroid =
-            Int::try_from(first_oid(db, &centroid)?).map_err(|error| format!("{error:?}"))?;
-        let member = first_oid(db, &member)? as usize;
-        mapping[member] = centroid;
-        mappings += 1;
+    let mappings = visit_cluster_lines(&mut input, errors, |centroid, member| {
+        let centroid = Int::try_from(first_oid(db, centroid, errors)?)
+            .map_err(|error| format!("{error:?}"))?;
+        let member = first_oid(db, member, errors)? as usize;
+        let entry = mapping
+            .get_mut(member)
+            .ok_or_else(|| "Clustering member OID is outside the database".to_owned())?;
+        *entry = centroid;
+        Ok(())
+    })?;
+    let closed = input.into_inner().close().map_err(std::io::Error::other);
+    if let Some(errors) = errors {
+        errors.capture(closed)?;
+    } else {
+        closed.map_err(|error| error.to_string())?;
     }
     if mappings != db.sequence_count() {
         return Err("Invalid/incomplete clustering.".to_owned());
@@ -147,9 +375,11 @@ where
     let mut pairs = oid_pairs.to_vec();
     pairs.sort_by_key(|&(_, member)| member);
     for (centroid, member) in pairs {
-        let centroid = db.accession(centroid.try_into().map_err(|error| format!("{error:?}"))?)?;
-        let member = db.accession(member.try_into().map_err(|error| format!("{error:?}"))?)?;
-        out.write_record_strings(&[centroid, member])?;
+        let centroid =
+            db.accession_bytes(centroid.try_into().map_err(|error| format!("{error:?}"))?)?;
+        let member =
+            db.accession_bytes(member.try_into().map_err(|error| format!("{error:?}"))?)?;
+        out.write_record_bytes(&[centroid, member])?;
     }
     Ok(())
 }
@@ -171,25 +401,25 @@ where
             let centroid;
             let member;
             if oid_output {
-                centroid = centroid_oid.to_string();
-                member = member_oid.to_string();
+                centroid = centroid_oid.to_string().into_bytes();
+                member = member_oid.to_string().into_bytes();
             } else {
                 centroid = db
-                    .accession(
+                    .accession_bytes(
                         centroid_oid
                             .try_into()
                             .map_err(|error| format!("{error:?}"))?,
                     )?
                     .to_owned();
                 member = db
-                    .accession(
+                    .accession_bytes(
                         member_oid
                             .try_into()
                             .map_err(|error| format!("{error:?}"))?,
                     )?
                     .to_owned();
             }
-            out.write_record_strings(&[&centroid, &member])?;
+            out.write_record_bytes(&[&centroid, &member])?;
         }
     }
     Ok(())
@@ -209,6 +439,56 @@ where
 {
     let (clusters, centroids) = cluster_sorted(mapping);
     output_mem_clusters(out, db, &clusters, &centroids, oid_output)
+}
+
+/// Concrete Source output_mem file boundary. Retain the O(N) sorted numeric
+/// clustering representation, but stage only one accession row as text.
+pub fn output_mem_mapping_stream<Int, D, W>(
+    out: &mut W,
+    db: &D,
+    mapping: &[Int],
+    oid_output: bool,
+) -> Result<(), String>
+where
+    Int: Copy + Ord + std::hash::Hash + Display + TryFrom<usize> + TryInto<OId>,
+    <Int as TryFrom<usize>>::Error: std::fmt::Debug,
+    <Int as TryInto<OId>>::Error: std::fmt::Debug,
+    D: ClusterHelperDatabase,
+    W: Write + ?Sized,
+{
+    let (clusters, centroids) = cluster_sorted(mapping);
+    let mut line = Vec::new();
+    for (index, &centroid_oid) in centroids.iter().enumerate() {
+        let centroid = if oid_output {
+            centroid_oid.to_string().into_bytes()
+        } else {
+            db.accession_bytes(
+                centroid_oid
+                    .try_into()
+                    .map_err(|error| format!("{error:?}"))?,
+            )?
+            .to_owned()
+        };
+        for &member_oid in clusters.range(index as u64) {
+            let member = if oid_output {
+                member_oid.to_string().into_bytes()
+            } else {
+                db.accession_bytes(
+                    member_oid
+                        .try_into()
+                        .map_err(|error| format!("{error:?}"))?,
+                )?
+                .to_owned()
+            };
+            line.clear();
+            line.extend_from_slice(&centroid);
+            line.push(b'\t');
+            line.extend_from_slice(&member);
+            line.push(b'\n');
+            out.write_all(&line).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 pub fn output_mem_pairs<Int, D>(
@@ -367,9 +647,13 @@ pub fn output_edges<D: ClusterHelperDatabase>(
 ) -> Result<(), String> {
     let mut out = std::fs::File::create(file_name).map_err(|error| error.to_string())?;
     for edge in edges {
-        let node1 = db.accession(edge.node1 as OId)?;
-        let node2 = db.accession(edge.node2 as OId)?;
-        writeln!(out, "{node1}\t{node2}").map_err(|error| error.to_string())?;
+        let node1 = db.accession_bytes(edge.node1 as OId)?;
+        let node2 = db.accession_bytes(edge.node2 as OId)?;
+        out.write_all(node1)
+            .and_then(|()| out.write_all(b"\t"))
+            .and_then(|()| out.write_all(node2))
+            .and_then(|()| out.write_all(b"\n"))
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }

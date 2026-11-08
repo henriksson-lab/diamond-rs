@@ -1,0 +1,60 @@
+[
+  {
+    "args": [
+      "benchmark",
+      "-p",
+      "1"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Option is not permitted for this workflow: p\n"
+  },
+  {
+    "args": [
+      "benchmark",
+      "--type",
+      "swipe"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid option: type\n"
+  },
+  {
+    "args": [
+      "benchmark",
+      "--matrix",
+      "BLOSUM62"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Option is not permitted for this workflow: matrix\n"
+  },
+  {
+    "args": [
+      "benchmark",
+      "-q",
+      "missing.faa"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Option is not permitted for this workflow: q\n"
+  },
+  {
+    "args": [
+      "benchmark",
+      "--help"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid option: help\n"
+  },
+  {
+    "args": [
+      "benchmark",
+      "--unknown"
+    ],
+    "status": 1,
+    "stdout": "",
+    "stderr": "Error: Invalid option: unknown\n"
+  }
+]

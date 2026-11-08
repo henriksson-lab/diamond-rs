@@ -3,7 +3,9 @@ use crate::basic::packed_transcript::EditOperation;
 use crate::basic::value::{Letter, LETTER_MASK};
 use crate::basic::{reduction::Reduction, shape::Shape};
 use crate::data::sequence_set::LetterStringSet;
-use crate::dna::alignment::{compute_ksw_cigar, compute_wfa_extension, Cigar, DnaScoring, KswMode};
+use crate::dna::alignment::{
+    encoded_or_ascii, ksw_extension_result, try_compute_wfa_extension, DnaScoring, KswMode,
+};
 use crate::dna::build_score::Blastn_Score;
 use crate::dna::dna_index::Index;
 use crate::dna::extension_seed_matches::merge_and_extend_seeds;
@@ -14,9 +16,10 @@ use std::sync::Arc;
 pub const KSW2_END_BONUS: i32 = 5;
 pub const KSW2_BAND: i32 = 40;
 pub const WFA_CUTOFF_STEPS: i32 = 10;
-pub const KSW_FLAG_R: i32 = 1;
-pub const KSW_FLAG_L: i32 = 2;
-pub const KSW_FLAG_G: i32 = 3;
+pub const KSW_FLAG_R: i32 =
+    (super::ksw::EXTZ_ONLY | super::ksw::APPROX_MAX | super::ksw::APPROX_DROP) as i32;
+pub const KSW_FLAG_L: i32 = KSW_FLAG_R | super::ksw::REV_CIGAR as i32;
+pub const KSW_FLAG_G: i32 = (super::ksw::APPROX_MAX | super::ksw::APPROX_DROP) as i32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnaExtensionAlgo {
@@ -129,9 +132,51 @@ impl KswCigar {
         ungapped_score: i32,
         band: i32,
     ) -> Self {
-        let target_bytes = target.iter().map(|&x| x as u8).collect::<Vec<_>>();
-        let query_bytes = query.iter().map(|&x| x as u8).collect::<Vec<_>>();
-        let mut extension = Cigar::new();
+        Self::new_with_zdrop(target, query, score_builder, flag, ungapped_score, band, 40)
+    }
+
+    /// Older typed convenience API; the command/backend uses the checked
+    /// encoded entry point below, with its actual Source --zdrop value.
+    pub fn new_with_zdrop(
+        target: &[Letter],
+        query: &[Letter],
+        score_builder: &Blastn_Score,
+        flag: i32,
+        ungapped_score: i32,
+        band: i32,
+        zdrop: i32,
+    ) -> Self {
+        let target = encoded_or_ascii(&target.iter().map(|&x| x as u8).collect::<Vec<_>>())
+            .into_iter()
+            .map(|x| x as Letter)
+            .collect::<Vec<_>>();
+        let query = encoded_or_ascii(&query.iter().map(|&x| x as u8).collect::<Vec<_>>())
+            .into_iter()
+            .map(|x| x as Letter)
+            .collect::<Vec<_>>();
+        Self::try_new_with_zdrop(
+            &target,
+            &query,
+            score_builder,
+            flag,
+            ungapped_score,
+            band,
+            zdrop,
+        )
+        .unwrap_or_else(|_| Self(CigarShort::default()))
+    }
+
+    pub fn try_new_with_zdrop(
+        target: &[Letter],
+        query: &[Letter],
+        score_builder: &Blastn_Score,
+        flag: i32,
+        ungapped_score: i32,
+        band: i32,
+        zdrop: i32,
+    ) -> Result<Self, String> {
+        let target = target.iter().map(|&x| x as u8).collect::<Vec<_>>();
+        let query = query.iter().map(|&x| x as u8).collect::<Vec<_>>();
         let mode = if flag == KSW_FLAG_L {
             KswMode::Left
         } else if flag == KSW_FLAG_G {
@@ -139,32 +184,22 @@ impl KswCigar {
         } else {
             KswMode::Right
         };
-        compute_ksw_cigar(
-            &target_bytes,
-            &query_bytes,
-            scoring(score_builder),
-            mode,
-            &mut extension,
-            0,
-            band,
-        );
-        let mut cigar_data = extension.get_cigar_data_const().to_vec();
-        let (query_consumed, target_consumed) = consumed(&cigar_data);
+        let result =
+            ksw_extension_result(&target, &query, scoring(score_builder), mode, zdrop, band)?;
+        let mut cigar_data = result.cigar;
+        let mut score = result.max;
         if flag == KSW_FLAG_L {
-            cigar_data.reverse();
+            // REV_CIGAR already reverses the engine's run order. Reversing a
+            // second time here was an error in the earlier surrogate wrapper.
             cigar_data.push((ungapped_score, 'M'));
+            score += ungapped_score * score_builder.reward();
         }
-        Self(CigarShort {
+        Ok(Self(CigarShort {
             cigar_data,
-            score: extension.score
-                + if flag == KSW_FLAG_L {
-                    ungapped_score * score_builder.reward()
-                } else {
-                    0
-                },
-            max_query: query_consumed - 1,
-            max_target: target_consumed - 1,
-        })
+            score,
+            max_query: result.max_q,
+            max_target: result.max_t,
+        }))
     }
 
     pub fn into_inner(self) -> CigarShort {
@@ -196,12 +231,12 @@ impl WfaCigar {
                 })
                 .collect::<String>()
         };
-        let (_, encoded) = compute_wfa_extension(
+        let (_, encoded) = try_compute_wfa_extension(
             &encode(query),
             &encode(target),
             scoring(score_builder),
             band,
-        );
+        )?;
         let mut steps = 0i32;
         let mut score = 0i32;
         let mut cigar_data = Vec::new();
@@ -350,6 +385,7 @@ pub struct ExtensionConfig<'a> {
     pub kmer_size: i32,
     pub max_evalue: f64,
     pub dna_extension: DnaExtensionAlgo,
+    pub zdrop: i32,
     pub chaining_out: bool,
     pub align_long_reads: bool,
     pub chaining_extension: &'a ChainingExtension<'a>,
@@ -429,23 +465,25 @@ pub fn target_extension(
                         .into_inner()
                 }
                 DnaExtensionAlgo::Ksw => {
-                    KswCigar::new(
+                    KswCigar::try_new_with_zdrop(
                         &target_left,
                         &query_left,
                         cfg.score_builder,
                         KSW_FLAG_L,
                         hit.ungapped_score(),
                         band_left,
-                    )
+                        cfg.zdrop,
+                    )?
                     .into_inner()
-                        + KswCigar::new(
+                        + KswCigar::try_new_with_zdrop(
                             target_right,
                             query_right,
                             cfg.score_builder,
                             KSW_FLAG_R,
                             0,
                             band_right,
-                        )
+                            cfg.zdrop,
+                        )?
                         .into_inner()
                 }
             };
@@ -708,6 +746,7 @@ mod tests {
             kmer_size: 2,
             max_evalue: f64::INFINITY,
             dna_extension: DnaExtensionAlgo::Ksw,
+            zdrop: 40,
             chaining_out: false,
             align_long_reads: false,
             chaining_extension: &chaining,
@@ -751,6 +790,7 @@ mod tests {
             kmer_size: 2,
             max_evalue: f64::INFINITY,
             dna_extension: DnaExtensionAlgo::Ksw,
+            zdrop: 40,
             chaining_out: false,
             align_long_reads: false,
             chaining_extension: &chaining,

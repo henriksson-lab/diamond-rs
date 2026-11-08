@@ -338,6 +338,29 @@ impl Translator {
             .map(|&letter| Self::get_reverse_complement(letter))
             .collect()
     }
+
+    /// Translate with the lookup tables initialized by Source configuration.
+    pub fn translate_6_frames(&self, dna: &[u8]) -> [Vec<u8>; 6] {
+        let mut frames = std::array::from_fn(|_| Vec::new());
+        for offset in 0..3 {
+            for pos in (offset..dna.len().saturating_sub(2)).step_by(3) {
+                frames[offset].push(
+                    self.lookup[(dna[pos] as usize).min(4)][(dna[pos + 1] as usize).min(4)]
+                        [(dna[pos + 2] as usize).min(4)] as u8,
+                );
+            }
+            let mut end = dna.len().saturating_sub(offset);
+            while end >= 3 {
+                frames[3 + offset].push(
+                    self.lookup_reverse[(dna[end - 1] as usize).min(4)]
+                        [(dna[end - 2] as usize).min(4)][(dna[end - 3] as usize).min(4)]
+                        as u8,
+                );
+                end -= 3;
+            }
+        }
+        frames
+    }
 }
 
 /// Translate a DNA codon (3 nucleotide letters) to an amino acid letter.

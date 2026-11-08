@@ -5,6 +5,7 @@
 //! the translated backend traits so each command retains its upstream workflow
 //! rather than substituting a shared clustering algorithm.
 
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use crate::cluster::cascaded::wrapper::{
 use crate::cluster::cascaded::CascadedConfig;
 use crate::cluster::cascaded::GraphAlgo;
 use crate::commands::blastp::{self, BlastpConfig};
-use crate::data::fasta::{self, FastaRecord};
+use crate::data::fasta::{self, ByteFastaRecord as FastaRecord};
 use crate::data::sequence_file::DbFilter;
 use crate::masking::{MaskingAlgo, MaskingMode};
 use crate::stats::cbs::CbsMode;
@@ -36,28 +37,35 @@ pub enum ClusterWorkflow {
 /// ownership of the database and output adapters.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClusterConfig {
+    /// Canonical command input for common search controls retained across
+    /// clustering stages. Typed callers may leave this unset for defaults.
+    pub search_args: Option<Vec<OsString>>,
+    pub tuning: blastp::SearchTuning,
+    pub file_buffer_size: usize,
+    pub ext_chunk_size: i64,
+    pub tmpdir: PathBuf,
     pub workflow: ClusterWorkflow,
-    pub database: String,
-    pub output: String,
+    pub database: PathBuf,
+    pub output: PathBuf,
     pub threads: i32,
-    pub matrix: String,
+    pub matrix: Vec<u8>,
     pub gap_open: i32,
     pub gap_extend: i32,
     pub max_evalue: f64,
     pub comp_based_stats: i32,
     pub masking: MaskingMode,
     pub soft_masking: MaskingAlgo,
-    pub motif_masking: String,
-    pub extension_mode: String,
+    pub motif_masking: Vec<u8>,
+    pub extension_mode: Vec<u8>,
     pub member_cover: Option<f64>,
     pub mutual_cover: Option<f64>,
     /// `None` is important: upstream applies command-specific defaults in
     /// `Cluster::init_thresholds` (50, 90, and 0 respectively).
     pub approx_id: Option<f64>,
-    pub cluster_steps: Vec<String>,
-    pub connected_component_depth: Vec<String>,
-    pub round_coverage: Vec<String>,
-    pub round_approx_id: Vec<String>,
+    pub cluster_steps: Vec<Vec<u8>>,
+    pub connected_component_depth: Vec<Vec<u8>>,
+    pub round_coverage: Vec<Vec<u8>>,
+    pub round_approx_id: Vec<Vec<u8>>,
     pub kmer_ranking: bool,
     pub no_reassign: bool,
     pub weighted_gvc: bool,
@@ -66,19 +74,16 @@ pub struct ClusterConfig {
     pub memory_limit: u64,
     pub oid_output: bool,
     pub simple_header: bool,
-    pub alignment_output: Option<String>,
+    pub alignment_output: Option<PathBuf>,
+    pub parallel_tmpdir: PathBuf,
+    pub linclust_chunk_size: u64,
 }
 
 fn resolved_threads(threads: i32) -> i32 {
     if threads > 0 {
         threads
     } else {
-        i32::try_from(
-            std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(1),
-        )
-        .unwrap_or(i32::MAX)
+        crate::util::system::hardware_concurrency() as i32
     }
 }
 
@@ -97,6 +102,7 @@ pub fn translated_config(config: &ClusterConfig) -> CascadedWrapperConfig {
         threads,
         ..CascadedWrapperConfig::default()
     };
+    translated.parallel_tmpdir = config.parallel_tmpdir.clone();
     translated.thresholds.member_cover = config.member_cover;
     translated.thresholds.mutual_cover = config.mutual_cover;
     translated.thresholds.approx_min_id = config.approx_id;
@@ -105,6 +111,8 @@ pub fn translated_config(config: &ClusterConfig) -> CascadedWrapperConfig {
     translated.simple_header = config.simple_header;
     translated.core.threads = threads;
     translated.core.memory_limit = config.memory_limit;
+    translated.core.db_size = config.tuning.db_size;
+    translated.db_size = (config.tuning.db_size != 0).then_some(config.tuning.db_size);
     translated.core.matrix.clone_from(&config.matrix);
     translated.core.gap_open = config.gap_open;
     translated.core.gap_extend = config.gap_extend;
@@ -134,6 +142,32 @@ pub fn translated_config(config: &ClusterConfig) -> CascadedWrapperConfig {
 }
 
 #[derive(Clone)]
+struct NativeOptions {
+    io_errors: crate::util::io::IoErrorOwner,
+    search_base: Option<Arc<BlastpConfig>>,
+    file_buffer_size: usize,
+    tmpdir: PathBuf,
+    ext_chunk_size: i64,
+}
+impl Default for NativeOptions {
+    fn default() -> Self {
+        Self {
+            io_errors: Default::default(),
+            search_base: None,
+            file_buffer_size: 67_108_864,
+            tmpdir: PathBuf::new(),
+            ext_chunk_size: 0,
+        }
+    }
+}
+
+impl NativeOptions {
+    fn validate(&self) -> Result<(), String> {
+        Vec::<u8>::new().try_reserve_exact(self.file_buffer_size).map_err(|_| "Failed to allocate sufficient memory. Please refer to the online wiki for instructions on memory usage.".to_owned())
+    }
+}
+
+#[derive(Clone)]
 struct NativeBlock {
     records: Vec<FastaRecord>,
     original_oids: Vec<OId>,
@@ -141,6 +175,9 @@ struct NativeBlock {
     letters: u64,
     source: Option<NativeBlockSource>,
     soft_tantan_masker: Arc<crate::masking::tantan::TantanMasker>,
+    tuning: blastp::SearchTuning,
+    options: NativeOptions,
+    scoring_matrix: Option<Arc<crate::stats::score_matrix::ScoreMatrix>>,
 }
 
 #[derive(Clone)]
@@ -151,11 +188,14 @@ enum NativeBlockSource {
 
 struct SpillFile {
     path: PathBuf,
+    no_unlink: bool,
 }
 
 impl Drop for SpillFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if !self.no_unlink {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -235,7 +275,7 @@ impl NativeBlock {
         let (records, original_oids) = match source {
             NativeBlockSource::Input(path) => {
                 let mut records = Vec::with_capacity(self.sequence_count as usize);
-                visit_input_records(path, |oid, record| {
+                visit_input_records(path, self.options.file_buffer_size, |oid, record| {
                     records.push((oid as OId, record));
                     Ok(())
                 })?;
@@ -243,11 +283,17 @@ impl NativeBlock {
                 let records = records.into_iter().map(|(_, record)| record).collect();
                 (records, original_oids)
             }
-            NativeBlockSource::Spill(file) => read_spill_records(&file.path)?,
+            NativeBlockSource::Spill(file) => {
+                read_spill_records(&file.path, self.options.file_buffer_size)?
+            }
         };
         if records.len() != self.sequence_count as usize {
             return Err("Sequence block backing store has the wrong record count".to_owned());
         }
+        crate::data::sequence_file::check_protein_input(
+            records.iter().map(|record| record.sequence.as_slice()),
+            self.tuning.ignore_warnings,
+        )?;
         self.records = records;
         self.original_oids = original_oids;
         Ok(())
@@ -255,90 +301,144 @@ impl NativeBlock {
 }
 
 struct NativeDatabase {
+    accession_spool: Arc<crate::data::accession_spool::AccessionSpool>,
     path: PathBuf,
     block: NativeBlock,
-    seqids: Vec<String>,
     lengths: Vec<Loc>,
 }
 
 struct NativeBackend {
+    io_errors: crate::util::io::IoErrorOwner,
     output: PathBuf,
+    destination: Option<super::reassign::SourceWorkflowOutput>,
+    external_chunk_size: u64,
+    alignment_output: Option<PathBuf>,
     centroids: NativeBlock,
     /// Upstream's process-global `Masking` instance is derived from the score
     /// matrix once before `Cascaded::run`, then reused by every search round.
     soft_tantan_masker: std::sync::Arc<crate::masking::tantan::TantanMasker>,
+    tuning: blastp::SearchTuning,
+    options: NativeOptions,
+    scoring_matrix: Option<Arc<crate::stats::score_matrix::ScoreMatrix>>,
 }
 
-fn resolve_cluster_input(path: &str) -> Result<PathBuf, String> {
-    let requested = Path::new(path);
-    if requested.exists() {
-        return Ok(requested.to_path_buf());
+fn resolve_cluster_input(
+    path: &Path,
+    buffer_size: usize,
+    io_errors: &crate::util::io::IoErrorOwner,
+) -> Result<PathBuf, String> {
+    use crate::data::sequence_file::{SequenceFileFlags as Flags, SequenceFileType};
+    // Preserve auto_create's extension precedence and constructor failures.
+    // Clustering rejects BLAST only after its real owner has been opened.
+    let flags = Flags::NEED_LETTER_COUNT | Flags::OID_TO_ACC_MAPPING | Flags::NEED_LENGTH_LOOKUP;
+    let (kind, resolved) =
+        io_errors.capture(crate::data::sequence_file::detect_type_source_with_buffer(
+            &[PathBuf::from(path)],
+            flags,
+            Default::default(),
+            buffer_size,
+        ))?;
+    if kind == SequenceFileType::Blast {
+        let _owner = io_errors.capture(crate::data::blastdb::blastdb::BlastDB::new_path(
+            &resolved, flags,
+        ))?;
+        return Err("Clustering is not supported for BLAST databases.".into());
     }
-    let mut appended = requested.as_os_str().to_owned();
-    appended.push(".dmnd");
-    let resolved = PathBuf::from(appended);
-    if resolved.exists() {
-        Ok(resolved)
-    } else {
-        Err(format!("Database file not found: {path}"))
-    }
+    Ok(resolved)
 }
 
-fn visit_input_records<F>(path: &Path, mut visit: F) -> Result<(), String>
+fn visit_input_records<F>(path: &Path, buffer_size: usize, visit: F) -> Result<(), String>
 where
     F: FnMut(usize, FastaRecord) -> Result<(), String>,
 {
-    if path
-        .extension()
-        .is_some_and(|extension| extension == "dmnd")
-    {
-        crate::data::dmnd_reader::for_each_dmnd_record(path, |oid, id, sequence| {
+    visit_input_records_owned(path, buffer_size, &Default::default(), visit)
+}
+fn visit_input_records_owned<F>(
+    path: &Path,
+    buffer_size: usize,
+    errors: &crate::util::io::IoErrorOwner,
+    mut visit: F,
+) -> Result<(), String>
+where
+    F: FnMut(usize, FastaRecord) -> Result<(), String>,
+{
+    if crate::data::dmnd::is_diamond_db_file(path) {
+        let mut file = errors.capture(crate::data::dmnd::DatabaseFile::open_with_options_io(
+            path,
+            crate::data::dmnd::DatabaseOpenOptions {
+                file_buffer_size: Some(buffer_size),
+                ..Default::default()
+            },
+        ))?;
+        for oid in 0..file.sequence_count() {
+            let (sequence, id) = errors.capture(file.record_bytes_io(oid))?;
             visit(
-                oid,
+                usize::try_from(oid).map_err(|_| "Input OID exceeds address space")?,
                 FastaRecord {
-                    id: id.to_owned(),
-                    sequence: sequence.iter().map(|&letter| letter as i8).collect(),
+                    quality: None,
+                    id,
+                    sequence,
                 },
-            )
-            .map_err(io::Error::other)
-        })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+            )?;
+        }
+        Ok(())
     } else {
         let mut oid = 0usize;
-        fasta::for_each_fasta_file(path, SequenceType::AminoAcid, |record| {
-            let current = oid;
-            oid += 1;
-            visit(current, record).map_err(io::Error::other)
-        })
-        .map_err(|error| error.to_string())
+        errors.capture(fasta::for_each_fasta_file_with_buffer_size_bytes(
+            path,
+            SequenceType::AminoAcid,
+            buffer_size,
+            |record| {
+                let current = oid;
+                oid += 1;
+                visit(current, record).map_err(io::Error::other)
+            },
+        ))
     }
 }
 
-fn create_spill_file() -> Result<(Arc<SpillFile>, BufWriter<File>), String> {
-    let data = crate::util::io::TempFileData::init_in(false, std::env::temp_dir(), true)
-        .map_err(|error| error.to_string())?;
+fn create_spill_file(
+    options: &NativeOptions,
+    no_unlink: bool,
+) -> io::Result<(Arc<SpillFile>, BufWriter<File>)> {
+    let directory = options.tmpdir.clone();
+    let data =
+        crate::util::io::TempFileData::init_in(false, directory, true).map_err(io::Error::other)?;
     let path = PathBuf::from(&data.name);
     drop(data);
     let file = OpenOptions::new()
         .write(true)
         .truncate(true)
+        .create(cfg!(windows))
         .open(&path)
-        .map_err(|error| error.to_string())?;
-    Ok((Arc::new(SpillFile { path }), BufWriter::new(file)))
+        .map_err(|error| crate::util::io::FileOpenError::into_io(&path, error))?;
+    Ok((
+        Arc::new(SpillFile { path, no_unlink }),
+        BufWriter::with_capacity(options.file_buffer_size, file),
+    ))
 }
 
 fn write_spill_record(out: &mut BufWriter<File>, oid: OId, record: &FastaRecord) -> io::Result<()> {
     out.write_all(&oid.to_le_bytes())?;
     out.write_all(&(record.sequence.len() as u64).to_le_bytes())?;
+    // Source length_sort writes an intermediate FASTA with title "X".
+    // Its range-based Sequence::print strips annotation bits under SEQ_MASK;
+    // the subsequent FASTA read therefore sees biological residue codes only.
+    // Keep the original OID separately for the final clustering labels.
     for &letter in &record.sequence {
-        out.write_all(&[letter as u8])?;
+        out.write_all(&[(letter & crate::basic::value::LETTER_MASK) as u8])?;
     }
     Ok(())
 }
 
-fn read_spill_records(path: &Path) -> Result<(Vec<FastaRecord>, Vec<OId>), String> {
-    let mut input = BufReader::new(File::open(path).map_err(|error| error.to_string())?);
+fn read_spill_records(
+    path: &Path,
+    buffer_size: usize,
+) -> Result<(Vec<FastaRecord>, Vec<OId>), String> {
+    let mut input = BufReader::with_capacity(
+        buffer_size,
+        File::open(path).map_err(|error| error.to_string())?,
+    );
     let mut records = Vec::new();
     let mut original_oids = Vec::new();
     loop {
@@ -363,9 +463,10 @@ fn read_spill_records(path: &Path) -> Result<(Vec<FastaRecord>, Vec<OId>), Strin
             .map_err(|error| error.to_string())?;
         original_oids.push(OId::from_le_bytes(oid_bytes));
         records.push(FastaRecord {
+            quality: None,
             // Upstream SequenceFile::length_sort writes the literal placeholder
             // title "X" into every temporary FastaFile.
-            id: "X".to_owned(),
+            id: b"X".to_vec(),
             sequence: sequence.into_iter().map(|letter| letter as i8).collect(),
         });
     }
@@ -373,14 +474,61 @@ fn read_spill_records(path: &Path) -> Result<(Vec<FastaRecord>, Vec<OId>), Strin
 }
 
 impl NativeBackend {
+    #[cfg(test)]
     fn new(output: &str, matrix: &str, gap_open: i32, gap_extend: i32) -> Result<Self, String> {
-        let score_matrix =
-            crate::stats::score_matrix::ScoreMatrix::new(matrix, gap_open, gap_extend, 0, 1, 0)?;
-        let soft_tantan_masker = std::sync::Arc::new(
-            crate::masking::tantan::TantanMasker::from_score_matrix(&score_matrix, 0.9),
-        );
+        Self::new_with_tuning(
+            Path::new(output),
+            matrix.as_bytes(),
+            gap_open,
+            gap_extend,
+            &Default::default(),
+        )
+    }
+    fn new_with_tuning(
+        output: &Path,
+        matrix: &[u8],
+        gap_open: i32,
+        gap_extend: i32,
+        tuning: &blastp::SearchTuning,
+    ) -> Result<Self, String> {
+        Self::new_with_options(
+            output,
+            matrix,
+            gap_open,
+            gap_extend,
+            tuning,
+            &Default::default(),
+        )
+    }
+    fn new_with_options(
+        output: &Path,
+        matrix: &[u8],
+        gap_open: i32,
+        gap_extend: i32,
+        tuning: &blastp::SearchTuning,
+        options: &NativeOptions,
+    ) -> Result<Self, String> {
+        options.validate()?;
+        let score_matrix = Arc::new(options.io_errors.capture(
+            blastp::native_score_matrix_with_tuning_bytes(
+                matrix, gap_open, gap_extend, 0, tuning, 0,
+            ),
+        )?);
+        let soft_tantan_masker = tuning.runtime.tantan().unwrap_or_else(|| {
+            std::sync::Arc::new(crate::masking::tantan::TantanMasker::from_score_matrix(
+                &score_matrix,
+                tuning.tantan_min_mask_prob as f32,
+            ))
+        });
+        let mut options = options.clone();
+        options.tmpdir =
+            crate::util::io::temp_file::source_temp_directory_path(&options.tmpdir, output);
         Ok(Self {
+            io_errors: options.io_errors.clone(),
             output: PathBuf::from(output),
+            destination: None,
+            external_chunk_size: 10_000_000_000,
+            alignment_output: None,
             centroids: NativeBlock {
                 records: Vec::new(),
                 original_oids: Vec::new(),
@@ -388,33 +536,59 @@ impl NativeBackend {
                 letters: 0,
                 source: None,
                 soft_tantan_masker: soft_tantan_masker.clone(),
+                tuning: tuning.clone(),
+                options: options.clone(),
+                scoring_matrix: Some(score_matrix.clone()),
             },
             soft_tantan_masker,
+            tuning: tuning.clone(),
+            options: options.clone(),
+            scoring_matrix: Some(score_matrix.clone()),
         })
     }
 
     fn load(&self, path: &str) -> Result<NativeDatabase, String> {
-        let resolved = resolve_cluster_input(path)?;
-        let mut seqids = Vec::new();
+        self.load_path(Path::new(path))
+    }
+    fn load_path(&self, path: &Path) -> Result<NativeDatabase, String> {
+        let resolved = resolve_cluster_input(path, self.options.file_buffer_size, &self.io_errors)?;
+        // Source's original owner has OID_TO_ACC_MAPPING. This is the actual
+        // on-disk accession table consumed when final cluster rows are written.
+        let accession_spool = Arc::new(self.io_errors.capture(
+            crate::data::accession_spool::AccessionSpool::new_owned(
+                &self.options.tmpdir,
+                self.tuning.no_unlink,
+                self.options.file_buffer_size,
+                self.io_errors.clone().with_source_destructors(),
+            ),
+        )?);
         let mut lengths = Vec::new();
         let mut letters = 0u64;
-        visit_input_records(&resolved, |oid, record| {
-            if oid != lengths.len() {
-                return Err("Input database OIDs are not contiguous".to_owned());
-            }
-            let length = Loc::try_from(record.sequence.len())
-                .map_err(|_| "Sequence length exceeds Loc range".to_owned())?;
-            letters = letters
-                .checked_add(length as u64)
-                .ok_or_else(|| "Database letter count overflow".to_owned())?;
-            lengths.push(length);
-            // `SequenceFile::add_seqid_mapping` stores `Util::Seq::seqid`,
-            // not the complete FASTA title.
-            seqids.push(crate::util::sequence::seqid(&record.id));
-            Ok(())
-        })?;
+        visit_input_records_owned(
+            &resolved,
+            self.options.file_buffer_size,
+            &self.io_errors,
+            |oid, record| {
+                if oid != lengths.len() {
+                    return Err("Input database OIDs are not contiguous".to_owned());
+                }
+                let length = Loc::try_from(record.sequence.len())
+                    .map_err(|_| "Sequence length exceeds Loc range".to_owned())?;
+                letters = letters
+                    .checked_add(length as u64)
+                    .ok_or_else(|| "Database letter count overflow".to_owned())?;
+                lengths.push(length);
+                // `SequenceFile::add_seqid_mapping` stores `Util::Seq::seqid`,
+                // not the complete FASTA title.
+                let accession = crate::util::sequence::seqid_bytes(&record.id);
+                self.io_errors
+                    .capture(accession_spool.push_bytes(&accession))?;
+                Ok(())
+            },
+        )?;
         let sequence_count = lengths.len() as OId;
         Ok(NativeDatabase {
+            accession_spool,
             path: resolved.clone(),
             block: NativeBlock {
                 records: Vec::new(),
@@ -423,14 +597,38 @@ impl NativeBackend {
                 letters,
                 source: Some(NativeBlockSource::Input(resolved)),
                 soft_tantan_masker: self.soft_tantan_masker.clone(),
+                tuning: self.tuning.clone(),
+                options: self.options.clone(),
+                scoring_matrix: self.scoring_matrix.clone(),
             },
-            seqids,
             lengths,
         })
     }
 }
 
 impl CascadedBackend for NativeBlock {
+    fn io_errors(&self) -> crate::util::io::IoErrorOwner {
+        self.options.io_errors.clone()
+    }
+
+    fn block_size(
+        &self,
+        memory: i64,
+        letters: i64,
+        sensitivity: crate::config::Sensitivity,
+        linear: bool,
+        threads: i32,
+    ) -> (f64, i32) {
+        crate::basic::config::block_size(
+            memory,
+            letters,
+            sensitivity,
+            linear,
+            threads,
+            self.tuning.no_block_size_limit,
+        )
+    }
+
     fn sequence_count(&self) -> u64 {
         self.sequence_count
     }
@@ -457,89 +655,220 @@ impl CascadedBackend for NativeBlock {
         callback: &mut dyn crate::cluster::cascaded::helpers::EdgeCallback,
     ) -> Result<(), String> {
         self.ensure_loaded()?;
-        let mut active = self
+        let active = self
             .records
             .iter()
             .enumerate()
             .filter(|(oid, _)| filter.is_none_or(|set| set.get(*oid as OId)))
             .map(|(oid, record)| (oid as OId, record.clone()))
             .collect::<Vec<_>>();
-        length_sort_linear_active(&mut active, should_length_sort_queries(config));
         let local_to_block = active.iter().map(|(oid, _)| *oid).collect::<Vec<_>>();
         let records = active
             .into_iter()
             .map(|(_, record)| record)
             .collect::<Vec<_>>();
-        let target_count = records.len() as i64;
         let extension_mode = if config.extension_mode.is_empty() {
             None
         } else {
-            Some(crate::search::sensitivity::ExtensionMode::from_string(
-                &config.extension_mode,
+            Some(self.options.io_errors.capture(
+                crate::search::sensitivity::ExtensionMode::from_bytes(&config.extension_mode),
             )?)
         };
-        let search = BlastpConfig {
-            query_files: Vec::new(),
-            database: String::new(),
-            output: None,
-            matrix: config.matrix.clone(),
-            gap_open: config.gap_open,
-            gap_extend: config.gap_extend,
-            max_evalue: config.max_evalue,
-            // Upstream uses INT64_MAX to mean every target. The native
-            // chunk-size arithmetic cannot add to INT64_MAX; the number of
-            // loaded targets is the exactly equivalent finite upper bound.
-            max_target_seqs: config.max_target_seqs.min(target_count),
-            ext_chunk_size: 0,
-            toppercent: None,
-            global_ranking_targets: 0,
-            // Cascaded search applies `approx_min_id`; exact `min_id` remains
-            // unset for this workflow.
-            min_id: 0.0,
-            threads: config.threads,
-            outfmt: vec!["6".to_owned()],
-            sensitivity: config.sensitivity,
-            masking: config.masking,
-            motif_masking: config.motif_masking.clone(),
-            min_query_len: 0,
-            query_cover: config.query_cover,
-            subject_cover: config.subject_cover,
-            comp_based_stats: CbsMode::parse(&config.comp_based_stats.to_string()),
-            // Upstream `config.self` selects the triangular all-vs-all stage-1
-            // kernel; it is independent of the `--no-self-hits` content filter.
-            no_self_hits: false,
-            ungapped_xdrop_bits: 12.3,
-            memory_limit: None,
-            tmpdir: PathBuf::new(),
-            target_indexed: false,
-            translated_query_layout: None,
-        };
-        let queries = (!config.self_search).then(|| records.clone());
-        let mut edges = blastp::run_edges_in_memory(
-            &search,
-            records,
-            queries,
-            config.approx_min_id,
-            config.lin_stage1_query,
-            config.lin_stage1_target,
-            config.self_search,
-            config.query_or_target_cover,
-            config.mutual_cover,
-            crate::chaining::HammingExtConfig {
-                hamming_ext: config.hamming_ext,
-                approx_min_id: config.approx_min_id,
-                query_or_target_cover: config.query_or_target_cover,
+        let mut tuning = self.tuning.clone();
+        tuning.kmer_ranking = config.kmer_ranking;
+        tuning.db_size = config.db_size;
+        let index_chunks = u32::try_from(config.lowmem)
+            .map_err(|_| "Invalid index chunk count.")?
+            .max(1);
+        let mut search = self
+            .options
+            .search_base
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| BlastpConfig {
+                query_files: Vec::new(),
+                database: PathBuf::new(),
+                output: None,
+                matrix: config.matrix.clone(),
+                gap_open: config.gap_open,
+                gap_extend: config.gap_extend,
+                max_evalue: config.max_evalue,
+                min_bit_score: 0.0,
+                max_target_seqs: config.max_target_seqs,
+                max_hsps: 1,
+                report_unaligned: -1,
+                include_lineage: false,
+                output_header: None,
+                compression: Vec::new(),
+                file_buffer_size: self.options.file_buffer_size,
+                sam: Default::default(),
+                archive: Default::default(),
+                tuning: tuning.clone(),
+                scoring_matrix: self.scoring_matrix.clone(),
+                auxiliary_output: Default::default(),
+                taxonlist: Vec::new(),
+                taxon_exclude: Vec::new(),
+                seqidlist: PathBuf::new(),
+                skip_missing_seqids: false,
+                range_culling: false,
+                range_cover: 50.0,
+                culling_overlap: 50.0,
+                taxon_k: 0,
+                query_or_subject_cover: 0.0,
+                reference_taxon_rank_ids: None,
+                ext_chunk_size: self.options.ext_chunk_size,
+                toppercent: None,
+                global_ranking_targets: 0,
+                frame_shift: 0,
+                extension_mode: None,
+                iterate: None,
+                round_linear_target: false,
+                round_query_skip: None,
+                // Cascaded search applies `approx_min_id`; exact `min_id` remains
+                // unset for this workflow.
+                min_id: 0.0,
+                approx_min_id: 0.0,
+                soft_masking: crate::masking::MaskingAlgo::None,
+                threads: config.threads,
+                index_chunks: index_chunks,
+                block_size: None,
+                query_indexed: false,
+                contiguous_seed_mode: false,
+                swipe_all: false,
+                outfmt: vec!["6".to_owned()],
+                sensitivity: config.sensitivity,
+                masking: config.masking,
+                motif_masking: config.motif_masking.clone(),
+                min_query_len: 0,
                 query_cover: config.query_cover,
                 subject_cover: config.subject_cover,
-                max_evalue: config.max_evalue,
-                diag_filter_cov: config.diag_filter_cov,
-                diag_filter_id: config.diag_filter_id,
+                comp_based_stats: CbsMode::parse(&config.comp_based_stats.to_string()),
+                // Upstream `config.self` selects the triangular all-vs-all stage-1
+                // kernel; it is independent of the `--no-self-hits` content filter.
+                no_self_hits: false,
+                ungapped_xdrop_bits: 12.3,
+                memory_limit: None,
+                tmpdir: self.options.tmpdir.clone(),
+                target_indexed: false,
+                translated_query_layout: None,
+            });
+        search.query_files.clear();
+        search.database.clear();
+        search.output = None;
+        search.matrix = config.matrix.clone();
+        search.gap_open = config.gap_open;
+        search.gap_extend = config.gap_extend;
+        search.max_evalue = config.max_evalue;
+        search.max_target_seqs = config.max_target_seqs;
+        search.tuning = tuning;
+        // Cascaded Source phase forcibly sets global config.self=true.
+        search.tuning.self_search = true;
+        // Preserve the existing cascaded facade's explicitly supplied state
+        // for Source's indeterminate first current_ref_block read. This is a
+        // diagnostic compatibility choice, not a claim of defined C++ order.
+        // The master driver replaces it with real counters after traversal.
+        search.tuning.search_block.reference = config.current_ref_block as u32;
+        search.tuning.mapany = false;
+        search.tuning.setup.lin_stage1_query = config.lin_stage1_query;
+        search.tuning.setup.lin_stage1_target = config.lin_stage1_target;
+        search
+            .tuning
+            .algorithm
+            .force_source_algorithm(config.sensitivity, crate::run::config::Algo::DoubleIndexed)
+            .map_err(|error| error.to_string())?;
+        search.scoring_matrix = self.scoring_matrix.clone();
+        search.file_buffer_size = self.options.file_buffer_size;
+        search.ext_chunk_size = self.options.ext_chunk_size;
+        search.threads = config.threads;
+        search.index_chunks = index_chunks;
+        search.block_size = None;
+        search.query_indexed = false;
+        search.contiguous_seed_mode = false;
+        search.outfmt = vec!["edge".into()];
+        search.sensitivity = config.sensitivity;
+        search.masking = config.masking;
+        search.motif_masking = config.motif_masking.clone();
+        search.query_cover = config.query_cover;
+        search.subject_cover = config.subject_cover;
+        search.query_or_subject_cover = config.query_or_target_cover;
+        search.comp_based_stats = CbsMode::parse(&config.comp_based_stats.to_string());
+        search.tmpdir = self.options.tmpdir.clone();
+        search.iterate = None;
+
+        let database_letters = if config.db_size != 0 {
+            config.db_size
+        } else {
+            records
+                .iter()
+                .map(|record| record.sequence.len() as u64)
+                .sum()
+        };
+        let (kind, file_name) = match &self.source {
+            Some(NativeBlockSource::Input(path)) => {
+                let (kind, path) = crate::data::sequence_file::detect_type(
+                    std::slice::from_ref(path),
+                    crate::data::sequence_file::SequenceFileFlags::NONE,
+                    Default::default(),
+                )?;
+                let kind = match kind {
+                    crate::data::sequence_file::SequenceFileType::Dmnd => {
+                        super::search_blocks::ClusterOwnerKind::Dmnd
+                    }
+                    crate::data::sequence_file::SequenceFileType::Blast => {
+                        return Err("Clustering is not supported for BLAST databases.".into())
+                    }
+                    _ => super::search_blocks::ClusterOwnerKind::Fasta,
+                };
+                (kind, Some(path))
+            }
+            _ => (super::search_blocks::ClusterOwnerKind::Fasta, None),
+        };
+        let owner = super::search_blocks::ClusterSearchOwner {
+            kind,
+            file_name,
+            sequence_count: self.sequence_count as usize,
+            letters: self.letters,
+            active_filter: filter.is_some(),
+            accessions: matches!(self.source, Some(NativeBlockSource::Input(_))).then(|| {
+                self.records
+                    .iter()
+                    .map(|record| crate::util::sequence::seqid_bytes(&record.id))
+                    .collect()
+            }),
+            original_oids: local_to_block
+                .iter()
+                .map(|&oid| self.original_oids[oid as usize] as u64)
+                .collect(),
+        };
+        let mut edges = super::search_blocks::run_cluster_edges_with_owner(
+            &search,
+            &records,
+            (!config.self_search).then_some(records.as_slice()),
+            config.chunk_size,
+            database_letters,
+            blastp::ClusterSearchOptions {
+                approx_min_id: config.approx_min_id,
+                linear_query: config.lin_stage1_query,
+                linear_target: config.lin_stage1_target,
+                self_search: config.self_search,
+                query_or_target_cover: config.query_or_target_cover,
+                mutual_cover: config.mutual_cover,
+                hamming: crate::chaining::HammingExtConfig {
+                    hamming_ext: config.hamming_ext,
+                    approx_min_id: config.approx_min_id,
+                    query_or_target_cover: config.query_or_target_cover,
+                    query_cover: config.query_cover,
+                    subject_cover: config.subject_cover,
+                    max_evalue: config.max_evalue,
+                    diag_filter_cov: config.diag_filter_cov,
+                    diag_filter_id: config.diag_filter_id,
+                },
+                masker: Some(self.soft_tantan_masker.as_ref()),
+                soft_masking: config.soft_masking,
+                freq_masking: config.freq_masking,
+                extension: extension_mode,
             },
-            Some(self.soft_tantan_masker.as_ref()),
-            config.soft_masking,
-            config.freq_masking,
-            (config.db_size != 0).then_some(config.db_size),
-            extension_mode,
+            &owner,
         )
         .map_err(|error| error.to_string())?;
         edges.sort_by_key(|edge| (edge.edge.query, edge.edge.target));
@@ -559,6 +888,13 @@ impl CascadedBackend for NativeBlock {
     }
 
     fn output_edges(&mut self, path: &str, edges: &[Edge<SuperBlockId>]) -> Result<(), String> {
+        self.output_edges_path(Path::new(path), edges)
+    }
+    fn output_edges_path(
+        &mut self,
+        path: &Path,
+        edges: &[Edge<SuperBlockId>],
+    ) -> Result<(), String> {
         let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
         let mut out = BufWriter::new(file);
         for edge in edges {
@@ -570,17 +906,13 @@ impl CascadedBackend for NativeBlock {
                 .records
                 .get(edge.node2 as usize)
                 .ok_or_else(|| format!("Edge target OID out of range: {}", edge.node2))?;
-            let query_id = query
-                .id
-                .split_ascii_whitespace()
-                .next()
-                .unwrap_or(&query.id);
-            let target_id = target
-                .id
-                .split_ascii_whitespace()
-                .next()
-                .unwrap_or(&target.id);
-            writeln!(out, "{query_id}\t{target_id}").map_err(|error| error.to_string())?;
+            let query_id = crate::util::sequence::seqid_bytes(&query.id);
+            let target_id = crate::util::sequence::seqid_bytes(&target.id);
+            out.write_all(&query_id)
+                .and_then(|()| out.write_all(b"\t"))
+                .and_then(|()| out.write_all(&target_id))
+                .and_then(|()| out.write_all(b"\n"))
+                .map_err(|error| error.to_string())?;
         }
         out.flush().map_err(|error| error.to_string())
     }
@@ -589,19 +921,62 @@ impl CascadedBackend for NativeBlock {
 }
 
 impl CascadedWrapperBackend for NativeBackend {
+    fn io_errors(&self) -> crate::util::io::IoErrorOwner {
+        self.io_errors.clone()
+    }
+
+    fn block_size(
+        &self,
+        memory: i64,
+        letters: i64,
+        sensitivity: crate::config::Sensitivity,
+        linear: bool,
+        threads: i32,
+    ) -> (f64, i32) {
+        crate::basic::config::block_size(
+            memory,
+            letters,
+            sensitivity,
+            linear,
+            threads,
+            self.tuning.no_block_size_limit,
+        )
+    }
+
     type Database = NativeDatabase;
     type Block = NativeBlock;
 
-    fn external(&mut self, _config: &CascadedWrapperConfig) -> Result<(), String> {
-        Err("native external linclust backend is not implemented".to_owned())
+    fn external(&mut self, config: &CascadedWrapperConfig) -> Result<(), String> {
+        let matrix = self
+            .scoring_matrix
+            .as_ref()
+            .ok_or("External score matrix is absent")?
+            .as_ref()
+            .clone();
+        super::external_cluster::run(
+            config,
+            &self.output,
+            self.external_chunk_size,
+            self.alignment_output.as_deref(),
+            matrix,
+            &self.tuning,
+            &self.io_errors,
+        )
     }
 
     fn open_database(&mut self, path: &str) -> Result<Self::Database, String> {
         self.load(path)
     }
+    fn open_database_path(&mut self, path: &Path) -> Result<Self::Database, String> {
+        self.load_path(path)
+    }
 
     fn database_name(&self, database: &Self::Database) -> String {
-        database.path.to_string_lossy().into_owned()
+        database
+            .path
+            .to_str()
+            .expect("Non-UTF8 OS path; use native owner path")
+            .to_owned()
     }
 
     fn database_is_blast(&self, _database: &Self::Database) -> bool {
@@ -669,19 +1044,25 @@ impl CascadedWrapperBackend for NativeBackend {
             .map(|index| Vec::with_capacity(block_counts[index] as usize))
             .collect::<Vec<_>>();
         for _ in 0..block_counts.len() {
-            let (file, writer) = create_spill_file()?;
+            let (file, writer) = self
+                .io_errors
+                .capture(create_spill_file(&self.options, self.tuning.no_unlink))?;
             files.push(file);
             writers.push(writer);
         }
-        visit_input_records(&database.path, |oid, record| {
-            let block = *block_by_oid
-                .get(oid)
-                .ok_or_else(|| format!("Input OID out of range during length sort: {oid}"))?;
-            write_spill_record(&mut writers[block], oid as OId, &record)
-                .map_err(|error| error.to_string())?;
-            mappings[block].push(oid as OId);
-            Ok(())
-        })?;
+        visit_input_records(
+            &database.path,
+            self.options.file_buffer_size,
+            |oid, record| {
+                let block = *block_by_oid
+                    .get(oid)
+                    .ok_or_else(|| format!("Input OID out of range during length sort: {oid}"))?;
+                write_spill_record(&mut writers[block], oid as OId, &record)
+                    .map_err(|error| error.to_string())?;
+                mappings[block].push(oid as OId);
+                Ok(())
+            },
+        )?;
         for writer in &mut writers {
             writer.flush().map_err(|error| error.to_string())?;
         }
@@ -699,6 +1080,9 @@ impl CascadedWrapperBackend for NativeBackend {
                     letters: block_letters[index],
                     source: Some(NativeBlockSource::Spill(file)),
                     soft_tantan_masker: self.soft_tantan_masker.clone(),
+                    tuning: self.tuning.clone(),
+                    options: self.options.clone(),
+                    scoring_matrix: self.scoring_matrix.clone(),
                 },
                 super_block_id_to_oid,
             })
@@ -732,55 +1116,128 @@ impl CascadedWrapperBackend for NativeBackend {
         let extension_mode = if config.extension_mode.is_empty() {
             None
         } else {
-            Some(crate::search::sensitivity::ExtensionMode::from_string(
-                &config.extension_mode,
+            Some(self.options.io_errors.capture(
+                crate::search::sensitivity::ExtensionMode::from_bytes(&config.extension_mode),
             )?)
         };
-        let search = BlastpConfig {
-            query_files: Vec::new(),
-            database: String::new(),
-            output: None,
-            matrix: config.matrix.clone(),
-            gap_open: config.gap_open,
-            gap_extend: config.gap_extend,
-            max_evalue: config.max_evalue,
-            max_target_seqs: config.max_target_seqs,
-            ext_chunk_size: 0,
-            toppercent: config.top_percent,
-            global_ranking_targets: 0,
-            min_id: 0.0,
-            threads: config.threads,
-            outfmt: vec!["6".to_owned()],
-            sensitivity: config.sensitivity,
-            masking: config.masking,
-            motif_masking: config.motif_masking.clone(),
-            min_query_len: 0,
-            query_cover: config.query_cover,
-            subject_cover: config.subject_cover,
-            comp_based_stats: CbsMode::parse(&config.comp_based_stats.to_string()),
-            no_self_hits: false,
-            ungapped_xdrop_bits: 12.3,
-            memory_limit: None,
-            tmpdir: PathBuf::new(),
-            target_indexed: false,
-            translated_query_layout: None,
-        };
-        let mut targets = self
+        let mut tuning = self.tuning.clone();
+        tuning.db_size = config.db_size;
+        let index_chunks = u32::try_from(config.lowmem)
+            .map_err(|_| "Invalid index chunk count.")?
+            .max(1);
+        let mut search = self
+            .options
+            .search_base
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| BlastpConfig {
+                query_files: Vec::new(),
+                database: PathBuf::new(),
+                output: None,
+                matrix: config.matrix.clone(),
+                gap_open: config.gap_open,
+                gap_extend: config.gap_extend,
+                max_evalue: config.max_evalue,
+                min_bit_score: 0.0,
+                max_target_seqs: config.max_target_seqs,
+                max_hsps: 1,
+                report_unaligned: -1,
+                include_lineage: false,
+                output_header: None,
+                compression: Vec::new(),
+                file_buffer_size: self.options.file_buffer_size,
+                sam: Default::default(),
+                archive: Default::default(),
+                tuning: tuning.clone(),
+                scoring_matrix: self.scoring_matrix.clone(),
+                auxiliary_output: Default::default(),
+                taxonlist: Vec::new(),
+                taxon_exclude: Vec::new(),
+                seqidlist: PathBuf::new(),
+                skip_missing_seqids: false,
+                range_culling: false,
+                range_cover: 50.0,
+                culling_overlap: 50.0,
+                taxon_k: 0,
+                query_or_subject_cover: 0.0,
+                reference_taxon_rank_ids: None,
+                ext_chunk_size: self.options.ext_chunk_size,
+                toppercent: config.top_percent,
+                global_ranking_targets: 0,
+                frame_shift: 0,
+                extension_mode: None,
+                iterate: None,
+                round_linear_target: false,
+                round_query_skip: None,
+                min_id: 0.0,
+                approx_min_id: 0.0,
+                soft_masking: crate::masking::MaskingAlgo::None,
+                threads: config.threads,
+                index_chunks: index_chunks,
+                block_size: None,
+                query_indexed: false,
+                contiguous_seed_mode: false,
+                swipe_all: false,
+                outfmt: vec!["6".to_owned()],
+                sensitivity: config.sensitivity,
+                masking: config.masking,
+                motif_masking: config.motif_masking.clone(),
+                min_query_len: 0,
+                query_cover: config.query_cover,
+                subject_cover: config.subject_cover,
+                comp_based_stats: CbsMode::parse(&config.comp_based_stats.to_string()),
+                no_self_hits: false,
+                ungapped_xdrop_bits: 12.3,
+                memory_limit: None,
+                tmpdir: self.options.tmpdir.clone(),
+                target_indexed: false,
+                translated_query_layout: None,
+            });
+        search.query_files.clear();
+        search.database.clear();
+        search.output = None;
+        search.matrix = config.matrix.clone();
+        search.gap_open = config.gap_open;
+        search.gap_extend = config.gap_extend;
+        search.max_evalue = config.max_evalue;
+        search.max_target_seqs = config.max_target_seqs;
+        search.tuning = tuning;
+        search.tuning.self_search = false;
+        search.tuning.mapany = false;
+        search.tuning.setup.lin_stage1_query = config.lin_stage1_query;
+        search.tuning.setup.lin_stage1_target = config.lin_stage1_target;
+        search
+            .tuning
+            .algorithm
+            .force_source_algorithm(config.sensitivity, crate::run::config::Algo::DoubleIndexed)
+            .map_err(|error| error.to_string())?;
+        search.scoring_matrix = self.scoring_matrix.clone();
+        search.file_buffer_size = self.options.file_buffer_size;
+        search.ext_chunk_size = self.options.ext_chunk_size;
+        search.threads = config.threads;
+        search.index_chunks = index_chunks;
+        search.block_size = None;
+        search.query_indexed = false;
+        search.contiguous_seed_mode = false;
+        search.outfmt = vec!["edge".into()];
+        search.sensitivity = config.sensitivity;
+        search.masking = config.masking;
+        search.motif_masking = config.motif_masking.clone();
+        search.query_cover = config.query_cover;
+        search.subject_cover = config.subject_cover;
+        search.query_or_subject_cover = config.query_or_target_cover;
+        search.comp_based_stats = CbsMode::parse(&config.comp_based_stats.to_string());
+        search.tmpdir = self.options.tmpdir.clone();
+        search.toppercent = config.top_percent;
+        search.iterate = Some(config.iterate.clone());
+
+        let targets = self
             .centroids
             .records
             .iter()
             .cloned()
             .enumerate()
             .collect::<Vec<_>>();
-        if config.lin_stage1_target {
-            targets.sort_unstable_by(|(left_oid, left), (right_oid, right)| {
-                right
-                    .sequence
-                    .len()
-                    .cmp(&left.sequence.len())
-                    .then_with(|| right_oid.cmp(left_oid))
-            });
-        }
         let target_to_centroid = targets
             .iter()
             .map(|(centroid, _)| *centroid as OId)
@@ -789,31 +1246,39 @@ impl CascadedWrapperBackend for NativeBackend {
             .into_iter()
             .map(|(_, record)| record)
             .collect::<Vec<_>>();
-        let edges = blastp::run_edges_in_memory(
+        let database_letters = if config.db_size != 0 {
+            config.db_size
+        } else {
+            self.centroids.letter_count()
+        };
+        let edges = super::search_blocks::run_cluster_edges(
             &search,
-            target_records,
-            Some(block.records.clone()),
-            config.approx_min_id,
-            config.lin_stage1_query,
-            config.lin_stage1_target,
-            config.self_search,
-            config.query_or_target_cover,
-            config.query_cover > 0.0 && config.subject_cover > 0.0,
-            crate::chaining::HammingExtConfig {
-                hamming_ext: config.hamming_ext,
+            &target_records,
+            Some(&block.records),
+            config.chunk_size,
+            database_letters,
+            blastp::ClusterSearchOptions {
                 approx_min_id: config.approx_min_id,
+                linear_query: config.lin_stage1_query,
+                linear_target: config.lin_stage1_target,
+                self_search: config.self_search,
                 query_or_target_cover: config.query_or_target_cover,
-                query_cover: config.query_cover,
-                subject_cover: config.subject_cover,
-                max_evalue: config.max_evalue,
-                diag_filter_cov: config.diag_filter_cov,
-                diag_filter_id: config.diag_filter_id,
+                mutual_cover: config.query_cover > 0.0 && config.subject_cover > 0.0,
+                hamming: crate::chaining::HammingExtConfig {
+                    hamming_ext: config.hamming_ext,
+                    approx_min_id: config.approx_min_id,
+                    query_or_target_cover: config.query_or_target_cover,
+                    query_cover: config.query_cover,
+                    subject_cover: config.subject_cover,
+                    max_evalue: config.max_evalue,
+                    diag_filter_cov: config.diag_filter_cov,
+                    diag_filter_id: config.diag_filter_id,
+                },
+                masker: Some(self.soft_tantan_masker.as_ref()),
+                soft_masking: config.soft_masking,
+                freq_masking: config.freq_masking,
+                extension: extension_mode,
             },
-            Some(self.soft_tantan_masker.as_ref()),
-            config.soft_masking,
-            config.freq_masking,
-            (config.db_size != 0).then_some(config.db_size),
-            extension_mode,
         )
         .map_err(|error| error.to_string())?;
         let mut bytes = Vec::with_capacity(edges.len() * crate::output::edge::EdgeData::SIZE);
@@ -856,6 +1321,9 @@ impl CascadedWrapperBackend for NativeBackend {
                 .sum(),
             source: None,
             soft_tantan_masker: self.soft_tantan_masker.clone(),
+            tuning: self.tuning.clone(),
+            options: self.options.clone(),
+            scoring_matrix: self.scoring_matrix.clone(),
         })
     }
 
@@ -907,32 +1375,37 @@ impl CascadedWrapperBackend for NativeBackend {
         oid_output: bool,
         simple_header: bool,
     ) -> Result<(), String> {
-        let file = std::fs::File::create(&self.output).map_err(|error| error.to_string())?;
-        let mut writer = BufWriter::new(file);
-        if simple_header {
-            writeln!(writer, "centroid\tmember").map_err(|error| error.to_string())?;
+        if self.destination.is_none() {
+            // Retain direct adapter use; production enters through the actual
+            // pre-search open_output phase in the translated wrapper.
+            self.open_output(simple_header)?;
         }
+        let accessions = if oid_output {
+            None
+        } else {
+            Some(
+                self.io_errors.capture(
+                    database
+                        .accession_spool
+                        .read_table(resolved_threads(self.tuning.setup.threads) as usize),
+                )?,
+            )
+        };
+        let writer = self.destination.as_mut().unwrap();
         let mut write_pair = |centroid: OId, member: OId| -> Result<(), String> {
             if oid_output {
                 writeln!(writer, "{centroid}\t{member}").map_err(|error| error.to_string())
             } else {
-                let centroid_title = database
-                    .seqids
-                    .get(centroid as usize)
-                    .ok_or_else(|| format!("Centroid OID out of range: {centroid}"))?;
-                let member_title = database
-                    .seqids
-                    .get(member as usize)
-                    .ok_or_else(|| format!("Member OID out of range: {member}"))?;
-                let centroid_id = centroid_title
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or(centroid_title);
-                let member_id = member_title
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or(member_title);
-                writeln!(writer, "{centroid_id}\t{member_id}").map_err(|error| error.to_string())
+                let table = accessions.as_ref().unwrap();
+                if centroid as i64 >= table.size() || member as i64 >= table.size() {
+                    return Err("Cluster mapping OID outside accession table".to_owned());
+                }
+                writer
+                    .write_all(table.record(centroid as i64).string_bytes(0))
+                    .and_then(|()| writer.write_all(b"\t"))
+                    .and_then(|()| writer.write_all(table.record(member as i64).string_bytes(0)))
+                    .and_then(|()| writer.write_all(b"\n"))
+                    .map_err(|error| error.to_string())
             }
         };
         let mut pairs = match output {
@@ -950,26 +1423,197 @@ impl CascadedWrapperBackend for NativeBackend {
         writer.flush().map_err(|error| error.to_string())
     }
 
-    fn close_database(&mut self, _database: Self::Database) -> Result<(), String> {
+    fn open_output(&mut self, simple_header: bool) -> Result<(), String> {
+        let mut output =
+            self.io_errors
+                .capture(super::reassign::SourceWorkflowOutput::new_io_path(
+                    &self.output,
+                    self.options.file_buffer_size,
+                ))?;
+        if simple_header {
+            writeln!(output, "centroid\tmember").map_err(|error| error.to_string())?;
+        }
+        self.destination = Some(output);
+        Ok(())
+    }
+
+    fn close_database(&mut self, database: Self::Database) -> Result<(), String> {
+        drop(database);
+        if let Some(output) = self.destination.as_mut() {
+            output.close()?;
+        }
         Ok(())
     }
 }
 
-/// Run native clustering.
-///
-/// Database ownership, block orchestration, and output use the translated
-/// cascaded workflow above; it never substitutes the former one-pass greedy
-/// heuristic.
+/// Direct `Cluster::cascaded(db, linear)` entry used by recursive reclustering.
+/// The caller owns initialized/mutable workflow settings, bypassing the outer
+/// length-sorted-file wrapper just as the upstream recursive call does.
+pub(crate) fn cascaded_records(
+    records: Vec<FastaRecord>,
+    config: &mut CascadedConfig,
+    linear: bool,
+    tantan_min_mask_prob: f32,
+) -> Result<Vec<SuperBlockId>, String> {
+    cascaded_records_with_tuning(
+        records,
+        config,
+        linear,
+        tantan_min_mask_prob,
+        &Default::default(),
+    )
+}
+
+pub(crate) fn cascaded_records_with_tuning(
+    records: Vec<FastaRecord>,
+    config: &mut CascadedConfig,
+    linear: bool,
+    tantan_min_mask_prob: f32,
+    tuning: &blastp::SearchTuning,
+) -> Result<Vec<SuperBlockId>, String> {
+    cascaded_records_with_options(
+        records,
+        config,
+        linear,
+        tantan_min_mask_prob,
+        tuning,
+        &Default::default(),
+    )
+}
+
+pub(crate) fn cascaded_records_with_search(
+    records: Vec<FastaRecord>,
+    config: &mut CascadedConfig,
+    linear: bool,
+    tantan_min_mask_prob: f32,
+    search: &BlastpConfig,
+) -> Result<Vec<SuperBlockId>, String> {
+    cascaded_records_with_search_owned(
+        records,
+        config,
+        linear,
+        tantan_min_mask_prob,
+        search,
+        &Default::default(),
+    )
+}
+pub(crate) fn cascaded_records_with_search_owned(
+    records: Vec<FastaRecord>,
+    config: &mut CascadedConfig,
+    linear: bool,
+    tantan_min_mask_prob: f32,
+    search: &BlastpConfig,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<Vec<SuperBlockId>, String> {
+    cascaded_records_with_options(
+        records,
+        config,
+        linear,
+        tantan_min_mask_prob,
+        &search.tuning,
+        &NativeOptions {
+            io_errors: errors.clone(),
+            search_base: Some(Arc::new(search.clone())),
+            file_buffer_size: search.file_buffer_size,
+            tmpdir: search.tmpdir.clone(),
+            ext_chunk_size: search.ext_chunk_size,
+        },
+    )
+}
+
+fn cascaded_records_with_options(
+    records: Vec<FastaRecord>,
+    config: &mut CascadedConfig,
+    linear: bool,
+    tantan_min_mask_prob: f32,
+    tuning: &blastp::SearchTuning,
+    options: &NativeOptions,
+) -> Result<Vec<SuperBlockId>, String> {
+    options.validate()?;
+    let letters = records
+        .iter()
+        .map(|record| record.sequence.len() as u64)
+        .sum();
+    let matrix = options
+        .io_errors
+        .capture(blastp::native_score_matrix_with_tuning_bytes(
+            &config.matrix,
+            config.gap_open,
+            config.gap_extend,
+            0,
+            tuning,
+            letters,
+        ))?;
+    let count = records.len() as OId;
+    let mut block = NativeBlock {
+        letters: records
+            .iter()
+            .map(|record| record.sequence.len() as u64)
+            .sum(),
+        records,
+        original_oids: (0..count).collect(),
+        sequence_count: count,
+        source: None,
+        soft_tantan_masker: tuning.runtime.tantan().unwrap_or_else(|| {
+            Arc::new(crate::masking::tantan::TantanMasker::from_score_matrix(
+                &matrix,
+                tantan_min_mask_prob,
+            ))
+        }),
+        tuning: tuning.clone(),
+        options: options.clone(),
+        scoring_matrix: Some(Arc::new(matrix)),
+    };
+    cascaded::cascaded(&mut block, config, linear)
+}
+
+/// Run native clustering using the translated block and cascaded workflows.
 pub fn run(config: &ClusterConfig) -> io::Result<()> {
     let mut translated = translated_config(config);
-    let mut backend = NativeBackend::new(
+    let mut tuning = config.tuning.clone();
+    tuning.setup.threads = resolved_threads(config.threads);
+    tuning.algorithm.begin_search(
+        crate::config::Sensitivity::Default,
+        tuning.algorithm.requested,
+    );
+    tuning.kmer_ranking = config.kmer_ranking;
+    let errors = crate::util::io::IoErrorOwner::default();
+    let mut backend = errors.finish(NativeBackend::new_with_options(
         &config.output,
         &config.matrix,
         config.gap_open,
         config.gap_extend,
-    )
-    .map_err(io::Error::other)?;
-    crate::cluster::cascaded::wrapper::run(&mut backend, &mut translated).map_err(io::Error::other)
+        &tuning,
+        &NativeOptions {
+            io_errors: errors.clone(),
+            search_base: config
+                .search_args
+                .as_ref()
+                .map(|args| {
+                    let mut args = args.clone();
+                    args.extend([OsString::from("--outfmt"), OsString::from("edge")]);
+                    let mut search = super::dispatch::parse_native_blastp_config_os(
+                        &args,
+                        &super::reassign::invocation_bytes_os(&args)?,
+                    )?;
+                    search.tuning.runtime = config.tuning.runtime.clone();
+                    Ok::<_, io::Error>(Arc::new(search))
+                })
+                .transpose()?,
+            file_buffer_size: config.file_buffer_size,
+            tmpdir: crate::util::io::temp_file::source_temp_directory_path(
+                &config.tmpdir,
+                &config.output,
+            ),
+            ext_chunk_size: config.ext_chunk_size,
+        },
+    ))?;
+    backend.io_errors = backend.io_errors.with_source_destructors();
+    backend.external_chunk_size = config.linclust_chunk_size;
+    backend.alignment_output = config.alignment_output.clone();
+    let errors = backend.io_errors.clone();
+    let result = crate::cluster::cascaded::wrapper::run(&mut backend, &mut translated);
+    errors.finish(result)
 }
 
 #[cfg(test)]
@@ -979,19 +1623,24 @@ mod tests {
 
     fn config(workflow: ClusterWorkflow) -> ClusterConfig {
         ClusterConfig {
+            search_args: None,
+            tuning: Default::default(),
+            file_buffer_size: 67_108_864,
+            tmpdir: PathBuf::new(),
+            ext_chunk_size: 0,
             workflow,
-            database: "input.dmnd".to_owned(),
-            output: "clusters.tsv".to_owned(),
+            database: "input.dmnd".into(),
+            output: "clusters.tsv".into(),
             threads: 3,
-            matrix: "blosum62".to_owned(),
+            matrix: b"blosum62".to_vec(),
             gap_open: -1,
             gap_extend: -1,
             max_evalue: 0.001,
             comp_based_stats: 1,
             masking: MaskingMode::None,
             soft_masking: MaskingAlgo::Tantan,
-            motif_masking: String::new(),
-            extension_mode: String::new(),
+            motif_masking: Vec::new(),
+            extension_mode: Vec::new(),
             member_cover: None,
             mutual_cover: None,
             approx_id: None,
@@ -1008,13 +1657,16 @@ mod tests {
             oid_output: false,
             simple_header: false,
             alignment_output: None,
+            parallel_tmpdir: PathBuf::new(),
+            linclust_chunk_size: 10_000_000_000,
         }
     }
 
     #[test]
     fn linear_active_block_matches_upstream_length_sort_tie_break() {
         let record = |id: &str, len: usize| FastaRecord {
-            id: id.to_owned(),
+            quality: None,
+            id: id.as_bytes().to_vec(),
             sequence: vec![1; len],
         };
         let original = vec![
@@ -1095,8 +1747,8 @@ mod tests {
         let output = std::env::temp_dir().join(format!("{stem}.tsv"));
         let sequence = "ARNDCQEGHILKMFPSTWYVARNDCQEGHILKMFPSTWYV";
         std::fs::write(&input, format!(">a\n{sequence}\n>b\n{sequence}\n")).unwrap();
-        cfg.database = input.to_string_lossy().into_owned();
-        cfg.output = output.to_string_lossy().into_owned();
+        cfg.database = input.to_path_buf();
+        cfg.output = output.to_path_buf();
         run(&cfg).unwrap();
         let rows = std::fs::read_to_string(&output).unwrap();
         assert_eq!(rows.lines().count(), 2);
@@ -1113,17 +1765,17 @@ mod tests {
     fn translated_config_forwards_cluster_controls_without_defaulting_member_cover_early() {
         let mut cfg = config(ClusterWorkflow::Cascaded);
         cfg.mutual_cover = Some(77.0);
-        cfg.cluster_steps = vec!["faster_lin".into(), "default".into()];
-        cfg.connected_component_depth = vec!["2".into()];
-        cfg.round_coverage = vec!["81".into(), "82".into()];
-        cfg.round_approx_id = vec!["55".into(), "60".into()];
+        cfg.cluster_steps = vec![b"faster_lin".to_vec(), b"default".to_vec()];
+        cfg.connected_component_depth = vec![b"2".to_vec()];
+        cfg.round_coverage = vec![b"81".to_vec(), b"82".to_vec()];
+        cfg.round_approx_id = vec![b"55".to_vec(), b"60".to_vec()];
         cfg.kmer_ranking = true;
         cfg.no_reassign = true;
         cfg.weighted_gvc = true;
         cfg.strict_gvc = true;
         cfg.graph_algo = GraphAlgo::LengthSorted;
         cfg.memory_limit = 3_000_000_000;
-        cfg.matrix = "pam250".to_owned();
+        cfg.matrix = b"pam250".to_vec();
         cfg.gap_open = 15;
         cfg.gap_extend = 3;
         cfg.oid_output = true;
@@ -1134,7 +1786,7 @@ mod tests {
         assert_eq!(translated.thresholds.mutual_cover, Some(77.0));
         assert_eq!(translated.memory_limit, 3_000_000_000);
         assert_eq!(translated.core.memory_limit, 3_000_000_000);
-        assert_eq!(translated.core.matrix, "pam250");
+        assert_eq!(translated.core.matrix, b"pam250");
         assert_eq!(translated.core.gap_open, 15);
         assert_eq!(translated.core.gap_extend, 3);
         assert_eq!(translated.core.helpers.cluster_steps, cfg.cluster_steps);
@@ -1158,7 +1810,9 @@ mod tests {
         let stem = format!("diamond-cluster-output-{}", std::process::id());
         let input = std::env::temp_dir().join(format!("{stem}.faa"));
         let output = std::env::temp_dir().join(format!("{stem}.tsv"));
-        std::fs::write(&input, ">centroid description\nAAAA\n>member\nAAA\n").unwrap();
+        // Source rejects all-DNA-looking protein blocks. Keep this output
+        // fixture unambiguously protein without changing its record lengths.
+        std::fs::write(&input, ">centroid description\nEFIL\n>member\nEFI\n").unwrap();
         let mut backend = NativeBackend::new(output.to_str().unwrap(), "blosum62", -1, -1).unwrap();
         let mut database = backend.load(input.to_str().unwrap()).unwrap();
         assert_eq!(database.block.sequence_count, 2);
@@ -1189,7 +1843,7 @@ mod tests {
         let output = std::env::temp_dir().join(format!("{stem}.tsv"));
         std::fs::write(
             &input,
-            ">zero\nAAAA\n>one\nAAAAAAAA\n>two\nAAAAAA\n>three\nAAAAAAAA\n>four\nAAA\n",
+            ">zero\nEFIL\n>one\nEFILPQEF\n>two\nEFILPQ\n>three\nEFILPQEF\n>four\nEFI\n",
         )
         .unwrap();
         let mut backend = NativeBackend::new(output.to_str().unwrap(), "blosum62", -1, -1).unwrap();
@@ -1209,7 +1863,7 @@ mod tests {
         for item in &mut blocks {
             item.block.ensure_loaded().unwrap();
             assert_eq!(item.block.records.len(), item.super_block_id_to_oid.len());
-            assert!(item.block.records.iter().all(|record| record.id == "X"));
+            assert!(item.block.records.iter().all(|record| record.id == b"X"));
             assert_eq!(item.block.original_oids, item.super_block_id_to_oid);
         }
 
@@ -1242,8 +1896,8 @@ mod tests {
         ] {
             let output = std::env::temp_dir().join(format!("{stem}-{workflow:?}.tsv"));
             let mut cfg = config(workflow);
-            cfg.database = input.to_string_lossy().into_owned();
-            cfg.output = output.to_string_lossy().into_owned();
+            cfg.database = input.to_path_buf();
+            cfg.output = output.to_path_buf();
             cfg.approx_id = None;
             run(&cfg).unwrap();
             let text = std::fs::read_to_string(&output).unwrap();

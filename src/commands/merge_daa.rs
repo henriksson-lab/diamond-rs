@@ -1,9 +1,31 @@
 use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::output::daa::merge::{merge_daa, DaaMergeConfig};
 
 pub fn run(input_files: &[String], output_file: &str) -> io::Result<()> {
-    let config = DaaMergeConfig::new(input_files.iter().cloned(), output_file);
+    run_with_buffer_size(input_files, output_file, 67_108_864)
+}
+
+pub fn run_with_buffer_size(
+    input_files: &[String],
+    output_file: &str,
+    file_buffer_size: usize,
+) -> io::Result<()> {
+    run_with_buffer_size_paths(
+        &input_files.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        Path::new(output_file),
+        file_buffer_size,
+    )
+}
+
+pub fn run_with_buffer_size_paths(
+    input_files: &[PathBuf],
+    output_file: &Path,
+    file_buffer_size: usize,
+) -> io::Result<()> {
+    let mut config = DaaMergeConfig::new(input_files.iter().cloned(), output_file);
+    config.file_buffer_size = file_buffer_size;
     merge_daa(&config).map(|_| ())
 }
 

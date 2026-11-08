@@ -9,3 +9,5 @@ pub mod daa_record;
 pub mod daa_write;
 pub mod merge;
 pub mod view;
+
+pub(crate) mod buffered_io;

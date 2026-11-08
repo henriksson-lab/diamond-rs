@@ -10,11 +10,36 @@ pub use fasta_file::{FastaEntry, FastaFile, FastaFileConfig};
 
 /// A parsed FASTA/FASTQ record.
 #[derive(Debug, Clone)]
-pub struct FastaRecord {
+pub struct FastaRecord<T = String> {
+    /// FASTQ quality values; absent for FASTA/database records.
+    pub quality: Option<T>,
     /// Sequence identifier (header line without '>').
-    pub id: String,
+    pub id: T,
     /// Encoded sequence as Letter values.
     pub sequence: Vec<Letter>,
+}
+
+/// Actual Source strings are arbitrary bytes. Native CLI owners use this
+/// specialization; the default String record remains a checked Rust API.
+pub type ByteFastaRecord = FastaRecord<Vec<u8>>;
+impl From<FastaRecord> for ByteFastaRecord {
+    fn from(record: FastaRecord) -> Self {
+        Self {
+            id: record.id.into_bytes(),
+            sequence: record.sequence,
+            quality: record.quality.map(String::into_bytes),
+        }
+    }
+}
+impl TryFrom<ByteFastaRecord> for FastaRecord {
+    type Error = std::string::FromUtf8Error;
+    fn try_from(record: ByteFastaRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: String::from_utf8(record.id)?,
+            sequence: record.sequence,
+            quality: record.quality.map(String::from_utf8).transpose()?,
+        })
+    }
 }
 
 /// Sequence file format.
@@ -30,21 +55,35 @@ where
     R: BufRead,
     F: FnMut(&str, &str, u64) -> io::Result<()>,
 {
-    let mut line = String::new();
+    read_fasta_bytes(reader, |id, sequence, offset| {
+        let id = std::str::from_utf8(id)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let sequence = std::str::from_utf8(sequence)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        f(id, sequence, offset)
+    })
+}
+
+pub fn read_fasta_bytes<R, F>(reader: &mut R, mut f: F) -> io::Result<()>
+where
+    R: BufRead,
+    F: FnMut(&[u8], &[u8], u64) -> io::Result<()>,
+{
+    let mut line = Vec::new();
     let mut pos = 0u64;
     let mut start = 0u64;
-    let mut id = String::new();
-    let mut seq = String::new();
+    let mut id = Vec::new();
+    let mut seq = Vec::new();
 
-    let mut n = reader.read_line(&mut line)?;
+    let mut n = reader.read_until(b'\n', &mut line)?;
     if n == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "FASTA format error: file does not start with '>'",
         ));
     }
-    let mut current = line.trim_end_matches('\n').to_string();
-    if current.is_empty() || !current.starts_with('>') {
+    let mut current = line.strip_suffix(b"\n").unwrap_or(&line).to_vec();
+    if current.is_empty() || !current.starts_with(b">") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "FASTA format error: file does not start with '>'",
@@ -52,17 +91,17 @@ where
     }
 
     loop {
-        if current.ends_with('\r') {
+        if current.ends_with(b"\r") {
             current.pop();
         }
         if !current.is_empty() {
-            if let Some(rest) = current.strip_prefix('>') {
+            if let Some(rest) = current.strip_prefix(b">") {
                 if !id.is_empty() {
                     f(&id, &seq, start)?;
                 }
                 start = pos;
                 id.clear();
-                id.push_str(rest);
+                id.extend_from_slice(rest);
                 if id.is_empty() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -71,17 +110,17 @@ where
                 }
                 seq.clear();
             } else {
-                seq.push_str(&current);
+                seq.extend_from_slice(&current);
             }
         }
 
         pos += n as u64;
         line.clear();
-        n = reader.read_line(&mut line)?;
+        n = reader.read_until(b'\n', &mut line)?;
         if n == 0 {
             break;
         }
-        current = line.trim_end_matches('\n').to_string();
+        current = line.strip_suffix(b"\n").unwrap_or(&line).to_vec();
     }
 
     if !id.is_empty() {
@@ -112,6 +151,297 @@ pub fn read_fasta_file(path: &Path, seq_type: SequenceType) -> io::Result<Vec<Fa
     Ok(records)
 }
 
+pub fn read_fasta_file_bytes(
+    path: &Path,
+    seq_type: SequenceType,
+) -> io::Result<Vec<ByteFastaRecord>> {
+    let mut records = Vec::new();
+    for_each_fasta_file_with_buffer_size_bytes(path, seq_type, 8192, |record| {
+        records.push(record);
+        Ok(())
+    })?;
+    Ok(records)
+}
+pub fn for_each_fasta_file_with_buffer_size_bytes<F>(
+    path: &Path,
+    seq_type: SequenceType,
+    buffer_size: usize,
+    f: F,
+) -> io::Result<()>
+where
+    F: FnMut(ByteFastaRecord) -> io::Result<()>,
+{
+    let input = prepare_source_sequence_reader(path, buffer_size)?;
+    for_each_prepared_sequence_reader_bytes(input, seq_type, buffer_size, f)
+}
+
+/// FASTA/FASTQ autodetection for an already owned stream (including stdin).
+/// This typed convenience API explicitly autodetects supported codecs, including
+/// for borrowed cursors. Native file/stdin call sites use Source path policy.
+pub fn read_fasta_reader<R: Read>(
+    reader: R,
+    seq_type: SequenceType,
+) -> io::Result<Vec<FastaRecord>> {
+    let mut records = Vec::new();
+    for_each_fasta_decoded(
+        reader,
+        seq_type,
+        8192,
+        crate::util::io::std_stream::DecodeMode::NATIVE_AUTO,
+        "",
+        |record| {
+            records.push(record);
+            Ok(())
+        },
+    )?;
+    Ok(records)
+}
+
+/// Open the actual Source InputFile owner and detect the decoded format once.
+pub(crate) fn prepare_source_sequence_reader(
+    path: &Path,
+    buffer_size: usize,
+) -> io::Result<crate::util::io::InputFile> {
+    let name = path
+        .to_str()
+        .ok_or_else(|| io::Error::other("Non-UTF-8 sequence input path"))?;
+    let input = crate::util::io::InputFile::with_source_profile(name, 0, buffer_size)
+        .map_err(io::Error::other)?;
+    prepare_decoded_sequence_reader(input)
+}
+
+/// Validate a retained decoded owner without installing another codec/buffer.
+pub(crate) fn prepare_decoded_sequence_reader(
+    mut input: crate::util::io::InputFile,
+) -> io::Result<crate::util::io::InputFile> {
+    let first = input.peek_bytes(1).map_err(io::Error::other)?;
+    match first.first() {
+        Some(b'>' | b'@') => Ok(input),
+        None => Err(io::Error::other(
+            "Error detecting input file format. Input file seems to be empty.",
+        )),
+        _ => Err(io::Error::other(
+            "Error detecting input file format. First line must begin with '>' (FASTA) or '@' (FASTQ).",
+        )),
+    }
+}
+
+/// Parse an already decoded/prepared owner without codec probing or transport conversion.
+pub(crate) fn for_each_prepared_sequence_reader<
+    R: Read,
+    F: FnMut(FastaRecord) -> io::Result<()>,
+>(
+    reader: R,
+    seq_type: SequenceType,
+    buffer_size: usize,
+    mut f: F,
+) -> io::Result<()> {
+    for_each_prepared_sequence_reader_bytes(reader, seq_type, buffer_size, |record| {
+        f(FastaRecord::try_from(record)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?)
+    })
+}
+
+pub(crate) fn for_each_prepared_sequence_reader_bytes<
+    R: Read,
+    F: FnMut(ByteFastaRecord) -> io::Result<()>,
+>(
+    reader: R,
+    seq_type: SequenceType,
+    buffer_size: usize,
+    f: F,
+) -> io::Result<()> {
+    let encoding = match seq_type {
+        SequenceType::AminoAcid => {
+            CharRepresentation::new(AMINO_ACID_ALPHABET, MASK_LETTER, b"UO-")
+        }
+        SequenceType::Nucleotide => CharRepresentation::new(NUCLEOTIDE_ALPHABET, 4, b"MRWSYKVHDBX"),
+    };
+    let mut reader = BufReader::with_capacity(buffer_size.max(1), reader);
+    if reader.fill_buf()?.first() == Some(&b'@') {
+        for_each_source_fastq(&mut reader, &encoding, f)
+    } else {
+        for_each_source_fasta(&mut reader, &encoding, f)
+    }
+}
+
+fn for_each_source_fasta<R: BufRead, F: FnMut(ByteFastaRecord) -> io::Result<()>>(
+    reader: &mut R,
+    encoding: &CharRepresentation,
+    mut emit: F,
+) -> io::Result<()> {
+    loop {
+        let mut raw = Vec::new();
+        loop {
+            let n = reader.read_until(b'\n', &mut raw)?;
+            if n == 0 {
+                break;
+            }
+            if raw.last() == Some(&b'\n') {
+                let next = reader.fill_buf()?.first().copied();
+                if next.is_none() || next == Some(b'>') {
+                    // Source consumes the separating LF, leaves the next '>'
+                    // pending, and excludes that LF from this TSV record.
+                    raw.pop();
+                    break;
+                }
+            }
+        }
+        if raw.iter().all(u8::is_ascii_whitespace) {
+            return Ok(());
+        }
+        if raw.first() != Some(&b'>') {
+            return Err(io::Error::other("Missing fields in input line"));
+        }
+        let separator = raw
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .ok_or_else(|| io::Error::other("Missing fields in input line"))?;
+        if separator + 1 == raw.len() {
+            return Err(io::Error::other("Missing fields in input line"));
+        }
+        let mut id = raw[1..separator].to_vec();
+        if id.last() == Some(&b'\r') {
+            id.pop();
+        }
+        let sequence = raw[separator + 1..]
+            .iter()
+            .copied()
+            .filter(|byte| !matches!(byte, b'\n' | b'\r'))
+            .map(|byte| {
+                encoding
+                    .convert(byte)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        emit(ByteFastaRecord {
+            id,
+            sequence,
+            quality: None,
+        })?;
+        if reader.fill_buf()?.is_empty() {
+            return Ok(());
+        }
+    }
+}
+
+/// Source first assembles a complete stream record, then applies its three-field
+/// TSV schema. In particular, multiline sequence errors precede letter decoding
+/// but follow the complete quality read (tokenizer_dyn.h:297 and :249).
+fn for_each_source_fastq<R: BufRead, F: FnMut(ByteFastaRecord) -> io::Result<()>>(
+    reader: &mut R,
+    encoding: &CharRepresentation,
+    mut emit: F,
+) -> io::Result<()> {
+    fn line<R: BufRead>(reader: &mut R, number: &mut u64) -> io::Result<(Vec<u8>, bool)> {
+        let mut bytes = Vec::new();
+        reader.read_until(b'\n', &mut bytes)?;
+        let terminated = bytes.last() == Some(&b'\n');
+        if terminated {
+            bytes.pop();
+        }
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        *number += 1;
+        Ok((bytes, !terminated))
+    }
+    let mut number = 0;
+    loop {
+        let (header, eof) = line(reader, &mut number)?;
+        if eof && header.is_empty() {
+            return Ok(());
+        }
+        let start = number;
+        let malformed = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Malformed FASTQ record on line {start}"),
+            )
+        };
+        if header.first() != Some(&b'@') || eof {
+            return Err(malformed());
+        }
+        let mut raw = header;
+        raw.push(b'\n');
+        let mut len = 0;
+        loop {
+            let (bytes, eof) = line(reader, &mut number)?;
+            if eof || bytes.is_empty() {
+                return Err(malformed());
+            }
+            let separator = bytes.first() == Some(&b'+');
+            if !separator {
+                len += bytes.len();
+            }
+            raw.extend(bytes);
+            raw.push(b'\n');
+            if separator {
+                break;
+            }
+        }
+        let mut quality_len = 0;
+        let eof = loop {
+            let (bytes, eof) = line(reader, &mut number)?;
+            quality_len += bytes.len();
+            raw.extend(bytes);
+            raw.push(b'\n');
+            if eof || quality_len >= len {
+                break eof;
+            }
+        };
+        let (id, sequence, quality) = fasta_file::source_fastq_fields(&raw)?;
+        let quality = quality
+            .into_iter()
+            .filter(|byte| !matches!(byte, b'\r' | b'\n'))
+            .collect();
+        let sequence = sequence
+            .into_iter()
+            .map(|byte| {
+                encoding
+                    .convert(byte)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        emit(ByteFastaRecord {
+            id,
+            sequence,
+            quality: Some(quality),
+        })?;
+        if eof {
+            return Ok(());
+        }
+    }
+}
+
+/// Parse a forward-only input, detecting compression before record decoding.
+pub fn for_each_fasta_reader<R: Read, F: FnMut(FastaRecord) -> io::Result<()>>(
+    reader: R,
+    seq_type: SequenceType,
+    callback: F,
+) -> io::Result<()> {
+    for_each_fasta_decoded(
+        reader,
+        seq_type,
+        8192,
+        crate::util::io::std_stream::DecodeMode::NATIVE_AUTO,
+        "",
+        callback,
+    )
+}
+
+/// Stream an opened sequence source with the configured staging capacity.
+/// This supports non-seekable inputs such as standard input and named pipes.
+pub fn for_each_fasta_reader_with_buffer_size<R: Read, F: FnMut(FastaRecord) -> io::Result<()>>(
+    reader: R,
+    path: &Path,
+    seq_type: SequenceType,
+    buffer_size: usize,
+    callback: F,
+) -> io::Result<()> {
+    for_each_fasta_autodetect_with_buffer_size(reader, path, seq_type, buffer_size, callback)
+}
+
 /// Read a FASTA/FASTQ file one record at a time.
 ///
 /// Unlike [`read_fasta_file`], this keeps only the parser's current record in
@@ -121,8 +451,21 @@ pub fn for_each_fasta_file<F>(path: &Path, seq_type: SequenceType, f: F) -> io::
 where
     F: FnMut(FastaRecord) -> io::Result<()>,
 {
-    let file = std::fs::File::open(path)?;
-    for_each_fasta_autodetect(file, path, seq_type, f)
+    for_each_fasta_file_with_buffer_size(path, seq_type, 8192, f)
+}
+
+/// Search-side explicit input staging capacity, replacing source global config.
+pub fn for_each_fasta_file_with_buffer_size<F>(
+    path: &Path,
+    seq_type: SequenceType,
+    buffer_size: usize,
+    f: F,
+) -> io::Result<()>
+where
+    F: FnMut(FastaRecord) -> io::Result<()>,
+{
+    let input = prepare_source_sequence_reader(path, buffer_size)?;
+    for_each_prepared_sequence_reader(input, seq_type, buffer_size, f)
 }
 
 #[cfg(test)]
@@ -132,73 +475,61 @@ fn read_fasta_autodetect<R: Read>(
     seq_type: SequenceType,
 ) -> io::Result<Vec<FastaRecord>> {
     let mut records = Vec::new();
-    for_each_fasta_autodetect(reader, path, seq_type, |record| {
-        records.push(record);
-        Ok(())
-    })?;
+    for_each_fasta_decoded(
+        reader,
+        seq_type,
+        8192,
+        crate::util::io::std_stream::DecodeMode::NATIVE_AUTO,
+        path.to_string_lossy(),
+        |record| {
+            records.push(record);
+            Ok(())
+        },
+    )?;
     Ok(records)
 }
 
-fn for_each_fasta_autodetect<R, F>(
+fn for_each_fasta_autodetect_with_buffer_size<R: Read, F: FnMut(FastaRecord) -> io::Result<()>>(
     reader: R,
     path: &Path,
     seq_type: SequenceType,
+    buffer_size: usize,
     f: F,
-) -> io::Result<()>
-where
-    R: Read,
-    F: FnMut(FastaRecord) -> io::Result<()>,
-{
-    let mut reader = BufReader::new(reader);
+) -> io::Result<()> {
+    let mode = crate::util::io::std_stream::source_path_mode(path)?;
+    for_each_fasta_decoded(
+        reader,
+        seq_type,
+        buffer_size,
+        mode,
+        path.to_string_lossy(),
+        f,
+    )
+}
 
-    // C++ `detect_compressor` (`diamond/src/util/io/input_file.cpp:52-61`)
-    // sniffs the gzip magic `\x1F\x8B` from the first two bytes of the file,
-    // regardless of file extension. A gzip-compressed query named
-    // `query.fasta` (no `.gz`) would decompress fine in C++ but used to be
-    // read as binary garbage here. Peek the first two bytes to detect gzip
-    // magic before falling back to the extension check.
-    // `fill_buf` leaves the prefix unconsumed, unlike the previous read+seek
-    // implementation. This is the same forward-only boundary as upstream and
-    // permits pipes, FIFOs, and `/dev/stdin`.
-    let prefix = reader.fill_buf()?;
-    let is_gzip = if prefix.len() >= 2 {
-        prefix[..2] == [0x1F, 0x8B]
-    } else {
-        path.extension().is_some_and(|ext| ext == "gz")
-    };
-
-    // Use `MultiGzDecoder` so concatenated gzip members (e.g.
-    // `cat a.fa.gz b.fa.gz > combined.fa.gz`) decompress past the first
-    // member — `GzDecoder` stops at the first member's EOF and silently
-    // truncates the rest. C++ uses zlib which decompresses all members by
-    // default.
-    if is_gzip {
-        let decoder = flate2::read::MultiGzDecoder::new(reader);
-        match seq_type {
-            SequenceType::AminoAcid => for_each_fasta_with_encoding(
-                decoder,
-                &CharRepresentation::new(AMINO_ACID_ALPHABET, MASK_LETTER, b"UO-"),
-                f,
-            ),
-            SequenceType::Nucleotide => for_each_fasta_with_encoding(
-                decoder,
-                &CharRepresentation::new(NUCLEOTIDE_ALPHABET, 4, b"MRWSYKVHDBX"),
-                f,
-            ),
-        }
-    } else {
-        match seq_type {
-            SequenceType::AminoAcid => for_each_fasta_with_encoding(
-                reader,
-                &CharRepresentation::new(AMINO_ACID_ALPHABET, MASK_LETTER, b"UO-"),
-                f,
-            ),
-            SequenceType::Nucleotide => for_each_fasta_with_encoding(
-                reader,
-                &CharRepresentation::new(NUCLEOTIDE_ALPHABET, 4, b"MRWSYKVHDBX"),
-                f,
-            ),
-        }
+fn for_each_fasta_decoded<R: Read, F: FnMut(FastaRecord) -> io::Result<()>>(
+    reader: R,
+    seq_type: SequenceType,
+    buffer_size: usize,
+    mode: crate::util::io::std_stream::DecodeMode,
+    label: impl Into<String>,
+    f: F,
+) -> io::Result<()> {
+    let decoded =
+        crate::util::io::std_stream::decode_source_format_reader(reader, buffer_size, mode, label)?;
+    match seq_type {
+        SequenceType::AminoAcid => for_each_fasta_with_encoding_buffered(
+            decoded,
+            &CharRepresentation::new(AMINO_ACID_ALPHABET, MASK_LETTER, b"UO-"),
+            buffer_size,
+            f,
+        ),
+        SequenceType::Nucleotide => for_each_fasta_with_encoding_buffered(
+            decoded,
+            &CharRepresentation::new(NUCLEOTIDE_ALPHABET, 4, b"MRWSYKVHDBX"),
+            buffer_size,
+            f,
+        ),
     }
 }
 
@@ -217,13 +548,22 @@ fn read_fasta_with_encoding<R: Read>(
 fn for_each_fasta_with_encoding<R, F>(
     reader: R,
     encoding: &CharRepresentation,
-    mut f: F,
+    f: F,
 ) -> io::Result<()>
 where
     R: Read,
     F: FnMut(FastaRecord) -> io::Result<()>,
 {
-    let mut buf_reader = BufReader::new(reader);
+    for_each_fasta_with_encoding_buffered(reader, encoding, 8192, f)
+}
+
+fn for_each_fasta_with_encoding_buffered<R: Read, F: FnMut(FastaRecord) -> io::Result<()>>(
+    reader: R,
+    encoding: &CharRepresentation,
+    buffer_size: usize,
+    mut f: F,
+) -> io::Result<()> {
+    let mut buf_reader = BufReader::with_capacity(buffer_size.max(1), reader);
     {
         let buf = buf_reader.fill_buf()?;
         if buf.is_empty() {
@@ -249,6 +589,7 @@ where
                     );
                 }
                 f(FastaRecord {
+                    quality: None,
                     id: id.to_string(),
                     sequence,
                 })
@@ -263,106 +604,85 @@ where
         }
     }
 
-    let mut current_id: Option<String> = None;
-    let mut current_seq: Vec<Letter> = Vec::new();
-    let mut is_fastq = false;
-    let mut fastq_state = 0u8; // 0=header, 1=seq, 2=plus, 3=qual
-                               // The collecting parser used `records.is_empty()` here.  Keep the same
-                               // parser state explicitly now that records are delivered through a
-                               // callback instead of retained in a Vec.
-    let mut emitted_record = false;
-
-    for line in buf_reader.lines() {
+    // FastqTokenizer reads one sequence line, then enough quality lines to
+    // cover its length. EOF may leave a short quality string in the source.
+    let mut id: Option<String> = None;
+    let mut sequence = Vec::new();
+    let mut quality = String::new();
+    let mut state = 0;
+    let mut header_line = 1;
+    for (index, line) in buf_reader.lines().enumerate() {
         let line = line?;
-        let line = line.trim_end();
-
-        if line.is_empty() {
-            continue;
-        }
-
-        if !is_fastq && line.starts_with('>') {
-            // FASTA header
-            if let Some(id) = current_id.take() {
-                f(FastaRecord {
-                    id,
-                    sequence: std::mem::take(&mut current_seq),
-                })?;
-                emitted_record = true;
-            }
-            // Parse ID: take everything after '>' up to first delimiter
-            // Delimiters match C++: whitespace + \x01 (SOH, used in NCBI FASTA)
-            let header = &line[1..];
-            let id = header
-                .split(|c: char| c.is_whitespace() || c == '\x01')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            current_id = Some(id);
-        } else if line.starts_with('@')
-            && (!emitted_record && current_id.is_none() || fastq_state == 0)
-        {
-            // FASTQ header
-            is_fastq = true;
-            if let Some(id) = current_id.take() {
-                f(FastaRecord {
-                    id,
-                    sequence: std::mem::take(&mut current_seq),
-                })?;
-                emitted_record = true;
-            }
-            let header = &line[1..];
-            let id = header.split_whitespace().next().unwrap_or("").to_string();
-            current_id = Some(id);
-            fastq_state = 1;
-        } else if is_fastq {
-            match fastq_state {
-                1 => {
-                    // Sequence line(s) — continue until we hit a '+' line.
-                    // Bail on invalid characters like C++ does (its
-                    // `CharRepresentation::operator()` throws on unknown
-                    // chars). The previous `if let Ok(letter)` silently
-                    // dropped invalid bytes — that's a faithfulness gap that
-                    // also masks real data corruption from the user.
-                    if line.starts_with('+') {
-                        fastq_state = 3; // skip quality line next
-                    } else {
-                        for ch in line.bytes() {
-                            let letter = encoding.convert(ch).map_err(|e| {
-                                io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                            })?;
-                            current_seq.push(letter);
-                        }
-                    }
+        let line = line.trim_end_matches('\r');
+        match state {
+            0 => {
+                if let Some(previous) = id.take() {
+                    f(FastaRecord {
+                        id: previous,
+                        sequence: std::mem::take(&mut sequence),
+                        quality: Some(std::mem::take(&mut quality)),
+                    })?;
                 }
-                2 => {
-                    // Plus line (unused — handled in state 1)
-                    fastq_state = 3;
-                }
-                3 => {
-                    // Quality line - skip
-                    fastq_state = 0;
-                }
-                _ => {}
+                header_line = index + 1;
+                id = Some(
+                    line.strip_prefix('@')
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Malformed FASTQ record on line {header_line}"),
+                            )
+                        })?
+                        .to_owned(),
+                );
+                state = 1;
             }
-        } else {
-            // FASTA sequence line — error on invalid chars (matches C++).
-            for ch in line.bytes() {
-                let letter = encoding
-                    .convert(ch)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-                current_seq.push(letter);
+            1 => {
+                if line.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Malformed FASTQ record on line {header_line}"),
+                    ));
+                }
+                for letter in line.bytes() {
+                    sequence.push(
+                        encoding
+                            .convert(letter)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                    );
+                }
+                state = 2;
             }
+            2 => {
+                if !line.starts_with('+') {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Malformed FASTQ record",
+                    ));
+                }
+                state = 3;
+            }
+            3 => {
+                quality.push_str(line);
+                if quality.len() >= sequence.len() {
+                    state = 0;
+                }
+            }
+            _ => unreachable!(),
         }
     }
-
-    // Push last record
-    if let Some(id) = current_id {
+    if state == 1 || state == 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Malformed FASTQ record on line {header_line}"),
+        ));
+    }
+    if let Some(id) = id {
         f(FastaRecord {
             id,
-            sequence: current_seq,
+            sequence,
+            quality: Some(quality),
         })?;
     }
-
     Ok(())
 }
 
@@ -373,8 +693,29 @@ pub fn write_fasta<W: io::Write>(
     alphabet: &[u8],
     line_width: usize,
 ) -> io::Result<()> {
+    write_fasta_records(writer, records, alphabet, line_width)
+}
+
+pub fn write_fasta_bytes<W: io::Write>(
+    writer: &mut W,
+    records: &[ByteFastaRecord],
+    alphabet: &[u8],
+    line_width: usize,
+) -> io::Result<()> {
+    write_fasta_records(writer, records, alphabet, line_width)
+}
+
+fn write_fasta_records<W: io::Write, T: AsRef<[u8]>>(
+    writer: &mut W,
+    records: &[FastaRecord<T>],
+    alphabet: &[u8],
+    line_width: usize,
+) -> io::Result<()> {
     for record in records {
-        writeln!(writer, ">{}", record.id)?;
+        writer.write_all(b">")?;
+        // FastaFile::write_seq passes id.c_str() to Util::Seq::format.
+        writer.write_all(crate::util::sequence::c_string_bytes(record.id.as_ref()))?;
+        writer.write_all(b"\n")?;
         for chunk in record.sequence.chunks(line_width) {
             for &letter in chunk {
                 writer.write_all(&[alphabet[letter as usize]])?;
@@ -387,6 +728,25 @@ pub fn write_fasta<W: io::Write>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_fasta_index_callback_counts_original_header_bytes() {
+        let bytes = b">first\xff\r\nAR\n>second\x80\nNC\n";
+        let mut reader = std::io::Cursor::new(bytes);
+        let mut rows = Vec::new();
+        super::read_fasta_bytes(&mut reader, |id, sequence, offset| {
+            rows.push((id.to_vec(), sequence.to_vec(), offset));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (b"first\xff".to_vec(), b"AR".to_vec(), 0),
+                (b"second\x80".to_vec(), b"NC".to_vec(), 12)
+            ]
+        );
+    }
+
     use super::*;
     use crate::basic::value::AMINO_ACID_ALPHABET;
 
@@ -396,6 +756,64 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             self.0.read(buf)
         }
+    }
+
+    #[test]
+    fn prepared_byte_records_preserve_titles_and_quality_without_utf8() {
+        let mut records = Vec::new();
+        for_each_prepared_sequence_reader_bytes(
+            b">q\xff desc\0tail\nARND\n".as_slice(),
+            SequenceType::AminoAcid,
+            2,
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(records[0].id, b"q\xff desc\0tail");
+        assert!(FastaRecord::<String>::try_from(records.pop().unwrap()).is_err());
+        for_each_prepared_sequence_reader_bytes(
+            b"@q\xfe\nARND\n+\n!\xff!?\n".as_slice(),
+            SequenceType::AminoAcid,
+            2,
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(records[0].id, b"q\xfe");
+        assert_eq!(records[0].quality.as_deref(), Some(b"!\xff!?".as_slice()));
+    }
+
+    #[test]
+    fn source_prepared_fastq_uses_record_then_schema_errors() {
+        let mut records = Vec::new();
+        let mut parse = |bytes: &[u8]| {
+            for_each_prepared_sequence_reader(bytes, SequenceType::AminoAcid, 2, |record| {
+                records.push(record);
+                Ok(())
+            })
+        };
+        assert_eq!(
+            parse(b"@q\n?\nARND\n+\n!!!!!\n").unwrap_err().to_string(),
+            "Malformed FASTQ record"
+        );
+        assert_eq!(
+            parse(b"@q\n+\n!\n").unwrap_err().to_string(),
+            "Missing fields in input line"
+        );
+        assert_eq!(
+            parse(b"@q\nARND\n+").unwrap_err().to_string(),
+            "Malformed FASTQ record on line 1"
+        );
+        parse(b"@q\n@ARND\n+\n!!!!!\n").unwrap();
+        parse(b"@q\n@ARND\nQ\n+\n!!!!!!\n").unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sequence, [0, 1, 2, 3]);
+        assert_eq!(records[0].quality.as_deref(), Some("!!!!!"));
+        assert_eq!(records[1].quality.as_deref(), Some("Q"));
     }
 
     #[test]
@@ -532,6 +950,7 @@ mod tests {
     #[test]
     fn test_write_fasta() {
         let records = vec![FastaRecord {
+            quality: None,
             id: "seq1".to_string(),
             sequence: vec![0, 1, 2, 3],
         }];

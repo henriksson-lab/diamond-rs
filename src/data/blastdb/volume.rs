@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 pub use super::pal::Pal;
 pub use super::phr::{
-    build_title, decode_deflines, format_seqid, id_len, tag_name_from_number, BlastDefLine, SeqId,
+    build_title, build_title_bytes, decode_deflines, decode_deflines_bytes, format_seqid,
+    format_seqid_bytes, id_len, tag_name_from_number, BlastDefLine, ByteBlastDefLine, ByteSeqId,
+    SeqId,
 };
 pub use super::pin::PinIndex;
 pub use super::psq::{decode_protein_sequence, length};
@@ -146,6 +148,7 @@ pub struct BlastVolume {
     pub(super) psq_mapping: DiamondFile,
     pub(super) seq_ptr: u32,
     pub(super) hdr_ptr: u32,
+    pub(super) io_errors: crate::util::io::IoErrorOwner,
 }
 
 impl BlastVolume {
@@ -166,6 +169,7 @@ impl BlastVolume {
             psq_mapping,
             seq_ptr: 0,
             hdr_ptr: 0,
+            io_errors: crate::util::io::IoErrorOwner::default(),
         }
     }
 
@@ -189,15 +193,18 @@ impl BlastVolume {
             return Err("Nucleotide sequence decoding is not supported yet".to_string());
         }
         if oid != self.seq_ptr {
-            self.psq_mapping
-                .seek(start as i64, std::io::SeekFrom::Start(0))
-                .map_err(|e| e.to_string())?;
+            self.io_errors.capture(
+                self.psq_mapping
+                    .seek(start as i64, std::io::SeekFrom::Start(0))
+                    .map_err(std::io::Error::other),
+            )?;
         }
         self.seq_ptr = oid + 1;
-        let data = self
-            .psq_mapping
-            .read((end - start) as usize)
-            .map_err(|e| e.to_string())?;
+        let data = self.io_errors.capture(
+            self.psq_mapping
+                .read((end - start) as usize)
+                .map_err(std::io::Error::other),
+        )?;
         decode_protein_sequence(data)
     }
 
@@ -205,9 +212,11 @@ impl BlastVolume {
         let n = (self.index.sequence_index[(self.seq_ptr + count) as usize]
             - self.index.sequence_index[self.seq_ptr as usize]) as usize;
         let mut v = vec![0u8; n];
-        self.psq_mapping
-            .read_exact(&mut v)
-            .map_err(|e| e.to_string())?;
+        self.io_errors.capture(
+            self.psq_mapping
+                .read_exact(&mut v)
+                .map_err(std::io::Error::other),
+        )?;
         self.seq_ptr += count;
         Ok(v)
     }
@@ -396,8 +405,8 @@ mod tests {
         let index = BlastVolume::parse_pin_file(&mut pin, true).unwrap();
         assert_eq!(index.version, 4);
         assert!(index.is_protein);
-        assert_eq!(index.title, "test title");
-        assert_eq!(index.date, "2026-05-14");
+        assert_eq!(index.title, b"test title");
+        assert_eq!(index.date, b"2026-05-14");
         assert_eq!(index.num_oids, 2);
         assert_eq!(index.total_length, 1234);
         assert_eq!(index.max_length, 42);
@@ -411,7 +420,7 @@ mod tests {
         let index5 = BlastVolume::parse_pin_file(&mut pin5, false).unwrap();
         assert_eq!(index5.version, 5);
         assert_eq!(index5.volume_number, 9);
-        assert_eq!(index5.lmdb_file, "lmdb");
+        assert_eq!(index5.lmdb_file, b"lmdb");
         assert!(index5.header_index.is_empty());
 
         std::fs::remove_file(prefix.with_extension("pin")).unwrap();
@@ -536,8 +545,8 @@ mod tests {
         assert_eq!(pal.oid_index, vec![0, 2, 5]);
         assert_eq!(pal.volume(0), 0);
         assert_eq!(pal.volume(2), 1);
-        assert!(pal.metadata["SEQIDLIST"].ends_with("ids.txt"));
-        assert!(pal.metadata["TAXIDLIST"].ends_with("taxids.txt"));
+        assert!(pal.metadata["SEQIDLIST"].ends_with(b"ids.txt"));
+        assert!(pal.metadata["TAXIDLIST"].ends_with(b"taxids.txt"));
 
         std::fs::remove_file(v1.with_extension("pin")).unwrap();
         std::fs::remove_file(v1.with_extension("phr")).unwrap();

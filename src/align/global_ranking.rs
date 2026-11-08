@@ -63,7 +63,11 @@ pub fn target_score(
         return (score, context);
     }
 
-    hits.sort();
+    // Source global_ranking/table.cpp::target_score uses std::sort with
+    // SeedHit's (diag,j) comparator. Equal keys can have different frames;
+    // the next loop deliberately suppresses same-diagonal hits across them.
+    // Preserve the pinned GNU tie permutation instead of Rust stable order.
+    crate::util::algo::source_sort::sort_by(hits, SeedHit::cmp);
     let first = hits[0];
     let mut d = xdrop_ungapped(
         &query_seq[first.frame as usize],
@@ -112,7 +116,10 @@ pub fn merge_hits(
     }
     let count = used_end - table_begin;
     hits.extend_from_slice(&ranking_table[table_begin..used_end]);
-    hits.sort_by(Hit::cmp_oid_score);
+    // Equal OID/score entries may retain different winning contexts from
+    // the current shape and the previous table. Source unique_copy keeps
+    // whichever the pinned std::sort permutation puts first.
+    crate::util::algo::source_sort::sort_by(hits, Hit::cmp_oid_score);
     merged.clear();
     for hit in hits.iter() {
         if merged.last().is_none_or(|last| last.oid != hit.oid) {
@@ -193,7 +200,9 @@ pub fn get_query_hits_reextend(
         );
         out.push(Hit::new(
             target_block.block_id2oid(target_id) as u32,
-            score.min(u16::MAX as i32) as u16,
+            // The source Hit constructor takes uint16_t: this conversion
+            // narrows modulo 2^16, unlike recompute_overflow_scores' clamp.
+            score as u16,
             context,
         ));
     }
@@ -205,7 +214,7 @@ pub fn extend_query_from_query_list<F1, F2>(
     query_list: &QueryList,
     db2block_id: &TargetMap,
     query_seq: &[&[Letter]],
-    query_title: &str,
+    query_title: &(impl AsRef<[u8]> + ?Sized),
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; crate::basic::value::TRUE_AA as usize],
@@ -273,7 +282,7 @@ pub fn extend_query_from_ranking_table<F1, F2>(
     ranking_table: &[Hit],
     db2block_id: &TargetMap,
     query_seq: &[&[Letter]],
-    query_title: &str,
+    query_title: &(impl AsRef<[u8]> + ?Sized),
     source_query_len: i32,
     query_cbs: &[Vec<i8>],
     query_comp: &[f64; crate::basic::value::TRUE_AA as usize],
@@ -304,20 +313,27 @@ where
         return Vec::new();
     }
 
-    let mut query_list = QueryList {
-        query_block_id: source_query_block_id,
-        last_query_block_id: source_query_block_id,
-        targets: Vec::with_capacity(table_end - table_begin),
-    };
-    for hit in &ranking_table[table_begin..table_end] {
-        query_list.targets.push(QueryListTarget {
-            database_id: hit.oid,
+    // This source overload retains each ranked target's winning translated
+    // context. QueryListTarget has no context field and is only appropriate
+    // for the separate merged-query-list overload above.
+    let n = table_end - table_begin;
+    let mut l = crate::align::gapped_filter::SeedHitList::default();
+    l.target_block_ids.reserve(n);
+    l.target_scores.reserve(n);
+    l.seed_hits.reserve(n as u64, 0);
+    for (i, hit) in ranking_table[table_begin..table_end].iter().enumerate() {
+        l.target_block_ids
+            .push(*db2block_id.get(&(hit.oid as u64)).unwrap());
+        l.target_scores.push(TargetScore {
+            target: i as u32,
             score: hit.score,
         });
+        l.seed_hits.next();
+        l.seed_hits
+            .push_item(SeedHit::new(0, 0, hit.score as i32, hit.context as u32));
     }
-    extend_query_from_query_list(
-        &query_list,
-        db2block_id,
+    target::extend_seed_hit_list_mut(
+        source_query_block_id,
         query_seq,
         query_title,
         source_query_len,
@@ -325,6 +341,9 @@ where
         query_comp,
         target_block,
         stats,
+        Flags::FULL_MATRIX,
+        &mut l,
+        ExtensionMode::Full,
         cfg,
         ungapped_cfg,
         score_matrix,
@@ -570,6 +589,137 @@ mod tests {
         assert_eq!(reextended.len(), 1);
         assert_eq!(reextended[0].oid, 10);
         assert!(reextended[0].score > 20);
+    }
+
+    #[test]
+    fn ranked_xdrop_scores_use_source_uint16_narrowing() {
+        let matrix = sm();
+        // These identical diagonal alignments produce raw scores immediately
+        // below/at/above 2^16 without invoking quadratic full-matrix DP.
+        // The exact source Hit constructor was exercised separately at those
+        // integer boundaries: 65535 -> 65535, 65536 -> 0, 66000 -> 464.
+        for (tryptophans, alanines, raw_score, stored_score) in [
+            (5957, 2, 65_535, 65_535),
+            (5956, 5, 65_536, 0),
+            (6000, 0, 66_000, 464),
+        ] {
+            let mut query = vec![17; tryptophans];
+            query.extend(std::iter::repeat_n(0, alanines));
+            assert_eq!(
+                query
+                    .iter()
+                    .map(|&letter| matrix.score(letter, letter))
+                    .sum::<i32>(),
+                raw_score
+            );
+            let mut target = Block::new();
+            target
+                .push_back(
+                    &query,
+                    None,
+                    None,
+                    7,
+                    crate::basic::value::SequenceType::AminoAcid,
+                    0,
+                    false,
+                )
+                .unwrap();
+            let center = query.len() / 2;
+            let mut hits = [SearchHit::with_score(
+                0,
+                target.seqs().position(0, center) as u64,
+                center as u32,
+                255,
+            )];
+            let ranked = get_query_hits_reextend(
+                0,
+                &mut hits,
+                &[query.as_slice()],
+                &target,
+                1,
+                false,
+                20,
+                &matrix,
+            );
+            assert_eq!(ranked, [Hit::new(7, stored_score, 0)], "raw {raw_score}");
+        }
+    }
+
+    #[test]
+    fn ranked_table_extension_retains_forward_and_reverse_contexts() {
+        let matrix = sm();
+        let target_sequence: Vec<Letter> = (0..40).map(|i| (i % 20) as Letter).collect();
+        let mut target = Block::new();
+        target
+            .push_back(
+                &target_sequence,
+                None,
+                None,
+                7,
+                crate::basic::value::SequenceType::AminoAcid,
+                0,
+                false,
+            )
+            .unwrap();
+        let map = TargetMap::from([(7, 0)]);
+        let composition = crate::stats::cbs::compute_composition(&target_sequence);
+        let config = GappedScoreConfig {
+            global_ranking_targets: 2,
+            query_contexts: 6,
+            query_translated: true,
+            max_target_seqs: 10,
+            ..Default::default()
+        };
+        let ungapped = UngappedStageConfig {
+            query_contexts: 6,
+            query_translated: true,
+            ..Default::default()
+        };
+        for context in [1, 4, 5] {
+            let mut frames: [Vec<Letter>; 6] = std::array::from_fn(|frame| {
+                vec![crate::basic::value::MASK_LETTER; if frame % 3 == 0 { 41 } else { 40 }]
+            });
+            frames[context] = target_sequence.clone();
+            let query = frames.each_ref().map(Vec::as_slice);
+            // The selected query is the second table row. Unrelated OIDs in
+            // row zero must not be loaded, and its zero-score tail is ignored.
+            let table = [
+                Hit::new(99, 10, 0),
+                Hit::new(98, 9, 0),
+                Hit::new(7, 80, context as u32),
+                Hit::default(),
+            ];
+            let matches = extend_query_from_ranking_table(
+                1,
+                &table,
+                &map,
+                &query,
+                "translated",
+                123,
+                &[],
+                &composition,
+                &mut target,
+                &mut Statistics::new(),
+                &config,
+                &ungapped,
+                &matrix,
+                HspValues::TRANSCRIPT,
+                |_, _| -1,
+                |_, _| -1,
+                matrix.gap_open(),
+                matrix.gap_extend(),
+                1,
+                100,
+            );
+            assert_eq!(matches.len(), 1, "context {context}");
+            assert_eq!(matches[0].target_block_id, 0);
+            assert!(!matches[0].hsps.is_empty(), "context {context}");
+            assert!(matches[0]
+                .hsps
+                .iter()
+                .all(|hsp| hsp.frame == context as i32));
+            assert_eq!(matches[0].hsps[0].identities, 40);
+        }
     }
 
     #[test]

@@ -16,13 +16,21 @@ extern "C" {
 /// Returns the exit code from DIAMOND.
 #[cfg(all(feature = "ffi", diamond_ffi_available, not(windows)))]
 pub fn run_cpp(args: &[&str]) -> i32 {
+    let args: Vec<&[u8]> = args.iter().map(|value| value.as_bytes()).collect();
+    run_cpp_bytes(&args)
+}
+
+/// Raw argument entry for the explicit, default-off conformance oracle.
+#[cfg(all(feature = "ffi", diamond_ffi_available, not(windows)))]
+pub fn run_cpp_bytes(args: &[&[u8]]) -> i32 {
     let c_strings: Vec<CString> = args
         .iter()
-        .map(|s| CString::new(*s).expect("argument contains null byte"))
+        .map(|value| CString::new(*value).expect("argument contains null byte"))
         .collect();
-    let c_ptrs: Vec<*const c_char> = c_strings.iter().map(|s| s.as_ptr()).collect();
-    let argc = c_int::try_from(c_ptrs.len()).expect("too many arguments for C++ adapter");
-
+    let argc = c_int::try_from(c_strings.len()).expect("too many arguments for C++ adapter");
+    let mut c_ptrs: Vec<*const c_char> = c_strings.iter().map(|value| value.as_ptr()).collect();
+    // C main's argv contract includes argv[argc] == nullptr.
+    c_ptrs.push(std::ptr::null());
     unsafe { diamond_main(argc, c_ptrs.as_ptr()) }
 }
 

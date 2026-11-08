@@ -45,43 +45,44 @@ pub fn write_paf_record<W: Write>(writer: &mut W, r: &PafRecord<'_>) -> io::Resu
 }
 
 /// Matches C++ `PAFFormat::print_match(const HspContext&)`.
-pub fn print_match_context<W: Write>(
+pub fn print_match_context_bytes<W: Write, T: AsRef<[u8]>>(
     writer: &mut W,
-    r: &HspContext,
+    r: &HspContext<T>,
     score_matrix: &ScoreMatrix,
 ) -> io::Result<()> {
-    print_match_context_with_command(writer, r, score_matrix, false)
+    print_match_context_with_command_bytes(writer, r, score_matrix, false)
 }
 
 /// Full mapping of C++ `PAFFormat::print_match`, including the `WITH_DNA`
 /// `config.command == blastn` output branch.
-pub fn print_match_context_with_command<W: Write>(
+pub fn print_match_context_with_command_bytes<W: Write, T: AsRef<[u8]>>(
     writer: &mut W,
-    r: &HspContext,
+    r: &HspContext<T>,
     score_matrix: &ScoreMatrix,
     blastn_command: bool,
 ) -> io::Result<()> {
-    let query_id = r
-        .query_title
-        .split(|c: char| ID_DELIMITERS.contains(c))
-        .next()
-        .unwrap_or("");
-    let target_title = print_title(&r.target_title, false, false, "<>", false);
+    let query_id = crate::util::sequence::seqid_bytes(r.query_title.as_ref());
+    let target_title =
+        super::format::print_title_bytes(r.target_title.as_ref(), false, false, b"<>", false);
     let strand = if Frame::from_index(r.frame() as i32).strand == Strand::Forward {
         '+'
     } else {
         '-'
     };
 
+    writer.write_all(&query_id)?;
     write!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
-        query_id,
+        "\t{}\t{}\t{}\t{}\t",
         r.query_len,
         r.query_source_range().begin,
         r.query_source_range().end - 1,
-        strand,
-        target_title,
+        strand
+    )?;
+    writer.write_all(&target_title)?;
+    write!(
+        writer,
+        "\t{}\t{}\t{}\t{}\t{}\t",
         r.subject_len,
         r.subject_range().begin,
         r.subject_range().end - 1,
@@ -108,17 +109,15 @@ pub fn print_match_context_with_command<W: Write>(
 }
 
 /// Matches C++ `PAFFormat::print_query_intro()`.
-pub fn print_query_intro<W: Write>(
+pub fn print_query_intro_bytes<W: Write>(
     writer: &mut W,
-    query_title: &str,
+    query_title: &[u8],
     unaligned: bool,
 ) -> io::Result<()> {
     if unaligned {
-        let query_id = query_title
-            .split(|c: char| ID_DELIMITERS.contains(c))
-            .next()
-            .unwrap_or("");
-        writeln!(writer, "{}\t4\t*\t0\t255\t*\t*\t0\t0\t*\t*", query_id)?;
+        let query_id = crate::util::sequence::seqid_bytes(query_title);
+        writer.write_all(&query_id)?;
+        writeln!(writer, "\t4\t*\t0\t255\t*\t*\t0\t0\t*\t*")?;
     }
     Ok(())
 }
@@ -250,4 +249,30 @@ mod tests {
         print_query_intro(&mut buf, "query one", false).unwrap();
         assert!(buf.is_empty());
     }
+}
+
+// String compatibility entry points share the raw renderer.
+pub fn print_match_context<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    score_matrix: &ScoreMatrix,
+) -> io::Result<()> {
+    print_match_context_bytes(writer, r, score_matrix)
+}
+
+pub fn print_match_context_with_command<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    score_matrix: &ScoreMatrix,
+    blastn_command: bool,
+) -> io::Result<()> {
+    print_match_context_with_command_bytes(writer, r, score_matrix, blastn_command)
+}
+
+pub fn print_query_intro<W: Write>(
+    writer: &mut W,
+    query_title: &str,
+    unaligned: bool,
+) -> io::Result<()> {
+    print_query_intro_bytes(writer, query_title.as_bytes(), unaligned)
 }

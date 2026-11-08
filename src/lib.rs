@@ -55,6 +55,8 @@ pub mod stats;
 #[path = "lib/tantan/mod.rs"]
 pub mod tantan;
 pub mod tools;
+#[path = "test/mod.rs"]
+pub mod upstream_test;
 pub mod util;
 
 /// Convenient re-exports for common types.
@@ -69,25 +71,23 @@ pub mod prelude {
     pub use crate::stats::score_matrix::ScoreMatrix;
 }
 
-/// Run DIAMOND with command-line arguments through the C++ FFI implementation.
+/// Run connected DIAMOND commands through the native Rust dispatcher.
 ///
-/// The FFI backend is intended for non-Windows conformance testing and is only
-/// available when a source checkout containing the adjacent upstream
-/// `diamond/` tree is built with `--features ffi`.
+/// Returns the command status without terminating the calling process. The
+/// first argument is the program name. Untranslated commands/options return
+/// an explicit error; C++ conformance is available separately via `ffi::run_cpp`
+/// only in a feature-enabled source checkout.
 ///
-/// # Example
-/// ```rust,no_run,ignore
-/// let code = diamond::run(&["diamond", "version"]);
-/// assert_eq!(code, 0);
+/// ```no_run
+/// assert_eq!(diamond::run(&["diamond", "version"]), 0);
 /// ```
-#[cfg(all(feature = "ffi", diamond_ffi_available, not(windows)))]
 pub fn run(args: &[&str]) -> i32 {
-    crate::ffi::run(args)
+    crate::commands::dispatch::run(args)
 }
 
-/// Fallback when the C++ FFI backend is not compiled.
-#[cfg(not(all(feature = "ffi", diamond_ffi_available, not(windows))))]
-pub fn run(_args: &[&str]) -> i32 {
-    eprintln!("C++ FFI backend is not available in this build.");
-    1
+/// Run the native CLI with OS arguments, preserving Unix filename bytes and
+/// Windows UTF-16 paths. No production route invokes the C++ oracle.
+pub fn run_os(args: &[&std::ffi::OsStr]) -> i32 {
+    let args: Vec<std::ffi::OsString> = args.iter().map(|value| (*value).to_owned()).collect();
+    crate::commands::dispatch::run_os(&args)
 }

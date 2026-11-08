@@ -1,19 +1,22 @@
 //! External-clustering output assembly from
 //! `diamond/src/cluster/external/output.cpp`.
 //!
-//! The C++ thread pools, cross-process queues, and radix-sort workers are
-//! represented by deterministic local passes over the same radix files. File
-//! formats, ordering, names, round composition, and cleanup remain unchanged.
+//! File-backed queues retain Source's output phases and its single-pass
+//! variable-record radix protocol. Accession bytes remain uninterpreted.
 
+use crate::util::io::source_c_path;
 use std::cmp::Ordering;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use super::external::Job;
 use super::pair_table::{Bucket, RadixedTable, RADIX_BITS, RADIX_COUNT};
 use super::seed_table::VolumedFile;
+use super::storage::BucketWriter;
 use crate::basic::value::OId;
-use crate::util::io::{CompressedBuffer, InputFile};
+use crate::util::io::InputFile;
+use crate::util::parallel::{Atomic, FileStack};
 
 pub const ACC_MAPPING_NIL: OId = OId::MAX;
 
@@ -114,8 +117,7 @@ pub fn read_clustering(job: &Job, round: i32) -> Result<Vec<OId>, String> {
             .base_dir(Some(round))
             .join("clustering")
             .join(format!("volume{volume}"));
-        let bytes =
-            fs::read(&path).map_err(|_| format!("Error opening file: {}", path.display()))?;
+        let bytes = job.read_plain_file(&path)?;
         let record_count = bytes.len() / std::mem::size_of::<OId>();
         let end = offset
             .checked_add(record_count)
@@ -152,17 +154,159 @@ pub fn merge(job: &Job) -> Result<Vec<OId>, String> {
 }
 
 pub fn output_oids(merged: &[OId], output_file: &Path) -> Result<OId, String> {
-    let mut bytes = Vec::new();
+    output_oids_owned(merged, output_file, &Default::default())
+}
+
+fn output_oids_owned(
+    merged: &[OId],
+    output_file: &Path,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<OId, String> {
+    let mut output = fs::File::create(source_c_path(&(output_file)).as_ref())
+        .map_err(|_| super::storage::path_error(errors, b"Error opening file: ", output_file))?;
     let mut clusters = 0;
     for (member, &rep) in merged.iter().enumerate() {
         if rep == member as OId {
             clusters += 1;
         }
-        bytes.extend_from_slice(format!("{rep}\t{member}\n").as_bytes());
+        // Source checks fopen alone; fprintf/fclose failures are ignored.
+        let _ = output.write_all(format!("{rep}\t{member}\n").as_bytes());
     }
-    fs::write(output_file, bytes)
-        .map_err(|_| format!("Error opening file: {}", output_file.display()))?;
     Ok(clusters)
+}
+
+// The pinned GNU64 Source ABI charges two uint64_t fields and two
+// std::pmr::strings (40 bytes each). This is an allocation heuristic, not the
+// serialized size or Rust's String/Vec layout. The reference object performs
+// the corresponding multiply by 96 in radix_sort<AccMapping>.
+const SOURCE_ACC_MAPPING_SIZE: u64 = 96;
+
+#[derive(Debug, Eq, PartialEq)]
+struct SourceAccMapping {
+    rep: OId,
+    member: OId,
+    rep_acc: Vec<u8>,
+    member_acc: Vec<u8>,
+}
+
+impl Ord for SourceAccMapping {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.rep, self.member).cmp(&(other.rep, other.member))
+    }
+}
+impl PartialOrd for SourceAccMapping {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl SourceAccMapping {
+    fn serialize(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(18 + self.rep_acc.len() + self.member_acc.len());
+        bytes.extend_from_slice(&self.rep.to_ne_bytes());
+        bytes.extend_from_slice(&self.member.to_ne_bytes());
+        bytes.extend_from_slice(&self.rep_acc);
+        bytes.push(0);
+        bytes.extend_from_slice(&self.member_acc);
+        bytes.push(0);
+        bytes
+    }
+    fn deserialize(job: &Job, input: &mut InputFile) -> Result<Self, String> {
+        fn string(job: &Job, input: &mut InputFile) -> Result<Vec<u8>, String> {
+            let mut bytes = Vec::new();
+            loop {
+                let byte = job.io(input.read_value::<u8>())?;
+                if byte == 0 {
+                    return Ok(bytes);
+                }
+                bytes.push(byte);
+            }
+        }
+        Ok(Self {
+            rep: job.io(input.read_u64())?,
+            member: job.io(input.read_u64())?,
+            rep_acc: string(job, input)?,
+            member_acc: string(job, input)?,
+        })
+    }
+}
+
+/// Source std::getline removes only LF and does not throw on read failure.
+/// Its round-one ifstream is unchecked; round two checks the constructor alone.
+fn accession_lines(
+    path: &Path,
+    errors: &crate::util::io::IoErrorOwner,
+    checked_open: bool,
+    max_lines: Option<u64>,
+    mut visit: impl FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    let file = match fs::File::open(source_c_path(&(path)).as_ref()) {
+        Ok(file) => file,
+        Err(_) if !checked_open => return Ok(()),
+        Err(_) => {
+            return Err(super::storage::path_error(
+                errors,
+                b"Error opening file: ",
+                path,
+            ))
+        }
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut lines = 0_u64;
+    while max_lines.map_or(true, |limit| lines < limit) {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        visit(&line)?;
+        lines += 1;
+    }
+    Ok(())
+}
+
+fn accession_volumes(path: &Path) -> Result<Vec<(PathBuf, u64)>, String> {
+    accession_volumes_owned(path, &Default::default())
+}
+
+fn accession_volumes_owned(
+    path: &Path,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<Vec<(PathBuf, u64)>, String> {
+    // VolumedFile checks ifstream construction, then reads lines without an
+    // exception mask. Preserve that class rather than reporting FileOpenError.
+    let file = fs::File::open(source_c_path(&(path)).as_ref())
+        .map_err(|_| super::storage::path_error(errors, b"Error opening file ", path))?;
+    let mut reader = BufReader::new(file);
+    let mut rows = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let mut fields = line
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty());
+        let file = fields.next().ok_or("Format error in VolumedFile")?;
+        let count = std::str::from_utf8(fields.next().ok_or("Format error in VolumedFile")?)
+            .map_err(|_| "Format error in VolumedFile")?
+            .parse::<u64>()
+            .map_err(|_| "Format error in VolumedFile")?;
+        rows.push((
+            PathBuf::from(
+                errors.capture(
+                    crate::util::io::source_bytes_os(file).map_err(std::io::Error::other),
+                )?,
+            ),
+            count,
+        ));
+    }
+    Ok(rows)
 }
 
 pub fn output_accs_round1(
@@ -178,58 +322,163 @@ pub fn output_accs_round1(
         ));
     }
     let base_dir = job.root_dir().join("output");
-    fs::create_dir_all(&base_dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(source_c_path(&base_dir).as_ref()).map_err(|error| error.to_string())?;
+    let mut output =
+        BucketWriter::new_owned(&base_dir, job.worker_id(), RADIX_COUNT, job.io_errors())?;
+    let queue = Atomic::new(base_dir.join("queue_round1"));
     let shift = bit_length(job.max_oid).saturating_sub(RADIX_BITS);
-    let mut mappings = vec![Vec::<AccMapping>::new(); RADIX_COUNT];
-    for (index, volume) in volumes.0.iter().take(job.volumes).enumerate() {
+    let mut counts = vec![0_u64; RADIX_COUNT];
+    loop {
+        let index =
+            usize::try_from(queue.fetch_add_one()?).map_err(|_| "Negative output volume index")?;
+        if index >= job.volumes {
+            break;
+        }
+        let volume = &volumes.0[index];
+        job.log(&format!(
+            "Building output (round 1). Volume={}/{}",
+            index + 1,
+            job.volumes
+        ))?;
         let path = job
             .root_dir()
             .join("accessions")
             .join(format!("{index}.txt"));
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.to_string()),
-        };
         let mut oid = volume.oid_begin;
-        for accession in text.lines() {
+        accession_lines(&path, &job.io_errors(), false, None, |accession| {
             let rep = *merged
                 .get(oid as usize)
                 .ok_or_else(|| format!("Accession OID out of range: {oid}"))?;
-            let radix = ((rep >> shift) & (RADIX_COUNT as u64 - 1)) as usize;
-            mappings[radix].push(AccMapping::new(rep, oid, accession.to_owned()));
+            let radix = usize::try_from(rep >> shift).map_err(|_| "Accession radix overflow")?;
+            let count = counts
+                .get_mut(radix)
+                .ok_or("Accession radix out of range")?;
+            let entry = SourceAccMapping {
+                rep,
+                member: oid,
+                rep_acc: Vec::new(),
+                member_acc: accession.to_vec(),
+            };
+            output.write(radix, &entry.serialize())?;
+            *count += 1;
             oid += 1;
-        }
+            Ok(())
+        })?;
     }
+    let mut table = output.finish()?;
+    for (bucket, count) in table.0.iter_mut().zip(counts) {
+        bucket.records = Some(count);
+    }
+    Ok(table)
+}
 
-    let mut buckets = Vec::with_capacity(RADIX_COUNT);
-    for (radix, entries) in mappings.into_iter().enumerate() {
-        let directory = base_dir.join(radix.to_string());
-        fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-        let manifest = directory.join("bucket.tsv");
-        if entries.is_empty() {
-            fs::write(&manifest, []).map_err(|error| error.to_string())?;
-        } else {
-            let volume = directory.join(format!("worker_{}_volume_0", job.worker_id()));
-            let mut compressed = CompressedBuffer::new();
-            for entry in &entries {
-                let mut bytes = Vec::new();
-                entry.serialize(&mut bytes);
-                compressed
-                    .write(&bytes)
-                    .map_err(|error| error.to_string())?;
-            }
-            compressed.finish().map_err(|error| error.to_string())?;
-            fs::write(&volume, compressed.data()).map_err(|error| error.to_string())?;
-            fs::write(
-                &manifest,
-                format!("{}\t{}\n", volume.display(), entries.len()),
-            )
-            .map_err(|error| error.to_string())?;
+fn radix_cluster_accessions(
+    job: &Job,
+    volumes: &[(PathBuf, u64)],
+    directory: &Path,
+    bits_unsorted: u32,
+) -> Result<RadixedTable, String> {
+    let mut output =
+        BucketWriter::new_owned(directory, job.worker_id(), RADIX_COUNT, job.io_errors())?;
+    let shift = bits_unsorted - RADIX_BITS;
+    let mut counts = vec![0_u64; RADIX_COUNT];
+    for (path, count) in volumes {
+        let mut input = job.open_input(path, 0)?;
+        for _ in 0..*count {
+            let record = SourceAccMapping::deserialize(job, &mut input)?;
+            let radix = ((record.rep >> shift) & (RADIX_COUNT as u64 - 1)) as usize;
+            output.write(radix, &record.serialize())?;
+            counts[radix] += 1;
         }
-        buckets.push(Bucket::new(manifest, Some(entries.len() as u64)));
+        job.io(input.close())?;
     }
-    Ok(RadixedTable(buckets))
+    let mut table = output.finish()?;
+    for (bucket, count) in table.0.iter_mut().zip(counts) {
+        bucket.records = Some(count);
+    }
+    job.log(&format!(
+        "Radix sorted bucket records={}",
+        volumes.iter().map(|(_, n)| *n).sum::<u64>()
+    ))?;
+    Ok(table)
+}
+
+fn radix_sort_accessions(
+    job: &Job,
+    table: RadixedTable,
+    bits_unsorted: u32,
+) -> Result<RadixedTable, String> {
+    if bits_unsorted < RADIX_BITS {
+        return Ok(table);
+    }
+    let first = table.first().ok_or("base_path")?;
+    let base = super::external::base_path(&first.path)?;
+    let queue = Atomic::new(base.join("radix_sort_queue"));
+    let manifest_path = base.join("radix_sort_out");
+    let manifest = FileStack::try_new_owned(&manifest_path, job.io_errors())?;
+    let mut processed = 0_i64;
+    loop {
+        let index =
+            usize::try_from(queue.fetch_add_one()?).map_err(|_| "Negative radix bucket index")?;
+        let Some(bucket) = table.get(index) else {
+            break;
+        };
+        let volumes = accession_volumes_owned(&bucket.path, &job.io_errors())?;
+        let count: u64 = volumes.iter().map(|(_, n)| *n).sum();
+        let bytes = count.wrapping_mul(SOURCE_ACC_MAPPING_SIZE);
+        job.log(&format!(
+            "Radix sorting. Bucket={}/{} Records={} Size={}",
+            index + 1,
+            table.len(),
+            crate::util::string::format(count),
+            crate::util::string::format(bytes)
+        ))?;
+        if bytes > job.mem_limit {
+            let children = radix_cluster_accessions(
+                job,
+                &volumes,
+                bucket.path.parent().ok_or("base_path")?,
+                bits_unsorted,
+            )?;
+            let mut text = Vec::new();
+            // Source appends every child, including empty buckets. It neither
+            // recurses into skewed children nor removes the old input here.
+            for child in children.iter() {
+                text.extend_from_slice(&job.io(super::storage::manifest_line(
+                    &child.path,
+                    &[child.record_count_owned(&job.io_errors())?],
+                ))?);
+            }
+            manifest.push_bytes(&text)?;
+        } else if count > 0 {
+            manifest.push_bytes(&job.io(super::storage::manifest_line(&bucket.path, &[count]))?)?;
+        } else {
+            for (path, _) in volumes {
+                let _ = fs::remove_file(source_c_path(&(path)).as_ref());
+            }
+            let _ = fs::remove_file(source_c_path(&bucket.path).as_ref());
+            if let Some(parent) = bucket.path.parent() {
+                let _ = fs::remove_dir(source_c_path(&(parent)).as_ref());
+            }
+        }
+        processed += 1;
+    }
+    let finished = Atomic::new(base.join("radix_sort_finished"));
+    finished.fetch_add(processed)?;
+    finished.await_value(table.len() as i64)?;
+    RadixedTable::from_manifest_owned(manifest_path, &job.io_errors())
+}
+
+fn read_acc_bucket(job: &Job, bucket: &Bucket) -> Result<Vec<SourceAccMapping>, String> {
+    let mut entries = Vec::new();
+    for (path, count) in accession_volumes_owned(&bucket.path, &job.io_errors())? {
+        let mut input = job.open_input(&path, 0)?;
+        for _ in 0..count {
+            entries.push(SourceAccMapping::deserialize(job, &mut input)?);
+        }
+        job.io(input.close())?;
+    }
+    Ok(entries)
 }
 
 pub fn output_accs(
@@ -239,82 +488,103 @@ pub fn output_accs(
     output_file: &Path,
 ) -> Result<OId, String> {
     let round1 = output_accs_round1(job, merged, database)?;
-    let accession_by_oid = read_accessions(job, database)?;
+    let round1 = radix_sort_accessions(
+        job,
+        round1,
+        bit_length(job.max_oid).saturating_sub(RADIX_BITS),
+    )?;
+    let queue = Atomic::new(job.root_dir().join("output/queue_round2"));
     let digits = decimal_digits(job.max_oid);
     let mut cluster_count = 0;
-    for bucket in round1.iter() {
-        let mut entries = read_acc_bucket(bucket)?;
+    loop {
+        let index =
+            usize::try_from(queue.fetch_add_one()?).map_err(|_| "Negative output bucket index")?;
+        let Some(bucket) = round1.get(index) else {
+            break;
+        };
+        let mut entries = read_acc_bucket(job, bucket)?;
+        job.log(&format!(
+            "Building output (round 2). Bucket={}/{} Records={} Size={}",
+            index + 1,
+            round1.len(),
+            crate::util::string::format(entries.len() as u64),
+            crate::util::string::format(
+                (entries.len() as u64).wrapping_mul(SOURCE_ACC_MAPPING_SIZE)
+            )
+        ))?;
         if entries.is_empty() {
             continue;
         }
-        entries.sort_unstable();
-        let mut begin = 0;
-        while begin < entries.len() {
-            let rep = entries[begin].rep;
-            let mut end = begin + 1;
-            while end < entries.len() && entries[end].rep == rep {
-                end += 1;
+        entries.sort();
+        let oid_begin = entries[0].rep;
+        let oid_end = entries
+            .last()
+            .unwrap()
+            .rep
+            .checked_add(1)
+            .ok_or("Accession OID overflow")?;
+        for (volume_index, volume) in database.0.iter().enumerate() {
+            if volume.oid_end <= oid_begin || volume.oid_begin >= oid_end {
+                continue;
             }
-            let rep_acc = accession_by_oid
-                .get(rep as usize)
-                .and_then(Option::as_deref)
-                .ok_or_else(|| format!("Representative accession not found for OID: {rep}"))?;
-            let path = PathBuf::from(format!("{}.{rep:0digits$}", output_file.display()));
-            let mut output = Vec::new();
-            for entry in &entries[begin..end] {
-                output.extend_from_slice(rep_acc.as_bytes());
-                output.push(b'\t');
-                output.extend_from_slice(entry.member_acc.as_bytes());
-                output.push(b'\n');
-            }
-            fs::write(&path, output)
-                .map_err(|_| format!("Error opening file: {}", path.display()))?;
-            cluster_count += 1;
-            begin = end;
+            let mut position = entries.partition_point(|entry| entry.rep < volume.oid_begin);
+            let mut file_oid = volume.oid_begin;
+            let path = job
+                .root_dir()
+                .join("accessions")
+                .join(format!("{volume_index}.txt"));
+            let mut output: Option<fs::File> = None;
+            let mut opened = false;
+            let mut failed = false;
+            accession_lines(
+                &path,
+                &job.io_errors(),
+                true,
+                Some(oid_end.saturating_sub(volume.oid_begin)),
+                |accession| {
+                    if file_oid >= oid_end || position >= entries.len() {
+                        return Ok(());
+                    }
+                    if entries[position].rep > file_oid {
+                        file_oid += 1;
+                        return Ok(());
+                    }
+                    let begin = position;
+                    while position < entries.len() && entries[position].rep == file_oid {
+                        if !opened {
+                            let mut name = output_file.as_os_str().to_os_string();
+                            name.push(format!(".{:0digits$}", entries[position].rep));
+                            let name = PathBuf::from(name);
+                            output = fs::File::create(source_c_path(&(name)).as_ref()).ok();
+                            failed = output.is_none();
+                            opened = true;
+                        }
+                        if !failed {
+                            if let Some(file) = &mut output {
+                                let mut row = Vec::with_capacity(
+                                    accession.len() + entries[position].member_acc.len() + 2,
+                                );
+                                row.extend_from_slice(accession);
+                                row.push(b'\t');
+                                row.extend_from_slice(&entries[position].member_acc);
+                                row.push(b'\n');
+                                if file.write_all(&row).is_err() {
+                                    failed = true;
+                                }
+                            }
+                        }
+                        position += 1;
+                    }
+                    if position > begin {
+                        cluster_count += 1;
+                    }
+                    file_oid += 1;
+                    Ok(())
+                },
+            )?;
         }
     }
     Ok(cluster_count)
-}
-
-fn read_acc_bucket(bucket: &Bucket) -> Result<Vec<AccMapping>, String> {
-    let manifest = fs::read_to_string(&bucket.path).map_err(|error| error.to_string())?;
-    let mut entries = Vec::new();
-    for line in manifest.lines().filter(|line| !line.trim().is_empty()) {
-        let mut fields = line.split_whitespace();
-        let path = fields
-            .next()
-            .ok_or_else(|| "Format error in VolumedFile".to_owned())?;
-        let count = fields
-            .next()
-            .ok_or_else(|| "Format error in VolumedFile".to_owned())?
-            .parse::<usize>()
-            .map_err(|_| "Format error in VolumedFile".to_owned())?;
-        let mut input = InputFile::new(path, 0).map_err(|error| error.to_string())?;
-        for _ in 0..count {
-            entries.push(AccMapping::deserialize(&mut input)?);
-        }
-    }
-    Ok(entries)
-}
-
-fn read_accessions(job: &Job, database: &VolumedFile) -> Result<Vec<Option<String>>, String> {
-    let mut accessions = vec![None; job.max_oid as usize + 1];
-    for (index, volume) in database.0.iter().enumerate() {
-        let path = job
-            .root_dir()
-            .join("accessions")
-            .join(format!("{index}.txt"));
-        let text = fs::read_to_string(&path)
-            .map_err(|_| format!("Error opening file: {}", path.display()))?;
-        for (offset, accession) in text.lines().enumerate() {
-            let oid = volume.oid_begin as usize + offset;
-            let slot = accessions
-                .get_mut(oid)
-                .ok_or_else(|| format!("Accession OID out of range: {oid}"))?;
-            *slot = Some(accession.to_owned());
-        }
-    }
-    Ok(accessions)
 }
 
 pub fn output(
@@ -325,7 +595,7 @@ pub fn output(
     job.log("Generating output")?;
     let merged = merge(job)?;
     let cluster_count = if config.oid_output {
-        output_oids(&merged, &config.output_file)?
+        output_oids_owned(&merged, &config.output_file, &job.io_errors())?
     } else {
         output_accs(job, &merged, volumes, &config.output_file)?
     };
@@ -348,15 +618,23 @@ fn cleanup_round_files(job: &Job) -> Result<(), String> {
     for round in (0..job.round_index()).rev() {
         let manifest = job.base_dir(Some(round)).join("reps").join("reps.tsv");
         if manifest.exists() {
-            let text = fs::read_to_string(&manifest).map_err(|error| error.to_string())?;
-            for line in text.lines().filter(|line| !line.trim().is_empty()) {
-                if let Some(path) = line.split_whitespace().next() {
-                    remove_if_present(Path::new(path))?;
+            let text =
+                fs::read(source_c_path(&manifest).as_ref()).map_err(|error| error.to_string())?;
+            for line in text
+                .split(|&b| b == b'\n')
+                .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+            {
+                if let Some(path) = line
+                    .split(u8::is_ascii_whitespace)
+                    .find(|field| !field.is_empty())
+                {
+                    let path = job.io(crate::util::io::source_bytes_os(path))?;
+                    remove_if_present(Path::new(&path))?;
                 }
             }
             remove_if_present(&manifest)?;
             if let Some(directory) = manifest.parent() {
-                let _ = fs::remove_dir(directory);
+                let _ = fs::remove_dir(source_c_path(&(directory)).as_ref());
             }
         }
         for volume in 0..job.volumes {
@@ -372,7 +650,7 @@ fn cleanup_round_files(job: &Job) -> Result<(), String> {
 
 fn remove_if_present(path: &Path) -> Result<(), String> {
     // C++ intentionally ignores `remove(3)` return values during cleanup.
-    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(source_c_path(&(path)).as_ref());
     Ok(())
 }
 
@@ -503,15 +781,102 @@ mod tests {
             fs::read_to_string(root.join("clusters.4")).unwrap(),
             "E\tE\n"
         );
-        let radix = output_accs_round1(&job, &[0, 0, 2, 2, 4], &volumes).unwrap();
+        // The actual Source round-one queue is persistent. Inspect the
+        // completed manifests instead of invoking that phase twice in a job.
         assert_eq!(
-            radix
-                .iter()
-                .map(|bucket| bucket.record_count().unwrap())
+            (0..RADIX_COUNT)
+                .map(
+                    |radix| accession_volumes(&root.join(format!("output/{radix}/bucket.tsv")))
+                        .unwrap()
+                        .iter()
+                        .map(|(_, count)| *count)
+                        .sum::<u64>()
+                )
                 .sum::<u64>(),
             5
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_bucket_representatives_share_one_source_volume_output_owner() {
+        let root = temp_dir("same_bucket_owner");
+        let count = 512;
+        let job = Job::new(count - 1, 1, 1_000_000_000, &root, 0).unwrap();
+        let volumes = VolumedFile(vec![Volume::new(root.join("unused"), 0, count, count)]);
+        fs::create_dir_all(root.join("accessions")).unwrap();
+        let ids: Vec<Vec<u8>> = (0..count)
+            .map(|i| {
+                let mut id = format!("A{i}").into_bytes();
+                if i == 1 {
+                    id.push(0xff);
+                }
+                id
+            })
+            .collect();
+        let input: Vec<u8> = ids
+            .iter()
+            .flat_map(|id| id.iter().copied().chain([b'\n']))
+            .collect();
+        fs::write(root.join("accessions/0.txt"), input).unwrap();
+        let merged: Vec<_> = (0..count).map(|i| i % 2).collect();
+        assert_eq!(
+            output_accs(&job, &merged, &volumes, &root.join("clusters")).unwrap(),
+            2
+        );
+        assert!(!root.join("clusters.001").exists());
+        let mut expected = Vec::new();
+        for rep in 0..2 {
+            for member in (rep..count as usize).step_by(2) {
+                expected.extend_from_slice(&ids[rep]);
+                expected.push(b'\t');
+                expected.extend_from_slice(&ids[member]);
+                expected.push(b'\n');
+            }
+        }
+        assert_eq!(fs::read(root.join("clusters.000")).unwrap(), expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_nonpod_memory_charge_adds_one_radix_pass_and_changes_owner_boundaries() {
+        let count = 65_536_u64;
+        assert_eq!(count * SOURCE_ACC_MAPPING_SIZE, 6_291_456);
+        let ids: Vec<u8> = (0..count)
+            .flat_map(|i| format!("A{i}\n").into_bytes())
+            .collect();
+        let merged: Vec<_> = (0..count).map(|i| i % 2).collect();
+        for (name, memory, split) in [("large", 1_000_000_000, false), ("small", 5_000_000, true)] {
+            let root = temp_dir(name);
+            let job = Job::new(count - 1, 1, memory, &root, 0).unwrap();
+            let volumes = VolumedFile(vec![Volume::new(root.join("unused"), 0, count, count)]);
+            fs::create_dir_all(root.join("accessions")).unwrap();
+            fs::write(root.join("accessions/0.txt"), &ids).unwrap();
+            assert_eq!(
+                output_accs(&job, &merged, &volumes, &root.join("clusters")).unwrap(),
+                2
+            );
+            assert_eq!(root.join("clusters.00001").exists(), split);
+            let first = fs::read(root.join("clusters.00000")).unwrap();
+            let second = if split {
+                fs::read(root.join("clusters.00001")).unwrap()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                first.iter().filter(|&&b| b == b'\n').count()
+                    + second.iter().filter(|&&b| b == b'\n').count(),
+                count as usize
+            );
+            let manifest = fs::read_to_string(root.join("output/radix_sort_out")).unwrap();
+            assert_eq!(
+                manifest.lines().count(),
+                if split { RADIX_COUNT } else { 1 }
+            );
+            assert_eq!(root.join("output/0/0/bucket.tsv").exists(), split);
+            assert!(root.join("output/0/bucket.tsv").exists()); // Source retains spill input.
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

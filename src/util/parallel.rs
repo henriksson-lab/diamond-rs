@@ -10,6 +10,7 @@ pub mod filestack;
 /// Serialization and path helpers from `util/parallel/multiprocessing.{h,cpp}`.
 pub mod multiprocessing;
 pub mod parallelizer;
+pub(crate) mod ordered_pipeline;
 
 pub use filestack::FileStack;
 pub use parallelizer::Parallelizer;

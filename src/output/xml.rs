@@ -1,6 +1,8 @@
 use std::io::{self, Write};
 
-use super::format::{format_double, format_evalue, print_title_xml};
+use super::format::{
+    format_default_float, format_double, format_evalue, format_fixed_float, print_title_xml,
+};
 use crate::align::hsp::HspContext;
 use crate::basic::consts::VERSION_STRING;
 use crate::basic::value::{Letter, AMINO_ACID_ALPHABET, LETTER_MASK};
@@ -56,16 +58,40 @@ pub fn write_xml_header<W: Write>(writer: &mut W, program: &str, database: &str)
 }
 
 /// Matches C++ `XMLFormat::print_header()`.
-pub fn print_header<W: Write>(
+pub fn print_header_bytes<W: Write>(
     writer: &mut W,
     mode: u32,
     matrix: &str,
     gap_open: i32,
     gap_extend: i32,
     evalue: f64,
-    first_query_name: &str,
+    first_query_name: &[u8],
     first_query_len: u32,
-    database: &str,
+    database: &[u8],
+) -> io::Result<()> {
+    print_header_raw(
+        writer,
+        mode,
+        matrix.as_bytes(),
+        gap_open,
+        gap_extend,
+        evalue,
+        first_query_name,
+        first_query_len,
+        database,
+    )
+}
+
+pub fn print_header_raw<W: Write>(
+    writer: &mut W,
+    mode: u32,
+    matrix: &[u8],
+    gap_open: i32,
+    gap_extend: i32,
+    evalue: f64,
+    first_query_name: &[u8],
+    first_query_len: u32,
+    database: &[u8],
 ) -> io::Result<()> {
     let mode_str = match mode {
         2 => "blastp",
@@ -73,12 +99,15 @@ pub fn print_header<W: Write>(
         4 => "blastn",
         _ => "",
     };
+    let first_query_name = super::format::c_string_bytes(first_query_name);
     let first_query_cut = first_query_name
-        .find('\x01')
-        .unwrap_or(first_query_name.len());
-    let escaped_first_query_name = escape_xml(first_query_name);
+        .iter()
+        .position(|&byte| byte == 1)
+        .unwrap_or(usize::MAX);
+    let escaped_first_query_name =
+        crate::util::escape_sequences::XML.escape_bytes(first_query_name);
     let first_query_def =
-        &escaped_first_query_name[..first_query_cut.min(escaped_first_query_name.len())];
+        &escaped_first_query_name.as_slice()[..first_query_cut.min(escaped_first_query_name.len())];
     writeln!(writer, "<?xml version=\"1.0\"?>")?;
     writeln!(
         writer,
@@ -99,16 +128,16 @@ pub fn print_header<W: Write>(
         writer,
         "  <BlastOutput_reference>Benjamin Buchfink, Xie Chao, and Daniel Huson (2015), &quot;Fast and sensitive protein alignment using DIAMOND&quot;, Nature Methods 12:59-60.</BlastOutput_reference>"
     )?;
-    writeln!(writer, "  <BlastOutput_db>{}</BlastOutput_db>", database)?;
+    writer.write_all(b"  <BlastOutput_db>")?;
+    writer.write_all(database)?;
+    writeln!(writer, "</BlastOutput_db>")?;
     writeln!(
         writer,
         "  <BlastOutput_query-ID>Query_1</BlastOutput_query-ID>"
     )?;
-    writeln!(
-        writer,
-        "  <BlastOutput_query-def>{}</BlastOutput_query-def>",
-        first_query_def
-    )?;
+    write!(writer, "  <BlastOutput_query-def>")?;
+    writer.write_all(first_query_def)?;
+    writeln!(writer, "</BlastOutput_query-def>")?;
     writeln!(
         writer,
         "  <BlastOutput_query-len>{}</BlastOutput_query-len>",
@@ -116,15 +145,13 @@ pub fn print_header<W: Write>(
     )?;
     writeln!(writer, "  <BlastOutput_param>")?;
     writeln!(writer, "    <Parameters>")?;
-    writeln!(
-        writer,
-        "      <Parameters_matrix>{}</Parameters_matrix>",
-        matrix
-    )?;
+    writer.write_all(b"      <Parameters_matrix>")?;
+    writer.write_all(matrix)?;
+    writer.write_all(b"</Parameters_matrix>\n")?;
     writeln!(
         writer,
         "      <Parameters_expect>{}</Parameters_expect>",
-        evalue
+        format_default_float(evalue)
     )?;
     writeln!(
         writer,
@@ -185,10 +212,10 @@ pub fn write_iteration_end<W: Write>(writer: &mut W) -> io::Result<()> {
 }
 
 /// Matches C++ `XMLFormat::print_query_intro()`.
-pub fn print_query_intro<W: Write>(
+pub fn print_query_intro_bytes<W: Write>(
     writer: &mut W,
     query_oid: u64,
-    query_title: &str,
+    query_title: &[u8],
     query_len: i32,
 ) -> io::Result<()> {
     writeln!(writer, "<Iteration>")?;
@@ -202,11 +229,15 @@ pub fn print_query_intro<W: Write>(
         "  <Iteration_query-ID>Query_{}</Iteration_query-ID>",
         query_oid + 1
     )?;
-    writeln!(
-        writer,
-        "  <Iteration_query-def>{}</Iteration_query-def>",
-        print_title_xml(query_title, true, false, "", false)
-    )?;
+    writer.write_all(b"  <Iteration_query-def>")?;
+    writer.write_all(&super::format::print_title_xml_bytes(
+        query_title,
+        true,
+        false,
+        b"",
+        false,
+    ))?;
+    writeln!(writer, "</Iteration_query-def>")?;
     writeln!(
         writer,
         "  <Iteration_query-len>{}</Iteration_query-len>",
@@ -247,16 +278,17 @@ pub fn print_query_epilog<W: Write>(
         writer,
         "      <Statistics_eff-space>0</Statistics_eff-space>"
     )?;
-    // C++ uses iostream default (6 significant digits via %f).
+    // TextBuffer::print_d uses snprintf %f: six digits after the decimal,
+    // including the C spelling and sign of non-finite values.
     writeln!(
         writer,
-        "      <Statistics_kappa>{:.6}</Statistics_kappa>",
-        kappa
+        "      <Statistics_kappa>{}</Statistics_kappa>",
+        format_fixed_float(kappa)
     )?;
     writeln!(
         writer,
-        "      <Statistics_lambda>{:.6}</Statistics_lambda>",
-        lambda
+        "      <Statistics_lambda>{}</Statistics_lambda>",
+        format_fixed_float(lambda)
     )?;
     writeln!(writer, "      <Statistics_entropy>0</Statistics_entropy>")?;
     writeln!(writer, "    </Statistics>")?;
@@ -299,15 +331,15 @@ pub fn write_hit<W: Write>(writer: &mut W, hit: &XmlHit<'_>) -> io::Result<()> {
 }
 
 /// Matches C++ `XMLFormat::print_match(const HspContext&)`.
-pub fn print_match_context<W: Write>(
+pub fn print_match_context_bytes<W: Write, T: AsRef<[u8]>>(
     writer: &mut W,
-    r: &HspContext,
+    r: &HspContext<T>,
     score_matrix: &ScoreMatrix,
     query_translated: bool,
     xml_blord_format: bool,
     no_parse_seqids: bool,
 ) -> io::Result<()> {
-    print_match_context_with_accession_stats(
+    print_match_context_with_accession_stats_bytes(
         writer,
         r,
         score_matrix,
@@ -320,9 +352,9 @@ pub fn print_match_context<W: Write>(
 
 /// Full C++ `XMLFormat::print_match` mapping, including mutation of the
 /// accession parsing statistics stored in `Output::Info`.
-pub fn print_match_context_with_accession_stats<W: Write>(
+pub fn print_match_context_with_accession_stats_bytes<W: Write, T: AsRef<[u8]>>(
     writer: &mut W,
-    r: &HspContext,
+    r: &HspContext<T>,
     score_matrix: &ScoreMatrix,
     query_translated: bool,
     xml_blord_format: bool,
@@ -337,32 +369,36 @@ pub fn print_match_context_with_accession_stats<W: Write>(
 
         writeln!(writer, "<Hit>")?;
         writeln!(writer, "  <Hit_num>{}</Hit_num>", r.hit_num + 1)?;
-        let (id, def) = get_title_def(&r.target_title);
+        let (id, def) = crate::util::sequence::get_title_def_bytes(r.target_title.as_ref());
         if xml_blord_format {
             writeln!(writer, "  <Hit_id>gnl|BL_ORD_ID|{}</Hit_id>", r.subject_oid)?;
-            writeln!(
-                writer,
-                "  <Hit_def>{}</Hit_def>",
-                print_title_xml(&r.target_title, true, true, " &gt;", false)
-            )?;
+            writer.write_all(b"  <Hit_def>")?;
+            writer.write_all(&super::format::print_title_xml_bytes(
+                r.target_title.as_ref(),
+                true,
+                true,
+                b" &gt;",
+                false,
+            ))?;
+            writeln!(writer, "</Hit_def>")?;
         } else {
-            writeln!(writer, "  <Hit_id>{}</Hit_id>", escape_xml(&id))?;
-            writeln!(
-                writer,
-                "  <Hit_def>{}</Hit_def>",
-                print_title_xml(&def, true, true, " &gt;", false)
-            )?;
+            writer.write_all(b"  <Hit_id>")?;
+            writer.write_all(&crate::util::escape_sequences::XML.escape_bytes(&id))?;
+            writeln!(writer, "</Hit_id>")?;
+            writer.write_all(b"  <Hit_def>")?;
+            writer.write_all(&super::format::print_title_xml_bytes(
+                &def, true, true, b" &gt;", false,
+            ))?;
+            writeln!(writer, "</Hit_def>")?;
         }
         let accession = if no_parse_seqids {
             id
         } else {
-            get_accession(&id, accession_stats)
+            crate::util::sequence::get_accession_bytes(&id, accession_stats)
         };
-        writeln!(
-            writer,
-            "  <Hit_accession>{}</Hit_accession>",
-            escape_xml(&accession)
-        )?;
+        writer.write_all(b"  <Hit_accession>")?;
+        writer.write_all(&crate::util::escape_sequences::XML.escape_bytes(&accession))?;
+        writeln!(writer, "</Hit_accession>")?;
         writeln!(writer, "  <Hit_len>{}</Hit_len>", r.subject_len)?;
         writeln!(writer, "  <Hit_hsps>")?;
     }
@@ -425,7 +461,7 @@ pub fn print_match_context_with_accession_stats<W: Write>(
     write!(writer, "         <Hsp_qseq>")?;
     let mut it = r.begin();
     while it.good() {
-        write!(writer, "{}", it.query_char())?;
+        write!(writer, "{}", it.try_query_char()?)?;
         it.advance();
     }
     writeln!(writer, "</Hsp_qseq>")?;
@@ -433,7 +469,7 @@ pub fn print_match_context_with_accession_stats<W: Write>(
     write!(writer, "         <Hsp_hseq>")?;
     let mut it = r.begin();
     while it.good() {
-        write!(writer, "{}", it.subject_char())?;
+        write!(writer, "{}", it.try_subject_char()?)?;
         it.advance();
     }
     writeln!(writer, "</Hsp_hseq>")?;
@@ -444,7 +480,7 @@ pub fn print_match_context_with_accession_stats<W: Write>(
         write!(
             writer,
             "{}",
-            it.midline_char(score_matrix.score(it.query(), it.subject()))
+            it.midline_char(score_matrix.score(it.try_query()?, it.try_subject()?))
         )?;
         it.advance();
     }
@@ -788,4 +824,76 @@ mod tests {
             "</BlastOutput_iterations>\n</BlastOutput>"
         );
     }
+}
+
+// String compatibility entry points share the raw renderer.
+pub fn print_header<W: Write>(
+    writer: &mut W,
+    mode: u32,
+    matrix: &str,
+    gap_open: i32,
+    gap_extend: i32,
+    evalue: f64,
+    first_query_name: &str,
+    first_query_len: u32,
+    database: &str,
+) -> io::Result<()> {
+    print_header_bytes(
+        writer,
+        mode,
+        matrix,
+        gap_open,
+        gap_extend,
+        evalue,
+        first_query_name.as_bytes(),
+        first_query_len,
+        database.as_bytes(),
+    )
+}
+
+pub fn print_match_context<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    score_matrix: &ScoreMatrix,
+    query_translated: bool,
+    xml_blord_format: bool,
+    no_parse_seqids: bool,
+) -> io::Result<()> {
+    print_match_context_bytes(
+        writer,
+        r,
+        score_matrix,
+        query_translated,
+        xml_blord_format,
+        no_parse_seqids,
+    )
+}
+
+pub fn print_match_context_with_accession_stats<W: Write>(
+    writer: &mut W,
+    r: &HspContext,
+    score_matrix: &ScoreMatrix,
+    query_translated: bool,
+    xml_blord_format: bool,
+    no_parse_seqids: bool,
+    accession_stats: &mut AccessionParsing,
+) -> io::Result<()> {
+    print_match_context_with_accession_stats_bytes(
+        writer,
+        r,
+        score_matrix,
+        query_translated,
+        xml_blord_format,
+        no_parse_seqids,
+        accession_stats,
+    )
+}
+
+pub fn print_query_intro<W: Write>(
+    writer: &mut W,
+    query_oid: u64,
+    query_title: &str,
+    query_len: i32,
+) -> io::Result<()> {
+    print_query_intro_bytes(writer, query_oid, query_title.as_bytes(), query_len)
 }

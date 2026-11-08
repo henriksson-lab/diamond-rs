@@ -3,7 +3,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::dmnd::{ReferenceHeader, SeqInfo};
-use super::fasta::FastaRecord;
+use super::fasta::{ByteFastaRecord, FastaRecord};
 use crate::basic::value::Letter;
 
 /// Read all sequences from a DIAMOND database file.
@@ -17,6 +17,17 @@ use crate::basic::value::Letter;
 /// current encoding (masked letters stay below 0x9F) but would break the moment
 /// any encoding uses 0xFF in a payload, and it silently swallows corrupt data.
 pub fn read_dmnd(path: &Path) -> io::Result<(ReferenceHeader, Vec<FastaRecord>)> {
+    let (header, records) = read_dmnd_bytes(path)?;
+    let records = records
+        .into_iter()
+        .map(|record| {
+            FastaRecord::try_from(record)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok((header, records))
+}
+pub fn read_dmnd_bytes(path: &Path) -> io::Result<(ReferenceHeader, Vec<ByteFastaRecord>)> {
     let mut file = BufReader::new(File::open(path)?);
 
     // Read header1
@@ -25,21 +36,25 @@ pub fn read_dmnd(path: &Path) -> io::Result<(ReferenceHeader, Vec<FastaRecord>)>
         .validate()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    // Read header2 size prefix and skip header2 — honor the prefix so we
-    // correctly skip any future-extended header2 (e.g. C++ EXTRA builds add
-    // a `db_type` int32_t making h2 52 bytes instead of 48).
-    let mut buf8 = [0u8; 8];
-    file.read_exact(&mut buf8)?;
-    let h2_size = u64::from_le_bytes(buf8);
-    file.seek(SeekFrom::Current(h2_size as i64))?;
-
-    let seq_data_start = file.stream_position()?;
-    if header.pos_array_offset < seq_data_start {
+    // The size prefix is sizeof(Header2), not its serialized field count:
+    // EXTRA advertises 56 bytes on 64-bit targets but writes only 52. These
+    // positional adapters use the actual SeqInfo offsets, like seq_data(),
+    // rather than inheriting the separate sequential-init cursor quirk.
+    let mut size_prefix = [0u8; 8];
+    file.read_exact(&mut size_prefix)?;
+    file.seek(SeekFrom::Start(header.pos_array_offset))?;
+    let infos = (0..header.sequences)
+        .map(|_| SeqInfo::read_from(&mut file))
+        .collect::<io::Result<Vec<_>>>()?;
+    let seq_data_start = infos[0].pos;
+    if seq_data_start < ReferenceHeader::SIZE as u64 + 8 || header.pos_array_offset < seq_data_start
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "pos_array_offset is before sequence data — corrupt DMND header",
         ));
     }
+    file.seek(SeekFrom::Start(seq_data_start))?;
     let seq_data_len = (header.pos_array_offset - seq_data_start) as usize;
     let mut seq_data = vec![0u8; seq_data_len];
     file.read_exact(&mut seq_data)?;
@@ -49,8 +64,7 @@ pub fn read_dmnd(path: &Path) -> io::Result<(ReferenceHeader, Vec<FastaRecord>)>
     // sequence bounds; the bytes are `[pos+1, pos+1+seq_len)` and the id is
     // the C-string immediately following the closing `0xFF` framing byte.
     let mut records = Vec::with_capacity(header.sequences as usize);
-    for _ in 0..header.sequences {
-        let info = SeqInfo::read_from(&mut file)?;
+    for info in infos {
         if info.pos < seq_data_start {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -77,10 +91,14 @@ pub fn read_dmnd(path: &Path) -> io::Result<(ReferenceHeader, Vec<FastaRecord>)>
         while id_end < seq_data_len && seq_data[id_end] != 0x00 {
             id_end += 1;
         }
-        let id = String::from_utf8_lossy(&seq_data[id_start..id_end]).to_string();
+        let id = seq_data[id_start..id_end].to_vec();
         // Bytes are already in Letter encoding; just bit-cast u8→i8.
         let sequence: Vec<Letter> = seq_bytes.iter().map(|&b| b as Letter).collect();
-        records.push(FastaRecord { id, sequence });
+        records.push(FastaRecord {
+            quality: None,
+            id,
+            sequence,
+        });
     }
 
     Ok((header, records))
@@ -88,7 +106,10 @@ pub fn read_dmnd(path: &Path) -> io::Result<(ReferenceHeader, Vec<FastaRecord>)>
 
 /// Read a DIAMOND database, handling .dmnd extension.
 pub fn read_dmnd_auto(path_str: &str) -> io::Result<(ReferenceHeader, Vec<FastaRecord>)> {
-    read_dmnd(&resolve_dmnd_path(path_str)?)
+    read_dmnd_auto_path(Path::new(path_str))
+}
+pub fn read_dmnd_auto_path(path: &Path) -> io::Result<(ReferenceHeader, Vec<FastaRecord>)> {
+    read_dmnd(&resolve_dmnd_path(path)?)
 }
 
 /// Visit database records in OID order without retaining the complete database.
@@ -101,7 +122,7 @@ pub fn for_each_dmnd_record_auto<F>(path_str: &str, mut visit: F) -> io::Result<
 where
     F: FnMut(usize, &str, &[u8]) -> io::Result<()>,
 {
-    let path = resolve_dmnd_path(path_str)?;
+    let path = resolve_dmnd_path(Path::new(path_str))?;
     for_each_dmnd_record(&path, &mut visit)
 }
 
@@ -111,6 +132,16 @@ pub fn for_each_dmnd_record<F>(path: &Path, mut visit: F) -> io::Result<Referenc
 where
     F: FnMut(usize, &str, &[u8]) -> io::Result<()>,
 {
+    for_each_dmnd_record_bytes(path, |ordinal, id, sequence| {
+        let id = std::str::from_utf8(id)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        visit(ordinal, id, sequence)
+    })
+}
+pub fn for_each_dmnd_record_bytes<F>(path: &Path, mut visit: F) -> io::Result<ReferenceHeader>
+where
+    F: FnMut(usize, &[u8], &[u8]) -> io::Result<()>,
+{
     let mut data = BufReader::new(File::open(&path)?);
     let mut positions = BufReader::new(File::open(path)?);
 
@@ -119,24 +150,28 @@ where
         .validate()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
-    let mut buf8 = [0u8; 8];
-    data.read_exact(&mut buf8)?;
-    let h2_size = u64::from_le_bytes(buf8);
-    data.seek(SeekFrom::Current(h2_size as i64))?;
-    let data_start = data.stream_position()?;
-    if header.pos_array_offset < data_start {
+    let mut size_prefix = [0u8; 8];
+    data.read_exact(&mut size_prefix)?;
+    positions.seek(SeekFrom::Start(header.pos_array_offset))?;
+    let first = SeqInfo::read_from(&mut positions)?;
+    let data_start = first.pos;
+    if data_start < ReferenceHeader::SIZE as u64 + 8 || header.pos_array_offset < data_start {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "pos_array_offset is before sequence data — corrupt DMND header",
         ));
     }
-    positions.seek(SeekFrom::Start(header.pos_array_offset))?;
+    data.seek(SeekFrom::Start(data_start))?;
 
     let mut sequence = Vec::new();
     let mut id = Vec::new();
     let mut data_position = data_start;
     for ordinal in 0..header.sequences as usize {
-        let info = SeqInfo::read_from(&mut positions)?;
+        let info = if ordinal == 0 {
+            first
+        } else {
+            SeqInfo::read_from(&mut positions)?
+        };
         if info.pos < data_start || info.pos >= header.pos_array_offset {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -190,14 +225,12 @@ where
                 "Sequence record offset overflow in DIAMOND database",
             )
         })?;
-        let id = String::from_utf8_lossy(&id);
         visit(ordinal, &id, &sequence)?;
     }
     Ok(header)
 }
 
-fn resolve_dmnd_path(path_str: &str) -> io::Result<std::path::PathBuf> {
-    let path = Path::new(path_str);
+fn resolve_dmnd_path(path: &Path) -> io::Result<std::path::PathBuf> {
     if path.exists() {
         return Ok(path.to_path_buf());
     }
@@ -205,8 +238,12 @@ fn resolve_dmnd_path(path_str: &str) -> io::Result<std::path::PathBuf> {
     if with_ext.exists() {
         return Ok(with_ext);
     }
+    let mut message = b"Database file not found: ".to_vec();
+    message.extend_from_slice(
+        &crate::util::io::path_diagnostic_bytes(path).map_err(io::Error::other)?,
+    );
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        format!("Database file not found: {}", path_str),
+        crate::util::io::RawDiagnosticError(message),
     ))
 }

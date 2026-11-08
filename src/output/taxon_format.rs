@@ -2,7 +2,8 @@
 //! `TaxonFormat` declaration in `output_format.h`.
 
 pub use super::taxon::{
-    print_match, print_query_epilog, query_id, subject_taxids, taxon_lineage, TaxonFormat,
+    print_match, print_query_epilog, print_query_epilog_bytes, query_id, subject_taxids,
+    taxon_lineage, TaxonFormat,
 };
 
 #[cfg(test)]

@@ -83,12 +83,17 @@ impl LambdaCalculator {
 }
 
 fn round_to_few_digits(value: f64) -> f64 {
-    // `%g` without an explicit precision uses six significant digits.
-    if value == 0.0 || !value.is_finite() {
-        return value;
+    // Source formats with `%g` (six significant digits) and parses the
+    // resulting decimal. Scaling and f64::round is not equivalent: it rounds
+    // halfway values away from zero and can overflow for tiny probabilities.
+    // Scientific notation with five fractional digits has the same numeric
+    // result while keeping the implementation independent of the C runtime.
+    if value.is_nan() {
+        return f64::NAN.copysign(value);
     }
-    let scale = 10_f64.powf(5.0 - value.abs().log10().floor());
-    (value * scale).round() / scale
+    format!("{value:.5e}")
+        .parse()
+        .expect("formatted floating-point value must parse")
 }
 
 fn max_index(matrix: &[Vec<f64>], column: usize) -> usize {
@@ -121,7 +126,9 @@ fn lu_pivoting(matrix: &mut [Vec<f64>], indices: &mut [usize]) -> bool {
         for j in i + 1..matrix.len() {
             matrix[j][i] *= matrix[i][i];
             for k in i + 1..matrix.len() {
-                matrix[j][k] -= matrix[j][i] * matrix[i][k];
+                // The pinned source object contracts this subtract-product
+                // into FMA. Spell it out for the same rounding on every ISA.
+                matrix[j][k] = (-matrix[j][i]).mul_add(matrix[i][k], matrix[j][k]);
             }
         }
     }
@@ -134,14 +141,14 @@ fn solve_p(matrix: &[Vec<f64>], rhs: &[f64]) -> Vec<f64> {
     for i in 0..n {
         y[i] = rhs[i];
         for j in 0..i {
-            y[i] -= matrix[i][j] * y[j];
+            y[i] = (-matrix[i][j]).mul_add(y[j], y[i]);
         }
     }
     let mut x = vec![0.0; n];
     for i in (0..n).rev() {
         x[i] = y[i];
         for j in i + 1..n {
-            x[i] -= matrix[i][j] * x[j];
+            x[i] = (-matrix[i][j]).mul_add(x[j], x[i]);
         }
         x[i] *= matrix[i][i];
     }
@@ -376,6 +383,25 @@ mod tests {
     use super::*;
     use crate::basic::value::AMINO_ACID_COUNT;
     use crate::stats::matrices::{BLOSUM62, PAM250};
+
+    #[test]
+    fn probability_rounding_matches_source_decimal_conversion() {
+        let probes = include_str!("../../../tests/data/tantan_lambda/rounding.tsv");
+        let mut count = 0;
+        for line in probes.lines() {
+            let columns: Vec<_> = line.split('\t').collect();
+            let value = f64::from_bits(u64::from_str_radix(columns[0], 16).unwrap());
+            let expected = u64::from_str_radix(columns[1], 16).unwrap();
+            assert_eq!(
+                round_to_few_digits(value).to_bits(),
+                expected,
+                "source %g conversion for {value:?}: {}",
+                columns[2]
+            );
+            count += 1;
+        }
+        assert_eq!(count, 19);
+    }
 
     #[test]
     fn standard_matrices_match_upstream_states() {

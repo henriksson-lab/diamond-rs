@@ -1321,6 +1321,7 @@ impl Default for pvalues {
 }
 
 /// Parameters for the ALP finite-size correction.
+#[derive(Clone)]
 pub struct AreaParams {
     pub a_i: f64,
     pub b_i: f64,
@@ -1359,9 +1360,11 @@ fn log_diff(a: f64, b: f64) -> f64 {
 /// correction. Working in log-space avoids catastrophic cancellation when erfc(F)
 /// is near 0 (large query/subject; e-value far below 1).
 pub fn compute_log_area(p: &AreaParams, score: f64, query_len: f64, subject_len: f64) -> f64 {
+    // Preserve the pinned source build's contracted multiply/add operations.
+    // Separately rounded intermediates change binary corrected scores by ULPs.
     let const_val = 1.0 / (2.0 * PI).sqrt();
-    let m_li_y = query_len - (p.a_i * score + p.b_i);
-    let vi_y = p.vi_y_thr.max(p.alpha_i * score + p.beta_i);
+    let m_li_y = query_len - p.a_i.mul_add(score, p.b_i);
+    let vi_y = p.vi_y_thr.max(p.alpha_i.mul_add(score, p.beta_i));
     let sqrt_vi_y = vi_y.sqrt();
     let m_f = if sqrt_vi_y == 0.0 {
         1e100
@@ -1373,7 +1376,7 @@ pub fn compute_log_area(p: &AreaParams, score: f64, query_len: f64, subject_len:
     let log_p_m_f = -std::f64::consts::LN_2
         + crate::util::log_erfc::log_erfc(-std::f64::consts::FRAC_1_SQRT_2 * m_f);
     // log(-E_m_F) = log(const_val) - 0.5 * m_F^2  (E_m_F is negative, so log of its negation)
-    let log_minus_e_m_f = const_val.ln() + (-0.5 * m_f * m_f);
+    let log_minus_e_m_f = (-0.5 * m_f).mul_add(m_f, const_val.ln());
     let log_minus_sqrt_vi_y_e_m_f = sqrt_vi_y.ln() + log_minus_e_m_f;
 
     let log_p1 = if m_li_y < 0.0 {
@@ -1384,8 +1387,8 @@ pub fn compute_log_area(p: &AreaParams, score: f64, query_len: f64, subject_len:
         log_sum(log_minus_sqrt_vi_y_e_m_f, log_m_li_y_p_m_f)
     };
 
-    let n_lj_y = subject_len - (p.a_j * score + p.b_j);
-    let vj_y = p.vj_y_thr.max(p.alpha_j * score + p.beta_j);
+    let n_lj_y = subject_len - p.a_j.mul_add(score, p.b_j);
+    let vj_y = p.vj_y_thr.max(p.alpha_j.mul_add(score, p.beta_j));
     let sqrt_vj_y = vj_y.sqrt();
     let n_f = if sqrt_vj_y == 0.0 {
         1e100
@@ -1395,7 +1398,7 @@ pub fn compute_log_area(p: &AreaParams, score: f64, query_len: f64, subject_len:
 
     let log_p_n_f = -std::f64::consts::LN_2
         + crate::util::log_erfc::log_erfc(-std::f64::consts::FRAC_1_SQRT_2 * n_f);
-    let log_minus_e_n_f = const_val.ln() + (-0.5 * n_f * n_f);
+    let log_minus_e_n_f = (-0.5 * n_f).mul_add(n_f, const_val.ln());
     let log_minus_sqrt_vj_y_e_n_f = sqrt_vj_y.ln() + log_minus_e_n_f;
 
     let log_p2 = if n_lj_y < 0.0 {
@@ -1406,7 +1409,7 @@ pub fn compute_log_area(p: &AreaParams, score: f64, query_len: f64, subject_len:
         log_sum(log_minus_sqrt_vj_y_e_n_f, log_n_lj_y_p_n_f)
     };
 
-    let log_c_y = p.c_y_thr.max(p.sigma * score + p.tau).ln();
+    let log_c_y = p.c_y_thr.max(p.sigma.mul_add(score, p.tau)).ln();
     let log_p_m_f_p_n_f = log_p_m_f + log_p_n_f;
     let log_c_y_p_m_f_p_n_f = log_c_y + log_p_m_f_p_n_f;
     let log_p1_p2 = log_p1 + log_p2;

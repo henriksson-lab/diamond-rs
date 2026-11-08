@@ -5,6 +5,7 @@
 //! and output objects.  Those dependencies are explicit traits here, while
 //! preserving the ordering, culling, filtering, and output lifecycle.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 
 use crate::align::hsp::Hsp;
@@ -274,7 +275,12 @@ impl Target {
         }
     }
 
-    pub fn apply_filters(&mut self, dna_len: i32, subject_len: i32, filters: HspFilters<'_>) {
+    pub fn apply_filters<T: ?Sized>(
+        &mut self,
+        dna_len: i32,
+        subject_len: i32,
+        filters: HspFilters<'_, T>,
+    ) {
         let _query_title = filters.query_title; // C++ accepts but does not use this parameter.
         self.hsps.retain(|hsp| {
             !(hsp.id_percent() < filters.min_id
@@ -285,11 +291,11 @@ impl Target {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct HspFilters<'a> {
+pub struct HspFilters<'a, T: ?Sized = str> {
     pub min_id: f64,
     pub query_cover: f64,
     pub subject_cover: f64,
-    pub query_title: &'a str,
+    pub query_title: &'a T,
 }
 
 #[derive(Debug, Clone)]
@@ -328,17 +334,17 @@ impl Default for QueryMapperConfig {
 }
 
 /// Explicit adapter for the C++ query/target/database and score globals.
-pub trait QueryMapperBackend {
+pub trait QueryMapperBackend<T: ?Sized + ToOwned + AsRef<[u8]> = str> {
     fn source_query_len(&self, query_id: u32) -> u32;
     fn query_seq(&self, query_id: u32, frame: u32) -> &[Letter];
     fn query_source_seq(&self, query_id: u32) -> &[Letter];
-    fn query_title(&self, query_id: u32) -> &str;
+    fn query_title(&self, query_id: u32) -> &T;
     fn query_oid(&self, query_id: u32) -> OId;
     fn local_target_position(&self, packed_position: u64) -> (usize, usize);
     fn target_seq(&self, subject_id: BlockId) -> &[Letter];
     fn target_oid(&self, subject_id: BlockId) -> OId;
     fn target_taxon_rank_ids(&self, oid: OId) -> Vec<u32>;
-    fn target_title(&self, subject_id: BlockId, oid: OId) -> String;
+    fn target_title(&self, subject_id: BlockId, oid: OId) -> T::Owned;
     fn target_dict_id(&self, current_ref_block: usize, subject_id: BlockId) -> usize;
     fn score_matrix(&self) -> &ScoreMatrix;
     fn xdrop_ungapped(
@@ -359,26 +365,26 @@ pub enum OutputMode {
     Intermediate,
 }
 
-pub struct QueryIntro<'a> {
+pub struct QueryIntro<'a, T: ?Sized = str> {
     pub mode: OutputMode,
     pub unaligned: bool,
     pub query_id: u32,
     pub query_oid: OId,
-    pub title: &'a str,
+    pub title: &'a T,
     pub source_seq: &'a [Letter],
 }
 
-pub struct MatchContext<'a> {
+pub struct MatchContext<'a, T: ?Sized = str> {
     pub mode: OutputMode,
     pub hsp: &'a Hsp,
     pub query_id: u32,
     pub query_oid: OId,
-    pub query_title: &'a str,
+    pub query_title: &'a T,
     /// The context selected from C++ `TranslatedSequence` by `hsp.frame`.
     pub query: &'a [Letter],
     pub database_id: OId,
     pub subject_len: u32,
-    pub target_title: &'a str,
+    pub target_title: &'a T,
     pub target_index: u32,
     pub hsp_index: u32,
     pub subject: &'a [Letter],
@@ -386,13 +392,13 @@ pub struct MatchContext<'a> {
 }
 
 /// Explicit adapter for regular, DAA, and intermediate output writers.
-pub trait QueryMapperOutput {
+pub trait QueryMapperOutput<T: ?Sized = str> {
     fn mode(&self) -> OutputMode;
     fn report_unaligned(&self) -> bool {
         false
     }
-    fn begin_query(&mut self, intro: QueryIntro<'_>) -> usize;
-    fn write_match(&mut self, context: MatchContext<'_>);
+    fn begin_query(&mut self, intro: QueryIntro<'_, T>) -> usize;
+    fn write_match(&mut self, context: MatchContext<'_, T>);
     fn finish_query(&mut self, seek_pos: usize);
 }
 
@@ -403,7 +409,7 @@ pub struct GenerateOutputConfig {
     pub current_ref_block: usize,
 }
 
-pub struct QueryMapper<'a, B: QueryMapperBackend> {
+pub struct QueryMapper<'a, B: QueryMapperBackend<T>, T: ?Sized + ToOwned + AsRef<[u8]> = str> {
     pub source_hits: Vec<Hit>,
     pub query_id: u32,
     pub targets_finished: u32,
@@ -416,9 +422,10 @@ pub struct QueryMapper<'a, B: QueryMapperBackend> {
     pub target_parallel: bool,
     pub config: QueryMapperConfig,
     backend: &'a B,
+    title_type: std::marker::PhantomData<fn(&T)>,
 }
 
-impl<'a, B: QueryMapperBackend> QueryMapper<'a, B> {
+impl<'a, B: QueryMapperBackend<T>, T: ?Sized + ToOwned + AsRef<[u8]>> QueryMapper<'a, B, T> {
     pub fn new(
         query_id: usize,
         source_hits: Vec<Hit>,
@@ -438,16 +445,20 @@ impl<'a, B: QueryMapperBackend> QueryMapper<'a, B> {
             target_parallel: false,
             config,
             backend,
+            title_type: std::marker::PhantomData,
         }
     }
 
     pub fn init(&mut self) {
         if self.config.log_query {
-            eprintln!(
-                "Query = {}\t{}",
-                self.backend.query_title(self.query_id),
-                self.query_id
-            );
+            if let Ok(mut stream) = crate::util::log_stream::message_stream().lock() {
+                let mut line = b"Query = ".to_vec();
+                line.extend_from_slice(crate::util::sequence::c_string_bytes(
+                    self.backend.query_title(self.query_id).as_ref(),
+                ));
+                line.extend_from_slice(format!("\t{}\n", self.query_id).as_bytes());
+                let _ = stream.write_bytes(&line);
+            }
         }
         if self.config.hauser {
             for frame in 0..self.config.query_contexts {
@@ -608,12 +619,15 @@ impl<'a, B: QueryMapperBackend> QueryMapper<'a, B> {
         self.targets.truncate(i);
     }
 
-    pub fn generate_output<O: QueryMapperOutput>(
+    pub fn generate_output<O: QueryMapperOutput<T>>(
         &mut self,
         output: &mut O,
         stat: &mut Statistics,
         cfg: GenerateOutputConfig,
-    ) -> bool {
+    ) -> bool
+    where
+        T::Owned: Default,
+    {
         if self.config.toppercent.is_none() {
             self.targets.sort_by(Target::compare_evalue);
         } else {
@@ -638,7 +652,7 @@ impl<'a, B: QueryMapperBackend> QueryMapper<'a, B> {
             let subject_id = target.subject_block_id;
             let database_id = backend.target_oid(subject_id);
             let target_title = if cfg.blocked_processing {
-                String::new()
+                T::Owned::default()
             } else {
                 backend.target_title(subject_id, database_id)
             };
@@ -701,7 +715,7 @@ impl<'a, B: QueryMapperBackend> QueryMapper<'a, B> {
                     query: backend.query_seq(self.query_id, hsp.frame as u32),
                     database_id,
                     subject_len,
-                    target_title: &target_title,
+                    target_title: target_title.borrow(),
                     target_index: n_target_seq,
                     hsp_index: hit_hsps,
                     subject: &target.subject,

@@ -10,8 +10,9 @@ use super::seed_match::{self, SeedLoc, SeedMatch};
 use crate::basic::reduction::Reduction;
 use crate::basic::seed::PackedSeed;
 use crate::basic::shape::Shape;
-use crate::basic::value::Letter;
+use crate::basic::value::{Letter, Loc};
 use crate::search::seed_complexity;
+use crate::util::data_structures::BitVector;
 
 /// Default number of seed partition bits.
 /// 10 bits = 1024 partitions (memory `project_seed_array_partitioning`:
@@ -228,6 +229,46 @@ fn build_search_seed_array(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_search_seed_array_with_skip(
+    seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    seedp_bits: i32,
+    min_query_len: Loc,
+    sketch_size: usize,
+    query_skip: Option<&BitVector>,
+    query_contexts: usize,
+) -> SeedArray {
+    if sketch_size > 0 {
+        SeedArray::build_sketch_with_min_query_len_partition_range_with_skip(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            sketch_size,
+            min_query_len,
+            0,
+            crate::basic::seed::seedp_count(seedp_bits) as usize,
+            query_skip,
+            query_contexts,
+        )
+    } else {
+        SeedArray::build_with_complexity_cut_and_min_query_len_partition_range_with_skip(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            0.0,
+            min_query_len,
+            0,
+            crate::basic::seed::seedp_count(seedp_bits) as usize,
+            query_skip,
+            query_contexts,
+        )
+    }
+}
+
 /// Seed arrays after the partition-local sort/join and low-complexity pass.
 ///
 /// Upstream builds each shape's arrays once, masks rejected joined groups,
@@ -257,25 +298,55 @@ pub fn prepare_seed_join_partitioned_min_query_len(
     min_query_len: usize,
     sketch_size: usize,
 ) -> PreparedSeedJoin {
+    prepare_seed_join_partitioned_min_query_len_with_skip(
+        query_seqs,
+        ref_seqs,
+        shape,
+        reduction,
+        complexity_cut,
+        min_query_len.min(Loc::MAX as usize) as Loc,
+        sketch_size,
+        None,
+        1,
+    )
+}
+
+/// Round-local query skip; each translated source owns `query_contexts` records.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_seed_join_partitioned_min_query_len_with_skip(
+    query_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: Loc,
+    sketch_size: usize,
+    query_skip: Option<&BitVector>,
+    query_contexts: usize,
+) -> PreparedSeedJoin {
     let seedp_bits = DEFAULT_SEEDP_BITS;
-    let query = build_search_seed_array(
+    let query = build_search_seed_array_with_skip(
         query_seqs,
         shape,
         reduction,
         seedp_bits,
         min_query_len,
         sketch_size,
+        query_skip,
+        query_contexts,
     );
     // Upstream's ostensibly query-specific option is read from global config
     // by every seed enumeration, including reference enumeration. Preserve
     // that observable behavior for exact parity.
-    let reference = build_search_seed_array(
+    let reference = build_search_seed_array_with_skip(
         ref_seqs,
         shape,
         reduction,
         seedp_bits,
         min_query_len,
         sketch_size,
+        None,
+        query_contexts,
     );
     prepare_seed_join_from_arrays(
         query_seqs,
@@ -303,9 +374,39 @@ pub fn prepare_seed_join_partition_range_min_query_len(
     partition_begin: usize,
     partition_end: usize,
 ) -> PreparedSeedJoin {
+    prepare_seed_join_partition_range_min_query_len_with_skip(
+        query_seqs,
+        ref_seqs,
+        shape,
+        reduction,
+        complexity_cut,
+        min_query_len.min(Loc::MAX as usize) as Loc,
+        sketch_size,
+        partition_begin,
+        partition_end,
+        None,
+        1,
+    )
+}
+
+/// Round-local query skip; each translated source owns `query_contexts` records.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_seed_join_partition_range_min_query_len_with_skip(
+    query_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: Loc,
+    sketch_size: usize,
+    partition_begin: usize,
+    partition_end: usize,
+    query_skip: Option<&BitVector>,
+    query_contexts: usize,
+) -> PreparedSeedJoin {
     let seedp_bits = DEFAULT_SEEDP_BITS;
     let query = if sketch_size > 0 {
-        SeedArray::build_sketch_with_min_query_len_partition_range(
+        SeedArray::build_sketch_with_min_query_len_partition_range_with_skip(
             query_seqs,
             shape,
             reduction,
@@ -314,9 +415,11 @@ pub fn prepare_seed_join_partition_range_min_query_len(
             min_query_len,
             partition_begin,
             partition_end,
+            query_skip,
+            query_contexts,
         )
     } else {
-        SeedArray::build_with_complexity_cut_and_min_query_len_partition_range(
+        SeedArray::build_with_complexity_cut_and_min_query_len_partition_range_with_skip(
             query_seqs,
             shape,
             reduction,
@@ -325,10 +428,12 @@ pub fn prepare_seed_join_partition_range_min_query_len(
             min_query_len,
             partition_begin,
             partition_end,
+            query_skip,
+            query_contexts,
         )
     };
     let reference = if sketch_size > 0 {
-        SeedArray::build_sketch_with_min_query_len_partition_range(
+        SeedArray::build_sketch_with_min_query_len_partition_range_with_skip(
             ref_seqs,
             shape,
             reduction,
@@ -337,9 +442,11 @@ pub fn prepare_seed_join_partition_range_min_query_len(
             min_query_len,
             partition_begin,
             partition_end,
+            None,
+            query_contexts,
         )
     } else {
-        SeedArray::build_with_complexity_cut_and_min_query_len_partition_range(
+        SeedArray::build_with_complexity_cut_and_min_query_len_partition_range_with_skip(
             ref_seqs,
             shape,
             reduction,
@@ -348,6 +455,8 @@ pub fn prepare_seed_join_partition_range_min_query_len(
             min_query_len,
             partition_begin,
             partition_end,
+            None,
+            query_contexts,
         )
     };
     prepare_seed_join_from_arrays(
@@ -383,8 +492,40 @@ pub fn prepare_seed_join_partition_range_from_counts_min_query_len(
     query_counts: &[usize],
     reference_counts: &[usize],
 ) -> PreparedSeedJoin {
+    prepare_seed_join_partition_range_from_counts_min_query_len_with_skip(
+        query_seqs,
+        ref_seqs,
+        shape,
+        reduction,
+        complexity_cut,
+        min_query_len.min(Loc::MAX as usize) as Loc,
+        partition_begin,
+        partition_end,
+        query_counts,
+        reference_counts,
+        None,
+        1,
+    )
+}
+
+/// Round-local query skip; each translated source owns `query_contexts` records.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_seed_join_partition_range_from_counts_min_query_len_with_skip(
+    query_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: Loc,
+    partition_begin: usize,
+    partition_end: usize,
+    query_counts: &[usize],
+    reference_counts: &[usize],
+    query_skip: Option<&BitVector>,
+    query_contexts: usize,
+) -> PreparedSeedJoin {
     let seedp_bits = DEFAULT_SEEDP_BITS;
-    let query = SeedArray::build_partition_range_from_counts_reuse(
+    let query = SeedArray::build_partition_range_from_counts_reuse_with_skip(
         query_seqs,
         shape,
         reduction,
@@ -394,8 +535,10 @@ pub fn prepare_seed_join_partition_range_from_counts_min_query_len(
         partition_end,
         query_counts,
         Vec::new(),
+        query_skip,
+        query_contexts,
     );
-    let reference = SeedArray::build_partition_range_from_counts_reuse(
+    let reference = SeedArray::build_partition_range_from_counts_reuse_with_skip(
         ref_seqs,
         shape,
         reduction,
@@ -405,6 +548,8 @@ pub fn prepare_seed_join_partition_range_from_counts_min_query_len(
         partition_end,
         reference_counts,
         Vec::new(),
+        None,
+        query_contexts,
     );
     prepare_seed_join_from_arrays(
         query_seqs,
@@ -432,8 +577,40 @@ pub fn prepare_seed_join_partition_range_from_worker_counts_min_query_len(
     query_counts: &super::seed_array::WorkerPartitionCounts,
     reference_counts: &super::seed_array::WorkerPartitionCounts,
 ) -> PreparedSeedJoin {
+    prepare_seed_join_partition_range_from_worker_counts_min_query_len_with_skip(
+        query_seqs,
+        ref_seqs,
+        shape,
+        reduction,
+        complexity_cut,
+        min_query_len.min(Loc::MAX as usize) as Loc,
+        partition_begin,
+        partition_end,
+        query_counts,
+        reference_counts,
+        None,
+        1,
+    )
+}
+
+/// Round-local query skip; each translated source owns `query_contexts` records.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_seed_join_partition_range_from_worker_counts_min_query_len_with_skip(
+    query_seqs: &[&[Letter]],
+    ref_seqs: &[&[Letter]],
+    shape: &Shape,
+    reduction: &Reduction,
+    complexity_cut: f64,
+    min_query_len: Loc,
+    partition_begin: usize,
+    partition_end: usize,
+    query_counts: &super::seed_array::WorkerPartitionCounts,
+    reference_counts: &super::seed_array::WorkerPartitionCounts,
+    query_skip: Option<&BitVector>,
+    query_contexts: usize,
+) -> PreparedSeedJoin {
     let seedp_bits = DEFAULT_SEEDP_BITS;
-    let query = SeedArray::build_partition_range_from_worker_counts_reuse(
+    let query = SeedArray::build_partition_range_from_worker_counts_reuse_with_skip(
         query_seqs,
         shape,
         reduction,
@@ -443,8 +620,10 @@ pub fn prepare_seed_join_partition_range_from_worker_counts_min_query_len(
         partition_end,
         query_counts,
         Vec::new(),
+        query_skip,
+        query_contexts,
     );
-    let reference = SeedArray::build_partition_range_from_worker_counts_reuse(
+    let reference = SeedArray::build_partition_range_from_worker_counts_reuse_with_skip(
         ref_seqs,
         shape,
         reduction,
@@ -454,6 +633,8 @@ pub fn prepare_seed_join_partition_range_from_worker_counts_min_query_len(
         partition_end,
         reference_counts,
         Vec::new(),
+        None,
+        query_contexts,
     );
     prepare_seed_join_from_arrays(
         query_seqs,
@@ -474,6 +655,14 @@ fn prepare_seed_join_from_arrays(
     mut reference: SeedArray,
 ) -> PreparedSeedJoin {
     let num_partitions = query.num_partitions();
+    let query_letters = query_seqs.iter().map(|seq| seq.len()).sum::<usize>();
+    let offsets = reference.seq_offsets();
+    let reference_letters = offsets
+        .last()
+        .zip(offsets.first())
+        .map_or(0, |(&end, &begin)| {
+            (end - begin) as usize - offsets.len().saturating_sub(1)
+        });
 
     fn split_into_partitions(
         sa: &mut SeedArray,
@@ -512,6 +701,14 @@ fn prepare_seed_join_from_arrays(
     drop(ref_parts);
 
     if complexity_cut <= 0.0 {
+        crate::search::seed_complexity::report_masking(
+            &crate::search::seed_complexity::MaskSeedsStats {
+                seed_count: blocks.iter().map(|part| part.blocks.len()).sum(),
+                ..Default::default()
+            },
+            query_letters,
+            reference_letters,
+        );
         return PreparedSeedJoin {
             query,
             reference,
@@ -531,7 +728,9 @@ fn prepare_seed_join_from_arrays(
         .map(|(partition, mut blocks)| {
             let query_part = query.partition(partition as u32);
             let mut masked = Vec::new();
+            let mut stats = crate::search::seed_complexity::MaskSeedsStats::default();
             blocks.blocks.retain(|block| {
+                stats.seed_count += 1;
                 let first = super::seed_array::decode_seq_pos(
                     query_offsets,
                     query_part[block.q_start as usize],
@@ -546,6 +745,9 @@ fn prepare_seed_join_from_arrays(
                         reduction,
                     )
                 {
+                    stats.masked_seed_count += 1;
+                    stats.query_count += block.q_count as usize;
+                    stats.target_count += block.r_count as usize;
                     masked.extend((block.q_start..block.q_start + block.q_count).map(|index| {
                         super::seed_array::decode_seq_pos(query_offsets, query_part[index as usize])
                     }));
@@ -554,15 +756,21 @@ fn prepare_seed_join_from_arrays(
                     true
                 }
             });
-            (blocks, masked)
+            (blocks, masked, stats)
         })
         .collect();
     let mut filtered_blocks = Vec::with_capacity(num_partitions);
     let mut masked_positions = Vec::new();
-    for (blocks, masked) in evaluated {
+    let mut mask_stats = crate::search::seed_complexity::MaskSeedsStats::default();
+    for (blocks, masked, stats) in evaluated {
+        mask_stats.seed_count += stats.seed_count;
+        mask_stats.masked_seed_count += stats.masked_seed_count;
+        mask_stats.query_count += stats.query_count;
+        mask_stats.target_count += stats.target_count;
         filtered_blocks.push(blocks);
         masked_positions.extend(masked);
     }
+    crate::search::seed_complexity::report_masking(&mask_stats, query_letters, reference_letters);
     PreparedSeedJoin {
         query,
         reference,
@@ -999,6 +1207,64 @@ where
     F: Fn((u32, u32), &[u32], &[(u32, u32)], &[u64], u32, &mut Vec<T>) -> usize + Sync,
     C: FnMut(Vec<Vec<T>>) + Send,
 {
+    visit_prepared_seed_hits_streaming_hamming_mode_with_options(
+        query_fingerprint_seqs,
+        ref_fingerprint_seqs,
+        exact_stage1_sets,
+        prepared,
+        hamming_filter_id,
+        partition_batch_size,
+        linear_stage1_query,
+        linear_stage1_target,
+        min_length_ratio,
+        self_search,
+        PreparedStage1Options::default(),
+        map_batch,
+        consume,
+    )
+}
+
+/// Source per-shape ranking and tile configuration for a prepared seed join.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedStage1Options {
+    pub kmer_ranking: bool,
+    pub keep_target_id: bool,
+    pub tile_size: usize,
+}
+impl Default for PreparedStage1Options {
+    fn default() -> Self {
+        Self {
+            kmer_ranking: false,
+            keep_target_id: true,
+            tile_size: 1024,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn visit_prepared_seed_hits_streaming_hamming_mode_with_options<T, F, C>(
+    query_fingerprint_seqs: &[&[Letter]],
+    ref_fingerprint_seqs: &[&[Letter]],
+    exact_stage1_sets: Option<(
+        &crate::data::sequence_set::SequenceSet,
+        &crate::data::sequence_set::SequenceSet,
+    )>,
+    prepared: PreparedSeedJoin,
+    hamming_filter_id: u32,
+    partition_batch_size: usize,
+    linear_stage1_query: bool,
+    linear_stage1_target: bool,
+    min_length_ratio: f64,
+    self_search: bool,
+    options: PreparedStage1Options,
+    map_batch: F,
+    consume: C,
+) -> usize
+where
+    T: Send,
+    F: Fn((u32, u32), &[u32], &[(u32, u32)], &[u64], u32, &mut Vec<T>) -> usize + Sync,
+    C: FnMut(Vec<Vec<T>>) + Send,
+{
     macro_rules! dispatch {
         ($kernel:expr) => {
             return visit_prepared_seed_hits_streaming_hamming_for::<{ $kernel }, T, F, C>(
@@ -1012,6 +1278,7 @@ where
                 linear_stage1_target,
                 min_length_ratio,
                 self_search,
+                options,
                 map_batch,
                 consume,
             );
@@ -1053,6 +1320,7 @@ fn visit_prepared_seed_hits_streaming_hamming_for<const HAMMING_KERNEL: u8, T, F
     linear_stage1_target: bool,
     min_length_ratio: f64,
     self_search: bool,
+    options: PreparedStage1Options,
     map_batch: F,
     mut consume: C,
 ) -> usize
@@ -1092,12 +1360,39 @@ where
     // buckets, which is especially costly in clustering's 15-shape
     // Linclust40 round.
     let exact_stage1_ranking = if linear_stage1_query {
-        exact_stage1_sets
-            .map(|(query_set, _)| crate::search::kmer_ranking::KmerRanking::from_queries(query_set))
+        let mut rank = vec![0.0f32; query_fingerprint_seqs.len()];
+        if options.keep_target_id && options.kmer_ranking {
+            // Source scans all post-mask joined groups in partition order once
+            // per shape/index chunk, adding sqrt(reference occurrence count)
+            // for every query occurrence in that group.
+            for (partition, joined) in blocks.iter().enumerate() {
+                let query_part = query_sa.partition(partition as u32);
+                for group in &joined.blocks {
+                    let contribution = (group.r_count as f32).sqrt();
+                    for index in group.q_start..group.q_start + group.q_count {
+                        let (query, _) = query_locator.decode(query_part[index as usize]);
+                        rank[query as usize] += contribution;
+                    }
+                }
+            }
+        } else if options.keep_target_id {
+            for (rank, query) in rank.iter_mut().zip(query_fingerprint_seqs) {
+                *rank = query.len() as f32;
+            }
+        }
+        // Source's PackedLoc linear kernel selects the first occurrence when
+        // IDs are absent. Equal zero ranks reproduce that selection while the
+        // native callback retains decoded IDs for its ownership adapter.
+        Some(crate::search::kmer_ranking::KmerRanking { rank })
     } else {
         None
     };
 
+    let search_started = std::time::Instant::now();
+    let joined_keys = blocks
+        .iter()
+        .map(|partition| partition.blocks.len() as u64)
+        .sum::<u64>();
     let raw_count = AtomicUsize::new(0);
     // Aggregate once per partition, rather than once per hit, so exposing the
     // same stage boundary as upstream's TENTATIVE_MATCHES1 counter has
@@ -1137,7 +1432,7 @@ where
             batch.reserve(32 - batch.capacity());
         }
         for block in &blocks.blocks {
-            partition_raw_count += if self_search && !linear_stage1_query {
+            let estimated_raw_count = if self_search && !linear_stage1_query {
                 let n = block.r_count as usize;
                 n.saturating_mul(n.saturating_sub(1)) / 2
             } else if linear_stage1_query {
@@ -1147,9 +1442,11 @@ where
             } else {
                 block.q_count as usize * block.r_count as usize
             };
+            let mut actual_kernel_count = None;
             let absolute_hamming = !linear_stage1_query
                 && !linear_stage1_target
                 && !self_search
+                && min_length_ratio == 0.0
                 && exact_stage1_sets.is_some();
             query_locs.clear();
             query_absolute.clear();
@@ -1177,18 +1474,14 @@ where
             batch.clear();
             let mut last_query = None;
             let query_group = if linear_stage1_query {
-                let mut ranked = 0usize;
-                let mut ranked_len = query_locs.first().map_or(0, |location| {
-                    query_fingerprint_seqs[location.0 as usize].len()
-                });
-                for (index, location) in query_locs.iter().enumerate().skip(1) {
-                    let length = query_fingerprint_seqs[location.0 as usize].len();
-                    if length > ranked_len {
-                        ranked = index;
-                        ranked_len = length;
+                let rank = &exact_stage1_ranking.as_ref().unwrap().rank;
+                let mut best = 0usize;
+                for index in 1..query_locs.len() {
+                    if rank[query_locs[index].0 as usize] > rank[query_locs[best].0 as usize] {
+                        best = index;
                     }
                 }
-                &query_locs[ranked..query_locs.len().min(ranked + 1)]
+                &query_locs[best..query_locs.len().min(best + 1)]
             } else {
                 query_locs.as_slice()
             };
@@ -1196,10 +1489,12 @@ where
                 // stage2.h::search_query_offset discards same-record hits
                 // for self searches before ungapped/gapped extension,
                 // including query-linear dispatch.
+                // Source TENTATIVE_MATCHES1 is counted in search_tile,
+                // before stage2's same-record self-hit rejection.
+                partition_hamming_count += 1;
                 if self_search && query.0 == target.0 {
                     return;
                 }
-                partition_hamming_count += 1;
                 if last_query.is_some() && last_query != Some(query) && !batch.is_empty() {
                     partition_ungapped_count += map_batch(
                         last_query.expect("nonempty stage-1 batch has a query"),
@@ -1222,7 +1517,10 @@ where
                 // Keep that boundary instead of repeatedly re-entering stage
                 // 2 for every 32 Hamming survivors.
             };
-            if (linear_stage1_query || linear_stage1_target || self_search)
+            if (linear_stage1_query
+                || linear_stage1_target
+                || self_search
+                || min_length_ratio > 0.0)
                 && exact_stage1_sets.is_some()
             {
                 let (query_set, target_set) = exact_stage1_sets.unwrap();
@@ -1250,8 +1548,7 @@ where
                 let mut work = crate::search::hamming::WorkSet::new(
                     query_set,
                     target_set,
-                    // basic/config.cpp default `--tile-size`.
-                    1024,
+                    options.tile_size,
                     hamming_filter_id,
                     exact_stage1_ranking.as_ref(),
                     |hits: &mut crate::search::hamming::HitField,
@@ -1284,6 +1581,7 @@ where
                     &dispatch,
                 )
                 .expect("translated stage1 dispatch must support clustering mode");
+                actual_kernel_count = Some(work.stats.seed_hits as usize);
             } else if absolute_hamming {
                 let (query_set, target_set) =
                     exact_stage1_sets.expect("absolute Hamming has backing sets");
@@ -1334,6 +1632,7 @@ where
                     &mut output,
                 );
             }
+            partition_raw_count += actual_kernel_count.unwrap_or(estimated_raw_count);
         }
         raw_count.fetch_add(partition_raw_count, Ordering::Relaxed);
         hamming_count.fetch_add(partition_hamming_count, Ordering::Relaxed);
@@ -1448,12 +1747,24 @@ where
             }
         });
     }
-    eprintln!(
-        "Stage-1 filters: {} -> {} (Hamming) -> {} (ungapped)",
-        raw_count.load(Ordering::Relaxed),
-        hamming_count.load(Ordering::Relaxed),
-        ungapped_count.load(Ordering::Relaxed),
+    let mut stat = crate::basic::statistics::Statistics::new();
+    use crate::basic::statistics::StatValue;
+    stat.inc(StatValue::SeedsHit, joined_keys as i64);
+    stat.inc(
+        StatValue::SeedHits,
+        raw_count.load(Ordering::Relaxed) as i64,
     );
+    stat.inc(
+        StatValue::TentativeMatches1,
+        hamming_count.load(Ordering::Relaxed) as i64,
+    );
+    stat.inc(
+        StatValue::TimeSearch,
+        search_started.elapsed().as_micros() as i64,
+    );
+    crate::basic::statistics::merge_statistics(&stat);
+    // The command's Source Statistics::print owns reporting; this worker
+    // must not bypass --quiet with an unconditional native stderr summary.
     raw_count.into_inner()
 }
 

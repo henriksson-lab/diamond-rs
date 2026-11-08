@@ -1,0 +1,4 @@
+cseqid	mseqid	approx_pident	cstart	cend	mstart	mend	evalue	Bitscore
+domain_query	single_domain	100	1	78	1	78	1.98e-59	176
+domain_query	domain_query	60.5	1	379	1	379	1.07e-157	437
+domain_query	reordered	100	1	78	302	379	1.26e-55	176

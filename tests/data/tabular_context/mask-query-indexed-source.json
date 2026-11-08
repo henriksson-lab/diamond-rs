@@ -1,0 +1,50 @@
+[
+  {
+    "label": "blastp.mask1.b1",
+    "algorithm": "1",
+    "same_as_algo0": true,
+    "sha256": "069007eafdeef2ab0e04d5428b003a3b58264995f1df25e8282405dbac259d9f"
+  },
+  {
+    "label": "blastp.mask1.b0.0000001",
+    "algorithm": "1",
+    "same_as_algo0": true,
+    "sha256": "069007eafdeef2ab0e04d5428b003a3b58264995f1df25e8282405dbac259d9f"
+  },
+  {
+    "label": "blastp.maskseg.b1",
+    "algorithm": "1",
+    "same_as_algo0": true,
+    "sha256": "069007eafdeef2ab0e04d5428b003a3b58264995f1df25e8282405dbac259d9f"
+  },
+  {
+    "label": "blastp.maskseg.b0.0000001",
+    "algorithm": "1",
+    "same_as_algo0": true,
+    "sha256": "069007eafdeef2ab0e04d5428b003a3b58264995f1df25e8282405dbac259d9f"
+  },
+  {
+    "label": "blastx.mask1.b1",
+    "algorithm": "1",
+    "same_as_algo0": false,
+    "sha256": "80a30c8ef28e70d9598e29088a763061486d618dbdbfa4bd6ffadc5af56be57b"
+  },
+  {
+    "label": "blastx.mask1.b0.0000001",
+    "algorithm": "1",
+    "same_as_algo0": true,
+    "sha256": "f4b44a396dba0ead6da7b51bf3582d7b96e8947b7a7a84b056469b7e62efe363"
+  },
+  {
+    "label": "blastx.maskseg.b1",
+    "algorithm": "1",
+    "same_as_algo0": false,
+    "sha256": "80a30c8ef28e70d9598e29088a763061486d618dbdbfa4bd6ffadc5af56be57b"
+  },
+  {
+    "label": "blastx.maskseg.b0.0000001",
+    "algorithm": "1",
+    "same_as_algo0": true,
+    "sha256": "f4b44a396dba0ead6da7b51bf3582d7b96e8947b7a7a84b056469b7e62efe363"
+  }
+]

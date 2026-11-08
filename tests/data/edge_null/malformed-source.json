@@ -1,0 +1,36 @@
+[
+  {
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/multiline-sequence.fq",
+      "-d",
+      ".tmp/native-edge-null-20261107/source.dmnd",
+      "-f",
+      "edge",
+      "-o",
+      ".tmp/native-edge-null-20261107/malformed.edge"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: .tmp/native-edge-null-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: .tmp/native-edge-null-20261107/source.dmnd (type: Diamond database, sequences: 3, letters: 536)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file...  [0s]\nLoading query sequences... Error: Malformed FASTQ record\n"
+  },
+  {
+    "args": [
+      "diamond/build/diamond",
+      "blastp",
+      "-q",
+      "tests/data/tabular_context/multiline-sequence.fq",
+      "-d",
+      ".tmp/native-edge-null-20261107/source.dmnd",
+      "-f",
+      "null",
+      "-o",
+      ".tmp/native-edge-null-20261107/malformed.null"
+    ],
+    "status": 1,
+    "stdout": "\u001b[0;39m",
+    "stderr": "diamond v2.1.24.178 (C) Max Planck Society for the Advancement of Science, Benjamin J. Buchfink, University of Tuebingen\nDocumentation, support and updates available at http://www.diamondsearch.org\nPlease cite: http://dx.doi.org/10.1038/s41592-021-01101-x Nature Methods (2021)\n\n#CPU threads: 40\nScoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n\u001b[1;33mWarning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\nTemporary directory: .tmp/native-edge-null-20261107\n#Target sequences to report alignments for: 25\nOpening the database...  [0s]\nDatabase: .tmp/native-edge-null-20261107/source.dmnd (type: Diamond database, sequences: 3, letters: 536)\nBlock size = 2000000000\nOpening the input file...  [0s]\nOpening the output file...  [0s]\nLoading query sequences... Error: Malformed FASTQ record\n"
+  }
+]

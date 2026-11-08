@@ -1,14 +1,16 @@
 //! External-clustering alignment stage from `cluster/external/align.cpp`.
 
+use crate::util::io::source_c_path;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::external::{ClusterStats, Edge, Job, PairEntryShort};
-use super::pair_table::{Bucket, RadixedTable, RADIX_BITS, RADIX_COUNT};
+use super::pair_table::{RadixedTable, RADIX_BITS, RADIX_COUNT};
 use super::seed_table::{SequenceVolumeReader, Volume, VolumedFile};
+use super::storage::BucketWriter;
 use crate::basic::statistics::Statistics;
 use crate::basic::value::Letter;
 use crate::dp::swipe::{
@@ -16,7 +18,7 @@ use crate::dp::swipe::{
 };
 use crate::stats::score_matrix::ScoreMatrix;
 use crate::util::hash::hash64;
-use crate::util::io::CompressedBuffer;
+use crate::util::parallel::Atomic;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlignConfig {
@@ -27,6 +29,8 @@ pub struct AlignConfig {
     pub alignment_output: Option<PathBuf>,
     pub cutoff_score_8bit: i32,
     pub max_swipe_dp: i64,
+    pub band_bin: i32,
+    pub col_bin: i32,
     pub approx_backtrace: bool,
     pub max_evalue: f64,
 }
@@ -41,6 +45,8 @@ impl Default for AlignConfig {
             alignment_output: None,
             cutoff_score_8bit: i8::MAX as i32,
             max_swipe_dp: 1_000_000,
+            band_bin: 24,
+            col_bin: 400,
             approx_backtrace: false,
             max_evalue: f64::MAX,
         }
@@ -62,11 +68,12 @@ impl ChunkSequences {
         let mut sequences = HashMap::new();
         let mut letters = 0usize;
         for volume in &volumes.0 {
-            for sequence in reader.read_volume(&volume.path)? {
+            reader.visit_volume(&volume.path, &mut |sequence| {
                 let oid = parse_oid(&sequence.id)?;
                 letters += sequence.sequence.len();
                 sequences.insert(oid, sequence.sequence);
-            }
+                Ok(())
+            })?;
         }
         Ok(Self {
             sequences,
@@ -112,58 +119,27 @@ fn parse_oid(id: &str) -> Result<u64, String> {
 }
 
 #[derive(Debug)]
-struct EdgeFileArray {
-    base_dir: PathBuf,
-    worker_id: i64,
-    edges: Vec<Vec<Edge>>,
-}
+struct EdgeFileArray(BucketWriter);
 
 impl EdgeFileArray {
-    fn new(base_dir: impl AsRef<Path>, worker_id: i64) -> Result<Self, String> {
-        let base_dir = base_dir.as_ref().to_path_buf();
-        for radix in 0..RADIX_COUNT {
-            fs::create_dir_all(base_dir.join(radix.to_string()))
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(Self {
-            base_dir,
+    fn new(
+        base_dir: impl AsRef<Path>,
+        worker_id: i64,
+        errors: crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
+        Ok(Self(BucketWriter::new_owned(
+            base_dir.as_ref(),
             worker_id,
-            edges: vec![Vec::new(); RADIX_COUNT],
-        })
+            RADIX_COUNT,
+            errors,
+        )?))
     }
-
-    fn write_msb(&mut self, edge: Edge) {
+    fn write_msb(&mut self, edge: Edge) -> Result<(), String> {
         let radix = (hash64(edge.member_oid) >> (64 - RADIX_BITS)) as usize;
-        self.edges[radix].push(edge);
+        self.0.write(radix, &encode_edge(edge))
     }
-
-    fn finish(&self) -> Result<RadixedTable, String> {
-        let mut buckets = Vec::with_capacity(RADIX_COUNT);
-        for radix in 0..RADIX_COUNT {
-            let directory = self.base_dir.join(radix.to_string());
-            let manifest = directory.join("bucket.tsv");
-            let edges = &self.edges[radix];
-            if edges.is_empty() {
-                fs::write(&manifest, []).map_err(|error| error.to_string())?;
-            } else {
-                let volume = directory.join(format!("worker_{}_volume_0", self.worker_id));
-                let mut compressed = CompressedBuffer::new();
-                for edge in edges {
-                    compressed
-                        .write(&encode_edge(*edge))
-                        .map_err(|error| error.to_string())?;
-                }
-                compressed.finish().map_err(|error| error.to_string())?;
-                fs::write(&volume, compressed.data()).map_err(|error| error.to_string())?;
-                fs::write(
-                    &manifest,
-                    format!("{}\t{}\n", volume.display(), edges.len()),
-                )
-                .map_err(|error| error.to_string())?;
-            }
-            buckets.push(Bucket::new(manifest, None));
-        }
-        Ok(RadixedTable(buckets))
+    fn finish(&mut self) -> Result<RadixedTable, String> {
+        self.0.finish()
     }
 }
 
@@ -222,8 +198,20 @@ pub fn align_rep(
     params.v = HspValues::COORDS;
     params.cutoff_score_8bit = config.cutoff_score_8bit;
     params.max_swipe_dp = config.max_swipe_dp;
+    params.band_bin = config.band_bin;
+    params.col_bin = config.col_bin;
     params.approx_backtrace = config.approx_backtrace;
     params.max_evalue = config.max_evalue;
+    // External::external sets these global controls before align_rep. SWIPE
+    // consumes them while selecting forward endpoints for the reverse pass,
+    // before the final external edge filters below.
+    if let Some(mutual_cover) = config.mutual_cover {
+        params.query_cover = mutual_cover;
+        params.subject_cover = mutual_cover;
+    } else {
+        params.query_or_target_cover = config.member_cover;
+    }
+    params.approx_min_id = config.approx_min_identity;
     params.statistics = Some(swipe_statistics);
     let hsps = swipe(&dp_targets, &mut params);
     stats.hits_evalue_filtered += hsps.len() as u64;
@@ -239,7 +227,11 @@ pub fn align_rep(
             writeln!(
                 writer,
                 "{}\t{}\t{}\t{}\t{}",
-                pair.rep_oid, pair.member_oid, query_cover, subject_cover, hsp.evalue
+                pair.rep_oid,
+                pair.member_oid,
+                crate::output::format::format_default_float(query_cover),
+                crate::output::format::format_default_float(subject_cover),
+                crate::output::format::format_default_float(hsp.evalue)
             )
             .map_err(|error| error.to_string())?;
         }
@@ -298,56 +290,118 @@ pub fn align_rep(
     Ok(())
 }
 
-fn read_volumed_file(path: &Path) -> Result<VolumedFile, String> {
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+fn read_volumed_file(
+    path: &Path,
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<VolumedFile, String> {
+    let bytes = fs::read(source_c_path(&(path)).as_ref()).map_err(|error| error.to_string())?;
     let mut volumes = Vec::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.is_empty() {
-            continue;
-        }
+    for line in bytes
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+    {
+        let fields = line
+            .split(u8::is_ascii_whitespace)
+            .filter(|field| !field.is_empty())
+            .collect::<Vec<_>>();
         let records = fields
             .last()
-            .and_then(|value| value.parse::<u64>().ok())
+            .and_then(|value| std::str::from_utf8(value).ok()?.parse::<u64>().ok())
             .unwrap_or(0);
-        volumes.push(Volume::new(fields[0], 0, 0, records));
+        let path = errors
+            .capture(crate::util::io::source_bytes_os(fields[0]).map_err(std::io::Error::other))?;
+        volumes.push(Volume::new(PathBuf::from(path), 0, 0, records));
     }
     Ok(VolumedFile(volumes))
 }
 
-fn read_pair_batches(path: &Path) -> Result<Vec<Vec<PairEntryShort>>, String> {
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    let mut offset = 0usize;
-    let mut batches = Vec::new();
-    while offset < bytes.len() {
-        if bytes.len() - offset < std::mem::size_of::<usize>() {
-            return Err("Short pair batch size.".to_string());
+#[cfg(test)]
+fn visit_pair_batches(
+    path: &Path,
+    visitor: &mut dyn FnMut(Vec<PairEntryShort>) -> Result<(), String>,
+) -> Result<(), String> {
+    let errors = crate::util::io::IoErrorOwner::default();
+    let mut input = errors.capture(
+        crate::util::io::InputFile::with_source_profile_path(
+            path,
+            crate::util::io::InputFile::NO_AUTODETECT,
+            65_536,
+        )
+        .map_err(std::io::Error::other),
+    )?;
+    visit_pair_batches_input(&mut input, &errors, visitor)
+}
+
+fn visit_pair_batches_input(
+    input: &mut crate::util::io::InputFile,
+    errors: &crate::util::io::IoErrorOwner,
+    visitor: &mut dyn FnMut(Vec<PairEntryShort>) -> Result<(), String>,
+) -> Result<(), String> {
+    let total = errors.capture(input.file_size().map_err(std::io::Error::other))? as u64;
+    let mut position = 0u64;
+    loop {
+        let mut header = [0; std::mem::size_of::<usize>()];
+        if errors.capture(
+            input
+                .read_raw(&mut header[..1])
+                .map_err(std::io::Error::other),
+        )? == 0
+        {
+            break;
         }
-        let mut size_bytes = [0u8; std::mem::size_of::<usize>()];
-        size_bytes.copy_from_slice(&bytes[offset..offset + std::mem::size_of::<usize>()]);
-        offset += std::mem::size_of::<usize>();
-        let size = usize::from_ne_bytes(size_bytes);
-        let byte_count = size
-            .checked_mul(16)
-            .ok_or_else(|| "Pair batch size overflow.".to_string())?;
-        if bytes.len() - offset < byte_count {
-            return Err("Short PairEntryShort batch.".to_string());
+        errors.capture(
+            input
+                .read_exact(&mut header[1..])
+                .map_err(std::io::Error::other),
+        )?;
+        let count = usize::from_ne_bytes(header);
+        let bytes = count.checked_mul(16).ok_or("Pair batch size overflow.")?;
+        position += header.len() as u64;
+        if bytes as u64 > total.saturating_sub(position) {
+            return Err("Short PairEntryShort batch.".into());
         }
-        let mut batch = Vec::with_capacity(size);
-        for record in bytes[offset..offset + byte_count].chunks_exact(16) {
+        let mut batch = Vec::new();
+        batch
+            .try_reserve(count)
+            .map_err(|error| error.to_string())?;
+        for _ in 0..count {
+            let mut pair = [0; 16];
+            errors.capture(input.read_values(&mut pair).map_err(std::io::Error::other))?;
+            position += pair.len() as u64;
             batch.push(PairEntryShort {
-                rep_oid: u64::from_ne_bytes(record[0..8].try_into().unwrap()),
-                member_oid: u64::from_ne_bytes(record[8..16].try_into().unwrap()),
+                rep_oid: u64::from_ne_bytes(pair[..8].try_into().unwrap()),
+                member_oid: u64::from_ne_bytes(pair[8..].try_into().unwrap()),
             });
         }
-        offset += byte_count;
-        batches.push(batch);
+        visitor(batch)?;
     }
+    errors.capture(input.close().map_err(std::io::Error::other))?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn read_pair_batches(path: &Path) -> Result<Vec<Vec<PairEntryShort>>, String> {
+    let mut batches = Vec::new();
+    visit_pair_batches(path, &mut |batch| {
+        batches.push(batch);
+        Ok(())
+    })?;
     Ok(batches)
 }
 
-/// C++ `External::align`; cross-process work claiming maps to deterministic
-/// chunk iteration while retaining the exact files, grouping and radix output.
+fn alignment_output_path(prefix: &Path) -> PathBuf {
+    #[cfg(unix)]
+    let id = unsafe { libc::pthread_self() as usize };
+    #[cfg(windows)]
+    let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() as usize };
+    #[cfg(not(any(unix, windows)))]
+    let id = std::process::id() as usize;
+    let mut path = prefix.as_os_str().to_owned();
+    path.push(format!(".{id}"));
+    PathBuf::from(path)
+}
+
+/// C++ `External::align` with file-backed cross-process chunk claims.
 pub fn align<R: SequenceVolumeReader>(
     job: &Job,
     chunk_count: usize,
@@ -361,11 +415,17 @@ pub fn align<R: SequenceVolumeReader>(
     }
     let chunks_path = job.base_dir(None).join("chunks");
     let alignment_path = job.base_dir(None).join("alignments");
-    let mut output_files = EdgeFileArray::new(&alignment_path, job.worker_id())?;
+    let mut output_files = EdgeFileArray::new(&alignment_path, job.worker_id(), job.io_errors())?;
     let mut all_stats = ClusterStats::default();
-    for chunk in 0..chunk_count {
+    let queue = Atomic::new(chunks_path.join("align_queue"));
+    let mut processed = 0;
+    loop {
+        let chunk = usize::try_from(queue.fetch_add_one()?).map_err(|error| error.to_string())?;
+        if chunk >= chunk_count {
+            break;
+        }
         let chunk_path = chunks_path.join(chunk.to_string());
-        let volumes = read_volumed_file(&chunk_path.join("bucket.tsv"))?;
+        let volumes = read_volumed_file(&chunk_path.join("bucket.tsv"), &job.io_errors())?;
         let chunk_sequences = ChunkSequences::from_volumes(&volumes, reader)?;
         job.log(&format!(
             "Computing alignments. Chunk={}/{} Volumes={} Sequences={} Letters={}",
@@ -376,21 +436,30 @@ pub fn align<R: SequenceVolumeReader>(
             chunk_sequences.letters()
         ))?;
         let pairs_path = chunk_path.join("pairs");
-        let batches = read_pair_batches(&pairs_path)?;
-        let mut alignment_output = if let Some(path) = &config.alignment_output {
+        let mut pairs_input =
+            job.open_input(&pairs_path, crate::util::io::InputFile::NO_AUTODETECT)?;
+        let path = config
+            .alignment_output
+            .as_deref()
+            .map(alignment_output_path);
+        let mut alignment_output = if let Some(path) = &path {
             Some(
                 OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(path)
+                    .open(source_c_path(&(path)).as_ref())
                     .map_err(|_| {
-                        format!("Failed to open alignment output file: {}", path.display())
+                        super::storage::path_error(
+                            &job.io_errors(),
+                            b"Failed to open alignment output file: ",
+                            &path,
+                        )
                     })?,
             )
         } else {
             None
         };
-        for batch in batches {
+        visit_pair_batches_input(&mut pairs_input, &job.io_errors(), &mut |batch| {
             let mut begin = 0usize;
             while begin < batch.len() {
                 let rep_oid = batch[begin].rep_oid;
@@ -409,15 +478,21 @@ pub fn align<R: SequenceVolumeReader>(
                     &mut all_stats,
                 )?;
                 for edge in edges {
-                    output_files.write_msb(edge);
+                    output_files.write_msb(edge)?;
                 }
                 begin = end;
             }
-        }
-        fs::remove_file(&pairs_path).map_err(|error| error.to_string())?;
+            Ok(())
+        })?;
+        processed += 1;
+        fs::remove_file(source_c_path(&pairs_path).as_ref()).map_err(|error| error.to_string())?;
     }
     job.log_stats(&all_stats)?;
-    Ok((output_files.finish()?, all_stats))
+    let table = output_files.finish()?;
+    let finished = Atomic::new(alignment_path.join("finished"));
+    finished.fetch_add(processed)?;
+    finished.await_value(chunk_count as i64)?;
+    Ok((table, all_stats))
 }
 
 #[cfg(test)]
@@ -509,6 +584,80 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!((edges[0].rep_oid, edges[0].member_oid), (2, 8));
         assert_eq!(stats.hits_filtered, 1);
+    }
+
+    #[test]
+    fn align_rep_applies_mutual_coverage_before_reverse_alignment() {
+        let mut sequences = ChunkSequences::default();
+        // An unambiguous prefix match: the subject is fully covered while
+        // only half of the representative is aligned. Repeated residues
+        // do not distinguish equally scoring reverse endpoints.
+        sequences
+            .sequences
+            .insert(0, sequence("ARNDCQEGHILKMFPSTWYV"));
+        sequences.sequences.insert(1, sequence("ARNDCQEGHI"));
+        let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 1_000_000_000).unwrap();
+        let pairs = [PairEntryShort {
+            rep_oid: 0,
+            member_oid: 1,
+        }];
+        for (mutual_cover, expected_hsps) in [(None, 1), (Some(100.0), 0)] {
+            let mut stats = ClusterStats::default();
+            let mut edges = Vec::new();
+            align_rep(
+                &sequences,
+                &pairs,
+                &matrix,
+                &AlignConfig {
+                    member_cover: 100.0,
+                    mutual_cover,
+                    ..Default::default()
+                },
+                &mut edges,
+                None,
+                &mut stats,
+            )
+            .unwrap();
+            assert_eq!(stats.extensions_computed, 1);
+            assert_eq!(stats.hits_evalue_filtered, expected_hsps);
+            assert_eq!(edges.len(), expected_hsps as usize);
+        }
+    }
+
+    #[test]
+    fn align_rep_applies_score_identity_bound_before_identity_shortcut() {
+        let mut sequences = ChunkSequences::default();
+        sequences
+            .sequences
+            .insert(0, sequence("AAAAAAAAAAAAAAAAAAAA"));
+        sequences
+            .sequences
+            .insert(1, sequence("AAAAAAAAAAAAAAAAAAAA"));
+        let matrix = ScoreMatrix::new("blosum62", 11, 1, 0, 1, 1_000_000_000).unwrap();
+        let mut stats = ClusterStats::default();
+        let mut edges = Vec::new();
+        align_rep(
+            &sequences,
+            &[PairEntryShort {
+                rep_oid: 0,
+                member_oid: 1,
+            }],
+            &matrix,
+            &AlignConfig {
+                member_cover: 100.0,
+                approx_min_identity: 90.0,
+                ..Default::default()
+            },
+            &mut edges,
+            None,
+            &mut stats,
+        )
+        .unwrap();
+        // The pre-reverse score bound is 80/20*16.56+11.41 = 77.65.
+        // A final identical-sequence check would instead report 100 percent.
+        assert_eq!(stats.extensions_computed, 1);
+        assert_eq!(stats.hits_evalue_filtered, 0);
+        assert!(edges.is_empty());
     }
 
     #[test]

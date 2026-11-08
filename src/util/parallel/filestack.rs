@@ -1,5 +1,6 @@
 //! Translation of `diamond/src/util/parallel/filestack.{h,cpp}`.
 
+use crate::util::io::source_c_path;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ pub struct FileStack {
     file: Mutex<File>,
     max_line_length: usize,
     mtx: Mutex<()>,
+    errors: crate::util::io::IoErrorOwner,
 }
 
 impl Default for FileStack {
@@ -40,21 +42,57 @@ impl FileStack {
         Self::with_max_line_length(file_name, DEFAULT_MAX_LINE_LENGTH)
     }
 
+    /// Fallible construction for translated callers which propagate the
+    /// Source constructor's open failure rather than unwinding through panic.
+    pub fn try_new(file_name: impl AsRef<Path>) -> Result<Self, String> {
+        Self::try_with_max_line_length(file_name, DEFAULT_MAX_LINE_LENGTH)
+    }
+
     /// C++ `FileStack::FileStack(const string&, int)`.
     pub fn with_max_line_length(file_name: impl AsRef<Path>, maximum_line_length: usize) -> Self {
-        let file_name = file_name.as_ref().to_path_buf();
+        Self::try_with_max_line_length(file_name, maximum_line_length)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn try_with_max_line_length(
+        file_name: impl AsRef<Path>,
+        maximum_line_length: usize,
+    ) -> Result<Self, String> {
+        Self::try_with_owner(file_name.as_ref(), maximum_line_length, Default::default())
+    }
+
+    pub fn try_new_owned(
+        file_name: impl AsRef<Path>,
+        errors: crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
+        Self::try_with_owner(file_name.as_ref(), DEFAULT_MAX_LINE_LENGTH, errors)
+    }
+
+    fn try_with_owner(
+        file_name: &Path,
+        maximum_line_length: usize,
+        errors: crate::util::io::IoErrorOwner,
+    ) -> Result<Self, String> {
+        let file_name = file_name.to_path_buf();
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(&file_name)
-            .unwrap_or_else(|_| panic!("could not open file {}", file_name.display()));
-        Self {
+            .open(source_c_path(&file_name).as_ref())
+            .map_err(|_| {
+                errors
+                    .capture::<()>(Err(std::io::Error::other(
+                        crate::util::io::IoError::path_message(b"could not open file ", &file_name),
+                    )))
+                    .unwrap_err()
+            })?;
+        Ok(Self {
             file_name,
             file: Mutex::new(file),
             max_line_length: maximum_line_length.max(MINIMUM_LINE_LENGTH),
             mtx: Mutex::new(()),
-        }
+            errors,
+        })
     }
 
     /// C++ `FileStack::size()`.
@@ -107,20 +145,63 @@ impl FileStack {
 
     /// C++ `FileStack::remove(const string&)`.
     pub fn remove(&self, line: &str) -> Result<(), String> {
+        self.remove_bytes(line.as_bytes())
+    }
+
+    pub fn remove_bytes(&self, line: &[u8]) -> Result<(), String> {
         self.with_lock(|file| {
             file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-            let mut data = String::new();
-            file.read_to_string(&mut data).map_err(|e| e.to_string())?;
-            let tokens = super::multiprocessing::split(&data, '\n');
-            let mut output = String::new();
-            for token in tokens.into_iter().filter(|token| token != line) {
-                output.push_str(&token);
-                output.push('\n');
+            let mut data = Vec::new();
+            file.read_to_end(&mut data).map_err(|e| e.to_string())?;
+            let mut output = Vec::new();
+            let length = data.len() - usize::from(data.last() == Some(&b'\n'));
+            if !data.is_empty() {
+                for token in data[..length]
+                    .split(|&byte| byte == b'\n')
+                    .filter(|token| *token != line)
+                {
+                    output.extend_from_slice(token);
+                    output.push(b'\n');
+                }
             }
             file.set_len(0).map_err(|e| e.to_string())?;
             file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-            file.write_all(output.as_bytes()).map_err(|e| e.to_string())
+            file.write_all(&output).map_err(|e| e.to_string())
         })
+    }
+
+    pub fn pop_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        self.with_lock(|file| self.pop_non_locked_bytes(file, false))
+    }
+    pub fn top_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        self.with_lock(|file| self.pop_non_locked_bytes(file, true))
+    }
+    pub fn pop_bytes_size(&self) -> Result<(Option<Vec<u8>>, usize), String> {
+        self.with_lock(|file| {
+            Ok((
+                self.pop_non_locked_bytes(file, false)?,
+                self.size_non_locked(file)?,
+            ))
+        })
+    }
+    pub fn push_bytes(&self, value: &[u8]) -> Result<i64, String> {
+        self.with_lock(|file| self.push_non_locked_bytes(file, value))
+    }
+    pub fn push_bytes_size(&self, value: &[u8]) -> Result<(i64, usize), String> {
+        self.with_lock(|file| {
+            Ok((
+                self.push_non_locked_bytes(file, value)?,
+                self.size_non_locked(file)?,
+            ))
+        })
+    }
+    pub fn pop_exclusive_bytes(&self) -> Result<Option<Vec<u8>>, String> {
+        let mut file = self.file.lock().map_err(|e| e.to_string())?;
+        self.pop_non_locked_bytes(&mut file, false)
+    }
+    pub fn push_exclusive_bytes(&self, value: &[u8]) -> Result<i64, String> {
+        let mut file = self.file.lock().map_err(|e| e.to_string())?;
+        self.push_non_locked_bytes(&mut file, value)
     }
 
     /// C++ `FileStack::push(int64_t)`.
@@ -201,7 +282,7 @@ impl FileStack {
             .lock()
             .map_err(|e| e.to_string())?
             .read(buf)
-            .map_err(|e| format!("Error reading file {}: {e}", self.file_name.display()))
+            .map_err(|e| self.message_error(b"Error reading file ", format!(": {e}").as_bytes()))
     }
 
     /// C++ `FileStack::write(const char*, size_t)`.
@@ -211,7 +292,7 @@ impl FileStack {
             .map_err(|e| e.to_string())?
             .write(buf)
             .map(|n| n as i64)
-            .map_err(|e| format!("Error writing file {}: {e}", self.file_name.display()))
+            .map_err(|e| self.message_error(b"Error writing file ", format!(": {e}").as_bytes()))
     }
 
     /// C++ `FileStack::truncate(size_t)`.
@@ -223,28 +304,51 @@ impl FileStack {
             .map_err(|e| e.to_string())
     }
 
-    /// C++ `FileStack::poll_query(...)`.
+    fn message_error(&self, prefix: &[u8], suffix: &[u8]) -> String {
+        let bytes = crate::util::io::path_diagnostic_bytes(&self.file_name).map(|path| {
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(&path);
+            bytes.extend_from_slice(suffix);
+            bytes
+        });
+        self.errors
+            .capture::<()>(Err(match bytes {
+                Ok(bytes) => std::io::Error::other(crate::util::io::RawDiagnosticError(bytes)),
+                Err(error) => std::io::Error::other(error),
+            }))
+            .unwrap_err()
+    }
+
+    /// C++ string searches operate on bytes, including filenames in queue lines.
     pub fn poll_query(&self, query: &str, sleep_s: f64, max_iter: usize) -> Result<bool, String> {
+        self.poll_query_bytes(query.as_bytes(), sleep_s, max_iter)
+    }
+    pub fn poll_query_bytes(
+        &self,
+        query: &[u8],
+        sleep_s: f64,
+        max_iter: usize,
+    ) -> Result<bool, String> {
         for _ in 0..max_iter {
-            if let Some(value) = self.top_string()? {
-                if value.contains(query) {
+            if let Some(value) = self.top_bytes()? {
+                if query.is_empty() || value.windows(query.len()).any(|part| part == query) {
                     return Ok(true);
                 }
-                if value.contains("STOP") {
-                    return Err(format!("STOP on FileStack {}", self.file_name.display()));
+                if value.windows(4).any(|part| part == b"STOP") {
+                    return Err(self.message_error(b"STOP on FileStack ", b""));
                 }
             }
             std::thread::sleep(Duration::from_secs_f64(sleep_s));
         }
-        Err(format!(
-            "Could not discover keyword {} on FileStack {} within {} seconds.",
-            query,
-            self.file_name.display(),
-            max_iter as f64 * sleep_s
+        let mut prefix = b"Could not discover keyword ".to_vec();
+        prefix.extend_from_slice(query);
+        prefix.extend_from_slice(b" on FileStack ");
+        Err(self.message_error(
+            &prefix,
+            format!(" within {} seconds.", max_iter as f64 * sleep_s).as_bytes(),
         ))
     }
 
-    /// C++ `FileStack::poll_size(...)`.
     pub fn poll_size(&self, size: usize, sleep_s: f64, max_iter: usize) -> Result<bool, String> {
         for _ in 0..max_iter {
             if self.size()? == size {
@@ -252,11 +356,9 @@ impl FileStack {
             }
             std::thread::sleep(Duration::from_secs_f64(sleep_s));
         }
-        Err(format!(
-            "Could not detect size {} of FileStack {} within {} seconds.",
-            size,
-            self.file_name.display(),
-            max_iter as f64 * sleep_s
+        Err(self.message_error(
+            format!("Could not detect size {size} of FileStack ").as_bytes(),
+            format!(" within {} seconds.", max_iter as f64 * sleep_s).as_bytes(),
         ))
     }
 
@@ -281,11 +383,14 @@ impl FileStack {
     }
 
     fn push_non_locked_string(&self, file: &mut File, value: &str) -> Result<i64, String> {
+        self.push_non_locked_bytes(file, value.as_bytes())
+    }
+
+    fn push_non_locked_bytes(&self, file: &mut File, value: &[u8]) -> Result<i64, String> {
         file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
-        file.write_all(value.as_bytes())
-            .map_err(|e| e.to_string())?;
+        file.write_all(value).map_err(|e| e.to_string())?;
         let mut written = value.len() as i64;
-        if !value.ends_with('\n') {
+        if !value.ends_with(b"\n") {
             file.write_all(b"\n").map_err(|e| e.to_string())?;
             written += 1;
         }
@@ -294,6 +399,18 @@ impl FileStack {
 
     /// C++ `FileStack::pop_non_locked(string&, bool, size_t&)`.
     fn pop_non_locked_string(&self, file: &mut File, keep: bool) -> Result<Option<String>, String> {
+        // The checked compatibility adapter validates before consuming the row.
+        let value = self
+            .pop_non_locked_bytes(file, true)?
+            .map(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string()))
+            .transpose()?;
+        if !keep && value.is_some() {
+            self.pop_non_locked_bytes(file, false)?;
+        }
+        Ok(value)
+    }
+
+    fn pop_non_locked_bytes(&self, file: &mut File, keep: bool) -> Result<Option<Vec<u8>>, String> {
         let size = file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? as usize;
         if size == 0 {
             return Ok(None);
@@ -317,8 +434,7 @@ impl FileStack {
         } else {
             begin + line_size
         };
-        let value =
-            String::from_utf8(chunk[begin..value_end].to_vec()).map_err(|e| e.to_string())?;
+        let value = chunk[begin..value_end].to_vec();
         if !keep {
             end = size - line_size;
             file.set_len(end as u64).map_err(|e| e.to_string())?;
@@ -360,14 +476,12 @@ impl FileStack {
         let _thread_lock = self.mtx.lock().map_err(|e| e.to_string())?;
         let mut file = self.file.lock().map_err(|e| e.to_string())?;
         lock_file(&file).map_err(|e| {
-            format!(
-                "could not put lock on file {}: {e}",
-                self.file_name.display()
-            )
+            self.message_error(b"could not put lock on file ", format!(": {e}").as_bytes())
         })?;
         let result = operation(&mut file);
-        let unlock = unlock_file(&file)
-            .map_err(|e| format!("could not unlock file {}: {e}", self.file_name.display()));
+        let unlock = unlock_file(&file).map_err(|e| {
+            self.message_error(b"could not unlock file ", format!(": {e}").as_bytes())
+        });
         match (result, unlock) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
@@ -432,7 +546,13 @@ fn unlock_file(file: &File) -> std::io::Result<()> {
     use windows_sys::Win32::System::IO::OVERLAPPED;
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
     let ok = unsafe {
-        UnlockFileEx(file.as_raw_handle() as _, 0, u32::MAX, u32::MAX, &mut overlapped)
+        UnlockFileEx(
+            file.as_raw_handle() as _,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
     };
     if ok != 0 {
         Ok(())
@@ -443,6 +563,21 @@ fn unlock_file(file: &File) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_stack_roundtrip_keeps_non_utf8_lines() {
+        let path = std::env::temp_dir().join(format!("diamond-raw-stack-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let stack = super::FileStack::try_new(&path).unwrap();
+        stack.push_bytes(b"volume_\xff\t2").unwrap();
+        stack.push_bytes(b"second_\x80").unwrap();
+        assert_eq!(stack.top_bytes().unwrap(), Some(b"second_\x80".to_vec()));
+        stack.remove_bytes(b"second_\x80").unwrap();
+        assert_eq!(stack.pop_bytes().unwrap(), Some(b"volume_\xff\t2".to_vec()));
+        assert_eq!(stack.pop_bytes().unwrap(), None);
+        drop(stack);
+        std::fs::remove_file(path).unwrap();
+    }
+
     use super::*;
     use std::sync::Arc;
 

@@ -5,7 +5,9 @@ pub mod cluster;
 pub mod external;
 pub mod output;
 pub mod pair_table;
+pub mod reader;
 pub mod seed_table;
+pub mod storage;
 
 pub use align::{align, align_rep, AlignConfig, ChunkSequences};
 pub use cluster::{

@@ -1,10 +1,14 @@
 //! Double-indexed search orchestration from `diamond/src/run/double_indexed.cpp`.
 //!
-//! The original translation unit coordinates process globals, sequence-file
-//! implementations, temporary consumers, multiprocessing stacks, masking,
-//! seed search, alignment, and output.  This port owns the decision making and
-//! iteration locally while exposing those concrete services through
-//! [`DoubleIndexedBackend`].
+//! The owner-based production orchestrator is exported as [`owned`]. It drives
+//! real native query, round, and lazy reference services with actual loaded
+//! owners. The metadata/WorkflowOp API below remains an explicit compatibility
+//! and audit model; its tests alone do not establish production parity.
+
+/// Actual native master/query/round/reference orchestration over loaded owners.
+/// The metadata/WorkflowOp API below remains a compatibility model.
+#[path = "double_indexed_owned.rs"]
+pub mod owned;
 
 use std::cmp::max;
 use std::path::{Path, PathBuf};
@@ -828,7 +832,12 @@ pub fn run_query_chunk<B: DoubleIndexedBackend>(
         backend.perform(WorkflowOp::SetupSearch(round.sensitivity))?;
         run_query_iteration(query_iteration, state, backend)?;
         if state.config.sensitivity.len() > 1 {
-            state.aligned_total += backend.take_iteration_aligned();
+            let iteration_aligned = backend.take_iteration_aligned();
+            state.aligned_total += iteration_aligned;
+            backend.perform(WorkflowOp::Message(format!(
+                "Aligned {iteration_aligned}/{source_count} queries in this iteration, {}/{source_count} total.",
+                state.aligned_total
+            )))?;
         }
     }
     backend.perform(WorkflowOp::LogRss)?;
@@ -926,7 +935,12 @@ pub fn master_thread<B: DoubleIndexedBackend>(
     }
     let mut offset = 0u64;
     state.current_query_block = 0;
-    loop {
+    let database_count = state
+        .database
+        .as_ref()
+        .ok_or("Database is not loaded.")?
+        .sequence_count;
+    while offset < database_count {
         let block = backend.load_query_block(
             state.config.block_size_letters,
             state.config.self_search,
@@ -937,7 +951,9 @@ pub fn master_thread<B: DoubleIndexedBackend>(
         if block.is_empty() {
             break;
         }
-        offset = block.oid_end;
+        if state.config.self_search {
+            offset = block.oid_end;
+        }
         state.query = Some(block);
         if state
             .config
@@ -963,6 +979,9 @@ pub fn master_thread<B: DoubleIndexedBackend>(
         }
         run_query_chunk(state, backend)?;
         if backend.stop_exists() {
+            backend.perform(WorkflowOp::Message(
+                "Encountered 'stop' file, shutting down run".into(),
+            ))?;
             break;
         }
         state.current_query_block += 1;

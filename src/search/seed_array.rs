@@ -9,10 +9,11 @@ use crate::basic::reduction::Reduction;
 use crate::basic::seed::{self, PackedSeed, SeedPartition};
 use crate::basic::seed_iterator::SketchIterator;
 use crate::basic::shape::Shape;
-use crate::basic::value::Letter;
+use crate::basic::value::{Letter, Loc};
 #[cfg(test)]
 use crate::basic::value::{MASK_LETTER, SEED_MASK};
 use crate::search::seed_match::SeedMatch;
+use crate::util::data_structures::BitVector;
 
 /// A single entry in the seed array: the seed key (with partition bits stripped)
 /// and the location it came from.
@@ -59,6 +60,56 @@ fn reduce_seed_sequence_into(seq: &[Letter], reduction: &Reduction, out: &mut Ve
     out.extend(seq.iter().map(|&raw| reduction.reduce_seed_letter(raw)));
 }
 
+/// Round-local source-query membership. Context records keep their original
+/// positions and sequence boundaries; skipped records are never compacted.
+#[inline]
+pub(crate) fn query_is_skipped(skip: Option<&BitVector>, contexts: usize, context: usize) -> bool {
+    skip.is_some_and(|mask| mask.get(context / contexts))
+}
+
+pub(crate) fn validate_query_skip(
+    skip: Option<&BitVector>,
+    contexts: usize,
+    sequence_count: usize,
+) {
+    assert!(contexts > 0, "query context count must be positive");
+    if let Some(mask) = skip {
+        assert_eq!(
+            mask.size() as usize,
+            sequence_count.div_ceil(contexts),
+            "source-query skip mask does not cover the context block"
+        );
+    }
+}
+
+/// Source SequenceSet::source_length uses the GLOBAL context count, including
+/// reference protein records in a translated search. An incomplete trailing
+/// group with fewer than three records is undefined upstream; safely reject
+/// it only while a positive length threshold is active.
+#[inline]
+pub(crate) fn query_is_too_short(
+    seqs: &[&[Letter]],
+    contexts: usize,
+    minimum: Loc,
+    context: usize,
+) -> bool {
+    if minimum <= 0 {
+        return false;
+    }
+    if contexts == 1 {
+        return seqs[context].len() < minimum as usize;
+    }
+    assert!(contexts > 0);
+    let begin = context - context % contexts;
+    let Some(group) = seqs.get(begin..begin + 3) else {
+        return true;
+    };
+    let length = group
+        .iter()
+        .try_fold(2usize, |total, seq| total.checked_add(seq.len()));
+    length.is_none_or(|length| length < minimum as usize)
+}
+
 impl SeedArray {
     fn sequence_offsets(seqs: &[&[Letter]]) -> Vec<u32> {
         let mut offsets = Vec::with_capacity(seqs.len() + 1);
@@ -83,6 +134,29 @@ impl SeedArray {
         seedp_bits: i32,
         min_query_len: usize,
     ) -> Vec<WorkerPartitionCounts> {
+        Self::count_partitions_by_worker_all_shapes_with_skip(
+            seqs,
+            shapes,
+            reduction,
+            seedp_bits,
+            min_query_len.min(Loc::MAX as usize) as Loc,
+            None,
+            1,
+        )
+    }
+
+    /// Enumerate unaligned SOURCE queries without changing context IDs or offsets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn count_partitions_by_worker_all_shapes_with_skip(
+        seqs: &[&[Letter]],
+        shapes: &[Shape],
+        reduction: &Reduction,
+        seedp_bits: i32,
+        min_query_len: Loc,
+        query_skip: Option<&BitVector>,
+        query_contexts: usize,
+    ) -> Vec<WorkerPartitionCounts> {
+        validate_query_skip(query_skip, query_contexts, seqs.len());
         use rayon::prelude::*;
 
         let num_partitions = seed::seedp_count(seedp_bits) as usize;
@@ -98,10 +172,16 @@ impl SeedArray {
             .map(|worker| {
                 let mut counts = vec![vec![0usize; num_partitions]; shapes.len()];
                 let mut reduced = Vec::new();
-                for seq in &seqs[worker_range(worker)] {
+                for seq_id in worker_range(worker) {
+                    if query_is_skipped(query_skip, query_contexts, seq_id) {
+                        continue;
+                    }
+                    let seq = &seqs[seq_id];
                     reduce_seed_sequence_into(seq, reduction, &mut reduced);
                     for (shape_id, shape) in shapes.iter().enumerate() {
-                        if seq.len() < min_query_len || seq.len() < shape.length as usize {
+                        if query_is_too_short(seqs, query_contexts, min_query_len, seq_id)
+                            || seq.len() < shape.length as usize
+                        {
                             continue;
                         }
                         let last = seq.len() - shape.length as usize;
@@ -236,6 +316,35 @@ impl SeedArray {
         partition_begin: usize,
         partition_end: usize,
     ) -> Self {
+        Self::build_sketch_with_min_query_len_partition_range_with_skip(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            sketch_size,
+            min_query_len.min(Loc::MAX as usize) as Loc,
+            partition_begin,
+            partition_end,
+            None,
+            1,
+        )
+    }
+
+    /// Enumerate unaligned SOURCE queries without changing context IDs or offsets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_sketch_with_min_query_len_partition_range_with_skip(
+        seqs: &[&[Letter]],
+        shape: &Shape,
+        reduction: &Reduction,
+        seedp_bits: i32,
+        sketch_size: usize,
+        min_query_len: Loc,
+        partition_begin: usize,
+        partition_end: usize,
+        query_skip: Option<&BitVector>,
+        query_contexts: usize,
+    ) -> Self {
+        validate_query_skip(query_skip, query_contexts, seqs.len());
         use rayon::prelude::*;
 
         let num_partitions = seed::seedp_count(seedp_bits) as usize;
@@ -249,7 +358,12 @@ impl SeedArray {
             .fold(
                 || (0..num_partitions).map(|_| Vec::new()).collect::<Vec<_>>(),
                 |mut buckets, (seq_id, seq)| {
-                    if seq.len() < min_query_len || seq.len() < shape.length as usize {
+                    if query_is_skipped(query_skip, query_contexts, seq_id) {
+                        return buckets;
+                    }
+                    if query_is_too_short(seqs, query_contexts, min_query_len, seq_id)
+                        || seq.len() < shape.length as usize
+                    {
                         return buckets;
                     }
                     let reduced = reduction.reduce_seq(seq);
@@ -323,6 +437,34 @@ impl SeedArray {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_complexity_cut_and_min_query_len_partition_range_with_skip(
+        seqs: &[&[Letter]],
+        shape: &Shape,
+        reduction: &Reduction,
+        seedp_bits: i32,
+        complexity_cut: f64,
+        min_query_len: Loc,
+        partition_begin: usize,
+        partition_end: usize,
+        query_skip: Option<&BitVector>,
+        query_contexts: usize,
+    ) -> Self {
+        Self::build_with_complexity_cut_and_min_query_len_partition_range_reuse_with_skip(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            complexity_cut,
+            min_query_len,
+            partition_begin,
+            partition_end,
+            Vec::new(),
+            query_skip,
+            query_contexts,
+        )
+    }
+
     pub fn build_with_complexity_cut_and_min_query_len_partition_range_reuse(
         seqs: &[&[Letter]],
         shape: &Shape,
@@ -332,8 +474,39 @@ impl SeedArray {
         min_query_len: usize,
         partition_begin: usize,
         partition_end: usize,
-        mut data: Vec<SeedEntry>,
+        data: Vec<SeedEntry>,
     ) -> Self {
+        Self::build_with_complexity_cut_and_min_query_len_partition_range_reuse_with_skip(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            complexity_cut,
+            min_query_len.min(Loc::MAX as usize) as Loc,
+            partition_begin,
+            partition_end,
+            data,
+            None,
+            1,
+        )
+    }
+
+    /// Enumerate unaligned SOURCE queries without changing context IDs or offsets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_complexity_cut_and_min_query_len_partition_range_reuse_with_skip(
+        seqs: &[&[Letter]],
+        shape: &Shape,
+        reduction: &Reduction,
+        seedp_bits: i32,
+        complexity_cut: f64,
+        min_query_len: Loc,
+        partition_begin: usize,
+        partition_end: usize,
+        mut data: Vec<SeedEntry>,
+        query_skip: Option<&BitVector>,
+        query_contexts: usize,
+    ) -> Self {
+        validate_query_skip(query_skip, query_contexts, seqs.len());
         use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
         let num_partitions = seed::seedp_count(seedp_bits) as usize;
@@ -347,9 +520,12 @@ impl SeedArray {
         if rayon::current_num_threads() == 1 {
             let mut counts = vec![0usize; num_partitions];
             let mut reduced = Vec::new();
-            for seq in seqs {
+            for (seq_id, seq) in seqs.iter().enumerate() {
+                if query_is_skipped(query_skip, query_contexts, seq_id) {
+                    continue;
+                }
                 let slen = seq.len();
-                if min_query_len > 0 && slen < min_query_len {
+                if query_is_too_short(seqs, query_contexts, min_query_len, seq_id) {
                     continue;
                 }
                 if slen < shape_length {
@@ -395,8 +571,11 @@ impl SeedArray {
             }
             let data_ptr = data.as_mut_ptr();
             for (seq_id, seq) in seqs.iter().enumerate() {
+                if query_is_skipped(query_skip, query_contexts, seq_id) {
+                    continue;
+                }
                 let slen = seq.len();
-                if min_query_len > 0 && slen < min_query_len {
+                if query_is_too_short(seqs, query_contexts, min_query_len, seq_id) {
                     continue;
                 }
                 if slen < shape_length {
@@ -481,9 +660,13 @@ impl SeedArray {
             .map(|worker| {
                 let mut counts = vec![0usize; num_partitions];
                 let mut reduced = Vec::new();
-                for seq in &seqs[worker_range(worker)] {
+                for seq_id in worker_range(worker) {
+                    if query_is_skipped(query_skip, query_contexts, seq_id) {
+                        continue;
+                    }
+                    let seq = &seqs[seq_id];
                     let slen = seq.len();
-                    if min_query_len > 0 && slen < min_query_len {
+                    if query_is_too_short(seqs, query_contexts, min_query_len, seq_id) {
                         continue;
                     }
                     if slen < shape_length {
@@ -555,9 +738,14 @@ impl SeedArray {
             .map(|(worker, mut cursors)| {
                 let mut reduced = Vec::new();
                 for seq_id in worker_range(worker) {
+                    if query_is_skipped(query_skip, query_contexts, seq_id) {
+                        continue;
+                    }
                     let seq = seqs[seq_id];
                     let slen = seq.len();
-                    if (min_query_len > 0 && slen < min_query_len) || slen < shape_length {
+                    if (query_is_too_short(seqs, query_contexts, min_query_len, seq_id))
+                        || slen < shape_length
+                    {
                         continue;
                     }
                     if complexity_cut <= 0.0 {
@@ -638,6 +826,33 @@ impl SeedArray {
         partition_begin: usize,
         partition_end: usize,
     ) -> Self {
+        Self::build_partition_range_one_pass_with_skip(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            min_query_len.min(Loc::MAX as usize) as Loc,
+            partition_begin,
+            partition_end,
+            None,
+            1,
+        )
+    }
+
+    /// Enumerate unaligned SOURCE queries without changing context IDs or offsets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_partition_range_one_pass_with_skip(
+        seqs: &[&[Letter]],
+        shape: &Shape,
+        reduction: &Reduction,
+        seedp_bits: i32,
+        min_query_len: Loc,
+        partition_begin: usize,
+        partition_end: usize,
+        query_skip: Option<&BitVector>,
+        query_contexts: usize,
+    ) -> Self {
+        validate_query_skip(query_skip, query_contexts, seqs.len());
         let num_partitions = seed::seedp_count(seedp_bits) as usize;
         debug_assert!(partition_begin <= partition_end);
         debug_assert!(partition_end <= num_partitions);
@@ -648,8 +863,11 @@ impl SeedArray {
         let mut buckets: Vec<Vec<SeedEntry>> = (0..range_len).map(|_| Vec::new()).collect();
 
         for (seq_id, seq) in seqs.iter().enumerate() {
+            if query_is_skipped(query_skip, query_contexts, seq_id) {
+                continue;
+            }
             let slen = seq.len();
-            if min_query_len > 0 && slen < min_query_len {
+            if query_is_too_short(seqs, query_contexts, min_query_len, seq_id) {
                 continue;
             }
             if slen < shape_length {
@@ -705,15 +923,43 @@ impl SeedArray {
         complexity_cut: f64,
         min_query_len: usize,
     ) -> Vec<usize> {
+        Self::count_partitions_with_skip(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            complexity_cut,
+            min_query_len.min(Loc::MAX as usize) as Loc,
+            None,
+            1,
+        )
+    }
+
+    /// Enumerate unaligned SOURCE queries without changing context IDs or offsets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn count_partitions_with_skip(
+        seqs: &[&[Letter]],
+        shape: &Shape,
+        reduction: &Reduction,
+        seedp_bits: i32,
+        complexity_cut: f64,
+        min_query_len: Loc,
+        query_skip: Option<&BitVector>,
+        query_contexts: usize,
+    ) -> Vec<usize> {
+        validate_query_skip(query_skip, query_contexts, seqs.len());
         let num_partitions = seed::seedp_count(seedp_bits) as usize;
         let mask = seed::seedp_mask(seedp_bits);
         let shape_length = shape.length as usize;
         let raw_weight12 = shape.weight == 12 && reduction.size() == 10;
         let mut counts = vec![0usize; num_partitions];
         let mut reduced = Vec::new();
-        for seq in seqs {
+        for (seq_id, seq) in seqs.iter().enumerate() {
+            if query_is_skipped(query_skip, query_contexts, seq_id) {
+                continue;
+            }
             let slen = seq.len();
-            if min_query_len > 0 && slen < min_query_len {
+            if query_is_too_short(seqs, query_contexts, min_query_len, seq_id) {
                 continue;
             }
             if slen < shape_length {
@@ -758,8 +1004,39 @@ impl SeedArray {
         partition_begin: usize,
         partition_end: usize,
         counts: &[usize],
-        mut data: Vec<SeedEntry>,
+        data: Vec<SeedEntry>,
     ) -> Self {
+        Self::build_partition_range_from_counts_reuse_with_skip(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            min_query_len.min(Loc::MAX as usize) as Loc,
+            partition_begin,
+            partition_end,
+            counts,
+            data,
+            None,
+            1,
+        )
+    }
+
+    /// Enumerate unaligned SOURCE queries without changing context IDs or offsets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_partition_range_from_counts_reuse_with_skip(
+        seqs: &[&[Letter]],
+        shape: &Shape,
+        reduction: &Reduction,
+        seedp_bits: i32,
+        min_query_len: Loc,
+        partition_begin: usize,
+        partition_end: usize,
+        counts: &[usize],
+        mut data: Vec<SeedEntry>,
+        query_skip: Option<&BitVector>,
+        query_contexts: usize,
+    ) -> Self {
+        validate_query_skip(query_skip, query_contexts, seqs.len());
         let num_partitions = seed::seedp_count(seedp_bits) as usize;
         debug_assert_eq!(counts.len(), num_partitions);
         debug_assert!(partition_begin <= partition_end);
@@ -790,8 +1067,11 @@ impl SeedArray {
         let mut reduced = Vec::new();
 
         for (seq_id, seq) in seqs.iter().enumerate() {
+            if query_is_skipped(query_skip, query_contexts, seq_id) {
+                continue;
+            }
             let slen = seq.len();
-            if min_query_len > 0 && slen < min_query_len {
+            if query_is_too_short(seqs, query_contexts, min_query_len, seq_id) {
                 continue;
             }
             if slen < shape_length {
@@ -856,8 +1136,39 @@ impl SeedArray {
         partition_begin: usize,
         partition_end: usize,
         histogram: &WorkerPartitionCounts,
-        mut data: Vec<SeedEntry>,
+        data: Vec<SeedEntry>,
     ) -> Self {
+        Self::build_partition_range_from_worker_counts_reuse_with_skip(
+            seqs,
+            shape,
+            reduction,
+            seedp_bits,
+            min_query_len.min(Loc::MAX as usize) as Loc,
+            partition_begin,
+            partition_end,
+            histogram,
+            data,
+            None,
+            1,
+        )
+    }
+
+    /// Enumerate unaligned SOURCE queries without changing context IDs or offsets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_partition_range_from_worker_counts_reuse_with_skip(
+        seqs: &[&[Letter]],
+        shape: &Shape,
+        reduction: &Reduction,
+        seedp_bits: i32,
+        min_query_len: Loc,
+        partition_begin: usize,
+        partition_end: usize,
+        histogram: &WorkerPartitionCounts,
+        mut data: Vec<SeedEntry>,
+        query_skip: Option<&BitVector>,
+        query_contexts: usize,
+    ) -> Self {
+        validate_query_skip(query_skip, query_contexts, seqs.len());
         use rayon::prelude::*;
 
         let num_partitions = seed::seedp_count(seedp_bits) as usize;
@@ -920,8 +1231,13 @@ impl SeedArray {
             .map(|(worker, mut cursors)| {
                 let mut reduced = Vec::new();
                 for seq_id in worker_range(worker) {
+                    if query_is_skipped(query_skip, query_contexts, seq_id) {
+                        continue;
+                    }
                     let seq = seqs[seq_id];
-                    if seq.len() < min_query_len || seq.len() < shape_length {
+                    if query_is_too_short(seqs, query_contexts, min_query_len, seq_id)
+                        || seq.len() < shape_length
+                    {
                         continue;
                     }
                     reduce_seed_sequence_into(seq, reduction, &mut reduced);

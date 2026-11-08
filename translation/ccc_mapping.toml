@@ -460,3 +460,13 @@ rust = "new"
 [[entries]]
 other = "cigar_to_hsp"
 rust = "cigar_to_hsp_seed_match"
+
+# Audited diamond/src/lib/tantan/LambdaCalculator.cc helpers. Allocation,
+# deletion, swaps and transpose map to ownership/slices as noted in file_map.
+[[entries]]
+other = "find_ub"
+rust = "find_upper_bound"
+
+[[entries]]
+other = "solvep"
+rust = "solve_p"

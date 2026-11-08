@@ -44,7 +44,7 @@ pub struct CascadedSearchConfig {
     pub double_indexed: bool,
     pub max_target_seqs: i64,
     pub self_search: bool,
-    pub iterate: Vec<String>,
+    pub iterate: Vec<Vec<u8>>,
     pub map_any: bool,
     pub lin_stage1_target: bool,
     pub db_size: u64,
@@ -61,15 +61,15 @@ pub struct CascadedSearchConfig {
     pub max_evalue: f64,
     /// Upstream constructs this score state once before entering the cascaded
     /// workflow. Rounds mutate sensitivity and cutoffs but retain it.
-    pub matrix: String,
+    pub matrix: Vec<u8>,
     pub gap_open: i32,
     pub gap_extend: i32,
     pub comp_based_stats: i32,
     pub masking: MaskingMode,
     pub soft_masking: MaskingAlgo,
-    pub motif_masking: String,
+    pub motif_masking: Vec<u8>,
     pub freq_masking: bool,
-    pub extension_mode: String,
+    pub extension_mode: Vec<u8>,
     pub hamming_ext: bool,
     pub diag_filter_cov: Option<f64>,
     pub diag_filter_id: Option<f64>,
@@ -80,20 +80,20 @@ pub struct CascadedSearchConfig {
 pub struct CascadedConfig {
     pub mutual_cover: Option<f64>,
     pub member_cover: f64,
-    pub round_coverage: Vec<String>,
-    pub round_approx_id: Vec<String>,
+    pub round_coverage: Vec<Vec<u8>>,
+    pub round_approx_id: Vec<Vec<u8>>,
     pub helpers: CascadedHelpersConfig,
     pub approx_min_id: f64,
     pub max_evalue: f64,
-    pub matrix: String,
+    pub matrix: Vec<u8>,
     pub gap_open: i32,
     pub gap_extend: i32,
     pub anchored_swipe: bool,
-    pub extension_mode: String,
+    pub extension_mode: Vec<u8>,
     pub comp_based_stats: i32,
     pub masking: MaskingMode,
     pub soft_masking: MaskingAlgo,
-    pub motif_masking: String,
+    pub motif_masking: Vec<u8>,
     pub freq_masking: bool,
     pub hamming_ext: bool,
     pub diag_filter_cov: Option<f64>,
@@ -107,7 +107,7 @@ pub struct CascadedConfig {
     pub strict_gvc: bool,
     pub no_gvc_reassign: bool,
     pub kmer_ranking: bool,
-    pub alignment_output: Option<String>,
+    pub alignment_output: Option<std::path::PathBuf>,
     // Fields mutated by `cluster`, retained because they are observable global
     // configuration in the original implementation.
     pub query_cover: f64,
@@ -128,17 +128,17 @@ impl Default for CascadedConfig {
             helpers: CascadedHelpersConfig::default(),
             approx_min_id: 50.0,
             max_evalue: 0.001,
-            matrix: "blosum62".to_owned(),
+            matrix: b"blosum62".to_vec(),
             gap_open: -1,
             gap_extend: -1,
             anchored_swipe: false,
-            extension_mode: String::new(),
+            extension_mode: Vec::new(),
             comp_based_stats: 1,
             // Cluster::init_thresholds overrides the ordinary search defaults:
             // hard masking is disabled and soft TANTAN masking is enabled.
             masking: MaskingMode::None,
             soft_masking: MaskingAlgo::Tantan,
-            motif_masking: String::new(),
+            motif_masking: Vec::new(),
             freq_masking: false,
             hamming_ext: false,
             diag_filter_cov: None,
@@ -173,6 +173,22 @@ pub struct CascadedRoundSummary {
 }
 
 pub trait CascadedBackend {
+    fn io_errors(&self) -> crate::util::io::IoErrorOwner {
+        Default::default()
+    }
+
+    /// Source's process-wide block budget with an adapter-controlled limit.
+    fn block_size(
+        &self,
+        memory: i64,
+        letters: i64,
+        sensitivity: Sensitivity,
+        linear: bool,
+        threads: i32,
+    ) -> (f64, i32) {
+        block_size(memory, letters, sensitivity, linear, threads)
+    }
+
     fn sequence_count(&self) -> u64;
     fn letters(&self) -> u64;
     fn letters_filtered(&self, filter: &DbFilter) -> u64;
@@ -185,6 +201,17 @@ pub trait CascadedBackend {
     ) -> Result<(), String>;
     fn output_edges(&mut self, _path: &str, _edges: &[Edge<SuperBlockId>]) -> Result<(), String> {
         Ok(())
+    }
+    fn output_edges_path(
+        &mut self,
+        path: &std::path::Path,
+        edges: &[Edge<SuperBlockId>],
+    ) -> Result<(), String> {
+        self.output_edges(
+            path.to_str()
+                .ok_or("Legacy backend requires UTF-8 paths; override output_edges_path")?,
+            edges,
+        )
     }
     fn round_complete(&mut self, _summary: &CascadedRoundSummary) {}
 }
@@ -204,10 +231,19 @@ pub fn rep_bitset(centroids: &[SuperBlockId], superset: Option<&DbFilter>) -> Db
 }
 
 fn round_value(
-    values: &[String],
+    values: &[Vec<u8>],
     name: &str,
     round: usize,
     round_count: usize,
+) -> Result<f64, String> {
+    round_value_with_errors(values, name, round, round_count, &Default::default())
+}
+fn round_value_with_errors(
+    values: &[Vec<u8>],
+    name: &str,
+    round: usize,
+    round_count: usize,
+    errors: &crate::util::io::IoErrorOwner,
 ) -> Result<f64, String> {
     if values.is_empty() || round >= round_count - 1 {
         return Ok(0.0);
@@ -217,15 +253,20 @@ fn round_value(
     }
     let mut parsed = Vec::with_capacity(values.len());
     for value in values {
-        let stripped = value.trim_start();
-        if stripped.is_empty() || stripped.trim_end().len() != stripped.len() {
-            return Err(format!("Invalid value provided for {name}: {value}"));
+        let stripped = value.trim_ascii_start();
+        let number = std::str::from_utf8(stripped)
+            .ok()
+            .and_then(|number| number.parse::<f64>().ok())
+            .filter(|number| number.is_finite());
+        if stripped.is_empty()
+            || stripped.trim_ascii_end().len() != stripped.len()
+            || number.is_none()
+        {
+            let mut message = format!("Invalid value provided for {name}: ").into_bytes();
+            message.extend_from_slice(value);
+            return errors.capture(Err(crate::util::io::RawDiagnosticError(message).into_io()));
         }
-        parsed.push(
-            stripped
-                .parse::<f64>()
-                .map_err(|_| format!("Invalid value provided for {name}: {value}"))?,
-        );
+        parsed.push(number.unwrap());
     }
     parsed.splice(
         0..0,
@@ -235,21 +276,7 @@ fn round_value(
 }
 
 fn sensitivity_from_name(name: &str) -> Result<Sensitivity, String> {
-    match name {
-        "faster" => Ok(Sensitivity::Faster),
-        "fast" => Ok(Sensitivity::Fast),
-        "default" => Ok(Sensitivity::Default),
-        "linclust-40" => Ok(Sensitivity::Linclust40),
-        "linclust-20" => Ok(Sensitivity::Linclust20),
-        "shapes-6x10" => Ok(Sensitivity::Shapes6x10),
-        "shapes-30x10" => Ok(Sensitivity::Shapes30x10),
-        "mid-sensitive" => Ok(Sensitivity::MidSensitive),
-        "sensitive" => Ok(Sensitivity::Sensitive),
-        "more-sensitive" => Ok(Sensitivity::MoreSensitive),
-        "very-sensitive" => Ok(Sensitivity::VerySensitive),
-        "ultra-sensitive" => Ok(Sensitivity::UltraSensitive),
-        _ => Err(format!("Invalid sensitivity level: {name}")),
-    }
+    crate::basic::config::sensitivity_from_string(name)
 }
 
 /// `Search::Config::Config()`'s protein-search `min_length_ratio` derivation.
@@ -330,15 +357,19 @@ pub fn cluster<B: CascadedBackend>(
     let mutual = config.mutual_cover.is_some();
     let round_coverage = if config.round_coverage.is_empty() {
         default_round_cov(round_count as i32)
+            .into_iter()
+            .map(String::into_bytes)
+            .collect()
     } else {
         config.round_coverage.clone()
     };
     let coverage = config.mutual_cover.unwrap_or(config.member_cover);
-    let round_coverage = coverage.max(round_value(
+    let round_coverage = coverage.max(round_value_with_errors(
         &round_coverage,
         "--round-coverage",
         round,
         round_count,
+        &backend.io_errors(),
     )?);
     if mutual {
         config.query_cover = round_coverage;
@@ -359,7 +390,7 @@ pub fn cluster<B: CascadedBackend>(
         } else {
             backend.letters()
         };
-        block_size(
+        backend.block_size(
             config.memory_limit.min(i64::MAX as u64) as i64,
             letters.min(i64::MAX as u64) as i64,
             config.sensitivity,
@@ -438,7 +469,7 @@ pub fn cluster<B: CascadedBackend>(
         })
         .collect::<Result<_, String>>()?;
     if let Some(path) = config.alignment_output.as_deref() {
-        backend.output_edges(path, &edges)?;
+        backend.output_edges_path(path, &edges)?;
     }
     let sequence_count = SuperBlockId::try_from(backend.sequence_count())
         .map_err(|_| "Sequence count exceeds SuperBlockId".to_owned())?;
@@ -521,24 +552,30 @@ pub fn cascaded<B: CascadedBackend>(
         config.comp_based_stats = 0;
     }
     for (round, step) in steps.iter().enumerate() {
-        config.lin_stage1_query = step.ends_with("_lin");
+        config.lin_stage1_query = step.ends_with(b"_lin");
         config.anchored_swipe = anchored_swipe && (linclust || !config.lin_stage1_query);
         // This intentionally tests the saved value, as the C++ source does.
         if anchored_swipe {
-            config.extension_mode = "banded-fast".to_owned();
+            config.extension_mode = b"banded-fast".to_vec();
         }
-        let sensitivity = step.strip_suffix("_lin").unwrap_or(step);
-        config.sensitivity = sensitivity_from_name(sensitivity)?;
+        let sensitivity = step.strip_suffix(b"_lin").unwrap_or(step);
+        config.sensitivity = backend
+            .io_errors()
+            .capture(crate::basic::config::sensitivity_from_bytes(sensitivity))?;
         let round_approx = if config.round_approx_id.is_empty() {
             default_round_approx_id(steps.len() as i32)
+                .into_iter()
+                .map(String::into_bytes)
+                .collect()
         } else {
             config.round_approx_id.clone()
         };
-        config.approx_min_id = target_approx_id.max(round_value(
+        config.approx_min_id = target_approx_id.max(round_value_with_errors(
             &round_approx,
             "--round-approx-id",
             round,
             steps.len(),
+            &backend.io_errors(),
         )?);
         config.max_evalue = if round + 1 == steps.len() {
             evalue_cutoff
@@ -756,16 +793,16 @@ mod tests {
         let mut config = CascadedConfig {
             mutual_cover: Some(75.0),
             helpers: CascadedHelpersConfig {
-                cluster_steps: vec!["faster_lin".into(), "default".into()],
+                cluster_steps: vec![b"faster_lin".to_vec(), b"default".to_vec()],
                 connected_component_depth: vec![],
             },
             max_evalue: 0.1,
-            matrix: "pam250".to_owned(),
+            matrix: b"pam250".to_vec(),
             gap_open: 15,
             gap_extend: 3,
             masking: MaskingMode::Tantan,
             soft_masking: MaskingAlgo::Seg,
-            motif_masking: "0".to_owned(),
+            motif_masking: b"0".to_vec(),
             approx_min_id: 50.0,
             anchored_swipe: true,
             graph_algo: GraphAlgo::LengthSorted,

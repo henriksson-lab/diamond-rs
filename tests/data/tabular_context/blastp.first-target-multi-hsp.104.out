@@ -1,0 +1,20 @@
+[
+	{
+	"qseqid":"domain_query",
+	"sseqid":"reordered",
+	"hspnum":0,
+	"cigar":"78M"
+	}
+	{
+	"qseqid":"domain_query",
+	"sseqid":"reordered",
+	"hspnum":1,
+	"cigar":"71M"
+	}
+	{
+	"qseqid":"domain_query",
+	"sseqid":"reordered",
+	"hspnum":2,
+	"cigar":"70M"
+	}
+]

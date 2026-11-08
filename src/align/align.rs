@@ -108,7 +108,34 @@ pub struct Hits {
 }
 
 /// Explicit adapter for globals and heavyweight extension/output subsystems.
+/// Storage and required execution contract for Source's real alignment driver.
+/// A backend owns the actual batch representation and bounded worker executor;
+/// the driver retains preload/prefetch/resident accounting/recycle ordering.
 pub trait AlignBackend {
+    type Batch;
+    fn prepare_alignment(&mut self, cfg: &AlignConfig) -> Result<(), String>;
+    fn resident_memory_size(&self) -> u64;
+    fn load_batch(&mut self, max_bytes: u64) -> bool;
+    fn retrieve_batch(&mut self) -> Result<Option<Self::Batch>, String>;
+    fn next_batch_size(&self) -> u64;
+    fn batch_hit_count(&self, batch: &Self::Batch) -> u64;
+    fn execute_batch(
+        &mut self,
+        batch: &mut Self::Batch,
+        cfg: &AlignConfig,
+        state: &mut AlignState,
+    ) -> Result<(), String>;
+    fn recycle_batch(&mut self, batch: Self::Batch);
+    fn disk_size(&self) -> i64;
+    fn complete_alignment(&mut self, cfg: &AlignConfig) -> Result<(), String>;
+    fn elapsed(&mut self, stage: &'static str) -> i64;
+    fn log_message(&mut self, message: &str);
+}
+
+/// Compatibility interface for callers with flat Source Hit records. Native
+/// production uses its owned grouped representation and real Match/output
+/// payloads instead; no target-ID side table is needed by that adapter.
+pub trait RecordAlignBackend {
     fn query_memory_size(&self) -> u64;
     fn target_memory_size(&self) -> u64;
     fn allocate_hit_buffer(&mut self);
@@ -312,7 +339,7 @@ impl<'a> HitIterator<'a> {
     }
 }
 
-pub fn legacy_pipeline<B: AlignBackend>(
+pub fn legacy_pipeline<B: RecordAlignBackend>(
     hit_group: &Hits,
     all_hits: &[Hit],
     cfg: &AlignConfig,
@@ -342,7 +369,7 @@ pub fn legacy_pipeline<B: AlignBackend>(
     Ok(Some(buffer))
 }
 
-pub fn align_worker<B: AlignBackend>(
+pub fn align_worker<B: RecordAlignBackend>(
     hit_it: &HitIterator<'_>,
     cfg: &AlignConfig,
     backend: &mut B,
@@ -410,113 +437,166 @@ pub fn align_worker<B: AlignBackend>(
     Ok(())
 }
 
+/// Run one flat-record batch through the retained typed compatibility path.
+fn execute_record_batch<B: RecordAlignBackend>(
+    batch: &mut HitBatch,
+    cfg: &AlignConfig,
+    backend: &mut B,
+    state: &mut AlignState,
+) -> Result<(), String> {
+    batch
+        .hits
+        .sort_unstable_by(|lhs, rhs| lhs.query.cmp(&rhs.query));
+    state.statistics.inc(
+        StatValue::TimeSortSeedHits,
+        backend.elapsed_microseconds("Sorting trace points"),
+    );
+    let partition = make_partition(&batch.hits, cfg.min_task_trace_pts, cfg.query_contexts);
+    let hit_it = HitIterator::new(
+        batch.query_begin,
+        batch.query_end,
+        &batch.hits,
+        &partition,
+        cfg.query_contexts,
+        cfg.swipe_all,
+        cfg.blastn,
+    );
+    backend.begin_output_batch(
+        batch.query_begin,
+        cfg.blocked_processing,
+        if cfg.blocked_processing {
+            0
+        } else {
+            cfg.query_separator
+        },
+    );
+    let parallel = cfg.swipe_all && cfg.target_sequence_count >= cfg.query_sequence_count;
+    let threads = if cfg.load_balancing == LoadBalancing::TargetParallel || parallel {
+        1
+    } else if cfg.threads_align == 0 {
+        cfg.threads
+    } else {
+        cfg.threads_align
+    };
+    let tasks = if cfg.swipe_all {
+        batch.query_begin as i64..batch.query_end as i64
+    } else {
+        0..hit_it.parts
+    };
+    backend.worker_count(threads, tasks.clone());
+    let heartbeat = cfg.verbosity >= 3
+        && cfg.load_balancing == LoadBalancing::QueryParallel
+        && !cfg.swipe_all
+        && cfg.heartbeat;
+    if heartbeat {
+        backend.heartbeat_begin(batch.query_end);
+    }
+    for task in tasks {
+        align_worker(&hit_it, cfg, backend, state, task)?;
+    }
+    if heartbeat {
+        backend.heartbeat_end();
+    }
+    backend.end_output_batch();
+    Ok(())
+}
+
+impl<B: RecordAlignBackend> AlignBackend for B {
+    type Batch = HitBatch;
+    fn prepare_alignment(&mut self, cfg: &AlignConfig) -> Result<(), String> {
+        if !cfg.blocked_processing && !cfg.iterated {
+            self.init_random_access(cfg.current_query_block)?;
+        }
+        self.allocate_hit_buffer();
+        Ok(())
+    }
+    fn resident_memory_size(&self) -> u64 {
+        self.query_memory_size() + self.target_memory_size()
+    }
+    fn load_batch(&mut self, max_bytes: u64) -> bool {
+        self.load_hit_buffer(max_bytes)
+    }
+    fn retrieve_batch(&mut self) -> Result<Option<HitBatch>, String> {
+        self.retrieve_hit_buffer().map(Some)
+    }
+    fn next_batch_size(&self) -> u64 {
+        self.next_bin_size()
+    }
+    fn batch_hit_count(&self, batch: &HitBatch) -> u64 {
+        batch.hits.len() as u64
+    }
+    fn execute_batch(
+        &mut self,
+        batch: &mut HitBatch,
+        cfg: &AlignConfig,
+        state: &mut AlignState,
+    ) -> Result<(), String> {
+        execute_record_batch(batch, cfg, self, state)
+    }
+    fn recycle_batch(&mut self, _batch: HitBatch) {}
+    fn disk_size(&self) -> i64 {
+        self.hit_buffer_disk_size()
+    }
+    fn complete_alignment(&mut self, cfg: &AlignConfig) -> Result<(), String> {
+        self.free_hit_buffer();
+        if !cfg.blocked_processing && !cfg.iterated {
+            self.end_random_access()?;
+        }
+        Ok(())
+    }
+    fn elapsed(&mut self, stage: &'static str) -> i64 {
+        self.elapsed_microseconds(stage)
+    }
+    fn log_message(&mut self, message: &str) {
+        self.log(message);
+    }
+}
+
+/// Source's buffer lifetime and prefetch driver, shared by the real grouped
+/// native backend and the retained flat-record typed interface.
 pub fn align_queries<B: AlignBackend>(
     cfg: &AlignConfig,
     backend: &mut B,
     state: &mut AlignState,
 ) -> Result<(), String> {
-    if !cfg.blocked_processing && !cfg.iterated {
-        backend.init_random_access(cfg.current_query_block)?;
-    }
-    let mut resident_size = backend.query_memory_size() + backend.target_memory_size();
-    backend.allocate_hit_buffer();
-    let initial_capacity = cfg
-        .memory_limit
-        .wrapping_sub(resident_size)
-        .wrapping_sub(backend.next_bin_size().wrapping_mul(cfg.hit_record_size))
-        .min(cfg.trace_pt_fetch_size);
-    let _ = backend.load_hit_buffer(initial_capacity);
+    backend.prepare_alignment(cfg)?;
+    let mut resident_size = backend.resident_memory_size();
+    let capacity = |resident: u64, next_bin: u64| {
+        cfg.memory_limit
+            .wrapping_sub(resident)
+            .wrapping_sub(next_bin.wrapping_mul(cfg.hit_record_size))
+            .min(cfg.trace_pt_fetch_size)
+    };
+    let _ = backend.load_batch(capacity(resident_size, backend.next_batch_size()));
     let mut keep_going = true;
-
     while keep_going {
-        let mut batch = backend.retrieve_hit_buffer()?;
+        let Some(mut batch) = backend.retrieve_batch()? else {
+            break;
+        };
         state.statistics.inc(
             StatValue::TimeLoadSeedHits,
-            backend.elapsed_microseconds("Loading trace points"),
+            backend.elapsed("Loading trace points"),
         );
-        let next_capacity = cfg
-            .memory_limit
-            .wrapping_sub(resident_size)
-            .wrapping_sub(backend.next_bin_size().wrapping_mul(cfg.hit_record_size))
-            .min(cfg.trace_pt_fetch_size);
-        keep_going = backend.load_hit_buffer(next_capacity);
-        backend.log(&format!(
+        // Begin the next load before this owned batch enters DP. Recycle only
+        // after its scoped workers and ordered writer have finished.
+        keep_going = backend.load_batch(capacity(resident_size, backend.next_batch_size()));
+        let count = backend.batch_hit_count(&batch);
+        backend.log_message(&format!(
             "Processing {} trace points ({}).",
-            batch.hits.len(),
-            crate::util::string::format(
-                (batch.hits.len() as u64).wrapping_mul(cfg.hit_record_size)
-            )
+            count,
+            crate::util::string::format(count.wrapping_mul(cfg.hit_record_size))
         ));
-        resident_size =
-            resident_size.wrapping_add((batch.hits.len() as u64).wrapping_mul(cfg.hit_record_size));
-
-        batch
-            .hits
-            .sort_unstable_by(|lhs, rhs| lhs.query.cmp(&rhs.query));
-        state.statistics.inc(
-            StatValue::TimeSortSeedHits,
-            backend.elapsed_microseconds("Sorting trace points"),
-        );
-        let partition = make_partition(&batch.hits, cfg.min_task_trace_pts, cfg.query_contexts);
-        let hit_it = HitIterator::new(
-            batch.query_begin,
-            batch.query_end,
-            &batch.hits,
-            &partition,
-            cfg.query_contexts,
-            cfg.swipe_all,
-            cfg.blastn,
-        );
-        backend.begin_output_batch(
-            batch.query_begin,
-            cfg.blocked_processing,
-            if cfg.blocked_processing {
-                0
-            } else {
-                cfg.query_separator
-            },
-        );
-        let parallel = cfg.swipe_all && cfg.target_sequence_count >= cfg.query_sequence_count;
-        let threads = if cfg.load_balancing == LoadBalancing::TargetParallel || parallel {
-            1
-        } else if cfg.threads_align == 0 {
-            cfg.threads
-        } else {
-            cfg.threads_align
-        };
-        let tasks = if cfg.swipe_all {
-            batch.query_begin as i64..batch.query_end as i64
-        } else {
-            0..hit_it.parts
-        };
-        backend.worker_count(threads, tasks.clone());
-        let heartbeat = cfg.verbosity >= 3
-            && cfg.load_balancing == LoadBalancing::QueryParallel
-            && !cfg.swipe_all
-            && cfg.heartbeat;
-        if heartbeat {
-            backend.heartbeat_begin(batch.query_end);
-        }
-        for task in tasks {
-            align_worker(&hit_it, cfg, backend, state, task)?;
-        }
-        if heartbeat {
-            backend.heartbeat_end();
-        }
-        state.statistics.inc(
-            StatValue::TimeExt,
-            backend.elapsed_microseconds("Computing alignments"),
-        );
-        backend.end_output_batch();
+        resident_size = resident_size.wrapping_add(count.wrapping_mul(cfg.hit_record_size));
+        backend.execute_batch(&mut batch, cfg, state)?;
+        state
+            .statistics
+            .inc(StatValue::TimeExt, backend.elapsed("Computing alignments"));
+        backend.recycle_batch(batch);
     }
     state
         .statistics
-        .max(StatValue::SearchTempSpace, backend.hit_buffer_disk_size());
-    backend.free_hit_buffer();
-    if !cfg.blocked_processing && !cfg.iterated {
-        backend.end_random_access()?;
-    }
-    Ok(())
+        .max(StatValue::SearchTempSpace, backend.disk_size());
+    backend.complete_alignment(cfg)
 }
 
 #[cfg(test)]
@@ -544,7 +624,7 @@ mod tests {
         legacy_aligned: bool,
     }
 
-    impl AlignBackend for Backend {
+    impl RecordAlignBackend for Backend {
         fn query_memory_size(&self) -> u64 {
             100
         }

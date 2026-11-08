@@ -1,0 +1,179 @@
+# DIAMOND v2.1.24. http://github.com/bbuchfink/diamond
+# Invocation: /data/henriksson/github/claude/diamond-rs/diamond/build/diamond blastx -q /data/henriksson/github/claude/diamond-rs/tests/data/tabular_context/query.fna -d /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/tax.dmnd --masking 0 --comp-based-stats 1 --max-hsps 0 -p1 -b 0.0000001 -f 104 qseqid staxids sscinames sfamily slineages --header verbose -o /data/henriksson/github/claude/diamond-rs/.tmp/native-output-options-20261107/source.out
+# Fields: Query Seq - id, Unique Subject Taxonomy ID(s), separated by a ';' (in numerical order), Unique Subject Scientific Name(s), separated by a ';', Unique subject family(s), separated by a ';', Unique Subject Lineage(s), separated by a '<>'
+[
+	{
+	"qseqid":"translated_query",
+	"staxids":[10],
+	"sscinames":["Zeta species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Zeta species"]
+	]
+	},
+	{
+	"qseqid":"translated_query",
+	"staxids":[11],
+	"sscinames":["Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	},
+	{
+	"qseqid":"translated_query",
+	"staxids":[11],
+	"sscinames":["Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	},
+	{
+	"qseqid":"translated_query",
+	"staxids":[11],
+	"sscinames":["Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	},
+	{
+	"qseqid":"translated_query",
+	"staxids":[],
+	"sscinames":[N/A],
+	"sfamily":[N/A],
+	"slineages": []
+	},
+	{
+	"qseqid":"translated_query",
+	"staxids":[],
+	"sscinames":[N/A],
+	"sfamily":[N/A],
+	"slineages": []
+	},
+	{
+	"qseqid":"translated_query",
+	"staxids":[],
+	"sscinames":[N/A],
+	"sfamily":[N/A],
+	"slineages": []
+	},
+	{
+	"qseqid":"translated_query",
+	"staxids":[10;11],
+	"sscinames":["Zeta species"",Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Zeta species"],
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	},
+	{
+	"qseqid":"translated_query",
+	"staxids":[10;11],
+	"sscinames":["Zeta species"",Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Zeta species"],
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	},
+	{
+	"qseqid":"translated_query",
+	"staxids":[10;11],
+	"sscinames":["Zeta species"",Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Zeta species"],
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	}
+	{
+	"qseqid":"reverse_query",
+	"staxids":[10],
+	"sscinames":["Zeta species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Zeta species"]
+	]
+	},
+	{
+	"qseqid":"reverse_query",
+	"staxids":[11],
+	"sscinames":["Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	},
+	{
+	"qseqid":"reverse_query",
+	"staxids":[11],
+	"sscinames":["Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	},
+	{
+	"qseqid":"reverse_query",
+	"staxids":[11],
+	"sscinames":["Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	},
+	{
+	"qseqid":"reverse_query",
+	"staxids":[],
+	"sscinames":[N/A],
+	"sfamily":[N/A],
+	"slineages": []
+	},
+	{
+	"qseqid":"reverse_query",
+	"staxids":[],
+	"sscinames":[N/A],
+	"sfamily":[N/A],
+	"slineages": []
+	},
+	{
+	"qseqid":"reverse_query",
+	"staxids":[],
+	"sscinames":[N/A],
+	"sfamily":[N/A],
+	"slineages": []
+	},
+	{
+	"qseqid":"reverse_query",
+	"staxids":[10;11],
+	"sscinames":["Zeta species"",Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Zeta species"],
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	},
+	{
+	"qseqid":"reverse_query",
+	"staxids":[10;11],
+	"sscinames":["Zeta species"",Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Zeta species"],
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	},
+	{
+	"qseqid":"reverse_query",
+	"staxids":[10;11],
+	"sscinames":["Zeta species"",Alpha species"],
+	"sfamily":[N/A],
+	"slineages": [
+		["Bacteria", "Test kingdom", "Test phylum", "Zeta species"],
+		["Bacteria", "Test kingdom", "Test phylum", "Alpha species"]
+	]
+	}
+]
