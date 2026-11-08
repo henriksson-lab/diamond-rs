@@ -206,6 +206,9 @@ impl std::fmt::Debug for PairFileArray {
 }
 
 impl PairFileArray {
+    /// Eager in-memory compatibility adapter: creates its parent hierarchy.
+    /// Actual Source FileArray workflows use the bounded owner after their
+    /// explicit, single-level mkdir phase.
     pub fn new(base_dir: impl AsRef<Path>, worker_id: i64) -> Result<Self, String> {
         let base_dir = base_dir.as_ref().to_path_buf();
         for radix in 0..RADIX_COUNT {
@@ -908,6 +911,7 @@ mod tests {
             assert_eq!(input.read_u32().unwrap(), pair.rep_len);
             assert_eq!(input.read_u32().unwrap(), pair.member_len);
         }
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -959,6 +963,7 @@ mod tests {
             let paths: Vec<_> = table.iter().map(|bucket| bucket.path.clone()).collect();
             let job = Job::new(40, 2, mem_limit, root.join("job"), 2).unwrap();
             fs::create_dir_all(job.base_dir(None).join("seed_table_0")).unwrap();
+            fs::create_dir(root.join("pairs")).unwrap();
             let mut output = PairFileArray::new_bounded(root.join("pairs"), 2).unwrap();
             let result = build_pair_table(
                 &job,
@@ -1010,6 +1015,7 @@ mod tests {
             expected.sort_unstable();
             assert_eq!(actual, expected);
             drop(output);
+            drop(job);
             fs::remove_dir_all(root).unwrap();
         }
     }

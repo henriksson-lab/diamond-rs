@@ -140,7 +140,7 @@ impl BucketWriter {
         let mut buckets = Vec::with_capacity(count);
         for radix in 0..count {
             let dir = file_array_directory(directory, radix);
-            fs::create_dir_all(source_c_path(&dir).as_ref()).map_err(|error| error.to_string())?;
+            errors.capture(crate::util::system::mkdir_path(&dir))?;
             // FileArray opens every initial volume before its FileStack,
             // including buckets which will receive no records.
             let file = Self::open_volume(
@@ -834,6 +834,22 @@ mod tests {
     }
 
     #[test]
+    fn source_file_array_existing_file_reaches_the_output_constructor() {
+        let root = temp_dir();
+        fs::write(root.join("0"), b"not a directory").unwrap();
+        let errors = IoErrorOwner::default();
+        let result = BucketWriter::new_owned(&root, 2, 1, errors.clone());
+        let error = errors.finish(result.map(|_| ())).unwrap_err();
+        let open = crate::util::io::file_open_error::find(&error)
+            .expect("Source mkdir ignores EEXIST; the actual OutputFile open must fail");
+        assert_eq!(open.path, root.join("0/worker_2_volume_0"));
+        #[cfg(unix)]
+        assert_eq!(open.raw_os_error, Some(libc::ENOTDIR));
+        assert_eq!(fs::read(root.join("0")).unwrap(), b"not a directory");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn output_constructor_retains_failing_volume_path_and_os_reason() {
         let root = temp_dir();
         let volume = root.join("0/worker_7_volume_0");
@@ -1086,6 +1102,7 @@ mod tests {
         actual.sort();
         expected.sort();
         assert_eq!(actual, expected);
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1116,6 +1133,7 @@ mod tests {
         std::io::Read::read_exact(&mut input, &mut actual).unwrap();
         input.close().unwrap();
         assert_eq!(actual, [bytes.clone(), bytes].concat());
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1141,6 +1159,7 @@ mod tests {
             crate::util::io::file_open_error::find(&error).unwrap().path,
             missing
         );
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 

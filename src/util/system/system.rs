@@ -276,16 +276,37 @@ pub fn mkdir(dir: &str) -> Result<(), String> {
     mkdir_path(std::path::Path::new(dir)).map_err(|error| error.to_string())
 }
 
+/// Source's single-directory creation operation, without recursive parents.
+/// POSIX ignores EEXIST even when the existing object is a regular file;
+/// Windows ignores the CreateDirectory result entirely.
 pub fn mkdir_path(dir: &std::path::Path) -> std::io::Result<()> {
+    let physical = crate::util::io::source_c_path(dir);
     #[cfg(unix)]
     let result = {
         use std::os::unix::fs::DirBuilderExt;
+        // Source explicitly clears errno before mkdir. Use the maintained
+        // libc accessor on the supported Linux and Apple profiles.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        #[cfg(target_vendor = "apple")]
+        unsafe {
+            *libc::__error() = 0;
+        }
         let mut builder = fs::DirBuilder::new();
-        builder.mode(0o755).create(dir)
+        builder.mode(0o755).create(physical.as_ref())
     };
-    #[cfg(not(unix))]
-    let result = fs::create_dir(dir);
-
+    #[cfg(windows)]
+    {
+        // The canonical wide path is retained: this is the existing wide-path
+        // extension of Source's ACP CreateDirectory call, with its ignored result.
+        let _ = fs::create_dir(physical.as_ref());
+        return Ok(());
+    }
+    #[cfg(not(any(unix, windows)))]
+    let result = fs::create_dir(physical.as_ref());
+    #[cfg(not(windows))]
     match result {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -458,6 +479,48 @@ pub fn parent_dir_posix(abs_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_mkdir_is_single_level_and_accepts_an_existing_regular_file() {
+        let root = std::env::temp_dir().join(format!(
+            "diamond-source-mkdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let existing = root.join("existing");
+        fs::write(&existing, b"unchanged").unwrap();
+        mkdir_path(&existing).unwrap();
+        assert_eq!(fs::read(&existing).unwrap(), b"unchanged");
+        let nested = root.join("missing/child");
+        let result = mkdir_path(&nested);
+        #[cfg(windows)]
+        result.unwrap();
+        #[cfg(not(windows))]
+        {
+            let error = result.unwrap_err();
+            let mut expected = b"could not create temporary directory ".to_vec();
+            expected.extend_from_slice(&crate::util::io::path_diagnostic_bytes(&nested).unwrap());
+            assert_eq!(
+                crate::util::io::RawDiagnosticError::find(&error),
+                Some(expected.as_slice())
+            );
+        }
+        assert!(!root.join("missing").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let target = root.join("prefix");
+            let mut raw = target.as_os_str().as_encoded_bytes().to_vec();
+            raw.extend_from_slice(b"\0ignored");
+            mkdir_path(&std::path::PathBuf::from(std::ffi::OsString::from_vec(raw))).unwrap();
+            assert!(target.is_dir());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn test_extension_helpers() {

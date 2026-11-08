@@ -346,7 +346,7 @@ pub fn output_accs_round1_with_threads(
         ));
     }
     let base_dir = source_child_path(&job.root_dir().join("output"), "");
-    fs::create_dir_all(source_c_path(&base_dir).as_ref()).map_err(|error| error.to_string())?;
+    job.capture_io(crate::util::system::mkdir_path(&base_dir))?;
     let output = Arc::new(Mutex::new(BucketWriter::new_file_array_owned(
         &base_dir,
         job.worker_id(),
@@ -854,6 +854,7 @@ mod tests {
         write_round(&job, 1, &[&[0, 0], &[1, 1, 1]]);
         assert_eq!(read_clustering(&job, 0).unwrap(), [0, 0, 2, 2, 4]);
         assert_eq!(merge(&job).unwrap(), [0, 0, 1, 1, 1]);
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -907,6 +908,7 @@ mod tests {
                 .sum::<u64>(),
             5
         );
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -950,6 +952,7 @@ mod tests {
             fs::read(root.join("clusters.000")).unwrap(),
             crate::util::io::source_text::expected_text(&expected)
         );
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -990,6 +993,7 @@ mod tests {
             );
             assert_eq!(root.join("output/0/0/bucket.tsv").exists(), split);
             assert!(root.join("output/0/bucket.tsv").exists()); // Source retains spill input.
+            drop(job);
             fs::remove_dir_all(root).unwrap();
         }
     }
@@ -1079,6 +1083,7 @@ mod tests {
             fs::write(&path, bytes).unwrap();
             volumes.push((path, 3));
         }
+        fs::create_dir(root.join("out")).unwrap();
         let children =
             radix_cluster_accessions(&job, &volumes, &root.join("out"), RADIX_BITS, 4).unwrap();
         assert_eq!(
@@ -1184,6 +1189,7 @@ mod tests {
         let log = fs::read_to_string(root.join("diamond_job.log")).unwrap();
         assert!(log.contains("Generating output"));
         assert!(log.contains("Cluster count = 1"));
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 }

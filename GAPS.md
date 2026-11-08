@@ -39,8 +39,11 @@ not known failures unless the text explicitly says otherwise.
   concrete chunk destructor, representative-worker and literal path gaps.
   Those fixes plus bounded parallel blocked/accession output now pass three
   compile profiles and 101 focused tests. New release comparisons against the
-  preserved Source captures remain pending. FileArray mkdir error semantics
-  remain a concrete code follow-up; full artifact parity is not established.
+  preserved Source captures verify all three code fixes. Directory modes
+  remain different in c3ea396; the subsequent mkdir/log package passes three
+  compile profiles and 79 focused tests but awaits new-release comparisons.
+  External Edge loading/sort, assignment workers/EOF and closure compression
+  remain concrete code work. Full artifact parity is not established.
 - Hosted CI verification, the Source-shared two-worker hazard, and final parity
   gates remain open. No complete-translation claim applies.
 

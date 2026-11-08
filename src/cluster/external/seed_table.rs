@@ -322,6 +322,9 @@ pub struct SeedFileArray {
 }
 
 impl SeedFileArray {
+    /// Eager in-memory compatibility adapter: creates its parent hierarchy.
+    /// Actual Source FileArray workflows use the bounded owner after their
+    /// explicit, single-level mkdir phase.
     pub fn new(base_dir: impl AsRef<Path>, worker_id: i64) -> Result<Self, String> {
         let base_dir = base_dir.as_ref().to_path_buf();
         for radix in 0..RADIX_COUNT {
@@ -462,13 +465,12 @@ where
     // serializing its bucket names. Preserve that lexical byte protocol.
     base_name.push(std::path::MAIN_SEPARATOR.to_string());
     let base_dir = PathBuf::from(base_name);
-    fs::create_dir_all(source_c_path(&base_dir).as_ref()).map_err(|error| error.to_string())?;
     let accessions = job.root_dir().join("accessions");
     let write_accessions = job.round_index() == 0 && shape_index == 0;
     if write_accessions {
-        fs::create_dir_all(source_c_path(&accessions).as_ref())
-            .map_err(|error| error.to_string())?;
+        job.capture_io(crate::util::system::mkdir_path(&accessions))?;
     }
+    job.capture_io(crate::util::system::mkdir_path(&base_dir))?;
     if config.threads == 0 {
         return Err("Seed-table thread count must be positive.".to_owned());
     }
@@ -909,6 +911,7 @@ mod tests {
                 crate::util::io::source_text::expected_text(expected)
             );
         }
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -985,6 +988,7 @@ mod tests {
         assert!(entries
             .iter()
             .all(|entry| entry.oid == 10 && entry.len == 4));
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1020,6 +1024,7 @@ mod tests {
         assert_eq!(stats.seeds_indexed, 2);
         assert!(masker.calls.is_empty());
         assert!(!root.join("accessions").exists());
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1051,6 +1056,7 @@ mod tests {
         assert_eq!(error, "Shape index out of bounds: 0");
         assert_eq!(c_atoll(" +123tail"), 123);
         assert_eq!(c_atoll("garbage"), 0);
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 

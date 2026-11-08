@@ -793,6 +793,7 @@ pub fn align_owned<R: SequenceVolumeReader>(
     }
     let chunks_path = job.base_dir(None).join("chunks");
     let alignment_path = job.base_dir(None).join("alignments");
+    job.capture_io(crate::util::system::mkdir_path(&alignment_path))?;
     let output = Arc::new(Mutex::new(BucketWriter::new_file_array_owned(
         &alignment_path,
         job.worker_id(),
@@ -1219,6 +1220,7 @@ mod tests {
         assert_eq!(fs::metadata(&files[0]).unwrap().len(), 0);
         assert_eq!(stats.extensions_computed, 0);
         assert!(!chunk.join("pairs").exists());
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1284,6 +1286,7 @@ mod tests {
             .sum();
         assert_eq!(records, 64); // The one HSP emits both Source directions.
         assert!(!chunk.join("pairs").exists());
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1323,6 +1326,7 @@ mod tests {
         assert_eq!(stats.hits_filtered, 1);
         assert!(!chunk.join("pairs").exists());
         assert!(table.iter().all(|bucket| bucket.path.exists()));
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 }

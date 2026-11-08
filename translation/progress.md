@@ -1472,7 +1472,7 @@ passes isolated default, dna/mcl/zstd and Windows GNU all-target compilation.
 All 101 selected tests pass: external77, join11, fetched-renderer1,
 worker-exit2, native blocked-search3 and supplied-block library7. The worker-exit
 parent launches the guarded probe subprocess to verify raw stderr/log bytes,
-status1 and no outer object unwind; ordinary embedded calls return normally.
+status 1 and no outer object unwind; ordinary embedded calls return normally.
 Ownership tests verify final-clone payload release before cache removal,
 constructor-failure file retention, configured representative terminal claims,
 literal path bytes, shared radix counts and Source cleanup error grammar.
@@ -1493,3 +1493,49 @@ This can change the early error class for a blocked radix directory; normal
 artifact checks do not establish constructor-failure parity. Caller directory
 creation and Source's Windows ignored-result behavior need a coherent callee/
 caller translation before that error-domain gate can close.
+
+
+## Directory/log callee and caller checkpoint (2026-11-08)
+
+Frozen package `78ff05d0fdf467968094368701f8a3cfeff7c2517034bb78bfa4e0e63c666400`
+passes isolated default, dna/mcl/zstd and Windows GNU all-target checks, 78
+external tests and the focused single-directory test (79 selected tests total).
+Source-style single-level mkdir uses mode 0755, ignores POSIX EEXIST (including
+regular files), and preserves Windows's ignored CreateDirectory result. Actual
+callers create directories in Source order; convenience-only recursive APIs
+remain explicit. Job retains its real FileStack log owner, opened after root/
+round0 and before worker-ID claim. Optional unchecked diagnostic stream failures
+stay silent; actual FileStack errors propagate. Windows fixture cleanup drops
+live Jobs after assertions, preserving Source handle ownership/share modes.
+
+The prior package `620f030c...` passed all three compile profiles but found eight
+runtime failures: one missing Source clustering-directory creation affected
+three flows; five direct fixtures had relied on implicit recursive parents.
+The corrective batch adds that real caller step and explicit fixture parents,
+with all output assertions retained. Failure evidence stays separate.
+
+The immutable c3ea396 release passes all 24 defined checks across the three
+natural controls, using preserved Source captures only. All three identified
+artifact defects are fixed: consumed chunks disappear, representative terminal
+claims match33/36, and forced-control seed manifests match byte-for-byte with
+literal repeated separators. Remaining classified differences are 17 directory
+modes (addressed by this new mkdir code but not yet release-verified), thread
+files/row order, elapsed log time, and legacy work-root paths. Evidence is
+`external-parallel-controls/captures/c3ea396-first/recovery.json`.
+
+Three new short Source constructor controls were captured once with binary `17a...`
+and all input hashes unchanged: missing parent, existing versioned-root file,
+and existing seed radix-directory file. All stop at the intended Source stage
+with status 1. They preserve raw streams/argv/artifacts under
+`external-mkdir-controls/source-proof.json`; Native comparison awaits this
+checkpoint's immutable release. Source was not rebuilt or retried.
+
+The next concrete code batch is external clustering: Edge InputBuffer loading/
+sorting, per-member assignment workers, assignment-volume reads to EOF rather
+than manifest count, and parallel closure compression. Source keeps the
+bidirectional degree/assignment loops serial; those must remain serial. Exact
+plan/hashes are retained under `external-cluster-parallel-audit/plan.json`.
+A Source closure race can occur when one part compresses a link another reads;
+Rust must use a real safe shared mapping owner, not unsafe aliases or a stale
+snapshot. This qualifies those race schedules, not all multithreaded inputs.
+Full translation and final parity remain open.

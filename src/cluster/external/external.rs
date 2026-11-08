@@ -15,7 +15,7 @@ use crate::util::io::{Compressor, InputFile, IoErrorOwner, IoResult, OutputFile}
 use crate::util::parallel::Atomic;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -183,6 +183,7 @@ pub struct Job {
     input_count: Vec<u64>,
     start: Instant,
     io_errors: IoErrorOwner,
+    log_file: std::sync::Arc<crate::util::parallel::FileStack>,
 }
 
 impl Job {
@@ -212,8 +213,12 @@ impl Job {
         io_errors: IoErrorOwner,
     ) -> Result<Self, String> {
         let root_dir = root_dir.as_ref().to_path_buf();
-        fs::create_dir_all(source_c_path(&(root_dir.join("round0"))).as_ref())
-            .map_err(|error| error.to_string())?;
+        io_errors.capture(crate::util::system::mkdir_path(&root_dir))?;
+        io_errors.capture(crate::util::system::mkdir_path(&root_dir.join("round0")))?;
+        let log_file = std::sync::Arc::new(crate::util::parallel::FileStack::try_new_owned(
+            root_dir.join("diamond_job.log"),
+            io_errors.clone(),
+        )?);
         Ok(Self {
             max_oid,
             volumes,
@@ -225,6 +230,7 @@ impl Job {
             input_count: Vec::new(),
             start: Instant::now(),
             io_errors,
+            log_file,
         })
     }
 
@@ -253,9 +259,10 @@ impl Job {
         io_errors: IoErrorOwner,
     ) -> Result<Self, String> {
         let root_dir = root_dir.as_ref().to_path_buf();
-        fs::create_dir_all(source_c_path(&root_dir).as_ref()).map_err(|error| error.to_string())?;
-        let worker_id = Atomic::new(root_dir.join("worker_id")).fetch_add_one()?;
-        Self::new_owned(max_oid, volumes, mem_limit, root_dir, worker_id, io_errors)
+        let mut job = Self::new_owned(max_oid, volumes, mem_limit, &root_dir, 0, io_errors)?;
+        // Source creates root and round directories before claiming worker_id.
+        job.worker_id = Atomic::new(root_dir.join("worker_id")).fetch_add_one()?;
+        Ok(job)
     }
 
     pub fn io_errors(&self) -> IoErrorOwner {
@@ -306,18 +313,21 @@ impl Job {
 
     pub fn log(&self, message: &str) -> Result<String, String> {
         let line = format!(
-            "[{}, {}] {}\n",
+            "[{}, {}] {}{}",
             self.worker_id,
             self.start.elapsed().as_secs(),
-            message
+            message,
+            crate::util::system::DEFAULT_LINE_DELIMITER,
         );
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(source_c_path(&(self.root_dir.join("diamond_job.log"))).as_ref())
-            .map_err(|error| error.to_string())?;
-        file.write_all(line.as_bytes())
-            .map_err(|error| error.to_string())?;
+        // Source publishes to the configured LogStream before pushing the
+        // same buffer to its retained, process-shared FileStack owner.
+        // MessageStream's optional ofstream has disabled exceptions. Failure
+        // there must not replace the actual FileStack result or primary error.
+        let _ = crate::util::log_stream::log_stream()
+            .lock()
+            .unwrap()
+            .write_bytes(line.as_bytes());
+        self.log_file.push_bytes(line.as_bytes())?;
         Ok(line)
     }
 
@@ -346,8 +356,7 @@ impl Job {
 
     pub fn next_round(&mut self) -> Result<(), String> {
         self.round += 1;
-        fs::create_dir_all(source_c_path(&(self.base_dir(None))).as_ref())
-            .map_err(|error| error.to_string())
+        self.capture_io(crate::util::system::mkdir_path(&self.base_dir(None)))
     }
 
     pub fn round_index(&self) -> i32 {
@@ -418,7 +427,7 @@ impl ClusterChunk {
 
     pub fn new_owned(id: i32, chunks_path: &Path, io_errors: IoErrorOwner) -> Result<Self, String> {
         let dir = chunks_path.join(id.to_string());
-        fs::create_dir_all(source_c_path(&dir).as_ref()).map_err(|error| error.to_string())?;
+        io_errors.capture(crate::util::system::mkdir_path(&dir))?;
         let path = dir.join("pairs");
         let pairs_out = io_errors.capture(
             OutputFile::with_source_profile_path(&path, Compressor::None, "wb", 65_536)
@@ -783,8 +792,8 @@ pub fn build_chunk_table(
     let shift = bit_length(max_oid).saturating_sub(RADIX_BITS);
     let table_dir = job.base_dir(None).join("chunk_table");
     let chunks_dir = job.base_dir(None).join("chunks");
-    fs::create_dir_all(source_c_path(&table_dir).as_ref()).map_err(|error| error.to_string())?;
-    fs::create_dir_all(source_c_path(&chunks_dir).as_ref()).map_err(|error| error.to_string())?;
+    job.capture_io(crate::util::system::mkdir_path(&table_dir))?;
+    job.capture_io(crate::util::system::mkdir_path(&chunks_dir))?;
     let table_files = Arc::new(Mutex::new(
         super::storage::BucketWriter::new_file_array_owned(
             &table_dir,
@@ -897,7 +906,6 @@ pub fn build_chunks_with_threads<R: SequenceVolumeReader>(
     let mut chunks_name = job.base_dir(None).join("chunks").into_os_string();
     chunks_name.push(std::path::MAIN_SEPARATOR.to_string());
     let chunks_dir = PathBuf::from(chunks_name);
-    fs::create_dir_all(source_c_path(&chunks_dir).as_ref()).map_err(|error| error.to_string())?;
     let queue = Atomic::new(chunks_dir.join("queue"));
     let output = Arc::new(Mutex::new(BucketWriter::new_file_array_owned(
         &chunks_dir,
@@ -1437,6 +1445,9 @@ pub fn round<B: ExternalPipeline>(
         shape_count
     ))?;
     job.set_round(volumes.0.iter().map(|volume| volume.record_count).sum());
+    job.capture_io(crate::util::system::mkdir_path(
+        &job.base_dir(None).join("pair_table"),
+    ))?;
     backend.begin_pair_table(job)?;
     let mut pair_table = RadixedTable::default();
     for shape in 0..shape_count {
@@ -1852,6 +1863,7 @@ mod tests {
             ">0\nAAAA\n>1\nBBB\n"
         );
         assert_eq!(fs::read_to_string(&paths[1]).unwrap(), ">2\nCC\n>3\nDD\n");
+        drop(job);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1877,6 +1889,7 @@ mod tests {
             base_path(Path::new("tmp/table/bucket.tsv")).unwrap_err(),
             "base_path"
         );
+        drop(job);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1903,6 +1916,7 @@ mod tests {
     #[test]
     fn cluster_chunk_writes_native_count_and_pair_records() {
         let dir = temp_dir("pairs");
+        fs::create_dir(&dir).unwrap();
         let mut chunk = ClusterChunk::new(0, &dir).unwrap();
         let mut pairs = vec![PairEntryShort {
             rep_oid: 4,
@@ -2188,6 +2202,8 @@ mod tests {
             fs::write(&path, payload).unwrap();
             database.0.push(Volume::new(path, oid, oid + 1, 1));
         }
+        fs::create_dir(dir.join("chunk-table")).unwrap();
+        fs::create_dir(job.base_dir(None).join("chunks")).unwrap();
         let mut table_writer = super::super::storage::BucketWriter::new_owned(
             &dir.join("chunk-table"),
             job.worker_id(),
@@ -2261,6 +2277,8 @@ mod tests {
             let oid = if round == 0 { 0 } else { 7 };
             let input = dir.join("volume.faa");
             fs::write(&input, b">7\nARND\n>invalid-tail\n!\n").unwrap();
+            fs::create_dir(dir.join("chunk-table")).unwrap();
+            fs::create_dir(job.base_dir(None).join("chunks")).unwrap();
             let mut table_writer = super::super::storage::BucketWriter::new_owned(
                 &dir.join("chunk-table"),
                 job.worker_id(),
@@ -2409,6 +2427,7 @@ mod tests {
                 .unwrap()
                 .ends_with("\t21\n")
         );
+        drop(job);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2464,12 +2483,14 @@ mod tests {
             .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(oids, [0, 1, 2]);
+        drop(job);
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn external_applies_coverage_runs_rounds_and_wins_output_lock() {
         let dir = temp_dir("external-pipeline");
+        fs::create_dir(&dir).unwrap();
         let output = dir.join("clusters.tsv");
         let volumes = VolumedFile(vec![Volume::new("fixture.faa", 0, 3, 3)]);
         let mut backend = RecordingPipeline {

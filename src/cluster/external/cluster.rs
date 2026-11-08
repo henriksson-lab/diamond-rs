@@ -65,7 +65,7 @@ pub fn compute_closure(job: &Job, volumes: &VolumedFile, rep: &mut [OId]) -> Res
     }
 
     let output_dir = job.base_dir(None).join("clustering");
-    fs::create_dir_all(source_c_path(&output_dir).as_ref()).map_err(|error| error.to_string())?;
+    job.capture_io(crate::util::system::mkdir_path(&output_dir))?;
     for (index, volume) in volumes.0.iter().enumerate() {
         let begin = usize::try_from(volume.oid_begin)
             .map_err(|_| "Volume OID range does not fit memory.".to_owned())?;
@@ -140,7 +140,7 @@ pub fn get_reps_with_threads(
         return Ok(PathBuf::new());
     }
     let base_dir = job.base_dir(None).join("reps");
-    fs::create_dir_all(source_c_path(&base_dir).as_ref()).map_err(|error| error.to_string())?;
+    job.capture_io(crate::util::system::mkdir_path(&base_dir))?;
     let manifest_path = base_dir.join("reps.tsv");
     let manifest = std::sync::Arc::new(FileStack::try_new_owned(&manifest_path, job.io_errors())?);
     let queue = std::sync::Arc::new(Atomic::new(base_dir.join("queue")));
@@ -263,6 +263,7 @@ pub fn cluster_with_threads(
     threads: usize,
 ) -> Result<PathBuf, String> {
     let directory = job.base_dir(None).join("clustering");
+    job.capture_io(crate::util::system::mkdir_path(&directory))?;
     let bucket_dir = directory.join("0");
     let mut output = BucketWriter::new_owned(&directory, job.worker_id(), 1, job.io_errors())?;
     let queue = Atomic::new(job.base_dir(None).join("alignments/queue"));
@@ -606,6 +607,7 @@ mod tests {
                 .len(),
             24
         );
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -677,6 +679,7 @@ mod tests {
         let newline = if cfg!(windows) { "\r\n" } else { "\n" };
         assert!(fasta.contains(&format!(">0{newline}ARND{newline}")));
         assert!(fasta.contains(&format!(">1{newline}ARND{newline}")));
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -726,6 +729,7 @@ mod tests {
                 "representative selection does not consume source inputs"
             );
         }
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -769,6 +773,8 @@ mod tests {
                 .unwrap(),
             2
         );
+        drop(late);
+        drop(first);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -813,6 +819,7 @@ mod tests {
         assert_eq!(cluster(&job, &edges, &volumes).unwrap(), PathBuf::new());
         assert_eq!(read_mapping(&job, 4), [0, 1, 0, 0]);
         assert!(!edges[0].path.exists());
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -851,6 +858,7 @@ mod tests {
         );
         assert_eq!(read_mapping(&job, 4), [0, 0, 0, 0]);
         assert!(!edges[0].path.exists());
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -864,6 +872,7 @@ mod tests {
             compute_closure(&job, &volumes, &mut rep).unwrap_err(),
             "Representative cycle contains OID 1."
         );
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 }
