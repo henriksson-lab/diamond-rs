@@ -545,6 +545,7 @@ mod tests {
         assert_eq!(input.read_u64().unwrap(), entry.seed);
         assert_eq!(input.read_i64().unwrap(), entry.oid);
         assert_eq!(input.read_i32().unwrap(), entry.len);
+        input.close().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

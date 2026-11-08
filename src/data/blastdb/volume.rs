@@ -423,6 +423,8 @@ mod tests {
         assert_eq!(index5.lmdb_file, b"lmdb");
         assert!(index5.header_index.is_empty());
 
+        pin.close().unwrap();
+        pin5.close().unwrap();
         std::fs::remove_file(prefix.with_extension("pin")).unwrap();
         std::fs::remove_file(prefix.with_extension("phr")).unwrap();
         std::fs::remove_file(prefix.with_extension("psq")).unwrap();
@@ -444,6 +446,7 @@ mod tests {
             volume.deflines(0, true, true, true).unwrap_err(),
             "Header offsets exceed PHR file size"
         );
+        drop(volume);
         std::fs::remove_file(prefix.with_extension("pin")).unwrap();
         std::fs::remove_file(prefix.with_extension("phr")).unwrap();
         std::fs::remove_file(prefix.with_extension("psq")).unwrap();
@@ -512,6 +515,7 @@ mod tests {
         assert_eq!(filtered.oids, vec![11]);
         assert!(accs["ACC2.2"]);
 
+        drop(volume);
         std::fs::remove_file(prefix.with_extension("pin")).unwrap();
         std::fs::remove_file(prefix.with_extension("phr")).unwrap();
         std::fs::remove_file(prefix.with_extension("psq")).unwrap();

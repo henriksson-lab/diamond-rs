@@ -60,6 +60,29 @@ pub(crate) fn tabular_format(
     if output_format.is_empty() {
         output_format.push(b"6".to_vec());
     }
+    let score_matrix_name = if config.tuning.matrix_file.as_os_str().is_empty() {
+        config.matrix.to_ascii_uppercase()
+    } else {
+        b"custom".to_vec()
+    };
+    // Source resolves the requested selector before constructing the sink.
+    // Preserve its raw error instead of silently coercing an unknown selector
+    // to tabular and failing later after stdout has already been owned.
+    if crate::output::format::FormatCode::parse_bytes(&output_format[0]).is_none() {
+        crate::output::format::get_output_format_bytes(
+            &output_format.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            std::path::Path::new(""),
+            if config.translated_query_layout.is_some() {
+                crate::output::format::OutputCommand::BlastX
+            } else {
+                crate::output::format::OutputCommand::BlastP
+            },
+            config.include_lineage,
+            config.frame_shift,
+            config.translated_query_layout.is_some(),
+            &score_matrix_name,
+        )?;
+    }
     let json = matches!(output_format[0].as_slice(), b"104" | b"json-flat");
     output_format[0] = if json { b"104".to_vec() } else { b"6".to_vec() };
     let mut formatter = crate::output::blast_tab_format::ByteBlastTabFormat::new_bytes(
@@ -68,11 +91,7 @@ pub(crate) fn tabular_format(
             json,
             frame_shift: config.frame_shift,
             query_translated: config.translated_query_layout.is_some(),
-            score_matrix_name: if config.tuning.matrix_file.as_os_str().is_empty() {
-                config.matrix.to_ascii_uppercase()
-            } else {
-                b"custom".to_vec()
-            },
+            score_matrix_name,
             report_unaligned: config.report_unaligned,
             qnum_offset: config.tuning.output.qnum_offset as u64,
             snum_offset: config.tuning.output.snum_offset as u64,

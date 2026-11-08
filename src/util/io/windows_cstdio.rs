@@ -736,13 +736,24 @@ mod tests {
     }
 
     #[test]
-    fn named_path_embedded_nul_preserves_invalid_argument_error() {
-        let IoError::FileOpenDetails(error) =
-            OwnedCstdio::open("invalid\0path", "rb", 0).unwrap_err()
+    fn named_path_embedded_nul_uses_c_prefix_and_retains_owner() {
+        let path = path("nul-prefix");
+        std::fs::write(&path, b"actual prefix").unwrap();
+        let mut full = path.clone();
+        full.as_mut_os_string().push("\0ignored-suffix");
+        let mut owner = OwnedCstdio::open_path(&full, "rb", 0).unwrap();
+        assert_eq!(owner.name, full);
+        let mut bytes = [0; 13];
+        assert_eq!(owner.read_bytes(&mut bytes).unwrap(), bytes.len());
+        assert_eq!(&bytes, b"actual prefix");
+        owner.close().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let IoError::FileOpenDetails(error) = OwnedCstdio::open_path(&full, "rb", 0).unwrap_err()
         else {
-            panic!("embedded NUL must remain a concrete open error");
+            panic!("missing C-prefix path must retain concrete open error");
         };
-        assert_eq!(error.raw_os_error, Some(libc::EINVAL));
+        assert_eq!(error.path, full);
+        assert_eq!(error.raw_os_error, Some(libc::ENOENT));
     }
 
     #[test]

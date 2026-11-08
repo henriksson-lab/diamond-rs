@@ -82,6 +82,7 @@ mod tests {
         assert_eq!(read_be32(&mut file).unwrap(), 0x1234_5678);
         assert_eq!(read_le64(&mut file).unwrap(), 0x0102_0304_0506_0708);
         assert_eq!(read_pascal_string(&mut file).unwrap(), "test");
+        file.close().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 }

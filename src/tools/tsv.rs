@@ -342,10 +342,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn source_tsv_raw_filename_keeps_byte_rows_and_typed_open_errors() {
-        use std::os::unix::ffi::OsStringExt;
-        let mut name = temp_path("raw-name").into_os_string().into_vec();
-        name.push(0xff);
-        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(name));
+        let root = temp_path("raw-name");
+        std::fs::create_dir(&root).unwrap();
+        let (path, _) = crate::util::test_os_path_or_unicode(&root, b"rows\xff.tsv", "rows-é.tsv");
         std::fs::write(&path, b"a\xfe\t1\nb\t2\n").unwrap();
         let mut output = Vec::new();
         let result =
@@ -360,6 +359,7 @@ mod tests {
             crate::util::io::file_open_error::find(&error).unwrap().path,
             path
         );
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[test]

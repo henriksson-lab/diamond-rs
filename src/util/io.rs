@@ -1142,6 +1142,7 @@ mod tests {
         let mut buf = [0u8; 11];
         input.read_raw(&mut buf).unwrap();
         assert_eq!(&buf, b"gzip-output");
+        input.close().unwrap();
 
         {
             let mut out = OutputFile::new(&name, Compressor::Zstd, "w+b").unwrap();
@@ -1154,6 +1155,7 @@ mod tests {
         let mut buf = [0u8; 11];
         input.read_raw(&mut buf).unwrap();
         assert_eq!(&buf, b"zstd-output");
+        input.close().unwrap();
 
         std::fs::remove_file(path).unwrap();
     }
@@ -1210,6 +1212,7 @@ mod tests {
         let mut buf = [0u8; 4];
         input.read_raw(&mut buf).unwrap();
         assert_eq!(&buf, b"zlib");
+        input.close().unwrap();
 
         let mut first = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         first.write_all(b"one").unwrap();
@@ -1223,6 +1226,7 @@ mod tests {
         let mut buf = [0u8; 6];
         input.read_raw(&mut buf).unwrap();
         assert_eq!(&buf, b"onetwo");
+        input.close().unwrap();
 
         let mut gzip_encoder =
             flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -1233,18 +1237,21 @@ mod tests {
         let mut buf = [0u8; 9];
         input.read_raw(&mut buf).unwrap();
         assert_eq!(&buf, b"gzip-data");
+        input.close().unwrap();
 
         std::fs::write(&path, zstd_compress_for_test(b"zstd-data")).unwrap();
         let mut input = InputFile::new(&name, 0).unwrap();
         let mut buf = [0u8; 9];
         input.read_raw(&mut buf).unwrap();
         assert_eq!(&buf, b"zstd-data");
+        input.close().unwrap();
 
         std::fs::write(&path, &gzip_compressed).unwrap();
         let mut input = InputFile::new(&name, InputFile::NO_AUTODETECT).unwrap();
         let mut header = [0u8; 2];
         input.read_raw(&mut header).unwrap();
         assert_eq!(header, [0x1f, 0x8b]);
+        input.close().unwrap();
 
         std::fs::remove_file(path).unwrap();
     }
@@ -1334,12 +1341,14 @@ mod tests {
         assert_eq!(text.line, "one");
         text.getline().unwrap();
         assert_eq!(text.line, "two");
+        text.into_inner().close().unwrap();
 
         let mut out = OutputFile::new(&name, Compressor::None, "w+b").unwrap();
         out.write_raw(b"out\n").unwrap();
         let mut text = TextInputFile::from_output_file(&mut out, b'\n').unwrap();
         text.getline().unwrap();
         assert_eq!(text.line, "out");
+        text.into_inner().close().unwrap();
         out.close().unwrap();
 
         let data = TempFileData::init(false).unwrap();
@@ -1348,6 +1357,7 @@ mod tests {
         let mut text = TextInputFile::from_temp_file(&mut tmp, b'\n').unwrap();
         text.getline().unwrap();
         assert_eq!(text.line, "tmp");
+        text.into_inner().close().unwrap();
         tmp.close().unwrap();
         std::fs::remove_file(&data.name).unwrap();
 
@@ -1356,6 +1366,7 @@ mod tests {
         let mut text = TextInputFile::from_temp_file(&mut unlinked, b'\n').unwrap();
         text.getline().unwrap();
         assert_eq!(text.line, "unlinked");
+        text.into_inner().close().unwrap();
         unlinked.close().unwrap();
 
         std::fs::remove_file(path).unwrap();

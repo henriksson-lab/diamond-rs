@@ -168,10 +168,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn raw_path_uses_source_file_owner_and_preserves_open_error() {
-        use std::os::unix::ffi::OsStringExt;
         let root = path("raw-path");
         std::fs::create_dir(&root).unwrap();
-        let name = root.join(std::ffi::OsString::from_vec(b"archive_\xff.daa".to_vec()));
+        let (name, _) =
+            crate::util::test_os_path_or_unicode(&root, b"archive_\xff.daa", "archive-é.daa");
         {
             let mut output = DaaOutput::create(&name, 8192).unwrap();
             output.write_all(b"raw").unwrap();
@@ -225,6 +225,7 @@ mod tests {
         let error = input.read_exact(&mut [0; 16]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(error.to_string(), "Unexpected end of input.");
+        drop(input);
         std::fs::remove_file(path).unwrap();
     }
 }

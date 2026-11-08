@@ -127,9 +127,12 @@ fn run_inner(
     // of the supplied master graph consumer. Its graph consequently stays
     // empty and the MCL phase emits singleton assignments. Reuse that exact
     // lifecycle rather than inventing a graph merge for this combination.
-    let tmpdir = crate::util::io::temp_file::source_temp_directory(
+    let tmpdir = crate::util::io::temp_file::source_temp_directory_path(
         &config.tmpdir,
-        config.output.as_deref().unwrap_or(""),
+        config
+            .output
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("")),
     );
     let graph = Arc::new(Mutex::new(SparseMatrixStream::create(
         count,

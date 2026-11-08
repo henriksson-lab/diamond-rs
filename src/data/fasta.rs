@@ -202,10 +202,7 @@ pub(crate) fn prepare_source_sequence_reader(
     path: &Path,
     buffer_size: usize,
 ) -> io::Result<crate::util::io::InputFile> {
-    let name = path
-        .to_str()
-        .ok_or_else(|| io::Error::other("Non-UTF-8 sequence input path"))?;
-    let input = crate::util::io::InputFile::with_source_profile(name, 0, buffer_size)
+    let input = crate::util::io::InputFile::with_source_profile_path(path, 0, buffer_size)
         .map_err(io::Error::other)?;
     prepare_decoded_sequence_reader(input)
 }

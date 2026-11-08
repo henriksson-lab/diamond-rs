@@ -7,6 +7,27 @@ mod source_startup;
 use std::path::Path;
 use std::process::Command;
 
+fn expected_source_text_output(bytes: Vec<u8>) -> Vec<u8> {
+    // Source greedy_vertex_cover.cpp:162–167 opens both outputs with plain
+    // std::ofstream (no ios::binary). Windows CRT text mode expands each LF.
+    // Project the frozen LF output only; edge inputs must remain byte-exact.
+    #[cfg(windows)]
+    {
+        let mut output = Vec::with_capacity(bytes.len());
+        for byte in bytes {
+            if byte == b'\n' {
+                output.push(b'\r');
+            }
+            output.push(byte);
+        }
+        output
+    }
+    #[cfg(not(windows))]
+    {
+        bytes
+    }
+}
+
 #[test]
 fn native_gvc_matches_upstream_graph_modes_and_ordering() {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/gvc");
@@ -57,7 +78,9 @@ fn native_gvc_matches_upstream_graph_modes_and_ordering() {
         for (actual, extension) in [(&output, "tsv"), (&centroids, "centroids")] {
             assert_eq!(
                 std::fs::read(actual).unwrap(),
-                std::fs::read(fixtures.join(format!("{mode}.{extension}"))).unwrap(),
+                expected_source_text_output(
+                    std::fs::read(fixtures.join(format!("{mode}.{extension}"))).unwrap()
+                ),
                 "{mode}.{extension}"
             );
         }

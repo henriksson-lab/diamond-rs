@@ -240,7 +240,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "diamond-rs-queue-filestack-{}-{}.tsv",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         filestack(&path, 4).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

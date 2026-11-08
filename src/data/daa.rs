@@ -1825,6 +1825,8 @@ mod tests {
         let seq_lens = refs.iter().map(|(_, len)| *len).collect::<Vec<_>>();
         finish_daa_from_refs(&mut f, &daa, &seq_ids, &seq_lens, 1).unwrap();
 
+        drop(f);
+        drop(daa);
         std::fs::remove_file(daa_path).unwrap();
     }
 
@@ -1867,12 +1869,14 @@ mod tests {
         .unwrap();
         assert_eq!(output, b"\xffuery0\t\xfeef0\n");
         merge_daa_files(&[&path], &merged).unwrap();
+        drop(daa);
         let mut daa = ByteDaaFile::open_bytes(&merged).unwrap();
         assert_eq!(daa.ref_name_bytes(0), b"\xfeef0");
         assert_eq!(
             daa.read_query_record_bytes().unwrap().unwrap().query_name,
             b"\xffuery0"
         );
+        drop(daa);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(merged).unwrap();
     }
@@ -1929,6 +1933,7 @@ mod tests {
         assert_eq!(h.block_type[1], BlockType::RefNames as u8);
         assert_eq!(h.block_type[2], BlockType::RefLengths as u8);
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2024,6 +2029,7 @@ mod tests {
         assert_eq!(daa.read_query_buffer().unwrap(), Some((query_payload, 0)));
         assert_eq!(daa.read_query_buffer().unwrap(), None);
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2073,6 +2079,7 @@ mod tests {
         assert!(r.source_seq.is_empty());
         assert_eq!(r.raw_matches(), raw_match);
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2105,6 +2112,7 @@ mod tests {
         );
         assert_eq!(r.raw_matches(), raw_match);
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2208,6 +2216,7 @@ mod tests {
         assert_eq!(matches[1].hit_num, 0);
         assert_eq!(matches[1].hsp_num, 1);
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2243,6 +2252,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, "Query begin out of bounds.");
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2293,6 +2303,7 @@ mod tests {
         assert_eq!(matches[0].hsp.subject_range, Interval::new(5, 7));
         assert_eq!(matches[0].hsp.length, 2);
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2369,6 +2380,7 @@ mod tests {
         assert_eq!(raw.score, 50);
         assert!(!raw_it.good());
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2390,6 +2402,7 @@ mod tests {
         assert_eq!(seq_ids, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(seq_lens, vec![10, 20]);
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2425,6 +2438,7 @@ mod tests {
         assert_eq!(raw.score, 42);
         assert!(!it.good());
 
+        drop(daa);
         std::fs::remove_file(input_path).unwrap();
     }
 
@@ -2483,6 +2497,7 @@ mod tests {
         assert_eq!(raw1.subject_id, 1);
         assert!(merged.read_query_buffer().unwrap().is_none());
 
+        drop(merged);
         std::fs::remove_file(p0).unwrap();
         std::fs::remove_file(p1).unwrap();
         std::fs::remove_file(out_path).unwrap();
@@ -2510,6 +2525,7 @@ mod tests {
         assert_eq!(r.context[0], seq);
         assert!(r.raw_matches().is_empty());
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2615,6 +2631,7 @@ mod tests {
             202
         );
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2649,6 +2666,7 @@ mod tests {
             b"old0\0old1\0"
         );
 
+        drop(daa);
         std::fs::remove_file(path).unwrap();
     }
 }

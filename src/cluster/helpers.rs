@@ -731,6 +731,33 @@ mod tests {
         std::env::temp_dir().join(format!("diamond-rs-helpers-{}-{name}", std::process::id()))
     }
 
+    // These ordering fixtures inspect a Table directly; choose the explicit
+    // in-memory extension rather than Source's empty-filename stdout owner.
+    fn memory_output(simple_header: bool) -> TsvFile {
+        let mut file = TsvFile::from_table(
+            crate::util::tsv::Table::new(vec![Type::String, Type::String]),
+            Flags::TEMP,
+        );
+        if simple_header {
+            file.write_record_strings(&["centroid", "member"]).unwrap();
+        }
+        file
+    }
+
+    #[test]
+    fn output_tsv_path_uses_real_owner_and_commits_on_close() {
+        let path = temp_path("real-output.tsv");
+        let db = Db::new(&["a", "b"]);
+        let mut file = open_out_tsv(path.to_str().unwrap(), true).unwrap();
+        output(&mut file, &db, &[(0u32, 1), (0, 0)]).unwrap();
+        file.close_io().unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"centroid\tmember\na\ta\na\tb\n"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn read_overloads_and_mapping_helpers() {
         let db = Db::new(&["a", "b", "c", "d"]);
@@ -749,7 +776,7 @@ mod tests {
     #[test]
     fn output_overloads_preserve_their_distinct_orders() {
         let db = Db::new(&["a", "b", "c", "d"]);
-        let mut joined = open_out_tsv("", false).unwrap();
+        let mut joined = memory_output(false);
         output(&mut joined, &db, &[(2u32, 3), (0, 1), (0, 0), (2, 2)]).unwrap();
         let got = (0..joined.table().size())
             .map(|i| {
@@ -767,7 +794,7 @@ mod tests {
             ]
         );
 
-        let mut memory = open_out_tsv("", true).unwrap();
+        let mut memory = memory_output(true);
         output_mem_mapping(&mut memory, &db, &[0u32, 0, 2, 2], true).unwrap();
         assert_eq!(memory.table().size(), 5);
         assert_eq!(memory.table().record(0).get(0), "centroid");
@@ -837,7 +864,7 @@ mod tests {
 
         let mut records =
             TsvFile::from_lines(vec![Type::Int64, Type::Int64], ["0\t0", "0\t1"]).unwrap();
-        let mut out = open_out_tsv("", false).unwrap();
+        let mut out = memory_output(false);
         output_mem_file(&mut out, &db, &mut records, false).unwrap();
         assert_eq!(out.table().record(1).get(1), "b");
 

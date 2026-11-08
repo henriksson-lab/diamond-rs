@@ -5612,10 +5612,10 @@ fn run_impl(
             format::DEFAULT_TABULAR_FIELDS.to_vec()
         }
     } else {
-        let mut message = b"Output format '".to_vec();
-        message.extend_from_slice(&config.outfmt[0]);
-        message.extend_from_slice(b"' is not implemented in the native blastp pipeline. Supported: 6/tab, 100/daa, 0, 5/xml and 103/paf.");
-        return Err(crate::util::io::RawDiagnosticError(message).into_io());
+        // Reuse Source's selector/field validation and raw diagnostic, also
+        // for direct in-memory library callers without an outer block writer.
+        super::search_output::tabular_format(config)?;
+        return Err(io::Error::other("Invalid native output format routing"));
     };
 
     // Match upstream's field-driven DP requirements. In particular positive

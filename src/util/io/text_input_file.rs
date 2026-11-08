@@ -369,12 +369,14 @@ mod tests {
         let mut named = TextInputFile::from_file_name_default(&name).unwrap();
         named.getline().unwrap();
         assert_eq!(named.line, "named");
+        named.into_inner().close().unwrap();
 
         let mut output = OutputFile::new(&name, Compressor::None, "w+b").unwrap();
         output.write_raw(b"output\n").unwrap();
         let mut from_output = TextInputFile::from_output_file_default(&mut output).unwrap();
         from_output.getline().unwrap();
         assert_eq!(from_output.line, "output");
+        from_output.into_inner().close().unwrap();
         output.close().unwrap();
 
         let data = TempFileData::init(false).unwrap();
@@ -383,6 +385,7 @@ mod tests {
         let mut from_temp = TextInputFile::from_temp_file_default(&mut temp).unwrap();
         from_temp.getline().unwrap();
         assert_eq!(from_temp.line, "temp");
+        from_temp.into_inner().close().unwrap();
         temp.close().unwrap();
 
         std::fs::remove_file(path).unwrap();

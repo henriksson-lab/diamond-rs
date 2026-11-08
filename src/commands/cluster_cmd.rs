@@ -1839,6 +1839,9 @@ mod tests {
         backend
             .write_output(&database, WrapperOutput::Dense(vec![0, 0]), false, true)
             .unwrap();
+        // Source write_output commits its serializer into the retained C FILE;
+        // closing the workflow owner makes those bytes visible to a new reader.
+        backend.close_database(database).unwrap();
         assert_eq!(
             std::fs::read_to_string(&output).unwrap(),
             "centroid\tmember\ncentroid\tcentroid\ncentroid\tmember\n"

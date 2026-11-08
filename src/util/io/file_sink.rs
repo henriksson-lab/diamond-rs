@@ -536,7 +536,13 @@ mod tests {
         sink.write(b"data").unwrap();
         sink.close().unwrap();
         sink.close().unwrap();
-        assert_eq!(sink.write(b"x").unwrap_err(), IoError::FileWrite(name));
+        let error = sink.write(b"x").unwrap_err();
+        let mut expected = b"Error writing file ".to_vec();
+        expected.extend_from_slice(name.as_bytes());
+        assert_eq!(
+            crate::util::io::RawDiagnosticError::find(&error),
+            Some(expected.as_slice())
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"data");
         std::fs::remove_file(path).unwrap();
     }

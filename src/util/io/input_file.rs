@@ -526,14 +526,26 @@ mod tests {
             crate::util::test_path_component()
         ));
         std::fs::create_dir(&root).unwrap();
-        let dir = root.join(std::ffi::OsString::from_vec(b"directory\xff".to_vec()));
+        let (dir, raw_names) =
+            crate::util::test_os_path_or_unicode(&root, b"directory\xff", "directory-é");
         std::fs::create_dir(&dir).unwrap();
-        let path = dir.join(std::ffi::OsString::from_vec(b"file\x80.gz".to_vec()));
+        let path = if raw_names {
+            dir.join(std::ffi::OsString::from_vec(b"file\x80.gz".to_vec()))
+        } else {
+            dir.join("file-λ.gz")
+        };
         let mut output =
             super::OutputFile::with_source_profile_path(&path, super::Compressor::Zlib, "wb", 32)
                 .unwrap();
         assert_eq!(output.file_path(), path);
-        assert!(output.try_file_name().is_err());
+        if raw_names {
+            assert!(output.try_file_name().is_err());
+        } else {
+            assert_eq!(
+                output.try_file_name().unwrap().as_bytes(),
+                path.as_os_str().as_bytes()
+            );
+        }
         output.write_raw(b"actual raw path").unwrap();
         output.close().unwrap();
         let mut input = super::InputFile::with_source_profile_path(&path, 0, 32).unwrap();

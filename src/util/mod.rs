@@ -54,3 +54,45 @@ pub(crate) fn test_path_component() -> String {
     }
     format!("{:016x}", hasher.finish())
 }
+
+/// Pick a filesystem-supported test name without treating opaque path bytes
+/// as universally creatable on Unix (APFS rejects invalid UTF-8 with EILSEQ).
+/// The rejection path still exercises the real Source opener and its saved
+/// raw-path diagnostic; callers then run their complete payload workflow with
+/// an explicit valid-Unicode alternative.
+#[cfg(all(test, unix))]
+pub(crate) fn test_os_path_or_unicode(
+    directory: &std::path::Path,
+    raw_component: &[u8],
+    unicode_component: &str,
+) -> (std::path::PathBuf, bool) {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let path = directory.join(std::ffi::OsString::from_vec(raw_component.to_vec()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            drop(file);
+            std::fs::remove_file(&path).unwrap();
+            (path, true)
+        }
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+            let source_error = io::FileSink::new_path(&path, "wb", false, 64).unwrap_err();
+            let saved = match source_error {
+                io::IoError::FileOpenDetails(saved) => saved,
+                other => panic!("Expected saved Source open failure, got {other:?}"),
+            };
+            assert_eq!(saved.path, path);
+            assert_eq!(saved.raw_os_error, Some(libc::EILSEQ));
+            assert!(!saved.reason.is_empty());
+            let mut expected = b"Error opening file ".to_vec();
+            expected.extend_from_slice(path.as_os_str().as_bytes());
+            assert_eq!(saved.try_message_bytes().unwrap(), expected);
+            assert!(!path.exists());
+            (directory.join(unicode_component), false)
+        }
+        Err(error) => panic!("Unexpected raw-filename capability error for {path:?}: {error}"),
+    }
+}

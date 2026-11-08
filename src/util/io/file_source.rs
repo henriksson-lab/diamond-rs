@@ -466,6 +466,7 @@ mod tests {
         let mut tail = [0; 2];
         assert_eq!(source.read(&mut tail).unwrap(), 0);
         assert!(source.eof().unwrap());
+        source.close().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
@@ -479,6 +480,7 @@ mod tests {
         assert!(source.eof().unwrap());
         assert_eq!(source.read(&mut []).unwrap(), 0);
         assert!(source.eof().unwrap());
+        source.close().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
@@ -497,6 +499,7 @@ mod tests {
         source.rewind().unwrap();
         assert_eq!(source.tell().unwrap(), 0);
         assert!(!source.eof().unwrap());
+        source.close().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
@@ -521,6 +524,7 @@ mod tests {
         let mut source = FileSource::new(&name).unwrap();
         source.file().unwrap().seek(SeekFrom::Start(1)).unwrap();
         assert_eq!(source.tell().unwrap(), 1);
+        source.close().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 

@@ -798,13 +798,21 @@ mod tests {
             crate::util::test_path_component()
         ));
         std::fs::create_dir(&root).unwrap();
-        let directory = root.join(std::ffi::OsString::from_vec(b"files\xff".to_vec()));
+        let (directory, raw_names) =
+            crate::util::test_os_path_or_unicode(&root, b"files\xff", "files-é");
         std::fs::create_dir(&directory).unwrap();
-        let input = directory.join(std::ffi::OsString::from_vec(b"input\x80.faa".to_vec()));
-        let output = directory.join(std::ffi::OsString::from_vec(b"output\xfe.dmnd".to_vec()));
-        let mapping = directory.join(std::ffi::OsString::from_vec(b"map\xff.tsv".to_vec()));
-        let nodes = directory.join(std::ffi::OsString::from_vec(b"nodes\x80.dmp".to_vec()));
-        let names = directory.join(std::ffi::OsString::from_vec(b"names\xfe.dmp".to_vec()));
+        let component = |raw: &[u8], unicode: &str| {
+            if raw_names {
+                directory.join(std::ffi::OsString::from_vec(raw.to_vec()))
+            } else {
+                directory.join(unicode)
+            }
+        };
+        let input = component(b"input\x80.faa", "input-λ.faa");
+        let output = component(b"output\xfe.dmnd", "output-é.dmnd");
+        let mapping = component(b"map\xff.tsv", "map-λ.tsv");
+        let nodes = component(b"nodes\x80.dmp", "nodes-é.dmp");
+        let names = component(b"names\xfe.dmp", "names-λ.dmp");
         std::fs::write(
             &input,
             b">ACC raw\xff\nMKTAYIAKQRQISFVKSHFSRQDILDLWIYHTQGYFPDWQNYT\n",

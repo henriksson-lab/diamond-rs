@@ -1316,7 +1316,7 @@ mod tests {
     fn raw_paths_survive_pal_volume_suffixes_accession_filter_and_diagnostics() {
         use std::os::unix::ffi::OsStringExt;
         let dir = temp_dir("raw-path");
-        let prefix = dir.join(std::ffi::OsString::from_vec(b"vol\xff".to_vec()));
+        let (prefix, raw_names) = crate::util::test_os_path_or_unicode(&dir, b"vol\xff", "vol-é");
         let header = sample_header("title", "ACC", 1, 7);
         write_volume_files(
             &prefix,
@@ -1326,14 +1326,23 @@ mod tests {
             &header,
             &[0, 1, 2, 0],
         );
-        let alias = dir.join(std::ffi::OsString::from_vec(b"alias\xfe.pal".to_vec()));
-        let ids = dir.join(std::ffi::OsString::from_vec(b"ids\xfd".to_vec()));
+        let component = |raw: &[u8], unicode: &str| {
+            if raw_names {
+                dir.join(std::ffi::OsString::from_vec(raw.to_vec()))
+            } else {
+                dir.join(unicode)
+            }
+        };
+        let alias = component(b"alias\xfe.pal", "alias-λ.pal");
+        let ids = component(b"ids\xfd", "ids-é");
         std::fs::write(&ids, b"ACC.1\n").unwrap();
-        std::fs::write(
-            &alias,
-            b"TITLE raw\xfc\nDBLIST vol\xff\nSEQIDLIST ids\xfd\n",
-        )
-        .unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let mut alias_bytes = b"TITLE raw\xfc\nDBLIST ".to_vec();
+        alias_bytes.extend_from_slice(prefix.file_name().unwrap().as_bytes());
+        alias_bytes.extend_from_slice(b"\nSEQIDLIST ");
+        alias_bytes.extend_from_slice(ids.file_name().unwrap().as_bytes());
+        alias_bytes.push(b'\n');
+        std::fs::write(&alias, &alias_bytes).unwrap();
         let mut db = BlastDB::new_path(&alias, SequenceFileFlags::ALL).unwrap();
         assert_eq!(db.file_path(), alias);
         assert_eq!(db.pal.volumes, vec![prefix]);
@@ -1750,6 +1759,7 @@ mod tests {
         assert_eq!(filter.oid_filter, vec![false, true]);
         assert_eq!(filter.letter_count, 3);
 
+        drop(db);
         std::fs::remove_file(prefix.with_extension("pin")).unwrap();
         std::fs::remove_file(prefix.with_extension("phr")).unwrap();
         std::fs::remove_file(prefix.with_extension("psq")).unwrap();
@@ -1847,6 +1857,10 @@ mod tests {
         assert_eq!(combined.taxon_scientific_name(7), "Alpha species");
         combined.close();
 
+        drop(combined);
+        drop(db3);
+        drop(db2);
+        drop(db);
         std::fs::remove_file(prefix.with_extension("pin")).unwrap();
         std::fs::remove_file(prefix.with_extension("phr")).unwrap();
         std::fs::remove_file(prefix.with_extension("psq")).unwrap();
@@ -1885,6 +1899,7 @@ mod tests {
         let rewound = db.raw_chunk(100, SequenceFileFlags::SEQS).unwrap();
         assert_eq!((rewound.no, rewound.begin, rewound.end), (0, 0, 1));
 
+        drop(db);
         for prefix in [&v1, &v2] {
             std::fs::remove_file(prefix.with_extension("pin")).unwrap();
             std::fs::remove_file(prefix.with_extension("phr")).unwrap();
@@ -2027,6 +2042,7 @@ mod tests {
         assert_eq!(db.taxids(1), vec![9]);
         assert!(!db.flags().contains(SequenceFileFlags::TAXON_MAPPING));
 
+        drop(db);
         std::fs::remove_file(prefix.with_extension("pin")).unwrap();
         std::fs::remove_file(prefix.with_extension("phr")).unwrap();
         std::fs::remove_file(prefix.with_extension("psq")).unwrap();

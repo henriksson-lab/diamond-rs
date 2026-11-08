@@ -639,10 +639,8 @@ impl Default for NativeViewCli {
     }
 }
 
-/// Match upstream's `atoll`-based parsing for signed ordinal offsets, but make
-/// its result deterministic across Rust targets: leading whitespace and a
-/// sign are accepted, parsing stops at the first non-digit, no digits means
-/// zero, and overflow saturates to the signed 64-bit limits.
+/// Match upstream's actual C-runtime `atoll` call. Out-of-range input follows
+/// that runtime's behavior, which differs between supported Source profiles.
 fn parse_cpp_atoll(value: &str) -> i64 {
     let mut value = value.as_bytes().to_vec();
     value.push(0);
@@ -1721,25 +1719,30 @@ mod tests {
         assert_eq!(parsed.soft_masking, crate::masking::MaskingAlgo::Tantan);
         assert!(parsed.motif_masking.is_empty());
         assert!(parsed.extension_mode.is_empty());
-        assert!(parse_native_cluster_config(&args(&[
-            "diamond",
-            "cluster",
-            "--comp-based-stats=6"
-        ]))
-        .is_err());
         assert_eq!(
-            parse_native_cluster_config(&args(&["diamond", "cluster", "--comp-based-stats=5"]))
+            parse_native_cluster_config(&args(&["diamond", "cluster", "--comp-based-stats", "6"]))
+                .unwrap_err(),
+            "Invalid value for --comp-based-stats. Permitted values: 0, 1, 2, 3, 4, 5."
+        );
+        assert_eq!(
+            parse_native_cluster_config(&args(&["diamond", "cluster", "--comp-based-stats", "5"]))
                 .unwrap()
                 .comp_based_stats,
             5
         );
         assert_eq!(
-            parse_native_cluster_config(&args(&["diamond", "cluster", "--comp-based-stats=7"]))
+            parse_native_cluster_config(&args(&["diamond", "cluster", "--comp-based-stats", "7"]))
                 .unwrap_err(),
             "Invalid value for --comp-based-stats. Permitted values: 0, 1, 2, 3, 4, 5."
         );
+        assert_eq!(
+            parse_native_cluster_config(&args(&["diamond", "cluster", "--comp-based-stats=5"]))
+                .unwrap_err(),
+            "Invalid option: comp-based-stats=5"
+        );
         assert!(
-            parse_native_cluster_config(&args(&["diamond", "cluster", "--ext=invalid"])).is_err()
+            parse_native_cluster_config(&args(&["diamond", "cluster", "--ext", "invalid"]))
+                .is_err()
         );
     }
 
@@ -1766,7 +1769,7 @@ mod tests {
     fn native_cluster_scoring_controls_require_values() {
         assert_eq!(
             parse_native_cluster_config(&args(&["diamond", "cluster", "--matrix"])).unwrap_err(),
-            "Option --matrix requires a value."
+            "Invalid parameter count for option '--matrix'"
         );
         assert_eq!(
             parse_native_cluster_config(&args(&["diamond", "cluster", "--gapopen", "bad"]))
@@ -1776,7 +1779,7 @@ mod tests {
         );
         assert_eq!(
             parse_native_cluster_config(&args(&["diamond", "cluster", "--gapextend"])).unwrap_err(),
-            "Option --gapextend requires a value."
+            "Invalid parameter count for option '--gapextend'"
         );
     }
 
@@ -1901,8 +1904,22 @@ mod tests {
     fn native_view_offsets_match_upstream_atoll_and_unsigned_conversion() {
         assert_eq!(parse_cpp_atoll("nope"), 0);
         assert_eq!(parse_cpp_atoll("  +12tail"), 12);
-        assert_eq!(parse_cpp_atoll("9223372036854775808"), i64::MAX);
-        assert_eq!(parse_cpp_atoll("-9223372036854775809"), i64::MIN);
+        assert_eq!(parse_cpp_atoll("9223372036854775807"), i64::MAX);
+        assert_eq!(parse_cpp_atoll("-9223372036854775808"), i64::MIN);
+        // Source uses atoll, not strtoll or a saturating Rust conversion.
+        // Keep the active CRT profile exact, including musl's overflow result,
+        // and verify the real option reader's signed-to-unsigned conversion.
+        for value in ["9223372036854775808", "-9223372036854775809"] {
+            let input = std::ffi::CString::new(value).unwrap();
+            let expected = unsafe { libc::atoll(input.as_ptr()) as i64 };
+            assert_eq!(parse_cpp_atoll(value), expected);
+            assert_eq!(
+                parse_native_view_cli(&args(&["diamond", "view", "--qnum-offset", value]))
+                    .unwrap()
+                    .qnum_offset,
+                expected as u64
+            );
+        }
         assert_eq!(
             parse_native_view_cli(&args(&[
                 "diamond",

@@ -189,12 +189,13 @@ jobs:
         run: cargo build --locked --release --target x86_64-unknown-linux-musl --bin diamond
 
       - name: Calibrate and test delayed spilling with musl
+        id: musl_spill
         env:
           DIAMOND_BIN: target/x86_64-unknown-linux-musl/release/diamond
         run: scripts/run_native_spill_conformance.sh target/native-spill-conformance-linux-musl
 
       - name: Upload musl spill decision evidence
-        if: always()
+        if: always() && (steps.musl_spill.outcome == 'success' || steps.musl_spill.outcome == 'failure')
         uses: actions/upload-artifact@v4
         with:
           name: native-spill-conformance-linux-musl

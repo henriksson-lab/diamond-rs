@@ -35,7 +35,10 @@ impl SparseMatrixStream {
         }
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let (path, file) = if let Some(path) = checkpoint {
-            (path.to_path_buf(), File::create(path)?)
+            (
+                path.to_path_buf(),
+                File::create(crate::util::io::source_c_path(path).as_ref())?,
+            )
         } else {
             loop {
                 let path = tmpdir.join(format!(
@@ -43,7 +46,11 @@ impl SparseMatrixStream {
                     std::process::id(),
                     NEXT.fetch_add(1, Ordering::Relaxed)
                 ));
-                match OpenOptions::new().write(true).create_new(true).open(&path) {
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(crate::util::io::source_c_path(&path).as_ref())
+                {
                     Ok(file) => break (path, file),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(error) => return Err(error),
@@ -74,7 +81,7 @@ impl SparseMatrixStream {
     }
 
     pub fn open(path: &Path, symmetric: bool) -> io::Result<Self> {
-        let mut reader = BufReader::new(File::open(path)?);
+        let mut reader = BufReader::new(File::open(crate::util::io::source_c_path(path).as_ref())?);
         let mut count = [0; std::mem::size_of::<usize>()];
         reader.read_exact(&mut count)?;
         let count = usize::from_ne_bytes(count);
@@ -176,7 +183,9 @@ impl SparseMatrixStream {
             return Err(invalid("MCL graph is not finalized"));
         }
         let remap: BTreeMap<_, _> = indices.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-        let mut reader = BufReader::new(File::open(&self.path)?);
+        let mut reader = BufReader::new(File::open(
+            crate::util::io::source_c_path(&self.path).as_ref(),
+        )?);
         let mut header = vec![0; std::mem::size_of::<usize>() + 4];
         reader.read_exact(&mut header)?;
         let mut edges: BTreeMap<(usize, usize), Triplet> = BTreeMap::new();
@@ -275,7 +284,7 @@ impl Drop for SparseMatrixStream {
     fn drop(&mut self) {
         self.writer.take();
         if self.temporary {
-            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(crate::util::io::source_c_path(&self.path).as_ref());
         }
     }
 }

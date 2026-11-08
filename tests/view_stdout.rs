@@ -88,6 +88,7 @@ fn native_view_writes_text_and_seekable_daa_to_stdout() {
     let (buffer, query_number) = daa.read_query_buffer().unwrap().unwrap();
     let record = DaaQueryRecord::from_buffer(&daa, &buffer, query_number).unwrap();
     assert_eq!(record.query_name, "query0");
+    drop(daa);
 
     std::fs::remove_dir_all(directory).unwrap();
 }
