@@ -264,6 +264,43 @@ impl SimpleThreadPool {
         }
     }
 
+    /// Source nested workers share one scheduler and exception/stop state.
+    /// Remove each handle under its scheduler lock, then release that lock
+    /// before waiting: a joined outer worker may still spawn/join child work.
+    pub fn join_shared<I>(pool: &Arc<StdMutex<Self>>, ids: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = ThreadId>,
+    {
+        for id in ids {
+            let handle = pool
+                .lock()
+                .unwrap()
+                .threads
+                .remove(&id)
+                .ok_or_else(|| "Thread ID not found in thread pool.".to_owned())?;
+            if let Err(payload) = handle.join() {
+                let message = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_owned()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Thread panicked.".to_owned()
+                };
+                let state = pool.lock().unwrap();
+                let mut error = state.first_exception.lock().unwrap();
+                if error.is_none() {
+                    *error = Some(message);
+                    state.stop_flag.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        // Source rethrows its retained first exception at every group join;
+        // an inner join must not consume the error before its outer join.
+        let error = Arc::clone(&pool.lock().unwrap().first_exception);
+        let result = error.lock().unwrap().clone();
+        result.map_or(Ok(()), Err)
+    }
+
     pub fn join(&mut self, thread_id: ThreadId) -> Result<(), String> {
         let handle = self
             .threads
@@ -1005,5 +1042,44 @@ mod tests {
         let mut p = Parallelizer::new();
         assert!(!p.barrier("before-init").unwrap());
         p.clear();
+    }
+
+    #[test]
+    fn simple_shared_pool_joins_nested_workers_without_holding_scheduler_lock() {
+        let pool = Arc::new(StdMutex::new(SimpleThreadPool::new()));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let child_pool = Arc::clone(&pool);
+        let child_completed = Arc::clone(&completed);
+        let outer = pool.lock().unwrap().spawn(move |_| {
+            let inner = child_pool.lock().unwrap().spawn(move |_| {
+                child_completed.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            });
+            SimpleThreadPool::join_shared(&child_pool, [inner])
+        });
+        SimpleThreadPool::join_shared(&pool, [outer]).unwrap();
+        assert_eq!(completed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn simple_shared_pool_retains_child_exception_for_outer_join() {
+        let pool = Arc::new(StdMutex::new(SimpleThreadPool::new()));
+        let child_pool = Arc::clone(&pool);
+        let outer = pool.lock().unwrap().spawn(move |stop| {
+            let inner = child_pool
+                .lock()
+                .unwrap()
+                .spawn(|_| Err("original child error".into()));
+            assert_eq!(
+                SimpleThreadPool::join_shared(&child_pool, [inner]).unwrap_err(),
+                "original child error"
+            );
+            assert!(stop.load(Ordering::Relaxed));
+            Err("outer replacement must not consume the child exception".into())
+        });
+        assert_eq!(
+            SimpleThreadPool::join_shared(&pool, [outer]).unwrap_err(),
+            "original child error"
+        );
     }
 }

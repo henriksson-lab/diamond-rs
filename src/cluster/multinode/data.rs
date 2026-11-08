@@ -12,7 +12,9 @@ use std::sync::Mutex;
 use super::output::Volume;
 use crate::basic::sequence::Sequence;
 use crate::basic::value::{Letter, OId, SequenceType, AMINO_ACID_ALPHABET};
+use crate::data::block::Block;
 use crate::data::fasta::fasta_file::{FastaFile, FastaFileConfig};
+use crate::data::sequence_file::{ProteinInputProbe, SequenceFileFlags};
 use crate::util::io::source_text::{path_error, SourceTextInput, TextOutput};
 use crate::util::io::{source_c_path, IoErrorOwner};
 use crate::util::parallel::{Atomic, FileStack};
@@ -84,8 +86,143 @@ impl SequenceReader for FastaSequenceReader {
     }
 }
 
+/// Metadata and indexed operations used by the historical Source FASTA owner.
+pub trait IndexedSequenceReader: SequenceReader {
+    fn letters(&self) -> u64;
+    fn partition(&self, max_letters: u64, start_size: u64) -> Result<(Vec<OId>, Vec<u64>), String>;
+    fn set_seqinfo_ptr(&mut self, oid: OId) -> Result<(), String>;
+    fn tell_seq(&self) -> OId;
+    fn load_seqs(
+        &mut self,
+        max_letters: i64,
+        max_seqs: OId,
+        flags: SequenceFileFlags,
+        ignore_warnings: bool,
+    ) -> Result<Block, String> {
+        let mut block = Block::new();
+        let mut oid = self.tell_seq();
+        let mut probe = ProteinInputProbe::new(ignore_warnings || oid != 0);
+        let (mut count, mut letters) = (0u64, 0i64);
+        loop {
+            let Some(record) = self.read_record()? else {
+                break;
+            };
+            if record.sequence.is_empty() {
+                continue;
+            }
+            letters = letters.wrapping_add(
+                block.push_back_bytes(
+                    &record.sequence,
+                    flags
+                        .contains(SequenceFileFlags::TITLES)
+                        .then_some(record.id.as_slice()),
+                    None,
+                    oid,
+                    SequenceType::AminoAcid,
+                    1,
+                    true,
+                )?,
+            );
+            oid = oid.wrapping_add(1);
+            count = count.wrapping_add(1);
+            probe.observe(&record.sequence)?;
+            if if max_seqs > 0 {
+                count >= max_seqs
+            } else {
+                letters >= max_letters
+            } {
+                break;
+            }
+        }
+        probe.finish_block()?;
+        Ok(block)
+    }
+}
+struct VecIndexedSequenceReader {
+    records: Vec<ByteSequenceRecord>,
+    at: usize,
+}
+impl SequenceReader for VecIndexedSequenceReader {
+    fn read_record(&mut self) -> Result<Option<ByteSequenceRecord>, String> {
+        let record = self.records.get(self.at).cloned();
+        self.at = self.at.saturating_add(1);
+        Ok(record)
+    }
+    fn close(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+impl IndexedSequenceReader for VecIndexedSequenceReader {
+    fn letters(&self) -> u64 {
+        self.records.iter().fold(0u64, |n, record| {
+            n.wrapping_add(record.sequence.len() as u64)
+        })
+    }
+    fn partition(&self, max_letters: u64, start_size: u64) -> Result<(Vec<OId>, Vec<u64>), String> {
+        let lengths = self
+            .records
+            .iter()
+            .map(|record| record.sequence.len() as crate::basic::value::Loc)
+            .collect::<Vec<_>>();
+        Ok(crate::data::sequence_file::partition(
+            &lengths,
+            max_letters,
+            start_size,
+        ))
+    }
+    fn set_seqinfo_ptr(&mut self, oid: OId) -> Result<(), String> {
+        self.at = usize::try_from(oid).map_err(|_| "OId out of bounds.")?;
+        Ok(())
+    }
+    fn tell_seq(&self) -> OId {
+        self.at as OId
+    }
+}
+impl IndexedSequenceReader for FastaSequenceReader {
+    fn letters(&self) -> u64 {
+        self.input.letters()
+    }
+    fn partition(&self, max_letters: u64, start_size: u64) -> Result<(Vec<OId>, Vec<u64>), String> {
+        let lengths = (0..self.input.sequence_count())
+            .map(|oid| self.input.seq_length(oid))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::data::sequence_file::partition(
+            &lengths,
+            max_letters,
+            start_size,
+        ))
+    }
+    fn set_seqinfo_ptr(&mut self, oid: OId) -> Result<(), String> {
+        self.errors.capture(self.input.set_seqinfo_ptr_io(oid))
+    }
+    fn tell_seq(&self) -> OId {
+        self.input.tell_seq()
+    }
+}
+
 /// Explicit adapter for C++ `SequenceFile::auto_create` and `read_seq`.
 pub trait SequenceSource: Sync {
+    /// In-memory compatibility sources have no physical index to materialize.
+    fn index_volume(
+        &self,
+        _path: &Path,
+        _index: &Path,
+        _errors: &IoErrorOwner,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn open_indexed_records(
+        &self,
+        path: &Path,
+        _index: &Path,
+        _flags: SequenceFileFlags,
+        errors: &IoErrorOwner,
+    ) -> Result<Box<dyn IndexedSequenceReader>, String> {
+        Ok(Box::new(VecIndexedSequenceReader {
+            records: self.read_records_bytes_with_errors(path, errors)?,
+            at: 0,
+        }))
+    }
     /// Compatibility implementation for in-memory custom sources. Concrete
     /// file-backed sources override this to retain their actual input owner.
     fn open_records(
@@ -134,6 +271,31 @@ impl FastaSequenceSource {
 }
 
 impl SequenceSource for FastaSequenceSource {
+    fn index_volume(&self, path: &Path, index: &Path, errors: &IoErrorOwner) -> Result<(), String> {
+        errors.capture(FastaFile::index_io(path, index))
+    }
+    fn open_indexed_records(
+        &self,
+        path: &Path,
+        index: &Path,
+        flags: SequenceFileFlags,
+        errors: &IoErrorOwner,
+    ) -> Result<Box<dyn IndexedSequenceReader>, String> {
+        let mut input = errors.capture(FastaFile::open_source_with_buffer(
+            &[path.to_path_buf()],
+            FastaFileConfig {
+                flags,
+                index_file: Some(index.to_path_buf()),
+                sequence_type: SequenceType::AminoAcid,
+            },
+            65_536,
+        ))?;
+        input.set_io_errors(errors.clone());
+        Ok(Box::new(FastaSequenceReader {
+            input,
+            errors: errors.clone(),
+        }))
+    }
     fn open_records(
         &self,
         path: &Path,

@@ -14,7 +14,7 @@ use crate::util::io::{Compressor, InputFile, IoErrorOwner, OutputFile, TempFile}
 pub(crate) use source_reader::source_fastq_fields;
 use source_reader::RecordReader;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -544,20 +544,55 @@ impl FastaFile {
         Self::index_io(path.as_ref(), destination.as_ref()).map_err(|error| error.to_string())
     }
     pub fn index_io(path: &Path, destination: &Path) -> io::Result<()> {
-        // Source opens its unchecked ofstream BEFORE checking the ifstream.
-        let mut output = File::create(destination).ok().map(BufWriter::new);
-        let file = File::open(path).map_err(|_| {
-            io::Error::other(crate::util::io::IoError::path_message(
-                b"Failed to open file: ",
-                path,
-            ))
-        })?;
-        crate::data::fasta::read_fasta_bytes(&mut BufReader::new(file), |_, sequence, offset| {
-            if let Some(out) = &mut output {
-                let _ = writeln!(out, "{offset}\t{}", sequence.len());
+        use crate::util::io::source_text::{SourceTextInput, TextOutput};
+        let errors = IoErrorOwner::default();
+        let execute = || -> Result<(), String> {
+            // Literal Source order: unchecked output before checked input.
+            let mut output = TextOutput::open_unchecked(destination, true);
+            let mut input = SourceTextInput::open(path, &errors, b"Failed to open file: ")?;
+            let mut position = input.line_position();
+            let mut start = position;
+            let mut line = Vec::new();
+            input.line_into(&mut line);
+            if line.is_empty() || line[0] != b'>' {
+                return Err("FASTA format error: file does not start with '>'".to_owned());
+            }
+            let (mut id, mut sequence_length) = (Vec::new(), 0usize);
+            loop {
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                if !line.is_empty() {
+                    if line[0] == b'>' {
+                        if !id.is_empty() {
+                            output.write(format!("{start}\t{sequence_length}").as_bytes());
+                            output.endl();
+                        }
+                        start = position;
+                        id = line[1..].to_vec();
+                        if id.is_empty() {
+                            return Err(format!(
+                                "FASTA format error: empty id at file offset {position}"
+                            ));
+                        }
+                        sequence_length = 0;
+                    } else {
+                        sequence_length = sequence_length.wrapping_add(line.len());
+                    }
+                    // Source's empty-line continue skips this tellg update.
+                    position = input.line_position();
+                }
+                if !input.line_into(&mut line) {
+                    break;
+                }
+            }
+            if !id.is_empty() {
+                output.write(format!("{start}\t{sequence_length}").as_bytes());
+                output.endl();
             }
             Ok(())
-        })
+        };
+        errors.finish(execute())
     }
 }
 impl Drop for FastaFile {
@@ -591,58 +626,83 @@ pub fn guess_format(bytes: &[u8]) -> Result<SeqFileFormat, String> {
     match bytes.first() { Some(b'>')=>Ok(SeqFileFormat::Fasta),Some(b'@')=>Ok(SeqFileFormat::Fastq),None=>Err("Error detecting input file format. Input file seems to be empty.".into()),_=>Err("Error detecting input file format. First line must begin with '>' (FASTA) or '@' (FASTQ).".into()) }
 }
 fn read_index(path: &Path) -> io::Result<Vec<(u64, Loc)>> {
-    let file = File::open(crate::util::io::source_c_path(path).as_ref()).map_err(|_| {
-        io::Error::other(crate::util::io::IoError::path_message(
-            b"Error opening file: ",
+    let errors = IoErrorOwner::default();
+    let execute = || -> Result<Vec<(u64, Loc)>, String> {
+        let mut input = crate::util::io::source_text::SourceTextInput::open(
             path,
-        ))
-    })?;
-    let mut input = BufReader::new(file);
-    // C++ operator>> tokenizes whitespace, not physical lines. Keep only the
-    // metadata vector, including multiple offset/length pairs on one line.
-    fn token(input: &mut impl BufRead) -> io::Result<Option<Vec<u8>>> {
-        let mut value = Vec::new();
-        loop {
-            let buffer = input.fill_buf()?;
-            if buffer.is_empty() {
-                return Ok((!value.is_empty()).then_some(value));
-            }
-            let byte = buffer[0];
-            input.consume(1);
-            if byte.is_ascii_whitespace() {
-                if !value.is_empty() {
-                    return Ok(Some(value));
-                }
-            } else {
-                value.push(byte);
-            }
+            &errors,
+            b"Error opening file: ",
+        )?;
+        let mut entries = Vec::new();
+        // Source declares len once outside the loop. A failed later sentry
+        // retains it; failed num_get stores its defined zero/clamped value.
+        let mut length = None;
+        while let Some(offset) = input.number() {
+            input.signed_i32_into(&mut length);
+            // Only a first missing length has no initialized Source value.
+            // Preserve the existing checked native boundary for that domain.
+            let length = length.ok_or("Invalid FASTA index")?;
+            entries.push((offset, length));
         }
-    }
-    let mut entries = Vec::new();
-    while let Some(offset) = token(&mut input)? {
-        let Some(offset) = std::str::from_utf8(&offset)
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            break;
-        };
-        let length = token(&mut input)?.and_then(|value| {
-            std::str::from_utf8(&value)
-                .ok()
-                .and_then(|value| value.parse::<Loc>().ok())
-        });
-        // Keep malformed index input at an explicit checked boundary; the
-        // Source-formatted records above retain their physical byte offsets.
-        let Some(length) = length else {
-            return Err(io::Error::other("Invalid FASTA index"));
-        };
-        entries.push((offset, length));
-    }
-    Ok(entries)
+        Ok(entries)
+    };
+    errors.finish(execute())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::io::source_text::expected_text;
+
+    #[test]
+    fn index_text_owner_preserves_source_empty_line_positions_and_partial_errors() {
+        let path = temp("index-source-boundaries.fa");
+        let index = temp("index-source-boundaries.fai");
+        std::fs::write(&path, b">a\nARN\n\n>b\nCQE\n").unwrap();
+        FastaFile::index_io(&path, &index).unwrap();
+        assert_eq!(
+            std::fs::read(&index).unwrap(),
+            expected_text(b"0\t3\n7\t3\n")
+        );
+        std::fs::write(&path, b">a\nARN\n>\n").unwrap();
+        let error = FastaFile::index_io(&path, &index).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "FASTA format error: empty id at file offset 7"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), expected_text(b"0\t3\n"));
+        std::fs::remove_file(&path).unwrap();
+        assert!(FastaFile::index_io(&path, &index)
+            .unwrap_err()
+            .to_string()
+            .starts_with("Failed to open file: "));
+        assert_eq!(std::fs::read(&index).unwrap(), b"");
+        std::fs::remove_file(index).unwrap();
+    }
+
+    #[test]
+    fn index_formatted_lengths_preserve_signed_fail_values_and_previous_length() {
+        let path = temp("index-formatted-length.fai");
+        for (bytes, expected) in [
+            (
+                b"0 -1\n8 2147483648\n16 5\n".as_slice(),
+                vec![(0, -1), (8, i32::MAX)],
+            ),
+            (b"0 -2147483649".as_slice(), vec![(0, i32::MIN)]),
+            (b"0 4\n8".as_slice(), vec![(0, 4), (8, 4)]),
+            (b"0 4\n8 x".as_slice(), vec![(0, 4), (8, 0)]),
+            (b"0x 4".as_slice(), vec![(0, 0)]),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(read_index(&path).unwrap(), expected);
+        }
+        std::fs::write(&path, b"0").unwrap();
+        assert_eq!(
+            read_index(&path).unwrap_err().to_string(),
+            "Invalid FASTA index"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("diamond-rs-{name}-{}", std::process::id()))

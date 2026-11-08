@@ -84,45 +84,69 @@ impl SourceTextInput {
         !self.failed && !self.read_failed
     }
     pub(crate) fn line(&mut self) -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.line_into(&mut bytes).then_some(bytes)
+    }
+    /// getline retains extracted bytes even if badbit makes its result false.
+    /// Callers which test the result can use line(); Source index checks only
+    /// the first line's contents, so it needs this exact extraction interface.
+    pub(crate) fn line_into(&mut self, bytes: &mut Vec<u8>) -> bool {
         if !self.good() || self.eofbit {
             self.failed = true;
-            return None;
+            return false;
         }
-        let mut bytes = Vec::new();
+        bytes.clear();
         loop {
             match self.take() {
-                Some(b'\n') => return Some(bytes),
+                Some(b'\n') => return true,
                 Some(byte) => bytes.push(byte),
                 None if self.read_failed || bytes.is_empty() => {
                     self.failed = true;
-                    return None;
+                    return false;
                 }
-                None => return Some(bytes),
+                None => return true,
+            }
+        }
+    }
+    /// Source tellg between getline calls (no pending numeric lookahead).
+    /// Exception-disabled streams set failure and return -1, without perror.
+    pub(crate) fn line_position(&mut self) -> i64 {
+        if !self.good() || self.eofbit || self.pending.is_some() {
+            self.failed = true;
+            return -1;
+        }
+        match self
+            .stream
+            .as_mut()
+            .and_then(|stream| stream.position().ok())
+        {
+            Some(position) => position,
+            None => {
+                self.failed = true;
+                -1
             }
         }
     }
     /// A sentry failure leaves the previous value intact. Once num_get runs,
     /// an invalid conversion stores zero, and overflow stores UINT64_MAX,
     /// both with failbit. Only the initial sentry/EOF leaves None undefined.
-    pub(crate) fn number_into(&mut self, value: &mut Option<u64>) {
+    fn numeric_parts(&mut self) -> Option<(bool, u64, bool, bool)> {
         if !self.good() || self.eofbit {
             self.failed = true;
-            return;
+            return None;
         }
         while self.peek().is_some_and(classic_space) {
             self.take();
         }
         if self.peek().is_none() {
             self.failed = true;
-            return;
+            return None;
         }
         let negative = self.peek() == Some(b'-');
         if matches!(self.peek(), Some(b'-' | b'+')) {
             self.take();
         }
-        let mut magnitude = 0u64;
-        let mut digits = false;
-        let mut overflow = false;
+        let (mut magnitude, mut digits, mut overflow) = (0u64, false, false);
         while let Some(byte) = self.peek().filter(u8::is_ascii_digit) {
             self.take();
             digits = true;
@@ -136,8 +160,14 @@ impl SourceTextInput {
         }
         if self.read_failed {
             self.failed = true;
-            return;
+            return None;
         }
+        Some((negative, magnitude, digits, overflow))
+    }
+    pub(crate) fn number_into(&mut self, value: &mut Option<u64>) {
+        let Some((negative, magnitude, digits, overflow)) = self.numeric_parts() else {
+            return;
+        };
         if !digits {
             *value = Some(0);
             self.failed = true;
@@ -149,6 +179,32 @@ impl SourceTextInput {
                 magnitude.wrapping_neg()
             } else {
                 magnitude
+            });
+        }
+    }
+    /// Source formatted extraction into signed 32-bit Loc. Conversion failure
+    /// stores zero and range failure stores the signed endpoint, both failbit;
+    /// a failed sentry leaves the caller's previously initialized value intact.
+    pub(crate) fn signed_i32_into(&mut self, value: &mut Option<i32>) {
+        let Some((negative, magnitude, digits, overflow)) = self.numeric_parts() else {
+            return;
+        };
+        let limit = if negative {
+            1u64 << 31
+        } else {
+            i32::MAX as u64
+        };
+        if !digits {
+            *value = Some(0);
+            self.failed = true;
+        } else if overflow || magnitude > limit {
+            *value = Some(if negative { i32::MIN } else { i32::MAX });
+            self.failed = true;
+        } else {
+            *value = Some(if negative {
+                (magnitude as i64).wrapping_neg() as i32
+            } else {
+                magnitude as i32
             });
         }
     }

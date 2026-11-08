@@ -2405,3 +2405,28 @@ A subsequent code audit identified a remaining UTF-8 title gate in the actual
 frameshift capture backend (`align/legacy/native.rs` and its QueryMapper
 contracts). That byte-contract migration is in progress and is not covered by
 the package above. Full translation and final-snapshot parity remain open.
+
+
+Worker/index translation checkpoint (2026-11-08): actual external seed, pair and
+chunk workers retain their independent buffers, shared file owners and Source
+cleanup order. The retained multinode prepare_inputs path now uses concrete
+FASTA indexing, indexed reads and Source partition/load behavior. Source text
+streams preserve physical offsets, numeric extraction and CRT output semantics.
+
+Frozen corrective package
+8f676da4b2d853f7fc4636d6a6a72bdd99507ae532f76d83ea70d0977d8f96e2
+passes isolated default, optional dna/mcl/zstd and Windows GNU all-target checks,
+plus 142 focused external, multinode, FASTA, sequence, text and scheduler tests.
+The earlier package's one failing fixture is retained: Source may emit an empty
+worker batch header. The corrected fixture checks every header, exact pair
+payload and complete file length; production code did not change between those
+two frozen packages. Inventory audit passes 199/199; this is not parity proof.
+
+Hosted run 42478857080 (81214dc) finished with six of seven jobs passing,
+including both macOS hosts. Its eight Windows text fixture failures are fixed
+in local commit 894bfbb; hosted verification of that commit remains pending.
+No new Source comparisons were run for this batch. Remaining code includes
+parallel oversized radix spill, generic parallel chunk loading/sorting, the
+concrete retained multinode search/GVC backend and Source seed-log number
+formatting. Source's inactive multinode CLI remains inactive. The full
+translation/parity goal stays open.

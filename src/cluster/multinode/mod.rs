@@ -6,7 +6,8 @@ pub mod output;
 
 pub use data::{
     get_reps, get_reps_fasta, get_reps_path, ByteSequenceRecord, FastaSequenceSource,
-    GetRepsConfig, RepresentativeJob, SequenceReader, SequenceRecord, SequenceSource,
+    GetRepsConfig, IndexedSequenceReader, RepresentativeJob, SequenceReader, SequenceRecord,
+    SequenceSource,
 };
 pub use multinode::{
     combo_to_rank, combos, multinode, multinode_io, rank_to_combo, round, round_path,

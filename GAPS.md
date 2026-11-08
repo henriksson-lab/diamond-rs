@@ -19,9 +19,13 @@ not known failures unless the text explicitly says otherwise.
   pools, parallel external volume readers/buffers, retained multinode streams,
   and Source's formatted manifest extraction. It passes isolated default,
   optional and Windows compilation plus 204 focused tests (one SIMD case ignored).
-- The retained multinode prepare_inputs indexed partition/load_seqs adapter is
-  still a concrete code follow-up. Fresh Source comparisons of the new parallel
-  branches and broader command/profile interactions remain evidence gates.
+- The retained multinode indexed partition/load_seqs adapter is now concrete.
+  The next batch adds parallel seed/pair/chunk workers and retained FASTA index
+  streams; its frozen package passes three compile profiles and 142 focused tests.
+  Remaining code includes oversized radix spill parallelism, generic parallel
+  chunk input loading/sorting, and a concrete retained multinode search/GVC backend.
+  Seed progress logging also needs the Source numeric formatter. Fresh Source
+  comparisons and broader command/profile interactions remain evidence gates.
 - Hosted CI verification, the Source-shared two-worker hazard, and final parity
   gates remain open. No complete-translation claim applies.
 

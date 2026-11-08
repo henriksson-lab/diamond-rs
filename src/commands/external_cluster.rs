@@ -21,6 +21,38 @@ struct Reader {
     errors: crate::util::io::IoErrorOwner,
 }
 impl SequenceVolumeReader for Reader {
+    fn visit_volume_bytes_while_with_cleanup(
+        &mut self,
+        path: &Path,
+        should_read: &mut dyn FnMut() -> bool,
+        on_open: &mut dyn FnMut() -> Result<(), String>,
+        on_error: &mut dyn FnMut(),
+        visitor: &mut dyn FnMut(external::seed_table::ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        external::reader::visit_volume_bytes_while_owned_with_cleanup(
+            path,
+            should_read,
+            visitor,
+            on_open,
+            on_error,
+            &self.errors,
+        )
+    }
+    fn visit_volume_bytes_while_with_open(
+        &mut self,
+        path: &Path,
+        should_read: &mut dyn FnMut() -> bool,
+        on_open: &mut dyn FnMut() -> Result<(), String>,
+        visitor: &mut dyn FnMut(external::seed_table::ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        external::reader::visit_volume_bytes_while_owned(
+            path,
+            should_read,
+            visitor,
+            on_open,
+            &self.errors,
+        )
+    }
     fn fork_reader(&self) -> Option<Box<dyn SequenceVolumeReader + Send>> {
         Some(Box::new(Self {
             errors: self.errors.clone(),
@@ -80,8 +112,12 @@ impl SequenceVolumeReader for Reader {
     }
 }
 
-struct Masker(crate::masking::tantan::TantanMasker, i32);
+#[derive(Clone)]
+struct Masker(Arc<crate::masking::tantan::TantanMasker>, i32);
 impl SeedMasker for Masker {
+    fn fork_masker(&self) -> Option<Box<dyn SeedMasker + Send>> {
+        Some(Box::new(self.clone()))
+    }
     fn mask(&mut self, sequence: &mut [Letter], tantan: bool, motif: bool) -> MaskingStat {
         let mut stats = MaskingStat::new();
         if tantan {
@@ -119,6 +155,32 @@ struct Pipeline {
     tuning: super::blastp::SearchTuning,
 }
 impl SequenceVolumeReader for Pipeline {
+    fn visit_volume_bytes_while_with_cleanup(
+        &mut self,
+        path: &Path,
+        should_read: &mut dyn FnMut() -> bool,
+        on_open: &mut dyn FnMut() -> Result<(), String>,
+        on_error: &mut dyn FnMut(),
+        visitor: &mut dyn FnMut(external::seed_table::ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.reader.visit_volume_bytes_while_with_cleanup(
+            path,
+            should_read,
+            on_open,
+            on_error,
+            visitor,
+        )
+    }
+    fn visit_volume_bytes_while_with_open(
+        &mut self,
+        path: &Path,
+        should_read: &mut dyn FnMut() -> bool,
+        on_open: &mut dyn FnMut() -> Result<(), String>,
+        visitor: &mut dyn FnMut(external::seed_table::ByteSeedSequence) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.reader
+            .visit_volume_bytes_while_with_open(path, should_read, on_open, visitor)
+    }
     fn fork_reader(&self) -> Option<Box<dyn SequenceVolumeReader + Send>> {
         self.reader.fork_reader()
     }
@@ -341,10 +403,10 @@ pub(crate) fn run(
             errors: errors.clone(),
         },
         masker: Masker(
-            crate::masking::tantan::TantanMasker::from_score_matrix(
+            Arc::new(crate::masking::tantan::TantanMasker::from_score_matrix(
                 &matrix,
                 tuning.tantan_min_mask_prob as f32,
-            ),
+            )),
             tuning.max_motif_len,
         ),
         matrix: Arc::new(matrix),

@@ -171,7 +171,7 @@ impl SizeCounter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Job {
     pub max_oid: OId,
     pub volumes: usize,
@@ -448,7 +448,27 @@ impl ClusterChunk {
 
 impl Drop for ClusterChunk {
     fn drop(&mut self) {
-        let _ = self.close();
+        if self.closed {
+            return;
+        }
+        if !self.io_errors.source_destructors() {
+            let _ = self.close();
+            return;
+        }
+        // The actual Source ClusterChunk destructor closes its OutputFile
+        // from a noexcept scope, including when another worker still retained
+        // the last shared owner after current_chunk was replaced.
+        if let Err(error) = self.io_errors.emit_pending_perror() {
+            crate::util::io::abort_source_diagnostic_error(&error);
+        }
+        self.io_errors = self.io_errors.cleanup_owner();
+        if let Err(message) = self.close() {
+            let error = self.io_errors.finish::<()>(Err(message)).unwrap_err();
+            if let Err(error) = crate::util::io::emit_source_perror(&error) {
+                crate::util::io::abort_source_diagnostic_error(&error);
+            }
+            crate::util::io::abort_source_process();
+        }
     }
 }
 
@@ -576,36 +596,197 @@ impl Default for ChunkTableConfig {
     }
 }
 
-/// Storage-backed C++ `build_chunk_table`.
+/// Shared Source current_chunk strong owner. Workers retain earlier chunks
+/// independently until their own pending pair batch has been written.
+struct ChunkTableWorkers {
+    current: std::sync::Mutex<std::sync::Arc<std::sync::Mutex<ClusterChunk>>>,
+    next: std::sync::Arc<Atomic>,
+    directory: PathBuf,
+    errors: IoErrorOwner,
+    max_chunk_size: i64,
+    max_processed: i64,
+    shift: u32,
+}
+
+impl ChunkTableWorkers {
+    fn allocate(&self) -> Result<std::sync::Arc<std::sync::Mutex<ClusterChunk>>, String> {
+        let id = i32::try_from(self.next.fetch_add_one()?)
+            .map_err(|_| "Chunk id overflow.".to_owned())?;
+        Ok(std::sync::Arc::new(std::sync::Mutex::new(
+            ClusterChunk::new_owned(id, &self.directory, self.errors.clone())?,
+        )))
+    }
+
+    fn current(&self) -> std::sync::Arc<std::sync::Mutex<ClusterChunk>> {
+        std::sync::Arc::clone(&self.current.lock().unwrap())
+    }
+
+    /// Source first checks for a stale my_chunk, then checks its estimate,
+    /// then rechecks identity under the current-owner replacement mutex.
+    fn after_flush(
+        &self,
+        mine: &std::sync::Arc<std::sync::Mutex<ClusterChunk>>,
+    ) -> Result<Option<std::sync::Arc<std::sync::Mutex<ClusterChunk>>>, String> {
+        use std::sync::Arc;
+        let current = self.current();
+        if !Arc::ptr_eq(mine, &current) {
+            return Ok(Some(current));
+        }
+        let estimate = mine.lock().unwrap().size.hll.estimate();
+        if estimate >= self.max_chunk_size {
+            let mut current = self.current.lock().unwrap();
+            if Arc::ptr_eq(mine, &current) {
+                *current = self.allocate()?;
+                return Ok(Some(Arc::clone(&current)));
+            }
+            // Source does not switch my_chunk in this second-check mismatch
+            // branch. The next threshold flush observes the newer owner.
+        }
+        Ok(None)
+    }
+}
+
+/// Source InputBuffer partitions nominal record ranges and moves both edges
+/// forward over equal keys. Empty adjusted parts still own BufferArrays and
+/// perform the worker's final zero-size pair write.
+fn chunk_pair_ranges(pairs: &[PairEntry], workers: usize) -> Vec<std::ops::Range<usize>> {
+    let partition = crate::util::algo::Partition::new(pairs.len(), workers);
+    (0..partition.parts)
+        .map(|part| {
+            let mut begin = partition.begin(part);
+            let mut end = partition.end(part);
+            if part > 0 {
+                while begin < pairs.len()
+                    && crate::util::hash::hash64(pairs[begin - 1].rep_oid)
+                        == crate::util::hash::hash64(pairs[begin].rep_oid)
+                {
+                    begin += 1;
+                }
+            }
+            while end < pairs.len()
+                && crate::util::hash::hash64(pairs[end - 1].rep_oid)
+                    == crate::util::hash::hash64(pairs[end].rep_oid)
+            {
+                end += 1;
+            }
+            begin..end
+        })
+        .collect()
+}
+
+fn chunk_pair_worker(
+    stop: &std::sync::atomic::AtomicBool,
+    pairs: &[PairEntry],
+    state: &ChunkTableWorkers,
+    mine: &mut std::sync::Arc<std::sync::Mutex<ClusterChunk>>,
+    buffers: &mut super::storage::WorkerBucketBuffers,
+) -> Result<(), String> {
+    let mut pair_buffer = Vec::new();
+    let mut size = SizeCounter::default();
+    let mut processed = 0i64;
+    let mut begin = 0;
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) && begin < pairs.len() {
+        let representative = pairs[begin];
+        let mut end = begin + 1;
+        while end < pairs.len() && pairs[end].rep_oid == representative.rep_oid {
+            end += 1;
+        }
+        let chunk_id = mine.lock().unwrap().id;
+        write_chunk_table_entry(buffers, state.shift, representative.rep_oid, chunk_id)?;
+        size.add(representative.rep_oid, representative.rep_len);
+        processed += i64::from(representative.rep_len);
+        let mut previous_member = None;
+        for pair in &pairs[begin..end] {
+            if previous_member == Some(pair.member_oid) {
+                continue;
+            }
+            previous_member = Some(pair.member_oid);
+            let chunk_id = mine.lock().unwrap().id;
+            write_chunk_table_entry(buffers, state.shift, pair.member_oid, chunk_id)?;
+            size.add(pair.member_oid, pair.member_len);
+            pair_buffer.push(PairEntryShort {
+                rep_oid: pair.rep_oid,
+                member_oid: pair.member_oid,
+            });
+            processed += i64::from(pair.member_len);
+            if processed >= state.max_processed {
+                mine.lock().unwrap().write(&mut pair_buffer, &mut size)?;
+                processed = 0;
+                if let Some(current) = state.after_flush(mine)? {
+                    *mine = current;
+                    let chunk_id = mine.lock().unwrap().id;
+                    write_chunk_table_entry(
+                        buffers,
+                        state.shift,
+                        representative.rep_oid,
+                        chunk_id,
+                    )?;
+                    size.add(representative.rep_oid, representative.rep_len);
+                    processed += i64::from(representative.rep_len);
+                }
+            }
+        }
+        begin = end;
+    }
+    // Source retains these accumulators across representatives and writes
+    // their final (possibly empty) batch only when this worker exits.
+    let result = mine.lock().unwrap().write(&mut pair_buffer, &mut size);
+    result
+}
+
+fn write_chunk_table_entry(
+    buffers: &mut super::storage::WorkerBucketBuffers,
+    shift: u32,
+    oid: OId,
+    chunk: i32,
+) -> Result<(), String> {
+    let radix = usize::try_from(oid >> shift)
+        .map_err(|_| "Chunk table radix does not fit memory.".to_owned())?;
+    let mut bytes = Vec::with_capacity(ChunkTableEntry::ENCODED_SIZE);
+    ChunkTableEntry::new(oid, chunk).serialize(&mut bytes);
+    buffers.write(radix, &bytes)
+}
+
+/// Storage-backed C++ build_chunk_table with actual per-part worker owners.
 pub fn build_chunk_table(
     job: &Job,
     pair_table: &RadixedTable,
     max_oid: OId,
     config: ChunkTableConfig,
 ) -> Result<(RadixedTable, usize), String> {
+    use std::sync::{Arc, Mutex};
     if config.threads == 0 {
         return Err("Thread count must be positive.".to_owned());
     }
-    let max_chunk_size = config.max_chunk_size.max(1);
+    let max_chunk_size = config.max_chunk_size;
     let max_processed = (max_chunk_size / config.threads as i64 / 16).clamp(1, 262_144);
     let shift = bit_length(max_oid).saturating_sub(RADIX_BITS);
     let table_dir = job.base_dir(None).join("chunk_table");
     let chunks_dir = job.base_dir(None).join("chunks");
     fs::create_dir_all(source_c_path(&table_dir).as_ref()).map_err(|error| error.to_string())?;
     fs::create_dir_all(source_c_path(&chunks_dir).as_ref()).map_err(|error| error.to_string())?;
-    let mut table_buckets = super::storage::BucketWriter::new_owned(
-        &table_dir,
-        job.worker_id(),
-        RADIX_COUNT,
-        job.io_errors(),
-    )?;
+    let table_files = Arc::new(Mutex::new(
+        super::storage::BucketWriter::new_file_array_owned(
+            &table_dir,
+            job.worker_id(),
+            RADIX_COUNT,
+            job.io_errors(),
+        )?,
+    ));
     let queue = Atomic::new(table_dir.join("queue"));
-    let next_chunk = Atomic::new(table_dir.join("next_chunk"));
-    let mut chunk_id =
-        i32::try_from(next_chunk.fetch_add_one()?).map_err(|_| "Chunk id overflow.".to_owned())?;
-    let mut current = ClusterChunk::new_owned(chunk_id, &chunks_dir, job.io_errors())?;
+    let next = Arc::new(Atomic::new(table_dir.join("next_chunk")));
+    let id = i32::try_from(next.fetch_add_one()?).map_err(|_| "Chunk id overflow.".to_owned())?;
+    let initial = ClusterChunk::new_owned(id, &chunks_dir, job.io_errors())?;
+    let state = Arc::new(ChunkTableWorkers {
+        current: Mutex::new(Arc::new(Mutex::new(initial))),
+        next: Arc::clone(&next),
+        directory: chunks_dir,
+        errors: job.io_errors(),
+        max_chunk_size,
+        max_processed,
+        shift,
+    });
     let mut buckets_processed = 0_i64;
-
     loop {
         let bucket_index = usize::try_from(queue.fetch_add_one()?)
             .map_err(|_| "Negative bucket id.".to_owned())?;
@@ -618,73 +799,52 @@ pub fn build_chunk_table(
             bucket_index + 1,
             pair_table.len(),
             pairs.len(),
-            pairs.len() * 24
+            pairs.len() * 24,
         ))?;
         pairs.sort_unstable();
-        let mut begin = 0usize;
-        while begin < pairs.len() {
-            let rep_oid = pairs[begin].rep_oid;
-            let rep_len = pairs[begin].rep_len;
-            let mut end = begin + 1;
-            while end < pairs.len() && pairs[end].rep_oid == rep_oid {
-                end += 1;
-            }
-            push_chunk_entry(&mut table_buckets, shift, rep_oid, current.id)?;
-            let mut size = SizeCounter::default();
-            size.add(rep_oid, rep_len);
-            let mut processed = i64::from(rep_len);
-            let mut pair_buffer = Vec::new();
-            let mut previous_member = None;
-            for pair in &pairs[begin..end] {
-                if previous_member == Some(pair.member_oid) {
-                    continue;
-                }
-                previous_member = Some(pair.member_oid);
-                push_chunk_entry(&mut table_buckets, shift, pair.member_oid, current.id)?;
-                size.add(pair.member_oid, pair.member_len);
-                pair_buffer.push(PairEntryShort {
-                    rep_oid,
-                    member_oid: pair.member_oid,
-                });
-                processed += i64::from(pair.member_len);
-                if processed >= max_processed {
-                    current.write(&mut pair_buffer, &mut size)?;
-                    processed = 0;
-                    if current.size.hll.estimate() >= max_chunk_size {
-                        current.close()?;
-                        drop(current);
-                        chunk_id = i32::try_from(next_chunk.fetch_add_one()?)
-                            .map_err(|_| "Chunk id overflow.".to_owned())?;
-                        current = ClusterChunk::new_owned(chunk_id, &chunks_dir, job.io_errors())?;
-                        push_chunk_entry(&mut table_buckets, shift, rep_oid, current.id)?;
-                        size.add(rep_oid, rep_len);
-                        processed += i64::from(rep_len);
-                    }
-                }
-            }
-            current.write(&mut pair_buffer, &mut size)?;
-            begin = end;
+        let ranges = chunk_pair_ranges(&pairs, config.threads);
+        let pairs = Arc::new(pairs);
+        let failure = Arc::new(Mutex::new(None));
+        let mut pool = crate::util::parallel::SimpleThreadPool::new();
+        for range in ranges {
+            let pairs = Arc::clone(&pairs);
+            let state = Arc::clone(&state);
+            let files = Arc::clone(&table_files);
+            let errors = job.io_errors();
+            let failure = Arc::clone(&failure);
+            pool.spawn(move |stop| {
+                // Source constructs my_chunk before BufferArray; destruction
+                // flushes buffers before releasing the retained chunk owner.
+                let mut mine = state.current();
+                let mut buffers =
+                    super::storage::WorkerBucketBuffers::new(files, RADIX_COUNT, errors, failure);
+                chunk_pair_worker(stop, &pairs[range], &state, &mut mine, &mut buffers)
+            });
         }
-        if current.size.hll.estimate() >= max_chunk_size {
-            current.close()?;
-            drop(current);
-            chunk_id = i32::try_from(next_chunk.fetch_add_one()?)
-                .map_err(|_| "Chunk id overflow.".to_owned())?;
-            current = ClusterChunk::new_owned(chunk_id, &chunks_dir, job.io_errors())?;
+        pool.join_all()?;
+        let cleanup_error = failure.lock().unwrap().take();
+        if let Some(error) = cleanup_error {
+            return Err(error);
         }
+        let current = state.current();
+        let estimate = current.lock().unwrap().size.hll.estimate();
+        if estimate >= max_chunk_size {
+            *state.current.lock().unwrap() = state.allocate()?;
+        }
+        drop(current);
         remove_manifest_storage(&bucket.path, &storage);
         buckets_processed += 1;
     }
-    // Source publishes/closes the chunk table before releasing its current
-    // chunk, then enters the completion-counter wait.
-    let table = table_buckets.finish()?;
-    current.close()?;
-    drop(current);
+    // Source destroys FileArray before releasing the last current_chunk owner,
+    // then enters the existing process-shared completion-counter wait.
+    let table = table_files.lock().unwrap().finish()?;
+    drop(table_files);
+    drop(state);
     let finished = Atomic::new(table_dir.join("finished"));
     finished.fetch_add(buckets_processed)?;
     finished.await_value(pair_table.len() as i64)?;
-    let chunk_count = usize::try_from(next_chunk.get()?)
-        .map_err(|_| "Chunk count does not fit memory.".to_owned())?;
+    let chunk_count =
+        usize::try_from(next.get()?).map_err(|_| "Chunk count does not fit memory.".to_owned())?;
     Ok((table, chunk_count))
 }
 
@@ -898,19 +1058,6 @@ fn write_chunk_volume<R: SequenceVolumeReader + ?Sized>(
             Ok(())
         },
     )
-}
-
-fn push_chunk_entry(
-    buckets: &mut super::storage::BucketWriter,
-    shift: u32,
-    oid: OId,
-    chunk: i32,
-) -> Result<(), String> {
-    let radix = usize::try_from(oid >> shift)
-        .map_err(|_| "Chunk table radix does not fit memory.".to_owned())?;
-    let mut bytes = Vec::with_capacity(ChunkTableEntry::ENCODED_SIZE);
-    ChunkTableEntry::new(oid, chunk).serialize(&mut bytes);
-    buckets.write(radix, &bytes)
 }
 
 fn read_pair_bucket(
@@ -1628,6 +1775,125 @@ mod tests {
     }
 
     #[test]
+    fn chunk_table_worker_keeps_batch_state_across_representatives() {
+        for (limit, expected_counts) in [(1_000_000, vec![2u64]), (256, vec![2u64, 0])] {
+            let dir = temp_dir("chunk-worker-state");
+            let job = Job::new(3, 1, 1 << 20, &dir, 0).unwrap();
+            // Adjacent representatives in one physical seed bucket. Their
+            // total length hits max_processed only after the second group.
+            // Source's shared PairFileArray hashes representatives to buckets;
+            // write this actual pair manifest directly to keep them together.
+            let payload = dir.join("pairs-input");
+            let mut bytes = Vec::new();
+            for pair in [
+                PairEntry {
+                    rep_oid: 0,
+                    member_oid: 1,
+                    rep_len: 4,
+                    member_len: 4,
+                },
+                PairEntry {
+                    rep_oid: 2,
+                    member_oid: 3,
+                    rep_len: 4,
+                    member_len: 4,
+                },
+            ] {
+                bytes.extend_from_slice(&pair.rep_oid.to_ne_bytes());
+                bytes.extend_from_slice(&pair.member_oid.to_ne_bytes());
+                bytes.extend_from_slice(&pair.rep_len.to_ne_bytes());
+                bytes.extend_from_slice(&pair.member_len.to_ne_bytes());
+            }
+            fs::write(&payload, bytes).unwrap();
+            let manifest = dir.join("pair-input.tsv");
+            fs::write(
+                &manifest,
+                super::super::storage::manifest_line(&payload, &[2]).unwrap(),
+            )
+            .unwrap();
+            let table = RadixedTable(vec![Bucket::new(manifest, Some(2))]);
+            let (_, chunks) = build_chunk_table(
+                &job,
+                &table,
+                3,
+                ChunkTableConfig {
+                    threads: 1,
+                    max_chunk_size: limit,
+                },
+            )
+            .unwrap();
+            assert_eq!(chunks, 1);
+            let raw = fs::read(job.base_dir(None).join("chunks/0/pairs")).unwrap();
+            let mut position = 0;
+            let mut counts = Vec::new();
+            let mut pairs = Vec::new();
+            while position < raw.len() {
+                let count = u64::from_ne_bytes(raw[position..position + 8].try_into().unwrap());
+                counts.push(count);
+                position += 8;
+                for _ in 0..count {
+                    pairs.push((
+                        u64::from_ne_bytes(raw[position..position + 8].try_into().unwrap()),
+                        u64::from_ne_bytes(raw[position + 8..position + 16].try_into().unwrap()),
+                    ));
+                    position += 16;
+                }
+            }
+            assert_eq!(counts, expected_counts);
+            assert_eq!(pairs, [(0, 1), (2, 3)]);
+            drop(job);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn chunk_partitions_keep_equal_keys_and_preserve_empty_worker_parts() {
+        let pairs = vec![
+            PairEntry {
+                rep_oid: 9,
+                ..Default::default()
+            };
+            3
+        ];
+        assert_eq!(chunk_pair_ranges(&pairs, 2), [0..3, 3..3]);
+        assert!(chunk_pair_ranges(&[], 2).is_empty());
+    }
+
+    #[test]
+    fn replaced_chunk_stays_open_until_its_last_worker_owner_exits() {
+        use std::sync::{Arc, Mutex};
+        let dir = temp_dir("retained-chunk-owner");
+        fs::create_dir_all(&dir).unwrap();
+        let next = Arc::new(Atomic::new(dir.join("next")));
+        assert_eq!(next.fetch_add_one().unwrap(), 0);
+        let state = ChunkTableWorkers {
+            current: Mutex::new(Arc::new(Mutex::new(ClusterChunk::new(0, &dir).unwrap()))),
+            next,
+            directory: dir.clone(),
+            errors: Default::default(),
+            max_chunk_size: 1,
+            max_processed: 1,
+            shift: 0,
+        };
+        let old = state.current();
+        let mut size = SizeCounter::default();
+        size.add(0, 4);
+        let mut pairs = vec![PairEntryShort {
+            rep_oid: 0,
+            member_oid: 1,
+        }];
+        old.lock().unwrap().write(&mut pairs, &mut size).unwrap();
+        let replacement = state.after_flush(&old).unwrap().unwrap();
+        assert_eq!(replacement.lock().unwrap().id, 1);
+        assert_eq!(fs::metadata(dir.join("0/pairs")).unwrap().len(), 0);
+        drop(old);
+        assert_eq!(fs::metadata(dir.join("0/pairs")).unwrap().len(), 24);
+        drop(replacement);
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn chunk_volume_workers_use_independent_inputs_and_byte_counted_members() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Barrier, Mutex};
@@ -1843,8 +2109,29 @@ mod tests {
         assert!(source_manifests.iter().all(|path| !path.exists()));
 
         let pair_bytes = fs::read(job.base_dir(None).join("chunks/0/pairs")).unwrap();
-        assert_eq!(u64::from_ne_bytes(pair_bytes[..8].try_into().unwrap()), 2);
-        assert_eq!(pair_bytes.len(), 8 + 2 * 16);
+        // Source starts two InputBuffer parts. Equal-key adjustment gives one
+        // worker the complete representative group and the other an empty
+        // range; both write their final batch, in either completion order.
+        let mut remaining = pair_bytes.as_slice();
+        let mut batch_counts = Vec::new();
+        let mut actual_pairs = Vec::new();
+        while !remaining.is_empty() {
+            let (header, tail) = remaining.split_at(8);
+            let count = u64::from_ne_bytes(header.try_into().unwrap());
+            batch_counts.push(count);
+            let (payload, tail) = tail.split_at(usize::try_from(count).unwrap() * 16);
+            for pair in payload.chunks_exact(16) {
+                actual_pairs.push((
+                    u64::from_ne_bytes(pair[..8].try_into().unwrap()),
+                    u64::from_ne_bytes(pair[8..].try_into().unwrap()),
+                ));
+            }
+            remaining = tail;
+        }
+        batch_counts.sort_unstable();
+        assert_eq!(batch_counts, [0, 2]);
+        assert_eq!(actual_pairs, [(0, 1), (0, 2)]);
+        assert_eq!(pair_bytes.len(), 2 * 8 + 2 * 16);
 
         let database = VolumedFile(vec![Volume::new("fixture.faa", 0, 3, 3)]);
         let mut reader = FixtureReader {

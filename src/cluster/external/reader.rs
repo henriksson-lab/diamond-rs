@@ -47,6 +47,26 @@ pub fn visit_volume_bytes_while_owned(
     on_open: &mut dyn FnMut() -> Result<(), String>,
     errors: &crate::util::io::IoErrorOwner,
 ) -> Result<(), String> {
+    visit_volume_bytes_while_owned_with_cleanup(
+        path,
+        should_read,
+        visit,
+        on_open,
+        &mut || {},
+        errors,
+    )
+}
+
+/// Source dependent owners declared after SequenceFile must unwind first.
+/// Keep the input local alive until on_error has released those owners.
+pub fn visit_volume_bytes_while_owned_with_cleanup(
+    path: &Path,
+    should_read: &mut dyn FnMut() -> bool,
+    visit: &mut dyn FnMut(ByteSeedSequence) -> Result<(), String>,
+    on_open: &mut dyn FnMut() -> Result<(), String>,
+    on_error: &mut dyn FnMut(),
+    errors: &crate::util::io::IoErrorOwner,
+) -> Result<(), String> {
     let (kind, resolved) = errors.capture(detect_type_source_with_buffer(
         &[path.to_path_buf()],
         Flags::NONE,
@@ -64,15 +84,21 @@ pub fn visit_volume_bytes_while_owned(
                         ..Default::default()
                     },
                 ))?;
-            on_open()?;
-            for oid in 0..file.sequence_count() {
-                if !should_read() {
-                    break;
+            let result = (|| {
+                on_open()?;
+                for oid in 0..file.sequence_count() {
+                    if !should_read() {
+                        break;
+                    }
+                    let (sequence, id) = errors.capture(file.record_bytes_io(oid))?;
+                    visit(ByteSeedSequence { id, sequence })?;
                 }
-                let (sequence, id) = errors.capture(file.record_bytes_io(oid))?;
-                visit(ByteSeedSequence { id, sequence })?;
+                Ok(())
+            })();
+            if result.is_err() {
+                on_error();
             }
-            Ok(())
+            result
         }
         SequenceFileType::Blast => {
             let mut file = errors.capture(
@@ -82,15 +108,21 @@ pub fn visit_volume_bytes_while_owned(
                     errors,
                 ),
             )?;
-            on_open()?;
-            for oid in 0..file.sequence_count() {
-                if !should_read() {
-                    break;
+            let result = (|| {
+                on_open()?;
+                for oid in 0..file.sequence_count() {
+                    if !should_read() {
+                        break;
+                    }
+                    let (sequence, id) = errors.capture(file.record_at_bytes_io(oid))?;
+                    visit(ByteSeedSequence { id, sequence })?;
                 }
-                let (sequence, id) = errors.capture(file.record_at_bytes_io(oid))?;
-                visit(ByteSeedSequence { id, sequence })?;
+                Ok(())
+            })();
+            if result.is_err() {
+                on_error();
             }
-            Ok(())
+            result
         }
         SequenceFileType::Fasta => {
             let mut file = errors.capture(
@@ -101,17 +133,23 @@ pub fn visit_volume_bytes_while_owned(
                 ),
             )?;
             file.set_io_errors(errors.clone());
-            on_open()?;
-            while should_read() {
-                let Some(record) = errors.capture(file.read_seq_bytes_io())? else {
-                    break;
-                };
-                visit(ByteSeedSequence {
-                    id: record.id,
-                    sequence: record.sequence,
-                })?;
+            let result = (|| {
+                on_open()?;
+                while should_read() {
+                    let Some(record) = errors.capture(file.read_seq_bytes_io())? else {
+                        break;
+                    };
+                    visit(ByteSeedSequence {
+                        id: record.id,
+                        sequence: record.sequence,
+                    })?;
+                }
+                errors.capture(file.close_io())
+            })();
+            if result.is_err() {
+                on_error();
             }
-            errors.capture(file.close_io())
+            result
         }
     }
 }
@@ -194,6 +232,71 @@ mod tests {
         )
         .is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn error_cleanup_closes_dependent_stream_before_retained_input() {
+        use super::super::seed_table::{FastaVolumeReader, SequenceVolumeReader};
+        use std::cell::{Cell, RefCell};
+        fn descriptor_is_open(path: &Path) -> bool {
+            std::fs::read_dir("/proc/self/fd").unwrap().any(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| std::fs::read_link(entry.path()).ok())
+                    .is_some_and(|target| target == path)
+            })
+        }
+        let root = std::env::temp_dir().join(format!(
+            "diamond-volume-cleanup-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for decode_error in [false, true] {
+            let input = root.join("input.faa");
+            std::fs::write(
+                &input,
+                if decode_error {
+                    b">bad\n!\n".as_slice()
+                } else {
+                    b">first\nARND\n".as_slice()
+                },
+            )
+            .unwrap();
+            let input = input.canonicalize().unwrap();
+            let output = root.canonicalize().unwrap().join("accessions.txt");
+            let dependent = RefCell::new(None);
+            let cleaned = Cell::new(false);
+            let errors = crate::util::io::IoErrorOwner::default();
+            let result = FastaVolumeReader.visit_volume_bytes_while_with_cleanup(
+                &input,
+                &mut || true,
+                &mut || {
+                    *dependent.borrow_mut() = Some(crate::util::io::source_text::TextOutput::open(
+                        &output,
+                        &errors,
+                        b"Error opening file ",
+                        true,
+                    )?);
+                    Ok(())
+                },
+                &mut || {
+                    assert!(descriptor_is_open(&input));
+                    assert!(descriptor_is_open(&output));
+                    drop(dependent.borrow_mut().take());
+                    assert!(!descriptor_is_open(&output));
+                    assert!(descriptor_is_open(&input));
+                    cleaned.set(true);
+                },
+                &mut |_| Err("visitor failed".to_owned()),
+            );
+            assert!(result.is_err());
+            assert!(cleaned.get());
+            assert!(!descriptor_is_open(&input));
+            assert!(!descriptor_is_open(&output));
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

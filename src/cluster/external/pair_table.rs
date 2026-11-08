@@ -9,10 +9,15 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use super::external::{Job, PairEntry};
-use super::storage::BucketWriter;
+use super::storage::{BucketWriter, WorkerBucketBuffers};
+use crate::util::algo::Partition;
 use crate::util::hash::hash64;
 use crate::util::io::{CompressedBuffer, InputFile};
 use crate::util::parallel::Atomic;
+use crate::util::parallel::SimpleThreadPool;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering as ThreadOrdering};
+use std::sync::{Arc, Mutex};
 
 pub const RADIX_BITS: u32 = 8;
 pub const RADIX_COUNT: usize = 1 << RADIX_BITS;
@@ -179,12 +184,25 @@ impl Default for PairTableConfig {
 
 /// FileArray-compatible output owner. Each bucket is emitted as a zlib volume
 /// plus the upstream tab-separated `bucket.tsv` volume manifest.
-#[derive(Debug)]
 pub struct PairFileArray {
     base_dir: PathBuf,
     worker_id: i64,
     pairs: Vec<Vec<PairEntry>>,
-    bounded: Option<RefCell<BucketWriter>>,
+    bounded: Option<Arc<Mutex<BucketWriter>>>,
+    legacy_buffers: RefCell<Option<WorkerBucketBuffers>>,
+    failure: Arc<Mutex<Option<String>>>,
+    errors: crate::util::io::IoErrorOwner,
+}
+
+impl std::fmt::Debug for PairFileArray {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("PairFileArray")
+            .field("base_dir", &self.base_dir)
+            .field("worker_id", &self.worker_id)
+            .field("pairs", &self.pairs)
+            .field("bounded", &self.bounded.is_some())
+            .finish()
+    }
 }
 
 impl PairFileArray {
@@ -199,6 +217,9 @@ impl PairFileArray {
             worker_id,
             pairs: vec![Vec::new(); RADIX_COUNT],
             bounded: None,
+            legacy_buffers: RefCell::new(None),
+            failure: Arc::new(Mutex::new(None)),
+            errors: Default::default(),
         })
     }
 
@@ -219,24 +240,41 @@ impl PairFileArray {
             base_dir: base_dir.as_ref().into(),
             worker_id,
             pairs: vec![Vec::new(); RADIX_COUNT],
-            bounded: Some(RefCell::new(BucketWriter::new_owned(
+            bounded: Some(Arc::new(Mutex::new(BucketWriter::new_file_array_owned(
                 base_dir.as_ref(),
                 worker_id,
                 RADIX_COUNT,
-                errors,
-            )?)),
+                errors.clone(),
+            )?))),
+            legacy_buffers: RefCell::new(None),
+            failure: Arc::new(Mutex::new(None)),
+            errors,
         })
     }
 
     pub fn write_msb(&mut self, entry: PairEntry) {
         let radix = (hash64(entry.rep_oid) >> (64 - RADIX_BITS)) as usize;
-        if let Some(writer) = &self.bounded {
-            writer
-                .borrow_mut()
-                .write_deferred(radix, &encode_pair_entry(entry));
+        if let Some(files) = &self.bounded {
+            let buffers = self.legacy_buffers.get_mut().get_or_insert_with(|| {
+                WorkerBucketBuffers::new(
+                    Arc::clone(files),
+                    RADIX_COUNT,
+                    self.errors.clone(),
+                    Arc::clone(&self.failure),
+                )
+            });
+            if let Err(error) = buffers.write(radix, &encode_pair_entry(entry)) {
+                self.failure.lock().unwrap().get_or_insert(error);
+            }
         } else {
             self.pairs[radix].push(entry);
         }
+    }
+
+    fn flush_legacy(&self) -> Result<(), String> {
+        let buffers = self.legacy_buffers.borrow_mut().take();
+        drop(buffers);
+        self.failure.lock().unwrap().clone().map_or(Ok(()), Err)
     }
 
     pub fn entries(&self, radix: usize) -> &[PairEntry] {
@@ -246,8 +284,18 @@ impl PairFileArray {
     /// Source per-worker BufferArray flush, retaining the enclosing
     /// round-local FileArray owner until External::round closes it.
     fn flush_unpublished(&self) -> Result<RadixedTable, String> {
-        if let Some(writer) = &self.bounded {
-            return writer.borrow_mut().flush_unpublished();
+        if self.bounded.is_some() {
+            self.flush_legacy()?;
+            return Ok(RadixedTable(
+                (0..RADIX_COUNT)
+                    .map(|radix| {
+                        Bucket::new(
+                            self.base_dir.join(radix.to_string()).join("bucket.tsv"),
+                            None,
+                        )
+                    })
+                    .collect(),
+            ));
         }
         // Preserve the older explicit in-memory writer's library behavior.
         self.finish()
@@ -255,7 +303,8 @@ impl PairFileArray {
 
     pub fn finish(&self) -> Result<RadixedTable, String> {
         if let Some(writer) = &self.bounded {
-            return writer.borrow_mut().finish();
+            self.flush_legacy()?;
+            return writer.lock().unwrap().finish();
         }
         let mut buckets = Vec::with_capacity(RADIX_COUNT);
         for radix in 0..RADIX_COUNT {
@@ -299,26 +348,47 @@ fn encode_pair_entry(entry: PairEntry) -> [u8; 24] {
 }
 
 pub fn get_pairs_uni_cov(entries: &[SeedEntry], output: &mut PairFileArray) {
-    let Some(rep) = entries.first() else {
-        return;
-    };
-    for member in &entries[1..] {
-        if rep.oid != member.oid {
-            output.write_msb(PairEntry {
-                rep_oid: rep.oid as u64,
-                member_oid: member.oid as u64,
-                rep_len: rep.len as u32,
-                member_len: member.len as u32,
-            });
-        }
-    }
+    let _ = pairs_uni_cov(entries, &mut |entry| {
+        output.write_msb(entry);
+        Ok(())
+    });
 }
-
 pub fn get_pairs_mutual_cov(
     entries: &[SeedEntry],
     min_length_ratio: f64,
     output: &mut PairFileArray,
 ) {
+    let _ = pairs_mutual_cov(entries, min_length_ratio, &mut |entry| {
+        output.write_msb(entry);
+        Ok(())
+    });
+}
+
+fn pairs_uni_cov(
+    entries: &[SeedEntry],
+    emit: &mut dyn FnMut(PairEntry) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(rep) = entries.first() else {
+        return Ok(());
+    };
+    for member in &entries[1..] {
+        if rep.oid != member.oid {
+            emit(PairEntry {
+                rep_oid: rep.oid as u64,
+                member_oid: member.oid as u64,
+                rep_len: rep.len as u32,
+                member_len: member.len as u32,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn pairs_mutual_cov(
+    entries: &[SeedEntry],
+    min_length_ratio: f64,
+    emit: &mut dyn FnMut(PairEntry) -> Result<(), String>,
+) -> Result<(), String> {
     let size = entries.len();
     let mut i = 0;
     let mut j = 0;
@@ -336,12 +406,12 @@ pub fn get_pairs_mutual_cov(
         let rep = entries[query_position];
         for member in &entries[j..j1] {
             if rep.oid != member.oid {
-                output.write_msb(PairEntry {
+                emit(PairEntry {
                     rep_oid: rep.oid as u64,
                     member_oid: member.oid as u64,
                     rep_len: rep.len as u32,
                     member_len: member.len as u32,
-                });
+                })?;
             }
         }
         j = j1;
@@ -357,9 +427,11 @@ pub fn get_pairs_mutual_cov(
             i += 1;
         }
     }
+    Ok(())
 }
 
-/// C++ `External::build_pair_table`.
+/// C++ `External::build_pair_table`: outer bucket workers and per-bucket
+/// equal-key partitions share one SimpleThreadPool exception/stop owner.
 pub fn build_pair_table(
     job: &Job,
     seed_table: &RadixedTable,
@@ -368,91 +440,260 @@ pub fn build_pair_table(
     output_files: &mut PairFileArray,
     config: PairTableConfig,
 ) -> Result<RadixedTable, String> {
+    if config.threads == 0 || seed_table.is_empty() {
+        return Err(
+            "Source pair-table worker allocation requires nonzero threads and buckets.".into(),
+        );
+    }
     let max_concurrent =
         seed_table.max_buckets_owned(job.mem_limit, SeedEntry::ENCODED_SIZE, &job.io_errors())?;
     let concurrent_buckets = usize::try_from(max_concurrent)
         .unwrap_or(usize::MAX)
-        .min(config.threads)
-        .max(1);
+        .min(config.threads);
+    if concurrent_buckets == 0 {
+        return Err(
+            "Source pair-table worker allocation requires a nonempty bucket budget.".into(),
+        );
+    }
     let bucket_workers = config.threads.div_ceil(concurrent_buckets);
-    job.log(&format!(
-        "Building pair table. Concurrent buckets={concurrent_buckets} Workers per bucket={bucket_workers}"
-    ))?;
+    job.log(&format!("Building pair table. Concurrent buckets={concurrent_buckets} Workers per bucket={bucket_workers}"))?;
     let _shift = bit_length(max_oid as u64).saturating_sub(RADIX_BITS);
-    let queue_path = job
-        .base_dir(None)
-        .join(format!("seed_table_{shape}"))
-        .join("build_pair_table_queue");
-
-    let queue = Atomic::new(queue_path);
-    let mut processed = 0;
-    loop {
-        let bucket_index =
-            usize::try_from(queue.fetch_add_one()?).map_err(|error| error.to_string())?;
-        let Some(bucket) = seed_table.get(bucket_index) else {
-            break;
-        };
-        let (mut entries, volume_paths) = read_seed_bucket(job, bucket)?;
-        job.log(&format!(
-            "Building pair table. Bucket={}/{} Records={} Size={}",
-            bucket_index + 1,
-            seed_table.len(),
-            entries.len(),
-            entries.len() * SeedEntry::ENCODED_SIZE
-        ))?;
-        entries.sort_unstable();
-        let mut begin = 0;
-        while begin < entries.len() {
-            let seed = entries[begin].merge_key();
-            let mut end = begin + 1;
-            while end < entries.len() && entries[end].merge_key() == seed {
-                end += 1;
+    let queue = Arc::new(Atomic::new(
+        job.base_dir(None)
+            .join(format!("seed_table_{shape}/build_pair_table_queue")),
+    ));
+    let processed = Arc::new(AtomicUsize::new(0));
+    let pool = Arc::new(Mutex::new(SimpleThreadPool::new()));
+    let shared_job = Arc::new(job.clone());
+    let seed_table = Arc::new(seed_table.clone());
+    let memory_pairs = Arc::new(Mutex::new(Vec::new()));
+    let mut outer = Vec::with_capacity(concurrent_buckets);
+    for _ in 0..concurrent_buckets {
+        let pool_for_worker = Arc::clone(&pool);
+        let queue = Arc::clone(&queue);
+        let processed = Arc::clone(&processed);
+        let job = Arc::clone(&shared_job);
+        let table = Arc::clone(&seed_table);
+        let files = output_files.bounded.clone();
+        let failure = Arc::clone(&output_files.failure);
+        let memory_pairs = Arc::clone(&memory_pairs);
+        outer.push(pool.lock().unwrap().spawn(move |stop| {
+            while !stop.load(ThreadOrdering::Relaxed) {
+                let bucket_index =
+                    usize::try_from(queue.fetch_add_one()?).map_err(|e| e.to_string())?;
+                let Some(bucket) = table.get(bucket_index) else {
+                    break;
+                };
+                let (mut entries, volume_paths) = read_seed_bucket(&job, bucket, config.threads)?;
+                job.log(&format!(
+                    "Building pair table. Bucket={}/{} Records={} Size={}",
+                    bucket_index + 1,
+                    table.len(),
+                    crate::util::string::format(entries.len() as u64),
+                    crate::util::string::format((entries.len() * SeedEntry::ENCODED_SIZE) as u64)
+                ))?;
+                if bucket_workers > 1 {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(bucket_workers)
+                        .build()
+                        .map_err(|error| {
+                            format!("Error creating pair-table sorting threads: {error}")
+                        })?
+                        .install(|| entries.par_sort_unstable());
+                } else {
+                    entries.sort_unstable();
+                }
+                let ranges = seed_part_ranges(&entries, bucket_workers);
+                let entries = Arc::new(entries);
+                let mut inner = Vec::with_capacity(ranges.len());
+                for range in ranges {
+                    let entries = Arc::clone(&entries);
+                    let files = files.clone();
+                    let failure = Arc::clone(&failure);
+                    let errors = job.io_errors();
+                    let memory_pairs = Arc::clone(&memory_pairs);
+                    inner.push(pool_for_worker.lock().unwrap().spawn(move |stop| {
+                        // A Source BufferArray belongs to every spawned input
+                        // part, even when equal-key extension leaves it empty.
+                        let mut buffers = files.map(|files| {
+                            WorkerBucketBuffers::new(files, RADIX_COUNT, errors, failure)
+                        });
+                        let mut local_pairs = Vec::new();
+                        let mut emit = |entry: PairEntry| {
+                            if let Some(buffers) = &mut buffers {
+                                let radix = (hash64(entry.rep_oid) >> (64 - RADIX_BITS)) as usize;
+                                buffers.write(radix, &encode_pair_entry(entry))
+                            } else {
+                                local_pairs.push(entry);
+                                Ok(())
+                            }
+                        };
+                        let mut begin = range.start;
+                        while !stop.load(ThreadOrdering::Relaxed) && begin < range.end {
+                            let mut end = begin + 1;
+                            while end < range.end
+                                && entries[end].merge_key() == entries[begin].merge_key()
+                            {
+                                end += 1;
+                            }
+                            if config.mutual_cover_present {
+                                pairs_mutual_cov(
+                                    &entries[begin..end],
+                                    config.min_length_ratio,
+                                    &mut emit,
+                                )?;
+                            } else {
+                                pairs_uni_cov(&entries[begin..end], &mut emit)?;
+                            }
+                            begin = end;
+                        }
+                        drop(emit);
+                        drop(buffers); // Flush worker members before input removal.
+                        memory_pairs.lock().unwrap().extend(local_pairs);
+                        Ok(())
+                    }));
+                }
+                SimpleThreadPool::join_shared(&pool_for_worker, inner)?;
+                // VolumedFile::remove intentionally ignores remove/rmdir
+                // results, after all input handles and bucket workers close.
+                for path in volume_paths {
+                    let _ = fs::remove_file(source_c_path(&path).as_ref());
+                }
+                let _ = fs::remove_file(source_c_path(&bucket.path).as_ref());
+                if let Some(parent) = bucket.path.parent() {
+                    let _ = fs::remove_dir(source_c_path(parent).as_ref());
+                }
+                processed.fetch_add(1, ThreadOrdering::Relaxed);
             }
-            if config.mutual_cover_present {
-                get_pairs_mutual_cov(&entries[begin..end], config.min_length_ratio, output_files);
-            } else {
-                get_pairs_uni_cov(&entries[begin..end], output_files);
-            }
-            begin = end;
+            Ok(())
+        }));
+    }
+    SimpleThreadPool::join_shared(&pool, outer)?;
+    if let Some(error) = output_files.failure.lock().unwrap().clone() {
+        return Err(error);
+    }
+    // The explicit unbounded library adapter collects logical records only;
+    // actual CLI workers wrote through the retained round FileArray above.
+    if output_files.bounded.is_none() {
+        for entry in memory_pairs.lock().unwrap().drain(..) {
+            output_files.write_msb(entry);
         }
-        for path in volume_paths {
-            fs::remove_file(source_c_path(&(path)).as_ref()).map_err(|error| error.to_string())?;
-        }
-        fs::remove_file(source_c_path(&bucket.path).as_ref()).map_err(|error| error.to_string())?;
-        if let Some(parent) = bucket.path.parent() {
-            let _ = fs::remove_dir(source_c_path(&(parent)).as_ref());
-        }
-        processed += 1;
     }
     let table = output_files.flush_unpublished()?;
     let finished = Atomic::new(
         job.base_dir(None)
             .join(format!("seed_table_{shape}/pair_table_finished")),
     );
-    finished.fetch_add(processed)?;
+    finished.fetch_add(processed.load(ThreadOrdering::Relaxed) as i64)?;
     finished.await_value(seed_table.len() as i64)?;
     Ok(table)
+}
+
+fn seed_part_ranges(entries: &[SeedEntry], workers: usize) -> Vec<std::ops::Range<usize>> {
+    let partition = Partition::new(entries.len(), workers);
+    (0..partition.parts)
+        .map(|part| {
+            let mut begin = partition.begin(part);
+            let mut end = partition.end(part);
+            if part > 0 {
+                while begin < entries.len() && entries[begin - 1].key() == entries[begin].key() {
+                    begin += 1;
+                }
+            }
+            while end < entries.len() && entries[end - 1].key() == entries[end].key() {
+                end += 1;
+            }
+            begin..end
+        })
+        .collect()
 }
 
 fn bit_length(value: u64) -> u32 {
     u64::BITS - value.leading_zeros()
 }
 
-fn read_seed_bucket(job: &Job, bucket: &Bucket) -> Result<(Vec<SeedEntry>, Vec<PathBuf>), String> {
+/// InputBuffer<SeedEntry> reads actual disjoint volume ranges concurrently.
+/// Scoped slices permit direct filling of the one Source data owner without
+/// extra full-volume Vec copies or unsafe shared writes/lifetime extension.
+fn read_seed_bucket(
+    job: &Job,
+    bucket: &Bucket,
+    threads: usize,
+) -> Result<(Vec<SeedEntry>, Vec<PathBuf>), String> {
+    let volumes =
+        super::external::read_volumed_file_manifest_owned(&bucket.path, &job.io_errors())?;
+    let count = volumes
+        .0
+        .iter()
+        .try_fold(0usize, |sum, volume| {
+            sum.checked_add(usize::try_from(volume.record_count).ok()?)
+        })
+        .ok_or("Seed InputBuffer size overflow.")?;
     let mut entries = Vec::new();
-    let mut paths = Vec::new();
-    for (path, count) in super::external::read_manifest_owned(&bucket.path, &job.io_errors())? {
-        let mut input = job.open_input(&path, 0)?;
-        for _ in 0..count {
-            entries.push(SeedEntry {
-                seed: job.io(input.read_u64())?,
-                oid: job.io(input.read_i64())?,
-                len: job.io(input.read_i32())?,
+    entries.try_reserve_exact(count).map_err(|error| {
+        job.capture_io::<()>(Err(std::io::Error::other(crate::util::io::BadAllocError(
+            error.to_string(),
+        ))))
+        .unwrap_err()
+    })?;
+    entries.resize(count, SeedEntry::default());
+    let mut tail = entries.as_mut_slice();
+    let mut cursor = 0usize;
+    let mut destinations = Vec::with_capacity(volumes.0.len());
+    for volume in &volumes.0 {
+        let begin = usize::try_from(volume.oid_begin).map_err(|e| e.to_string())?;
+        let count = usize::try_from(volume.record_count).map_err(|e| e.to_string())?;
+        if begin < cursor || begin - cursor > tail.len() || count > tail.len() - (begin - cursor) {
+            return Err(
+                "Source InputBuffer volume ranges overlap or exceed its allocated record domain."
+                    .into(),
+            );
+        }
+        let (_, remaining) = tail.split_at_mut(begin - cursor);
+        let (destination, remaining) = remaining.split_at_mut(count);
+        tail = remaining;
+        cursor = begin + count;
+        destinations.push((&volume.path, destination));
+    }
+    let pending = Mutex::new(destinations.into_iter());
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let error = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(volumes.0.len()) {
+            scope.spawn(|| {
+                while !stop.load(ThreadOrdering::Relaxed) {
+                    let Some((path, destination)) = pending.lock().unwrap().next() else {
+                        break;
+                    };
+                    let result = (|| {
+                        let mut input = job.open_input(path, 0)?;
+                        for entry in destination {
+                            *entry = SeedEntry {
+                                seed: job.io(input.read_u64())?,
+                                oid: job.io(input.read_i64())?,
+                                len: job.io(input.read_i32())?,
+                            };
+                        }
+                        job.io(input.close())?;
+                        Ok::<_, String>(())
+                    })();
+                    if let Err(message) = result {
+                        error.lock().unwrap().get_or_insert(message);
+                        stop.store(true, ThreadOrdering::Relaxed);
+                        break;
+                    }
+                }
             });
         }
-        paths.push(path);
+    });
+    drop(pending); // Release borrowed destination slices before returning their owner.
+    if let Some(error) = error.into_inner().unwrap() {
+        return Err(error);
     }
-    Ok((entries, paths))
+    Ok((
+        entries,
+        volumes.0.into_iter().map(|volume| volume.path).collect(),
+    ))
 }
 
 #[cfg(test)]
@@ -659,6 +900,109 @@ mod tests {
             assert_eq!(input.read_u32().unwrap(), pair.member_len);
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_partition_keeps_equal_seed_groups_in_one_part() {
+        let entries: Vec<_> = (0..8)
+            .map(|oid| SeedEntry::new(if oid < 6 { 10 } else { 20 }, oid, 100))
+            .collect();
+        assert_eq!(seed_part_ranges(&entries, 4), vec![0..6, 6..6, 6..6, 6..8]);
+        assert_eq!(
+            seed_part_ranges(&[], 4),
+            Vec::<std::ops::Range<usize>>::new()
+        );
+    }
+
+    fn write_seed_bucket_fixture(root: &Path, number: usize) -> Bucket {
+        let directory = root.join(format!("seed-bucket-{number}"));
+        fs::create_dir_all(&directory).unwrap();
+        let mut manifest = Vec::new();
+        for part in 0..2 {
+            let path = directory.join(format!("volume-{part}"));
+            let mut compressed = CompressedBuffer::new();
+            for offset in (part * 4..part * 4 + 4).rev() {
+                let entry = SeedEntry::new(number as u64 + 10, (number * 10 + offset) as i64, 100);
+                let mut bytes = Vec::new();
+                entry.serialize(&mut bytes);
+                compressed.write(&bytes).unwrap();
+            }
+            compressed.finish().unwrap();
+            fs::write(&path, compressed.data()).unwrap();
+            manifest.extend(super::super::storage::manifest_line(&path, &[4]).unwrap());
+        }
+        let path = directory.join("bucket.tsv");
+        fs::write(&path, manifest).unwrap();
+        Bucket::new(path, Some(8))
+    }
+
+    #[test]
+    fn bounded_pair_table_runs_both_worker_levels_without_early_publication() {
+        // One memory-limited bucket exercises four inner parts; four buckets
+        // exercise four concurrent outer claim loops with one inner part each.
+        for (bucket_count, mem_limit) in [(1, 1), (4, 1 << 20)] {
+            let root = temp_dir("parallel_pair_owners");
+            let table = RadixedTable(
+                (0..bucket_count)
+                    .map(|i| write_seed_bucket_fixture(&root, i))
+                    .collect(),
+            );
+            let paths: Vec<_> = table.iter().map(|bucket| bucket.path.clone()).collect();
+            let job = Job::new(40, 2, mem_limit, root.join("job"), 2).unwrap();
+            fs::create_dir_all(job.base_dir(None).join("seed_table_0")).unwrap();
+            let mut output = PairFileArray::new_bounded(root.join("pairs"), 2).unwrap();
+            let result = build_pair_table(
+                &job,
+                &table,
+                0,
+                40,
+                &mut output,
+                PairTableConfig {
+                    threads: 4,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(paths.iter().all(|path| !path.exists()));
+            assert!(
+                result
+                    .iter()
+                    .all(|bucket| fs::read(&bucket.path).unwrap().is_empty()),
+                "worker BufferArrays flush but the round FileArray has not published"
+            );
+            output.finish().unwrap();
+            let mut actual = Vec::new();
+            for bucket in result.iter() {
+                for (path, count) in super::super::storage::manifest_records(&bucket.path).unwrap()
+                {
+                    let mut input = InputFile::with_source_profile_path(&path, 0, 65_536).unwrap();
+                    for _ in 0..count {
+                        actual.push(PairEntry {
+                            rep_oid: input.read_u64().unwrap(),
+                            member_oid: input.read_u64().unwrap(),
+                            rep_len: input.read_u32().unwrap(),
+                            member_len: input.read_u32().unwrap(),
+                        });
+                    }
+                    input.close().unwrap();
+                }
+            }
+            actual.sort_unstable();
+            let mut expected: Vec<_> = (0..bucket_count)
+                .flat_map(|bucket| {
+                    (1..8).map(move |member| PairEntry {
+                        rep_oid: (bucket * 10) as u64,
+                        member_oid: (bucket * 10 + member) as u64,
+                        rep_len: 100,
+                        member_len: 100,
+                    })
+                })
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(actual, expected);
+            drop(output);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

@@ -34,6 +34,7 @@ const BLOSUM62_BACKGROUND_FREQS: [f64; TRUE_AA as usize] = [
 pub const DEFAULT_REDUCTION: &str = "A KR EDNQ C G H ILVM FYW P ST";
 
 /// Alphabet reduction mapping amino acids to fewer groups for seed computation.
+#[derive(Clone)]
 pub struct Reduction {
     map: [u32; 256],
     map8: [Letter; 256],

@@ -318,16 +318,16 @@ pub fn partition(
     let mut sizes = Vec::new();
     let mut block_size = start_size;
     for (i, &length) in seq_lengths.iter().enumerate() {
-        let length = length.max(0) as u64;
-        if block_size + length > max_block_size && block_size > 0 {
+        let length = length as u64;
+        if block_size.wrapping_add(length) > max_block_size && block_size > 0 {
             boundaries.push(i as OId);
-            sizes.push(block_size - if sizes.is_empty() { start_size } else { 0 });
+            sizes.push(block_size.wrapping_sub(if sizes.is_empty() { start_size } else { 0 }));
             block_size = 0;
         }
-        block_size += length;
+        block_size = block_size.wrapping_add(length);
     }
     boundaries.push(seq_lengths.len() as OId);
-    sizes.push(block_size - if sizes.is_empty() { start_size } else { 0 });
+    sizes.push(block_size.wrapping_sub(if sizes.is_empty() { start_size } else { 0 }));
     (boundaries, sizes)
 }
 
@@ -814,6 +814,9 @@ mod tests {
     fn cpp_partition_preserves_initial_size_semantics() {
         assert_eq!(partition(&[4, 7, 3], 10, 2), (vec![0, 1, 3], vec![4, 10]));
         assert_eq!(partition(&[4, 3], 10, 2), (vec![0, 2], vec![7]));
+        // Source converts signed Loc to uint64_t before partition arithmetic.
+        assert_eq!(partition(&[-1, 2], 10, 0), (vec![0, 2], vec![1]));
+        assert_eq!(partition(&[-1], 10, 2), (vec![0, 1], vec![u64::MAX]));
     }
 
     #[test]

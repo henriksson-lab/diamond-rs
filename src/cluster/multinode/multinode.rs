@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::data::{
-    get_reps_path, ByteSequenceRecord, GetRepsConfig, RepresentativeJob, SequenceRecord,
-    SequenceSource,
+    get_reps_path, GetRepsConfig, RepresentativeJob, SequenceRecord, SequenceSource,
 };
 use super::output::{merge, MergeConfig, MultinodeOutputJob, Volume};
 use crate::basic::value::{OId, AMINO_ACID_ALPHABET};
@@ -270,6 +269,7 @@ pub struct MultinodeConfig {
     pub max_evalue: f64,
     pub min_length_ratio: f64,
     pub file_buffer_size: usize,
+    pub ignore_warnings: bool,
 }
 
 impl Default for MultinodeConfig {
@@ -289,6 +289,7 @@ impl Default for MultinodeConfig {
             max_evalue: 0.001,
             min_length_ratio: 0.0,
             file_buffer_size: 0,
+            ignore_warnings: false,
         }
     }
 }
@@ -666,6 +667,8 @@ fn multinode_owned<B: MultinodeBackend>(
         job.log(&format!("#Volumes = {}", input.0.len()))?;
         job.log(&format!("#Sequences = {}", input.sparse_records()))?;
     }
+    #[cfg(windows)]
+    crate::util::io::cstdio_file::source_external_stdio_limit();
     let steps = cluster_steps(config.approx_min_id, true);
     job.set_round_count(steps.len() as i32);
     let evalue_cutoff = config.max_evalue;
@@ -673,8 +676,7 @@ fn multinode_owned<B: MultinodeBackend>(
     let startup_lock = Atomic::new(job.root_dir().join("startup_lock"));
     let startup_done = Atomic::new(job.root_dir().join("startup_done"));
     if startup_lock.fetch_add_one()? == 0 {
-        prepare_inputs(&job, input, backend)?;
-        startup_done.fetch_add_one()?;
+        prepare_inputs(&job, input, backend, config.ignore_warnings, &startup_done)?;
     } else {
         startup_done.await_value(1)?;
     }
@@ -794,106 +796,178 @@ fn write_representative_ids(job: &Job, volumes: &VolumedFile, path: &Path) -> Re
     Ok(())
 }
 
+/// Source volume.h `load_seqs`: open each intersecting indexed owner, seek its
+/// local OID, load the actual block, offset OIDs, append, then checked close.
+fn load_indexed_volume_block<B: SequenceSource>(
+    job: &Job,
+    volumes: &VolumedFile,
+    oid_begin: OId,
+    oid_end: OId,
+    index_dir: &Path,
+    backend: &B,
+    ignore_warnings: bool,
+) -> Result<crate::data::block::Block, String> {
+    let begin = volumes
+        .0
+        .partition_point(|volume| volume.oid_end <= oid_begin);
+    if begin == volumes.0.len() {
+        return Err("OID out of bounds".to_owned());
+    }
+    let mut end = begin + 1;
+    while end < volumes.0.len() && volumes.0[end].oid_begin < oid_end {
+        end += 1;
+    }
+    let flags = crate::data::sequence_file::SequenceFileFlags::ALL
+        | crate::data::sequence_file::SequenceFileFlags::NEED_LETTER_COUNT;
+    let mut combined: Option<crate::data::block::Block> = None;
+    for (index, volume) in volumes.0.iter().enumerate().take(end).skip(begin) {
+        let local_begin = oid_begin
+            .max(volume.oid_begin)
+            .wrapping_sub(volume.oid_begin);
+        let local_end = oid_end.min(volume.oid_end).wrapping_sub(volume.oid_begin);
+        let mut input = backend.open_indexed_records(
+            &volume.path,
+            &index_dir.join(index.to_string()),
+            flags,
+            &job.errors,
+        )?;
+        input.set_seqinfo_ptr(local_begin)?;
+        let mut block = input.load_seqs(
+            i64::MAX,
+            local_end.wrapping_sub(local_begin),
+            flags,
+            ignore_warnings,
+        )?;
+        block.offset_oids(volume.oid_begin);
+        match combined.as_mut() {
+            Some(combined) => combined.append(&block),
+            None => combined = Some(block),
+        }
+        input.close()?;
+    }
+    Ok(combined.unwrap_or_else(crate::data::block::Block::new))
+}
+
 fn prepare_inputs<B: SequenceSource>(
     job: &Job,
     volumes: &VolumedFile,
     backend: &B,
+    ignore_warnings: bool,
+    startup_done: &Atomic,
 ) -> Result<VolumedFile, String> {
     job.log(&format!("Memory limit = {}", job.mem_limit))?;
-    let block_size = (job.mem_limit / 20).max(1);
+    let block_size = job.mem_limit / 20;
     job.log(&format!("Block size = {block_size}"))?;
-    let mut records = Vec::<ByteSequenceRecord>::new();
-    let mut letters = 0_u64;
+    let index_dir = job.root_dir().join("index");
+    fs::create_dir_all(source_c_path(&index_dir).as_ref()).map_err(|error| error.to_string())?;
+    let (mut boundaries, mut sizes) = (Vec::<OId>::new(), Vec::<u64>::new());
+    let mut letters = 0u64;
     for (index, volume) in volumes.0.iter().enumerate() {
         job.log(&format!("Indexing volume {index}/{}", volumes.0.len()))?;
-        let mut input = backend.open_records(&volume.path, &job.errors)?;
-        while let Some(record) = input.read_record()? {
-            letters = letters.saturating_add(record.sequence.len() as u64);
-            records.push(record);
+        let index_path = index_dir.join(index.to_string());
+        backend.index_volume(&volume.path, &index_path, &job.errors)?;
+        let owner = backend.open_indexed_records(
+            &volume.path,
+            &index_path,
+            crate::data::sequence_file::SequenceFileFlags::NEED_LETTER_COUNT,
+            &job.errors,
+        )?;
+        letters = letters.wrapping_add(owner.letters());
+        let (local_boundaries, local_sizes) =
+            owner.partition(block_size, sizes.last().copied().unwrap_or(0))?;
+        if index == 0 {
+            boundaries = local_boundaries;
+            sizes = local_sizes;
+        } else {
+            *boundaries
+                .last_mut()
+                .ok_or("Source volume partition is missing its final OID.")? =
+                local_boundaries[1].wrapping_add(volume.oid_begin);
+            let last = sizes
+                .last_mut()
+                .ok_or("Source volume partition is missing its final size.")?;
+            *last = last.wrapping_add(local_sizes[0]);
+            for i in 2..local_boundaries.len() {
+                boundaries.push(local_boundaries[i].wrapping_add(volume.oid_begin));
+                sizes.push(local_sizes[i - 1]);
+            }
         }
-        input.close()?;
+        // Source's stack owner closes at this iteration's destructor boundary.
+        drop(owner);
     }
-    let mut blocks: Vec<Vec<ByteSequenceRecord>> = vec![Vec::new()];
-    let mut sizes = vec![0_u64];
-    for record in records {
-        let length = record.sequence.len() as u64;
-        let last = sizes.len() - 1;
-        if !blocks[last].is_empty() && sizes[last].saturating_add(length) > block_size {
-            blocks.push(Vec::new());
-            sizes.push(0);
-        }
-        let last = sizes.len() - 1;
-        sizes[last] = sizes[last].saturating_add(length);
-        blocks[last].push(record);
+    let mut blocks_file = job.errors.capture(
+        crate::util::io::File::new_path(&job.base_dir().join("blocks"), "wb")
+            .map_err(std::io::Error::other),
+    )?;
+    let mut bytes = Vec::with_capacity(boundaries.len() * std::mem::size_of::<OId>());
+    for oid in &boundaries {
+        bytes.extend_from_slice(&oid.to_ne_bytes());
     }
-    if blocks.len() == 1 && blocks[0].is_empty() {
-        blocks.clear();
-        sizes.clear();
-    }
-    let mut manifest = Vec::new();
+    job.errors
+        .capture(blocks_file.write(&bytes).map_err(std::io::Error::other))?;
+    job.errors
+        .capture(blocks_file.close().map_err(std::io::Error::other))?;
+    let mut message = format!(
+        "Sequences in database = {}\nLetters in database = {letters}\nDatabase blocks:\n",
+        volumes.max_oid().wrapping_add(1)
+    );
+    // This unchecked owner is constructed before any block loader or output.
+    let mut manifest = crate::util::io::source_text::TextOutput::open_unchecked(
+        &job.root_dir().join("input.tsv"),
+        true,
+    );
+    let mut oid = 0u64;
     let mut output_volumes = Vec::new();
-    let mut oid = 0_u64;
-    let mut boundaries = vec![0_u64];
-    for (index, block) in blocks.iter().enumerate() {
+    let traits = crate::basic::value::ValueTraits::new(
+        AMINO_ACID_ALPHABET,
+        crate::basic::value::MASK_LETTER,
+        b"UO-",
+        crate::basic::value::SequenceType::AminoAcid,
+    );
+    for (index, &size) in sizes.iter().enumerate() {
         let path = job.root_dir().join(format!("input{index}.faa"));
+        message.push_str(&format!("{}\t{size}\n", boundaries[index]));
+        let block = load_indexed_volume_block(
+            job,
+            volumes,
+            boundaries[index],
+            boundaries[index + 1],
+            &index_dir,
+            backend,
+            ignore_warnings,
+        )?;
+        let mut output = crate::util::io::source_text::TextOutput::open_unchecked(&path, true);
         let begin = oid;
-        let mut output = Vec::new();
-        for record in block {
-            let mut buffer = crate::util::text_buffer::TextBuffer::new();
+        let mut buffer = crate::util::text_buffer::TextBuffer::new();
+        for i in 0..block.seqs().len() {
             crate::util::sequence::format_bytes(
-                &record.sequence,
+                block.seqs().get(i),
                 oid.to_string().as_bytes(),
                 None,
                 &mut buffer,
                 "fasta",
-                &crate::basic::value::ValueTraits::new(
-                    AMINO_ACID_ALPHABET,
-                    crate::basic::value::MASK_LETTER,
-                    b"UO-",
-                    crate::basic::value::SequenceType::AminoAcid,
-                ),
+                &traits,
                 160,
             )?;
-            output.extend_from_slice(buffer.data());
-            oid += 1;
+            oid = oid.wrapping_add(1);
+            output.write(buffer.data());
+            buffer.clear();
         }
-        fs::write(source_c_path(&path).as_ref(), output).map_err(|error| error.to_string())?;
-        manifest.extend_from_slice(
+        manifest.write(
             &job.errors.capture(
                 crate::util::io::source_os_bytes(path.as_os_str())
                     .map(|v| v.into_owned())
                     .map_err(std::io::Error::other),
             )?,
         );
-        manifest.extend_from_slice(format!("\t{}\n", block.len()).as_bytes());
-        output_volumes.push(Volume::new(path, begin, oid, block.len() as OId));
-        boundaries.push(oid);
+        manifest.write(format!("\t{}", block.seqs().len()).as_bytes());
+        manifest.endl();
+        output_volumes.push(Volume::new(path, begin, oid, block.seqs().len() as OId));
     }
-    fs::write(
-        source_c_path(&job.root_dir().join("input.tsv")).as_ref(),
-        manifest,
-    )
-    .map_err(|error| error.to_string())?;
-    let mut boundary_bytes = Vec::with_capacity(boundaries.len() * 8);
-    for boundary in &boundaries {
-        boundary_bytes.extend_from_slice(&boundary.to_ne_bytes());
-    }
-    fs::write(
-        source_c_path(&job.base_dir().join("blocks")).as_ref(),
-        boundary_bytes,
-    )
-    .map_err(|error| error.to_string())?;
-    job.log(&format!(
-        "Sequences in database = {}\nLetters in database = {}\nDatabase blocks:\n{}",
-        volumes.max_oid() + 1,
-        letters,
-        output_volumes
-            .iter()
-            .zip(sizes)
-            .map(|(volume, size)| format!("{}\t{}", volume.oid_begin, size))
-            .collect::<Vec<_>>()
-            .join("\n")
-    ))?;
+    job.log(&message)?;
+    // Source publishes startup completion while idx remains alive; each row
+    // was already flushed by std::endl. Its unchecked close follows the signal.
+    startup_done.fetch_add_one()?;
     Ok(VolumedFile(output_volumes))
 }
 
@@ -1199,6 +1273,73 @@ mod tests {
             fs::read_to_string(root.join("round0/alignments.tsv")).unwrap(),
             "0\t0\n0\t1\n1\t1\n"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexed_input_preparation_carries_partition_sizes_across_volumes() {
+        let root = temp_dir("indexed-preparation");
+        let first = root.join("first.faa");
+        let second = root.join("second.faa");
+        fs::write(&first, b">first\xff\nARND\n").unwrap();
+        fs::write(&second, b">b\nCQEG\n>c\nHILK\n>d\nMFPS\n").unwrap();
+        let volumes = VolumedFile(vec![
+            Volume::new(first, 0, 1, 1),
+            Volume::new(second, 1, 4, 3),
+        ]);
+        let job = Job::new(3, 200, &root).unwrap();
+        let done = Atomic::new(root.join("startup_done"));
+        let output = prepare_inputs(
+            &job,
+            &volumes,
+            &super::super::data::FastaSequenceSource,
+            false,
+            &done,
+        )
+        .unwrap();
+        assert_eq!(done.fetch_add(0).unwrap(), 1);
+        assert_eq!(
+            output
+                .0
+                .iter()
+                .map(|volume| volume.record_count)
+                .collect::<Vec<_>>(),
+            [2, 2]
+        );
+        let expected_blocks = [0u64, 2, 4]
+            .into_iter()
+            .flat_map(u64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fs::read(root.join("round0/blocks")).unwrap(),
+            expected_blocks
+        );
+        assert_eq!(
+            fs::read(root.join("input0.faa")).unwrap(),
+            expected_text(b">0\nARND\n>1\nCQEG\n")
+        );
+        assert_eq!(
+            fs::read(root.join("input1.faa")).unwrap(),
+            expected_text(b">2\nHILK\n>3\nMFPS\n")
+        );
+        assert_eq!(
+            fs::read(root.join("index/0")).unwrap(),
+            expected_text(b"0\t4\n")
+        );
+        assert_eq!(
+            fs::read(root.join("index/1")).unwrap(),
+            expected_text(b"0\t4\n8\t4\n16\t4\n")
+        );
+        let manifest = format!(
+            "{}\t2\n{}\t2\n",
+            root.join("input0.faa").display(),
+            root.join("input1.faa").display()
+        );
+        assert_eq!(
+            fs::read(root.join("input.tsv")).unwrap(),
+            expected_text(manifest.as_bytes())
+        );
+        drop(job);
         fs::remove_dir_all(root).unwrap();
     }
 
