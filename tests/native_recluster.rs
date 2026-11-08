@@ -125,7 +125,10 @@ fn already_valid_clusters_match_unmodified_upstream() {
         );
         assert_eq!(
             source_startup::stdout_body(&result),
-            std::fs::read(data.join("recluster/valid.upstream.tsv")).unwrap()
+            source_startup::source_console_text(
+                &std::fs::read_to_string(data.join("recluster/valid.upstream.tsv")).unwrap()
+            )
+            .as_bytes()
         );
     }
 }

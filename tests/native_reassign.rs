@@ -107,7 +107,10 @@ fn singleton_reassignment_matches_unmodified_upstream() {
     );
     assert_eq!(
         source_startup::stdout_body(&result),
-        std::fs::read(fixtures.join("singletons.upstream.tsv")).unwrap()
+        source_startup::source_console_text(
+            &std::fs::read_to_string(fixtures.join("singletons.upstream.tsv")).unwrap()
+        )
+        .as_bytes()
     );
 }
 
