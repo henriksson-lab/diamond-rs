@@ -32,3 +32,19 @@ package build without the C++ tree. The final reader-only fixture batch passed
 All 18 raw-OS CLI controls matched preserved C++ results exactly without rerunning
 C++; bounded calibration and error-propagation shell checks passed. Fresh hosted
 macOS/Windows runtime results remain pending a push and CI rerun.
+
+Follow-up for run 42472717649: both hosted macOS spill checks passed. Corrected
+the numerical fixture's platform scope: all 54 GNU-profile vectors remain exact,
+while three libm/NaN-sensitive cases also have independent mathematical checks
+that run on every platform. Console-text expectations now use Windows CRT line
+endings; archive/data bytes remain exact. A Windows-only guard prevents archive
+subprocess tests from inheriting the parallel library test's open CRT handles.
+
+At the user's request, CI now has seven jobs instead of fourteen: one packaged
+native matrix for Linux, both macOS architectures, and Windows, plus musl and two
+32-bit checks. Default tests, all-feature builds without C++, and spill checks
+remain on native hosts; the full optional-feature runtime suite runs on Linux.
+Local isolated default/optional/Windows compilation, protocol, numerical,
+archive-library, stdout/help, and deprecated-command checks passed. Workflow YAML
+and shell syntax checks passed. Fresh hosted verification of this batch remains
+pending; the broader translation goal stays paused.

@@ -1,4 +1,7 @@
 //! Source-frozen two-phase ranking, final full extension and ordered output.
+#[path = "support/source_startup.rs"]
+mod source_startup;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -212,7 +215,9 @@ fn global_ranking_option_errors_match_source() {
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{flags:?}");
         assert!(
-            String::from_utf8_lossy(&output.stderr).ends_with(&format!("Error: {diagnostic}\n")),
+            String::from_utf8_lossy(&output.stderr).ends_with(
+                &source_startup::source_console_text(&format!("Error: {diagnostic}\n"))
+            ),
             "{flags:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );

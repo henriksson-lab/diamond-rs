@@ -9,17 +9,15 @@ on:
 permissions:
   contents: read
 
-# The package matrix builds several profiles and integration executables on
-# hosted runners with limited disk space. Keep test assertions and behavior,
-# while avoiding duplicate debug-symbol and incremental-codegen artifacts.
 env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
 jobs:
-  package:
-    name: Verify packaged crate (${{ matrix.platform }})
+  native:
+    name: Test (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -34,6 +32,12 @@ jobs:
           - platform: macOS Intel
             os: macos-15-intel
             host: x86_64-apple-darwin
+          - platform: Windows x86-64
+            os: windows-latest
+            host: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -45,120 +49,47 @@ jobs:
       - name: Select Rust
         run: rustup default stable
 
-      # Check the native host explicitly so a runner-label change cannot
-      # silently drop either Apple architecture from package validation.
       - name: Verify native compiler host
-        shell: bash
         env:
           EXPECTED_RUST_HOST: ${{ matrix.host }}
         run: |
           rustc -vV
-          cargo -V
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_RUST_HOST"
 
-      # Build from Cargo's isolated package staging directory. This catches
-      # accidental compile-time dependencies on checkout-only files (notably
-      # the adjacent upstream C++ tree) that an ordinary workspace build can
-      # hide.
-      - name: Verify package contents build independently
-        run: cargo package --locked
+      - name: Check spill calibration control flow
+        run: bash scripts/tests/spill_calibration.sh
 
-      - name: Test the isolated package contents
-        shell: bash
+      # Test the packaged crate on each host instead of testing the same code
+      # again from the checkout. No adjacent C++ tree may be required.
+      - name: Package and verify the crate
         run: |
-          package_dir="$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'diamond-rs-*' -print -quit)"
-          test -n "$package_dir"
-          cargo test --locked --all-targets --manifest-path "$package_dir/Cargo.toml"
-
-      # Execute optional native workflows on each package host as well as
-      # compiling them. Keep the diagnostic C++ bridge out of this test run.
-      - name: Test optional native features in the isolated package
-        shell: bash
-        run: |
-          package_dir="$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'diamond-rs-*' -print -quit)"
-          test -n "$package_dir"
-          cargo test --locked --all-targets --features dna,mcl,zstd --manifest-path "$package_dir/Cargo.toml"
-
-      # The published package omits diamond/. Even with ffi requested, it
-      # must compile on both Apple architectures without the C++ source tree.
-      - name: Build the isolated package with all features
-        shell: bash
-        run: |
+          cargo package --locked
           package_dir="$(find target/package -mindepth 1 -maxdepth 1 -type d -name 'diamond-rs-*' -print -quit)"
           test -n "$package_dir"
           test ! -e "$package_dir/diamond"
-          cargo build --locked --all-targets --all-features --manifest-path "$package_dir/Cargo.toml"
+          echo "PACKAGE_DIR=$package_dir" >> "$GITHUB_ENV"
 
-  build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          # macos-latest is the GitHub-hosted arm64 image. Keep an explicit
-          # Intel runner as well: RSS/Mach bindings and the target C runtime
-          # must be exercised natively on both supported architectures.
-          - macos-latest
-          - macos-15-intel
-          - windows-latest
+      - name: Test default features
+        run: cargo test --locked --all-targets --manifest-path "$PACKAGE_DIR/Cargo.toml"
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      # Run the optional suite once; the following build checks every feature
+      # on all four native hosts, including both Apple architectures.
+      - name: Test optional native features
+        if: matrix.platform == 'Linux x86-64'
+        run: cargo test --locked --all-targets --features dna,mcl,zstd --manifest-path "$PACKAGE_DIR/Cargo.toml"
 
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
-
-      - name: Select Rust
-        run: rustup default stable
-
-      - name: Build
-        run: cargo build --locked --all-targets
-
-      - name: Test
-        run: cargo test --locked --all-targets
-
-  native-spill-conformance:
-    name: Native delayed spill (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - macos-15-intel
-          - windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --no-self-update
-
-      - name: Select Rust
-        run: rustup default stable
-
-      - name: Check spill calibration control flow
-        shell: bash
-        run: bash scripts/tests/spill_calibration.sh
+      - name: Build all features without the C++ tree
+        run: cargo build --locked --all-targets --all-features --manifest-path "$PACKAGE_DIR/Cargo.toml"
 
       - name: Build release executable
-        run: cargo build --locked --release --bin diamond
+        run: cargo build --locked --release --bin diamond --manifest-path "$PACKAGE_DIR/Cargo.toml"
 
-      # Git for Windows supplies the same bash/awk/coreutils surface used on
-      # Linux and macOS. The driver calibrates from target-native RSS behavior;
-      # it does not reuse a threshold measured on another runner.
       - name: Calibrate and test delayed spilling
-        shell: bash
+        id: spill
         run: scripts/run_native_spill_conformance.sh target/native-spill-conformance
 
       - name: Upload spill decision evidence
-        if: always()
+        if: always() && (steps.spill.outcome == 'success' || steps.spill.outcome == 'failure')
         uses: actions/upload-artifact@v4
         with:
           name: native-spill-conformance-${{ matrix.os }}
@@ -173,7 +104,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
 
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
@@ -215,7 +145,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-
       - name: Install 32-bit C toolchain
         run: sudo apt-get update && sudo apt-get install --yes gcc-multilib
 
@@ -235,7 +164,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
 
       - name: Configure x86 MSVC environment
         uses: ilammy/msvc-dev-cmd@v1

@@ -108,19 +108,24 @@ fn native_view_matches_upstream_help_and_console_verbosity_policy() {
     assert!(!help.status.success());
     let help_stdout =
         std::str::from_utf8(source_startup::stdout_body_before_suffix(&help)).unwrap();
-    assert!(help_stdout.starts_with("Options:\n--threads"));
-    assert!(help_stdout.contains("--outfmt                 output format\n"));
-    assert!(help_stdout.contains(
+    assert!(help_stdout.starts_with(&source_startup::source_console_text("Options:\n--threads")));
+    assert!(help_stdout.contains(&source_startup::source_console_text(
+        "--outfmt                 output format\n"
+    )));
+    assert!(help_stdout.contains(&source_startup::source_console_text(
         "\tnormalized_bitscore means Bitscore normalized by maximum self alignment score\n"
-    ));
-    assert!(help_stdout.contains(
+    )));
+    assert!(help_stdout.contains(&source_startup::source_console_text(
         "\t        ssubvariety means Unique subject subvariety(s), separated by a ';'\n"
+    )));
+    assert!(help_stdout.ends_with(&source_startup::source_console_text(
+        "--forwardonly            only show alignments of forward strand\n\n"
+    )));
+    assert!(std::str::from_utf8(&help.stderr).unwrap().ends_with(
+        &source_startup::source_console_text(
+            "Error: The view command requires a DAA (option -a) input file.\n"
+        )
     ));
-    assert!(help_stdout
-        .ends_with("--forwardonly            only show alignments of forward strand\n\n"));
-    assert!(std::str::from_utf8(&help.stderr)
-        .unwrap()
-        .ends_with("Error: The view command requires a DAA (option -a) input file.\n"));
 
     let base = [
         "view",
@@ -148,11 +153,22 @@ fn native_view_matches_upstream_help_and_console_verbosity_policy() {
     assert_eq!(source_startup::stdout_body(&stdout_verbose), b"query0\n");
     let verbose_stderr = String::from_utf8(stdout_verbose.stderr).unwrap();
     assert!(verbose_stderr.starts_with("diamond v2.1.24.178 "));
-    assert!(verbose_stderr.contains("#CPU threads: 1\n"));
-    assert!(verbose_stderr
-        .contains("Scoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n"));
-    assert!(verbose_stderr.contains("Build version = 178\n"));
-    assert!(verbose_stderr.contains("#Target sequences to report alignments for: 25\n"));
+    assert!(verbose_stderr.contains(&source_startup::source_console_text("#CPU threads: 1\n")));
+    assert!(
+        verbose_stderr.contains(&source_startup::source_console_text(
+            "Scoring parameters: (Matrix=BLOSUM62 Lambda=0.267 K=0.041 Penalties=11/1)\n"
+        ))
+    );
+    assert!(
+        verbose_stderr.contains(&source_startup::source_console_text(
+            "Build version = 178\n"
+        ))
+    );
+    assert!(
+        verbose_stderr.contains(&source_startup::source_console_text(
+            "#Target sequences to report alignments for: 25\n"
+        ))
+    );
     assert!(!verbose_stderr.contains("DP fields:"));
 
     let output = directory.join("view.tsv");
@@ -182,13 +198,23 @@ fn native_view_matches_upstream_help_and_console_verbosity_policy() {
         .unwrap();
     assert!(file_log.status.success());
     let log_stderr = String::from_utf8(file_log.stderr).unwrap();
-    assert!(log_stderr.contains(" --quiet --log\n"));
-    assert!(log_stderr.contains("Build version = 178\n"));
-    assert!(log_stderr.contains("TRACE_PT_MEMBUF=OFF\n"));
-    assert!(log_stderr.contains("MAX_SHAPE_LEN=19 SEQ_MASK STRICT_BAND\n"));
-    assert!(log_stderr.contains("Min length ratio: 0\n"));
-    assert!(log_stderr.contains("#Target sequences to report alignments for: 25\n"));
-    assert!(log_stderr.contains("DP fields: 0\n"));
+    assert!(log_stderr.contains(&source_startup::source_console_text(" --quiet --log\n")));
+    assert!(log_stderr.contains(&source_startup::source_console_text(
+        "Build version = 178\n"
+    )));
+    assert!(log_stderr.contains(&source_startup::source_console_text(
+        "TRACE_PT_MEMBUF=OFF\n"
+    )));
+    assert!(log_stderr.contains(&source_startup::source_console_text(
+        "MAX_SHAPE_LEN=19 SEQ_MASK STRICT_BAND\n"
+    )));
+    assert!(log_stderr.contains(&source_startup::source_console_text(
+        "Min length ratio: 0\n"
+    )));
+    assert!(log_stderr.contains(&source_startup::source_console_text(
+        "#Target sequences to report alignments for: 25\n"
+    )));
+    assert!(log_stderr.contains(&source_startup::source_console_text("DP fields: 0\n")));
 
     std::fs::remove_dir_all(directory).unwrap();
 }

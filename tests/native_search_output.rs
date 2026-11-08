@@ -177,7 +177,9 @@ fn unaligned_option_cardinality_matches_the_upstream_parser() {
             .output()
             .unwrap();
         assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).ends_with(&format!("Error: {expected}\n")));
+        assert!(String::from_utf8_lossy(&result.stderr).ends_with(
+            &source_startup::source_console_text(&format!("Error: {expected}\n"))
+        ));
     }
 }
 
@@ -262,11 +264,12 @@ fn deprecated_workflows_use_native_validation_and_status() {
             );
             assert_eq!(
                 source_startup::stdout_body_before_suffix(&result),
-                b"Options:\n\n"
+                source_startup::source_console_text("Options:\n\n").as_bytes()
             );
             if command == "roc" {
-                assert!(String::from_utf8_lossy(&result.stderr)
-                    .ends_with("Error: Deprecated command: roc\n"));
+                assert!(String::from_utf8_lossy(&result.stderr).ends_with(
+                    &source_startup::source_console_text("Error: Deprecated command: roc\n")
+                ));
             }
         }
         for (args, message, extra_accepts) in [
@@ -306,13 +309,15 @@ fn deprecated_workflows_use_native_validation_and_status() {
                 );
                 assert_eq!(source_startup::stdout_body_before_suffix(&result), b"");
                 if command == "roc" {
-                    assert!(String::from_utf8_lossy(&result.stderr)
-                        .ends_with("Error: Deprecated command: roc\n"));
+                    assert!(String::from_utf8_lossy(&result.stderr).ends_with(
+                        &source_startup::source_console_text("Error: Deprecated command: roc\n")
+                    ));
                 }
             } else {
                 assert_eq!(result.status.code(), Some(1));
-                assert!(String::from_utf8_lossy(&result.stderr)
-                    .ends_with(&format!("Error: {message}\n")));
+                assert!(String::from_utf8_lossy(&result.stderr).ends_with(
+                    &source_startup::source_console_text(&format!("Error: {message}\n"))
+                ));
             }
         }
     }

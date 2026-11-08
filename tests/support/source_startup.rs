@@ -5,6 +5,16 @@
 
 const WARNING: &[u8] = b"Warning: This version of DIAMOND is more than 180 days old. It is recommended to always use the latest version.\n";
 
+/// Expected Source CLI cout/cerr text is written through CRT text streams.
+/// Project fixture text only; never normalize captured stdout, stderr, or files.
+pub fn source_console_text(expected: &str) -> String {
+    if cfg!(windows) {
+        expected.replace('\n', "\r\n")
+    } else {
+        expected.to_owned()
+    }
+}
+
 fn age_warning() -> bool {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -23,18 +33,20 @@ pub fn age_warning_stderr() -> Vec<u8> {
     } else {
         b"\x1b[1;33m".to_vec()
     };
-    expected.extend_from_slice(WARNING);
+    expected
+        .extend_from_slice(source_console_text(std::str::from_utf8(WARNING).unwrap()).as_bytes());
     expected
 }
 
 pub fn assert_age_warning(output: &std::process::Output) {
     let warning = age_warning_stderr();
+    let warning_text = source_console_text(std::str::from_utf8(WARNING).unwrap());
     if warning.is_empty() {
         assert!(
             !output
                 .stderr
-                .windows(WARNING.len())
-                .any(|bytes| bytes == WARNING),
+                .windows(warning_text.len())
+                .any(|bytes| bytes == warning_text.as_bytes()),
             "unexpected Source release-age warning"
         );
     } else {

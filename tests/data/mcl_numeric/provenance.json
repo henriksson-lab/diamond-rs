@@ -25,10 +25,16 @@
   "original_source_edits": [],
   "source_runtime_dependency": false,
   "full_mcl_cli_parity_claim": false,
-  "platform_scope": "Exact GNU11/Eigen3.3.8 f32 protocol. Expected bits retained on every Rust platform; unexplained platform differences must fail rather than be silently tolerated or skipped.",
+  "platform_scope": "All54 frozen bit vectors are asserted on Linux/GNU x86_64 (the captured GNU11/libm baseline-SSE profile). Other targets retain51 exact cases; the3 explicitly libm/NaN-sensitive cases execute independent mathematical checks instead of claiming cross-target Source bit parity.",
   "limitations": [
     "Full pinned MCL CLI cannot build unchanged (deleted reference.h and task_timer type); this is exact numerical helper proof only.",
     "Fractional first expansion with rejected eigenvector determinant leaves uninitialized C++ output; Rust allocating convenience uses definedzero. The exp-retain fixture instead probes actual defined initialized output ownership.",
     "Cases cover dense/sparse builders/gamma/exp/markov, duplicate order, tiny-value pruning, empty columns, convergence counters and valid fractional sizes2,3,5,8. Larger numerical/ordering scope remains subject to actual comparison. Nonnegative cyclic matrices additionally exercise complex-conjugate eigenvectors at3,5,8. n17 cases cover recursive-LU/packet thresholds."
-  ]
+  ],
+  "portable_profile_checks": {
+    "dense-markov-converged": "Exact absorbing values/identical columns and positive residual below algorithm f32 EPSILON; exact convergence counter remains checked.",
+    "dense-gamma-empty-column": "IEEE NaN classification for0/0; nonempty column remains exact1/5,4/5. NaNsign not asserted outside captured target.",
+    "dense-fractional-complex-cycle-8": "Complete matrix versus symmetric half-sum of independent200term realbinomialseries(I+P/2)^r and its transpose: Source dense.h46 discards imaginary diagonal powers via d.real() before reconstruction. Explicit n*f32EPSILON*absoluteSeriesSum rounding budget unchanged; no Sourcebit tolerance/global relaxation.",
+    "hosted_evidence": "Run42472717649: macOSARM38 mismatching cells across these3 cases; macOSIntel34 cells solely fractionalcomplexcycle8. Both use Darwinlibm unlike captured GNUlibm; source_complex_pow calls platform atan2/log/exp/sin/cos; gamma/Markov powf. No production change; no claim native DarwinSource comparison."
+  }
 }

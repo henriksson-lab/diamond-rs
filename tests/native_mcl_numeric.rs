@@ -1,4 +1,7 @@
-//! Frozen exact GNU/Eigen Source numerical vectors; no C++ runtime dependency.
+//! Frozen GNU11/Linux x86_64 Eigen vectors; no C++ runtime dependency.
+//! Three libm/NaN-sensitive cases additionally have independent mathematical
+//! checks. Their captured bits are asserted on the captured target profile;
+//! the other 51 cases retain exact comparisons on every target.
 use diamond::mcl::mcl::{DenseMatrix, Mcl, SparseMatrix, Triplet};
 
 #[test]
@@ -102,8 +105,26 @@ fn source_mcl_numerical_stages() {
                 .collect();
             match result {
                 Ok(actual) => {
+                    assert_eq!(actual.len(), expected.len(), "{name} matrix dimensions");
+                    let portable_case = matches!(
+                        name,
+                        "dense-markov-converged"
+                            | "dense-gamma-empty-column"
+                            | "dense-fractional-complex-cycle-8"
+                    );
+                    if portable_case {
+                        check_libm_sensitive_case(name, &actual, r, n);
+                    }
+                    // The fixture was captured with GNU11/libm on x86_64 Linux
+                    // using baseline SSE. Darwin libm differs even on x86_64;
+                    // ARM also has a different default sign for 0/0 NaNs.
+                    let captured_profile = cfg!(all(
+                        target_os = "linux",
+                        target_env = "gnu",
+                        target_arch = "x86_64"
+                    ));
                     for (i, (&got, &want)) in actual.iter().zip(&expected).enumerate() {
-                        if got != want {
+                        if got != want && (captured_profile || !portable_case) {
                             mismatches.push(format!(
                                 "{name} row={} col={}: {got:08x} != Source {want:08x}",
                                 i % n,
@@ -130,4 +151,64 @@ fn source_mcl_numerical_stages() {
         mismatches.len(),
         mismatches.join("\n")
     );
+}
+
+fn check_libm_sensitive_case(name: &str, bits: &[u32], power: f32, n: usize) {
+    let values: Vec<f64> = bits.iter().map(|&v| f32::from_bits(v) as f64).collect();
+    match name {
+        "dense-gamma-empty-column" => {
+            // Gamma computes 0/0 in the empty column. IEEE NaN classification
+            // is defined here, while its sign/payload is target arithmetic.
+            assert!(values[0].is_nan() && values[1].is_nan());
+            assert_eq!(bits[2], (1.0f32 / 5.0).to_bits());
+            assert_eq!(bits[3], (4.0f32 / 5.0).to_bits());
+        }
+        "dense-markov-converged" => {
+            // Both columns converge to the first absorbing state. The positive
+            // residual depends on powf rounding, and is below the algorithm's
+            // own f32::EPSILON stopping threshold on both captured platforms.
+            assert_eq!(n, 2);
+            assert_eq!(bits[0], 1.0f32.to_bits());
+            assert_eq!(bits[2], 1.0f32.to_bits());
+            assert_eq!(bits[1], bits[3]);
+            assert!(values[1] > 0.0 && values[1] < f32::EPSILON as f64);
+            assert_eq!(values[0] + values[1], 1.0);
+            assert_eq!(values[2] + values[3], 1.0);
+        }
+        "dense-fractional-complex-cycle-8" => {
+            assert_eq!(n, 8);
+            // Independent real binomial series for (I + P/2)^power, where P
+            // shifts a column down one position and P^8=I. Source dense.h:46
+            // uses V*d.real()*V.inverse(), so its output here is the symmetric
+            // half-sum of this power and its transpose: imaginary eigenvalue
+            // powers are discarded before reconstruction. No eigensolver,
+            // complex logarithm/power, or platform libm is used in this oracle.
+            // |P/2|<1 gives absolute convergence; 200 terms leave <2^-190
+            // truncation error. Compare the complete matrix, including small
+            // negative entries, with an explicit n*epsilon*L1-series rounding
+            // budget for the f32 matrix computation (not Source-bit parity).
+            let mut column = vec![0.0f64; n];
+            let mut coefficient = 1.0f64;
+            let mut absolute_sum = 0.0f64;
+            for k in 0..200 {
+                column[k % n] += coefficient;
+                absolute_sum += coefficient.abs();
+                coefficient *= (power as f64 - k as f64) * 0.5 / (k + 1) as f64;
+            }
+            let rounding_budget = n as f64 * f32::EPSILON as f64 * absolute_sum;
+            for col in 0..n {
+                for row in 0..n {
+                    let actual = values[col * n + row];
+                    let offset = (row + n - col) % n;
+                    let expected = 0.5 * (column[offset] + column[(n - offset) % n]);
+                    assert!(actual.is_finite());
+                    assert!(
+                        (actual - expected).abs() <= rounding_budget,
+                        "{name} ({row},{col}) actual={actual} binomial={expected} budget={rounding_budget}"
+                    );
+                }
+            }
+        }
+        _ => unreachable!("not a profile-sensitive fixture"),
+    }
 }

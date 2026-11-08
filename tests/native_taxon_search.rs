@@ -1,4 +1,7 @@
 //! Real taxonomy classification contexts against the unchanged source executable.
+#[path = "support/source_startup.rs"]
+mod source_startup;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -241,7 +244,7 @@ fn taxonomy_metadata_and_option_errors_match_source() {
     ] {
         let mut command=Command::new(env!("CARGO_BIN_EXE_diamond"));command.arg("blastp").arg("-q").arg(root.join("tests/data/tabular_context/query.faa")).arg("-d").arg(directory.join(format!("{variant}.dmnd"))).args(["-f","102"]);if lineage {command.arg("--include-lineage");}
         let result=command.output().unwrap();assert_eq!(result.status.code(),Some(1));
-        let expected=format!("Error: Options require taxonomy information included in the database. Please use the respective options to build this information into the database when running diamond makedb: {missing}\n");assert!(String::from_utf8_lossy(&result.stderr).ends_with(&expected),"{}",String::from_utf8_lossy(&result.stderr));
+        let expected=format!("Error: Options require taxonomy information included in the database. Please use the respective options to build this information into the database when running diamond makedb: {missing}\n");assert!(String::from_utf8_lossy(&result.stderr).ends_with(&source_startup::source_console_text(&expected)),"{}",String::from_utf8_lossy(&result.stderr));
     }
     for (options, error) in [
         (
@@ -277,7 +280,9 @@ fn taxonomy_metadata_and_option_errors_match_source() {
             .unwrap();
         assert_eq!(result.status.code(), Some(1));
         assert!(
-            String::from_utf8_lossy(&result.stderr).ends_with(&format!("Error: {error}\n")),
+            String::from_utf8_lossy(&result.stderr).ends_with(
+                &source_startup::source_console_text(&format!("Error: {error}\n"))
+            ),
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );

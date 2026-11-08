@@ -1,4 +1,7 @@
 //! Native search headers, gzip and configured I/O against frozen source output.
+#[path = "support/source_startup.rs"]
+mod source_startup;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -469,7 +472,9 @@ fn output_option_protocol_and_file_creation_match_source() {
         }
         assert_eq!(result.status.code(), Some(1));
         assert!(
-            String::from_utf8_lossy(&result.stderr).ends_with(&format!("Error: {error}\n")),
+            String::from_utf8_lossy(&result.stderr).ends_with(
+                &source_startup::source_console_text(&format!("Error: {error}\n"))
+            ),
             "{index}: {}",
             String::from_utf8_lossy(&result.stderr)
         );
@@ -500,7 +505,7 @@ fn output_option_protocol_and_file_creation_match_source() {
             .unwrap();
         assert_eq!(result.status.code(), Some(1), "buffer {value}");
         assert!(
-            String::from_utf8_lossy(&result.stderr).ends_with("Failed to allocate sufficient memory. Please refer to the online wiki for instructions on memory usage.\n"),
+            String::from_utf8_lossy(&result.stderr).ends_with(&source_startup::source_console_text("Failed to allocate sufficient memory. Please refer to the online wiki for instructions on memory usage.\n")),
             "buffer {value}: {}",
             String::from_utf8_lossy(&result.stderr)
         );

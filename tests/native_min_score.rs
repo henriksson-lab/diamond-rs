@@ -1,5 +1,8 @@
 //! Frozen C++ cutoffs exercise score-only, coordinate/statistics and transcript
 //! result paths, including merged reference/query blocks and adjusted matrices.
+#[path = "support/source_startup.rs"]
+mod source_startup;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -158,7 +161,7 @@ fn invalid_cutoff_arguments_do_not_require_cpp() {
             assert!(output.stdout.is_empty());
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
-                format!("Error: {message}\n")
+                source_startup::source_console_text(&format!("Error: {message}\n"))
             );
         }
     }

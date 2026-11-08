@@ -157,7 +157,9 @@ fn reassignment_validates_configuration_before_input_io() {
             .unwrap();
         assert!(!result.status.success());
         assert!(
-            String::from_utf8_lossy(&result.stderr).ends_with(&format!("Error: {message}\n")),
+            String::from_utf8_lossy(&result.stderr).ends_with(
+                &source_startup::source_console_text(&format!("Error: {message}\n"))
+            ),
             "{args:?}: {}",
             String::from_utf8_lossy(&result.stderr)
         );

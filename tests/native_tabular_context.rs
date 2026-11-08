@@ -1,4 +1,7 @@
 //! Concrete tabular callbacks against the immutable source's output files.
+#[path = "support/source_startup.rs"]
+mod source_startup;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -136,8 +139,9 @@ fn quality_and_field_validation_match_source_without_ffi() {
             std::fs::read(fixtures.join(format!("{name}.tsv"))).unwrap()
         );
         if name == "multiline-sequence" {
-            assert!(String::from_utf8_lossy(&result.stderr)
-                .ends_with("Error: Malformed FASTQ record\n"));
+            assert!(String::from_utf8_lossy(&result.stderr).ends_with(
+                &source_startup::source_console_text("Error: Malformed FASTQ record\n")
+            ));
         }
         assert!(!String::from_utf8_lossy(&result.stderr).contains("C++ FFI"));
     }
@@ -170,7 +174,9 @@ fn quality_and_field_validation_match_source_without_ffi() {
             .output()
             .unwrap();
         assert_eq!(result.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&result.stderr).ends_with(&format!("Error: {expected}\n")));
+        assert!(String::from_utf8_lossy(&result.stderr).ends_with(
+            &source_startup::source_console_text(&format!("Error: {expected}\n"))
+        ));
         assert!(!String::from_utf8_lossy(&result.stderr).contains("C++ FFI"));
     }
     for field in [
@@ -206,8 +212,11 @@ fn quality_and_field_validation_match_source_without_ffi() {
             .output()
             .unwrap();
         assert_eq!(result.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&result.stderr)
-            .ends_with(&format!("Error: Invalid output field: {field}\n")));
+        assert!(String::from_utf8_lossy(&result.stderr).ends_with(
+            &source_startup::source_console_text(&format!(
+                "Error: Invalid output field: {field}\n"
+            ))
+        ));
         assert_eq!(
             std::fs::read(output).unwrap(),
             std::fs::read(fixtures.join(format!("unaligned-error.{field}.tsv"))).unwrap()

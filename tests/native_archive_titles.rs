@@ -1,8 +1,18 @@
 //! Archive title policies preserve the source dictionary and real separators.
+#[path = "support/source_startup.rs"]
+mod source_startup;
+
 use diamond::commands::blastp::{self, ArchiveOptions, BlastpConfig, TranslatedQueryLayout};
 use diamond::data::{block::Block, daa::DaaFile, fasta};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+// Windows CRT files are inheritable, and Rust Command inherits handles by
+// default. Keep this binary's subprocess tests from inheriting the library
+// test's open archives; its internal parallel search coverage stays enabled.
+#[cfg(windows)]
+static ARCHIVE_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const FIELDS: &[&str] = &[
     "qseqid",
     "sseqid",
@@ -93,6 +103,10 @@ fn view(archive: &Path, output: &Path, expected: &[u8], label: &str) {
 }
 #[test]
 fn native_archive_titles_and_other_format_flags_match_source() {
+    #[cfg(windows)]
+    let _process_guard = ARCHIVE_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = directory("cli");
     let db = database(&dir);
     let fixture = fixtures();
@@ -260,6 +274,10 @@ fn config(dir: &Path, db: &Path, c: &[&str], threads: i32) -> BlastpConfig {
 }
 #[test]
 fn supplied_query_apis_preserve_archive_dictionary_policy_and_unaligned_behavior() {
+    #[cfg(windows)]
+    let _process_guard = ARCHIVE_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = directory("library");
     let db = database(&dir);
     let fixture = fixtures();
@@ -341,6 +359,10 @@ fn supplied_query_apis_preserve_archive_dictionary_policy_and_unaligned_behavior
 }
 #[test]
 fn archive_flag_protocol_matches_source() {
+    #[cfg(windows)]
+    let _process_guard = ARCHIVE_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = directory("errors");
     let db = database(&dir);
     for (flags, error) in [
@@ -366,7 +388,9 @@ fn archive_flag_protocol_matches_source() {
             .unwrap();
         assert_eq!(result.status.code(), Some(1));
         assert!(
-            String::from_utf8_lossy(&result.stderr).ends_with(&format!("Error: {error}\n")),
+            String::from_utf8_lossy(&result.stderr).ends_with(
+                &source_startup::source_console_text(&format!("Error: {error}\n"))
+            ),
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );

@@ -1,5 +1,8 @@
 //! Search controls exercise native seed eligibility and DP filtering against
 //! frozen outputs from the unchanged upstream executable.
+#[path = "support/source_startup.rs"]
+mod source_startup;
+
 use diamond::commands::blastp::{self, BlastpConfig, TranslatedQueryLayout};
 use diamond::data::{block::Block, fasta};
 use diamond::masking::{MaskingAlgo, MaskingMode};
@@ -343,7 +346,9 @@ fn search_control_errors_and_impossible_typed_buffer_are_recoverable() {
             .unwrap();
         assert_eq!(result.status.code(), Some(1));
         assert!(
-            String::from_utf8_lossy(&result.stderr).ends_with(&format!("Error: {error}\n")),
+            String::from_utf8_lossy(&result.stderr).ends_with(
+                &source_startup::source_console_text(&format!("Error: {error}\n"))
+            ),
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );

@@ -1,4 +1,7 @@
 //! SAM search callbacks compared with frozen output from the unchanged oracle.
+#[path = "support/source_startup.rs"]
+mod source_startup;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -142,7 +145,9 @@ fn sam_boolean_options_reject_values_like_source() {
             .output()
             .unwrap();
         assert_eq!(result.status.code(), Some(1));
-        assert!(String::from_utf8_lossy(&result.stderr).ends_with(&format!("Error: {error}\n")));
+        assert!(String::from_utf8_lossy(&result.stderr).ends_with(
+            &source_startup::source_console_text(&format!("Error: {error}\n"))
+        ));
         assert!(!String::from_utf8_lossy(&result.stderr).contains("C++ FFI"));
     }
 }

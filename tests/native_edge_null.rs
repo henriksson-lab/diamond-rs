@@ -1,4 +1,7 @@
 //! Source binary edge and null output through the actual native search pipeline.
+#[path = "support/source_startup.rs"]
+mod source_startup;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -225,9 +228,9 @@ fn null_and_edge_still_validate_actual_query_records() {
             .output()
             .unwrap();
         assert_eq!(result.status.code(), Some(1));
-        assert!(
-            String::from_utf8_lossy(&result.stderr).ends_with("Error: Malformed FASTQ record\n")
-        );
+        assert!(String::from_utf8_lossy(&result.stderr).ends_with(
+            &source_startup::source_console_text("Error: Malformed FASTQ record\n")
+        ));
         assert!(!String::from_utf8_lossy(&result.stderr).contains("C++ FFI"));
     }
 }
